@@ -318,7 +318,7 @@ test('never reloads over unsaved edits; the stale save is a conflict and the edi
   ed.pending = '{"mine":1}'; // an unsaved local edit
   server.revision = '"r2"';  // an agent wrote meanwhile
   server.text = 'agent-change';
-  assert.equal(await s.poll(), 'behind');
+  assert.equal(await s.poll(), undefined, 'a dirty editor does not poll');
   assert.ok(!ed.calls.some((c) => c.startsWith('reload')), 'unsaved work not replaced');
   assert.equal(await s.save(), 'conflict');
   assert.equal(sentWith, '"r1"', 'saved against the revision it was based on');
@@ -452,4 +452,35 @@ test('editing is suspended while a discard loads, so it cannot erase a newer edi
   await assert.rejects(s.discard());
   assert.equal(s.editable(), true);
   assert.equal(s.state.conflict, true, 'the conflict and unsaved work stay');
+});
+
+test('only a clean editor polls: no revision request while dirty, in a gesture or a text edit (review round 3)', async () => {
+  let requests = 0;
+  const { s, ed, server } = await readySession();
+  s.deps.revision = async () => { requests += 1; return server.revision; };
+  server.revision = '"r2"';
+  // Unsaved work.
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.poll(), undefined);
+  // A gesture or text edit under way (the editor reports it can't reload).
+  ed.pending = undefined;
+  ed.canReload = false;
+  assert.equal(await s.poll(), undefined);
+  assert.equal(requests, 0, 'no revision request was made');
+  // Clean again: it polls and loads the change.
+  ed.canReload = true;
+  assert.equal(await s.poll(), 'reloaded');
+  assert.equal(requests, 1);
+});
+
+test('an edit made while a clean poll is under way is never replaced', async () => {
+  const { s, ed, server } = await readySession();
+  const rev = deferred();
+  s.deps.revision = async () => rev.promise;
+  const polling = s.poll();
+  ed.pending = '{"mine":1}';
+  server.revision = '"r2"';
+  rev.resolve('"r2"');
+  assert.equal(await polling, 'behind');
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
 });

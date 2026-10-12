@@ -145,14 +145,18 @@ export class Session {
   }
 
   /**
-   * Look for a newer revision on the server. Returns 'reloaded' when the page was replaced in
-   * place, 'behind' when it changed but this tab has unsaved work (its next save will be a
-   * conflict), else
+   * Look for a newer revision on the server, only while the editor is clean. Returns
+   * 'reloaded' when the page was replaced in place, 'behind' when it changed but this tab got
+   * unsaved work while the request was under way (its next save will be a conflict), else
    * undefined.
    */
   async poll() {
     const s = this.state;
-    if (this.polling || !this.editable() || s.saving || s.conflict) return undefined;
+    // Only a clean editor polls: with unsaved work, a gesture or a text edit nothing could be
+    // loaded anyway, so no request is made.
+    if (this.polling || !this.editable() || s.saving || s.conflict || !this.ed.can_reload()) {
+      return undefined;
+    }
     this.polling = true;
     try {
       return await this.pollOnce();
