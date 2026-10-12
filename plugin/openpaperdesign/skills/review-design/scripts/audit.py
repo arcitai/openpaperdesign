@@ -18,6 +18,19 @@ HASH = r"[0-9a-f]{64}"
 PACKAGE = Path(__file__).resolve().parents[3]
 
 
+
+def strict_json(raw):
+    """json.loads, but a key repeated in any object is an error (ValueError, reported as
+    FAIL) instead of the last value silently winning."""
+    def pairs(items):
+        out = {}
+        for key, value in items:
+            if key in out:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            out[key] = value
+        return out
+    return json.loads(raw, object_pairs_hook=pairs)
+
 class Audit:
     def __init__(self):
         self.evidence = []
@@ -54,9 +67,21 @@ class Audit:
         if path and hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             self.gap("FAIL", root, f"Stale hash: {name}")
 
+    def unique(self, root, pairs, what):
+        """Records as a dict; a repeated name is contradictory evidence, never collapsed."""
+        out = {}
+        for name, value in pairs:
+            if name in out:
+                self.gap("FAIL", root, f"Duplicate {what}: {name}")
+                continue
+            out[name] = value
+        return out
+
     def field(self, text, label, root, strong=False):
         pattern = (rf"^- \*\*{re.escape(label)}:\*\*\s*([^\n]+)" if strong
                    else rf"^{re.escape(label)}:\s*([^\n]+)")
+        if len(re.findall(pattern, text, re.M)) > 1:
+            self.gap("FAIL", root, f"Repeated field: {label}")
         match = re.search(pattern, text, re.M)
         if not match:
             self.gap("BLOCKED", root, f"Missing field: {label}")
@@ -76,12 +101,12 @@ class Audit:
             result = self.field(review, "Result", root)
             hashes = {name: self.field(review, f"Reviewed {name} SHA-256", root)
                       for name in ("BRIEF.md", "DESIGN.md")}
-            companions = dict(re.findall(
+            companions = self.unique(root, re.findall(
                 rf"^Reviewed (?:source )?companion:\s*`([^`]+)`\s+(?:—|-)\s+SHA-256\s+`({HASH})`\s*$",
-                review, re.M))
+                review, re.M), "reviewed companion")
         else:
             raw = self.read(root, "proof.json")
-            proof = json.loads(raw) if raw else {}
+            proof = strict_json(raw) if raw else {}
             reviewer, result = proof.get("reviewer"), proof.get("review")
             hashes = {"BRIEF.md": proof.get("reviewed_brief_sha256"),
                       "DESIGN.md": proof.get("reviewed_design_sha256")}
@@ -117,7 +142,7 @@ class Audit:
         binder = self.read(root, "HANDOFF.md")
         integrity = re.search(r"^## Included snapshot and integrity\s*\n(.+?)(?=\n## |\Z)", binder, re.M | re.S)
         entries = re.findall(rf"^- `([^`]+)` — SHA-256 `({HASH})`", integrity[1] if integrity else "", re.M)
-        manifest = dict(entries)
+        manifest = self.unique(root, entries, "snapshot entry")
         hashes, companions = self.design(root, selected=manifest)
         for label in ("Contract", "Handoff ID", "Handoff revision", "Source", "Source revision",
                       "Receiving owner", "Receiving outcome", "Review state", "Review mode",
@@ -154,9 +179,9 @@ class Audit:
             # A review may cover extra companions that were deliberately not delivered.
             if name in manifest and manifest[name] != digest:
                 self.gap("FAIL", root, f"Manifest disagrees with reviewed companion: {name}")
-        derived = dict((name, (digest, source_hash)) for name, digest, source_hash in re.findall(
+        derived = self.unique(root, ((name, (digest, source_hash)) for name, digest, source_hash in re.findall(
             rf"^- `([^`]+)` — SHA-256 `({HASH})`; derived from reviewed DESIGN.md SHA-256 `({HASH})`",
-            binder, re.M))
+            binder, re.M)), "derived export")
         core = {"BRIEF.md", "DESIGN.md", "REVIEW.md", "proof.json"}
         for name, digest in manifest.items():
             if name in core or companions.get(name) == digest:

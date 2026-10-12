@@ -26,5 +26,9 @@ handoff (archive SHA-256 `c07f55536371d2d17b27a435f6d350ddcf4d490a46af71cdf14e37
 - Fixed on port (2026-10-12): in `review-design/scripts/audit.py`, a reviewed companion entry
   named like canonical evidence (for example `DESIGN.md`) replaced the canonical reviewed
   hash, so a stale review could audit as PASS. Canonical hashes are now checked separately
-  and such companion entries fail. The AIOS original is unchanged; its owners may want the
-  same fix.
+  and such companion entries fail. Also fixed on port (B2b review round 2): repeated
+  evidence was collapsed to one value (duplicate `proof.json` keys, repeated REVIEW.md
+  records), so contradictory evidence could audit as PASS. The audit now rejects duplicate
+  JSON keys at any depth and repeated records or fields, and `create-handoff.mjs` refuses a
+  REVIEW.md with repeated records. The AIOS original is unchanged; its owners may want the
+  same fixes.

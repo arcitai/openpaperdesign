@@ -84,6 +84,29 @@ class PortableTests(InstalledCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertNotEqual(first_revision, json.loads(second.stdout)["handoff"]["revision"])
 
+    def test_repeated_review_records_refuse_the_handoff(self):
+        """B2b review round 2: contradictory REVIEW.md records are refused, not collapsed."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = fixture(root / "design")
+            (source / "assets").mkdir()
+            (source / "assets/shape.svg").write_text("<svg/>\n")
+            write_review(source, companions=("assets/shape.svg",))
+            review = source / "REVIEW.md"
+            base = review.read_text()
+            record = "Reviewed source companion: `assets/shape.svg` — SHA-256 `" + "0" * 64 + "`\n"
+            review.write_text(record + base)
+            refused = self.handoff(source, root / "a", "--asset", "assets/shape.svg")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("more than once", refused.stderr)
+            review.write_text("Result: BLOCKED\n" + base)
+            refused = self.handoff(source, root / "b", "--asset", "assets/shape.svg")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("repeats Result", refused.stderr)
+            review.write_text(base)
+            passed = self.handoff(source, root / "c", "--asset", "assets/shape.svg")
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+
     def test_selected_exports_need_explicit_external_tool_and_bind_derivation(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

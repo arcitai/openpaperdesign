@@ -331,6 +331,11 @@ function inspectReview(sourceRoot) {
   const reviewPath = join(sourceRoot, "REVIEW.md");
   if (existsSync(reviewPath)) {
     const review = readFileSync(reviewPath, "utf8");
+    // Contradictory evidence is refused, never resolved by keeping one of the records.
+    for (const label of ["Result", "Reviewer", "Reviewed DESIGN\\.md SHA-256", "Reviewed BRIEF\\.md SHA-256"]) {
+      if ((review.match(new RegExp(`^${label}:`, "gm")) ?? []).length > 1)
+        return { error: `REVIEW.md repeats ${label.replaceAll("\\", "")}.` };
+    }
     const status = review.match(/^Result:\s*(PASS|REVISE|BLOCKED)\s*$/m)?.[1];
     const reviewer = review.match(/^Reviewer:\s*(\S[^\n]*)\s*$/m)?.[1]?.trim();
     const reviewedDesignSha256 = review.match(
@@ -340,8 +345,11 @@ function inspectReview(sourceRoot) {
     const reviewedSourceCompanions = {};
     for (const match of review.matchAll(
       /^Reviewed (?:source )?companion:\s*`([^`]+)`\s+(?:—|-)\s+SHA-256\s+`([0-9a-f]{64})`\s*$/gm,
-    ))
+    )) {
+      if (Object.hasOwn(reviewedSourceCompanions, match[1]))
+        return { error: `REVIEW.md lists reviewed companion ${match[1]} more than once.` };
       reviewedSourceCompanions[match[1]] = match[2];
+    }
     return {
       status,
       reviewer,

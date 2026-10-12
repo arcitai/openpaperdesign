@@ -81,6 +81,73 @@ class AuditTests(InstalledCase):
             (proofed / "proof.json").write_text(json.dumps(proof))
             self.assertEqual(self.audit("--design-dir", proofed)["status"], "PASS")
 
+    def test_duplicate_evidence_is_never_collapsed(self):
+        """B2b review round 2: repeated JSON keys or Markdown records used to keep only one
+        value, so contradictory evidence could audit as PASS."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def proof_form(name):
+                design = fixture(root / name)
+                (design / "REVIEW.md").unlink()
+                (design / "preview.html").write_text("<p>preview</p>\n")
+                return design
+
+            def audit_raw(design, raw):
+                (design / "proof.json").write_text(raw)
+                return self.audit("--design-dir", design)
+
+            def head(design):
+                return ('"reviewer": "Independent reviewer", '
+                        f'"reviewed_brief_sha256": "{digest(design / "BRIEF.md")}"')
+
+            stale = "0" * 64
+            # 1. reviewed_design_sha256 twice: stale, then current.
+            d = proof_form("dup canonical")
+            out = audit_raw(d, "{" + head(d) + ', "review": "PASS", '
+                            f'"reviewed_design_sha256": "{stale}", '
+                            f'"reviewed_design_sha256": "{digest(d / "DESIGN.md")}"}}')
+            self.assertEqual(out["status"], "FAIL")
+            self.assertTrue(any("duplicate JSON key" in g["message"] for g in out["gaps"]), out)
+            # 2. A companion container hiding the forbidden DESIGN.md companion behind a duplicate.
+            d = proof_form("dup container")
+            out = audit_raw(d, "{" + head(d) + ', "review": "PASS", '
+                            f'"reviewed_design_sha256": "{digest(d / "DESIGN.md")}", '
+                            f'"reviewed_source_companions": {{"DESIGN.md": "{digest(d / "DESIGN.md")}"}}, '
+                            '"reviewed_source_companions": {}}')
+            self.assertEqual(out["status"], "FAIL")
+            # 3. The same companion twice in one map: stale, then current.
+            d = proof_form("dup companion")
+            out = audit_raw(d, "{" + head(d) + ', "review": "PASS", '
+                            f'"reviewed_design_sha256": "{digest(d / "DESIGN.md")}", '
+                            f'"reviewed_source_companions": {{"preview.html": "{stale}", '
+                            f'"preview.html": "{digest(d / "preview.html")}"}}}}')
+            self.assertEqual(out["status"], "FAIL")
+            # 4. Verdict FAIL, then PASS.
+            d = proof_form("dup verdict")
+            out = audit_raw(d, "{" + head(d) + ', "review": "FAIL", "review": "PASS", '
+                            f'"reviewed_design_sha256": "{digest(d / "DESIGN.md")}"}}')
+            self.assertEqual(out["status"], "FAIL")
+            # The same proof without duplicates passes, so the duplicates are the reason.
+            out = audit_raw(d, "{" + head(d) + ', "review": "PASS", '
+                            f'"reviewed_design_sha256": "{digest(d / "DESIGN.md")}"}}')
+            self.assertEqual(out["status"], "PASS", out)
+            # 5. REVIEW.md: two companion records for one file, then two Result lines.
+            d = fixture(root / "markdown")
+            (d / "preview.html").write_text("<p>preview</p>\n")
+            review = d / "REVIEW.md"
+            base = review.read_text()
+            review.write_text(base
+                              + f"Reviewed source companion: `preview.html` — SHA-256 `{stale}`\n"
+                              + f"Reviewed source companion: `preview.html` — SHA-256 `{digest(d / 'preview.html')}`\n")
+            out = self.audit("--design-dir", d)
+            self.assertEqual(out["status"], "FAIL")
+            self.assertTrue(any("Duplicate reviewed companion" in g["message"] for g in out["gaps"]), out)
+            review.write_text("Result: FAIL\n" + base)
+            out = self.audit("--design-dir", d)
+            self.assertEqual(out["status"], "FAIL")
+            self.assertTrue(any("Repeated field: Result" in g["message"] for g in out["gaps"]), out)
+
     def test_snapshot_integrity_acceptance_and_tampering(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
