@@ -300,6 +300,12 @@ impl Launcher {
         let token = new_token().map_err(|e| e.to_string())?;
         let server = Server::open_embedded(dir, BUNDLE_FILES, port, token.clone())
             .map_err(|e| e.to_string())?;
+        // The switch now happens: the project being left releases its layout state, so the
+        // new one doesn't inherit it (the new one has already dropped stale entries for its
+        // own pages when it opened).
+        if let Some(old) = bound.as_ref() {
+            old.server.release_layout_state();
+        }
         let app = router(server.clone());
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

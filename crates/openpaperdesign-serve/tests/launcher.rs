@@ -179,6 +179,92 @@ async fn a_replaced_workspace_is_refused_not_followed() {
     c.cancel().await.unwrap();
 }
 
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            copy_dir(&p, &to.join(e.file_name()));
+        } else {
+            std::fs::copy(&p, to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// A child inserted into `frame`, and its width.
+async fn child_width(c: &Client, frame: &str) -> f64 {
+    let (ok, out) = call(
+        c,
+        "write_html",
+        json!({"targetNodeId": frame, "mode": "insert-children", "html": "<div style='height:20px'></div>"}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let id = v["createdNodeIds"][0].as_str().unwrap().to_string();
+    let (ok, out) = call(c, "get_node_info", json!({"nodeId": id})).await;
+    assert!(ok, "{out}");
+    serde_json::from_str::<Value>(&out).unwrap()["width"]
+        .as_f64()
+        .unwrap()
+}
+
+/// Operator's Mac finding on cffeec6 (the stdio route): bind X, make its frame stop
+/// stretching its children, bind Y (a copy with the same page ids, frame still stretching):
+/// a child inserted in Y must be 300px wide, not inherit X's layout state. A failed rebind
+/// and a rebind of the same project change nothing (X keeps not stretching).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switch_does_not_carry_layout_state_to_the_next_project() {
+    let t = tmp();
+    let ws = t.0.join("workspace");
+    let home = t.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(ws.join("notes")).unwrap();
+    let (x, _) = Store::open(ws.join("design")).unwrap().create("X").unwrap();
+    let c = launcher(&ws, &home).await;
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/X"})).await;
+    assert!(ok, "{out}");
+    read_page(&c).await;
+    let (ok, out) = call(
+        &c,
+        "create_artboard",
+        json!({"name": "Frame", "styles": {"display": "flex", "flexDirection": "column", "alignItems": "stretch", "width": "300px", "height": "200px"}}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let frame = serde_json::from_str::<Value>(&out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Y: the same project, page ids included, while its frame still stretches.
+    copy_dir(&x.dir, &ws.join("design/Y"));
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [frame], "styles": {"alignItems": "flex-start", "width": "450px"}}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_eq!(child_width(&c, &frame).await, 0.0, "X no longer stretches");
+    // A failed rebind changes nothing, nor does binding X again.
+    let (ok, out) = call(&c, "bind_project", json!({"path": "notes"})).await;
+    assert!(!ok, "{out}");
+    assert_eq!(child_width(&c, &frame).await, 0.0, "after a failed rebind");
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/X"})).await;
+    assert!(ok && out.contains("already bound"), "{out}");
+    assert_eq!(child_width(&c, &frame).await, 0.0, "after rebinding X");
+    // Switch to Y: its frame stretches, as on disk.
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/Y"})).await;
+    assert!(ok, "{out}");
+    read_page(&c).await;
+    assert_eq!(
+        child_width(&c, &frame).await,
+        300.0,
+        "Y doesn't inherit X's layout state"
+    );
+    c.cancel().await.unwrap();
+}
+
 /// A minimal HTTP/1.1 GET on loopback; returns the status code.
 async fn http_status(port: u16, path: &str, token: &str) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
