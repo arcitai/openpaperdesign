@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.3 · Updated: 2026-10-12
+Revision: 0.4 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -64,6 +64,11 @@ that guard, so a pass is not proof that rendering happened.
 (`docs/openpaperdesign/browser-edit-b1.md`). Its revision checks protect only writers that go
 through it. Never describe it as protecting a concurrently running native app or other
 external writer.
+
+Agents edit the same project over MCP at `/mcp` on that server, with the per-launch token as
+`Authorization: Bearer <token>`. Only the bound project is reachable: export and project
+creation are refused, and images must be `data:` URIs
+(`docs/openpaperdesign/agent-edit-b2a.md`). Never write the token into repository files or commit it.
 
 ## Model profile
 
