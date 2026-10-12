@@ -136,6 +136,12 @@ async fn call(
     (r.is_error != Some(true), text(&r))
 }
 
+/// What an agent does before it changes a page: read it in its own session.
+async fn read(c: &rmcp::service::RunningService<rmcp::RoleClient, ()>) {
+    let (ok, out) = call(c, "get_basic_info", json!({})).await;
+    assert!(ok, "{out}");
+}
+
 fn file(p: &Project, id: &str) -> Vec<u8> {
     std::fs::read(p.page_path(id)).unwrap()
 }
@@ -278,6 +284,20 @@ async fn agent_edits_land_on_disk_and_change_the_revision() {
     }
     let before = doc(&p, &page);
     let rev0 = etag(&file(&p, &page));
+    // Review round 2, finding 2: a session must read a page before it changes it, even on
+    // its first call.
+    let disk = file(&p, &page);
+    let manifest = std::fs::read(p.dir.join("project.json")).unwrap();
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "ellipse", "x": 400, "y": 50, "width": 80, "height": 60}),
+    )
+    .await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(file(&p, &page), disk);
+    assert_eq!(std::fs::read(p.dir.join("project.json")).unwrap(), manifest);
+    read(&c).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -348,6 +368,7 @@ async fn sequential_human_and_agent_edits_are_both_kept() {
     .await;
     assert_eq!(st, StatusCode::OK, "{out}");
     let before = doc(&p, &page);
+    read(&c).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -397,6 +418,7 @@ async fn a_stale_browser_save_after_an_agent_write_is_refused_and_writes_nothing
     // The browser loaded revision 1 and then has an unsaved local edit.
     let (base_tag, base) = browser_get(&r, &page).await;
     let rect = doc(&p, &page).nodes.keys().next().unwrap().0;
+    read(&c).await;
 
     for (what, agent) in [
         (
@@ -549,6 +571,180 @@ async fn a_stale_agent_write_after_a_browser_save_is_refused_and_writes_nothing(
     other.cancel().await.unwrap();
 }
 
+fn manifest(p: &Project) -> Value {
+    serde_json::from_slice(&std::fs::read(p.dir.join("project.json")).unwrap()).unwrap()
+}
+
+fn page_names(p: &Project) -> Vec<String> {
+    manifest(p)["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Review round 2, finding 2: a session whose reads were forgotten (more sessions than the
+/// host remembers) must read again; its stale write is refused, never let through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgotten_session_must_read_again() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    let rect = doc(&p, &page).nodes.keys().next().unwrap().0;
+    let x0 = doc(&p, &page).nodes[&paper_rs::model::NodeId(rect)].rect.x;
+    read(&c).await;
+    let (tag, body) = browser_get(&r, &page).await;
+    let (st, _, _, out) = http(
+        &r,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        Some(&tag),
+        moved(&body, rect, 90.0),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let browser_version = file(&p, &page);
+    // More sessions than the host remembers each read once.
+    for _ in 0..257 {
+        let o = client(r.port).await;
+        read(&o).await;
+        o.cancel().await.unwrap();
+    }
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"left": "200px"}}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(file(&p, &page), browser_version, "the browser's save stays");
+    // After reading again the write lands on top of the browser's save.
+    read(&c).await;
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"width": "10px"}}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let n = &doc(&p, &page).nodes[&paper_rs::model::NodeId(rect)];
+    assert_eq!((n.rect.x, n.rect.w), (x0 + 90.0, 10.0));
+    c.cancel().await.unwrap();
+}
+
+/// Review round 2, finding 3: a host reload (here after a browser save to another page)
+/// keeps the page names saved in the manifest; a later write doesn't revert a rename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reloads_keep_saved_page_names() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    read(&c).await;
+    let (ok, out) = call(
+        &c,
+        "rename_pages",
+        json!({"updates": [{"pageId": page, "name": "Saved new name"}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(&c, "create_page", json!({"name": "Second"})).await;
+    assert!(ok, "{out}");
+    let second = manifest(&p)["pages"][1]["id"].as_str().unwrap().to_string();
+    assert_eq!(page_names(&p), ["Saved new name", "Second"]);
+    // A browser save to the second page makes the host reload everything.
+    let (tag, body) = browser_get(&r, &second).await;
+    let mut data = page_from_json(&body).unwrap();
+    data.camera = None;
+    data.doc.next_id += 1;
+    let (st, _, _, out) = http(
+        &r,
+        "PUT",
+        &format!("/api/pages/{second}"),
+        Some(&tag),
+        page_to_json(&data),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    // An unrelated agent edit on the second page, after reading.
+    read(&c).await;
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "rectangle", "x": 0, "y": 0, "width": 5, "height": 5, "pageId": second}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        page_names(&p),
+        ["Saved new name", "Second"],
+        "the rename is kept"
+    );
+    let first = page_from_json(&String::from_utf8(file(&p, &page)).unwrap()).unwrap();
+    assert_ne!(
+        first.name, "Saved new name",
+        "renames only write the manifest"
+    );
+    c.cancel().await.unwrap();
+}
+
+/// Review round 2, finding 4: page renames (manifest metadata) obey the same conflict rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_page_renames_are_refused() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let a = client(r.port).await;
+    let b = client(r.port).await;
+    read(&a).await;
+    let (ok, out) = call(&a, "create_page", json!({"name": "Two"})).await;
+    assert!(ok, "{out}");
+    let two = manifest(&p)["pages"][1]["id"].as_str().unwrap().to_string();
+    read(&a).await;
+    read(&b).await;
+    // A renames page one; B, which read before that, renames it too: refused.
+    let (ok, out) = call(
+        &a,
+        "rename_pages",
+        json!({"updates": [{"pageId": page, "name": "First saved name"}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let m = std::fs::read(p.dir.join("project.json")).unwrap();
+    let (ok, out) = call(
+        &b,
+        "rename_pages",
+        json!({"updates": [{"pageId": page, "name": "Stale second name"}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(std::fs::read(p.dir.join("project.json")).unwrap(), m);
+    // A batch with one stale entry writes nothing either.
+    let (ok, out) = call(
+        &b,
+        "rename_pages",
+        json!({"updates": [{"pageId": two, "name": "B two"}, {"pageId": page, "name": "B one"}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(std::fs::read(p.dir.join("project.json")).unwrap(), m);
+    assert_eq!(page_names(&p), ["First saved name", "Two"]);
+    // After reading, B's rename goes through.
+    read(&b).await;
+    let (ok, out) = call(
+        &b,
+        "rename_pages",
+        json!({"updates": [{"pageId": page, "name": "B one"}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_eq!(page_names(&p), ["B one", "Two"]);
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+}
+
 fn set_manifest_pages(p: &Project, pages: Value) {
     let path = p.dir.join("project.json");
     let mut m: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -583,6 +779,7 @@ async fn page_ids_cannot_reach_outside_the_project() {
     std::fs::write(p.page_path(&page), page_to_json(&data)).unwrap();
     let r = serve(&p.dir).await;
     let c = client(r.port).await;
+    read(&c).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -620,6 +817,38 @@ async fn page_ids_cannot_reach_outside_the_project() {
     }
 }
 
+/// Operator Mac finding on a96b32c: on case-insensitive APFS, page ids `CasePage` and
+/// `casepage` are one file. Refused on every file system, before any page is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_ids_differing_only_in_case_are_refused() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let mut data = page_from_json(&String::from_utf8(file(&p, &page)).unwrap()).unwrap();
+    for id in ["CasePage", "casepage"] {
+        data.id = id.into();
+        std::fs::write(p.page_path(id), page_to_json(&data)).unwrap();
+    }
+    set_manifest_pages(
+        &p,
+        json!([{"id": "CasePage", "name": "A"}, {"id": "casepage", "name": "B"}]),
+    );
+    let e = open_error(&p.dir);
+    assert!(e.contains("differ in more than case"), "{e}");
+    // Mixed case alone is fine.
+    set_manifest_pages(&p, json!([{"id": "CasePage", "name": "A"}]));
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    read(&c).await;
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "rectangle", "x": 0, "y": 0, "width": 5, "height": 5}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    c.cancel().await.unwrap();
+}
+
 /// Review round 1, finding 3: a linked page file is refused before its bytes are read.
 #[cfg(unix)]
 #[test]
@@ -652,6 +881,14 @@ async fn svg_image_fragments_are_refused() {
         &c,
         "write_html",
         json!({"targetNodeId": "root", "mode": "insert-children", "html": "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='20'><image href='#private.png' width='30' height='20'/></svg>"}),
+    )
+    .await;
+    assert!(!ok && out.contains("refused"), "{out}");
+    // Review round 2, finding 1: a malformed data: href would be read as a file name.
+    let (ok, out) = call(
+        &c,
+        "write_html",
+        json!({"targetNodeId": "root", "mode": "insert-children", "html": "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='20'><image href='data:private.png' width='30' height='20'/></svg>"}),
     )
     .await;
     assert!(!ok && out.contains("refused"), "{out}");

@@ -172,7 +172,7 @@ fn links(m: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(unix)]
-fn dev_ino(m: &std::fs::Metadata) -> (u64, u64) {
+pub(crate) fn dev_ino(m: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (m.dev(), m.ino())
 }
@@ -287,8 +287,13 @@ pub(crate) fn read_manifest_checked(dir: &Path) -> Result<Manifest, String> {
         if !valid_page_id(&p.id) {
             return Err(format!("{MANIFEST} lists an unsafe page id {:?}", p.id));
         }
-        if !seen.insert(p.id.as_str()) {
-            return Err(format!("{MANIFEST} lists page id {:?} twice", p.id));
+        // Compared case-folded: on a case-insensitive file system (macOS APFS by default)
+        // `CasePage` and `casepage` are the same page file.
+        if !seen.insert(p.id.to_ascii_lowercase()) {
+            return Err(format!(
+                "{MANIFEST} lists page id {:?} twice (page ids must differ in more than case)",
+                p.id
+            ));
         }
     }
     Ok(m)

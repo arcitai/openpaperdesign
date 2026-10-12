@@ -742,7 +742,7 @@ async fn security_headers_are_on_every_response() {
             "stale write",
             req("PUT", &uri)
                 .header(header::IF_MATCH, tag.as_deref().unwrap())
-                // The same node moved differently: a merge conflict.
+                // Based on an older revision: refused (nothing merges).
                 .body(Body::from(moved(&body, 9.0, 9.0)))
                 .unwrap(),
             StatusCode::CONFLICT,
