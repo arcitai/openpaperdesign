@@ -164,7 +164,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         use std::hash::{BuildHasher, RandomState};
-        let ws = std::env::temp_dir().join(format!(
+        // Match the launcher's canonical paths before deriving project and hook paths.
+        // macOS temp_dir() can name an alias (e.g. /var rather than /private/var).
+        let ws = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "opd-lifecycle-{:016x}",
             RandomState::new().hash_one(std::time::SystemTime::now())
         ));
