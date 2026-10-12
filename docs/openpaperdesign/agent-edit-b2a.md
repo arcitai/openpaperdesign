@@ -118,16 +118,30 @@ check your client's docs if one is refused. The token changes on every start.
     and is refused.
   - **An MCP session must read a page before it changes it,** and an agent write can't
     overwrite a change the session hasn't read. There is no exception for a first call.
-  - **What counts as reading:** a call by the session that writes nothing (a summary, node
-    info, a screenshot, a selection) records the current revisions of every page's content
-    and metadata as read by that session. Calls refused by the policy or as a conflict
-    record nothing.
-  - **What is refused:** a call that changes an existing page's content, renames or moves it,
-    or deletes it, if the session hasn't read that page, or if the page's content or
-    metadata (name, position in the page list) changed since the session last read it. It
-    gets a `conflict` error, the change is discarded, and nothing is written (neither the
-    page nor the manifest). The agent reads and redoes the change.
-  - **Own writes** count as read. Pages a call creates are new, so never stale.
+  - **What counts as reading, per page:** a page is read at its current revision only by a
+    call that **succeeded** and **returned that page's content or state**. Which page that
+    is follows upstream's own resolution of the call's arguments: `pageId`, else the page
+    the user is viewing; a node id `<page prefix>:<n>` names its own page.
+    - `get_basic_info`: its page, plus the page list (see below).
+    - `get_tree_summary`, `get_children`, `get_screenshot`: the page of `nodeId` (or of
+      `"root"`).
+    - `get_node_info`, `get_jsx`, `get_fill_image`: the page of the node.
+    - `get_computed_styles`: the page of each node.
+    - `get_selection`: the page the user is viewing.
+    - `find_nodes`: the page it is scoped to by `nodeId` or `pageId`.
+  - **Acknowledges nothing:** any call that failed (an error, a policy refusal, a conflict, an
+    unknown tool), and any call that can't be attributed to one page: `find_nodes` across all
+    pages, `list_resources`, `get_guide`, `get_font_family_info`, `select_nodes`,
+    `finish_working_on_nodes`, no-op changes.
+  - **Page list:** the manifest's page metadata (ids, names, order) is a separate item. Only
+    `get_basic_info`, which returns it, reads it.
+  - **What is refused:** a call that changes an existing page's content, or removes it, unless
+    **every** page it writes is read at its current revision. The same applies to the page
+    list if the call changes it (a rename, a new page, a removed page). Otherwise it gets a
+    `conflict` error, the change is discarded, and nothing is written (no page and not the
+    manifest). The agent reads what it was told and redoes the change.
+  - **Own writes:** a session's own successful write counts as read, for the pages (and page
+    list) it wrote and nothing else. Pages a call creates are new, so never stale.
   - **Forgotten sessions:** the host remembers the reads of the last 256 sessions. A session
     it forgot (or never saw) has read nothing, so it must read again before changing a page:
     forgetting fails closed.
@@ -138,8 +152,10 @@ check your client's docs if one is refused. The token changes on every start.
 
 ### Browser (`static/session.js`, `static/page.js`, `src/state.rs`)
 
-- **Polling:** about once a second the page asks for the revision. Polling waits for Ready and
-  pauses during a fallback, a save or a conflict, under the same gating as B1.
+- **Polling:** about once a second the page asks for the revision, **only while the editor
+  is clean** (nothing unsaved, no save in flight, no gesture, no text edit). No request is
+  made otherwise. Polling also waits for Ready and pauses during a fallback, a save, a
+  discard or a conflict.
 - **Nothing unsaved:** the new revision is loaded in place (`WebState::reload`), keeping the
   camera, tool and the selection where it still exists. "Nothing unsaved" means no unsaved
   change, no save in flight, no gesture and no text edit.
@@ -194,6 +210,17 @@ them, but it can still overwrite this server's writes.
 
 Findings 6 and 7 were in the merge, which was removed (see the decision above).
 
+### Review round 3 (on `9c3ba69`)
+
+| Finding | Fix | Tests (each fails on `9c3ba69`'s code) |
+| --- | --- | --- |
+| P1. Reading page A acknowledged page B; failed and non-reading calls acknowledged every page; a batch writing A and B passed after reading only A | Per-page observation, set only by a successful call that returned that page (or by the session's own write to it). The page list is a separate item. Every page a change writes must be read at its current revision. | `reading_page_a_does_not_acknowledge_page_b`, `a_failed_read_acknowledges_nothing`, `own_writes_acknowledge_only_the_pages_written`, `unattributable_reads_acknowledge_nothing` (also successful non-reading and failed calls, and a rename after a page-only read), `a_batch_write_needs_every_page_it_writes_read` |
+| P3. A dirty editor still started revision polls | `poll()` starts only when `can_reload()` holds | `only a clean editor polls: no revision request while dirty, in a gesture or a text edit (review round 3)`; `never reloads over unsaved edits…` now expects no poll while dirty. `an edit made while a clean poll is under way is never replaced` keeps the in-flight case covered (it passes on both). |
+
+Two existing tests read only the page the user views before writing another page (or
+nothing before writing). Under the per-page rule those writes are refused, so the tests now
+read the page they write.
+
 ### Review round 2 (on `a96b32c`), findings 1–6, and the operator's Mac case-alias finding
 
 Lead decisions: refuse SVG image elements outright, and require a read before any change
@@ -214,7 +241,7 @@ The reviewer also flagged two stale comments that still said "merged"
 
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, `TMPDIR=<worktree>/target/tmp`)
 
-- **`tests/agent.rs` (13 passed; see the review round tables for the newer tests):** real loopback listener, upstream-compatible rmcp
+- **`tests/agent.rs` (18 passed; see the review round tables for the newer tests):** real loopback listener, upstream-compatible rmcp
   streamable-HTTP client.
   - `mcp_needs_the_token_and_a_loopback_host_and_origin`: 401 without or with a wrong token,
     403 for a foreign Host or Origin, 200 with the token, and a client without the token can't
@@ -253,7 +280,7 @@ The reviewer also flagged two stale comments that still said "merged"
   `#private.png`, `feImage`, `xlink:href`, missing ids).
 - **`state::tests` (2 new, 10 total passed):** `reload_only_when_clean_and_it_keeps_the_view`,
   `never_reload_over_unsaved_or_in_flight_edits`.
-- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (21 passed; mocked
+- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (23 passed; mocked
   editor/server/page, no browser).** The B2a tests:
   - `a change made elsewhere is loaded in place when nothing is unsaved`
   - `never reloads over unsaved edits; the stale save is a conflict and the edit stays`
@@ -297,6 +324,15 @@ page JavaScript only):
   Node: the reviewer sequence applies the older page, and the overlap test times out.
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run.
+
+Results of the review round 3 fixes (2026-10-12; serve crate and `session.js`):
+- **Run now:** `cargo fmt --all --check`; serve clippy (0 warnings); serve tests 4 unit,
+  18 agent, 17 serve; the CI Node command, 23 passed (Node 26.8.1); `node --check` on the
+  page JavaScript; the bundle rebuild; `git diff --check`.
+- **On `9c3ba69`'s code** (with the new tests copied in): the five new serve tests and the
+  two changed or new polling tests fail. The in-flight polling test passes on both.
+- **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
+  from the 2da2f52 run. No root-package or web Rust file changed.
 
 Results of the review round 2 fixes (2026-10-12; serve crate, page JavaScript, the two
 scripts, and one doc comment in web Rust):
