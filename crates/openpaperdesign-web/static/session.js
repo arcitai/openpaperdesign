@@ -31,6 +31,7 @@ export class Session {
     this.canvas = null;
     this.observer = null;
     this.forceWebgl = false;
+    this.errorReported = false;
     this.saveDone = Promise.resolve();
   }
 
@@ -95,11 +96,18 @@ export class Session {
 
   /**
    * One animation frame. Returns 'ready' the first time the editor becomes Ready, 'error'
-   * when a GPU problem ends editing, 'fallback' when a fallback was started, else undefined.
+   * once when a problem has ended editing (including a fallback that failed asynchronously),
+   * 'stopped' on every frame after that, 'fallback' when a fallback was started, else
+   * undefined.
    */
   frame(t) {
     const s = this.state;
-    if (s.switching || s.error || !this.ed) return undefined;
+    if (s.error) {
+      if (this.errorReported) return 'stopped';
+      this.errorReported = true;
+      return 'error';
+    }
+    if (s.switching || !this.ed) return undefined;
     this.ed.frame(t);
     const gpuError = this.ed.gpu_error();
     if (gpuError) {
@@ -108,6 +116,7 @@ export class Session {
         return 'fallback';
       }
       this.fail(`Renderer error: ${gpuError}`);
+      this.errorReported = true;
       return 'error';
     }
     if (!s.ready && this.ed.ready()) {

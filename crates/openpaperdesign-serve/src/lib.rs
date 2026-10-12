@@ -14,7 +14,7 @@
 //!   rename over the page file, so a write never lands outside `pages/`. Residual race: a
 //!   directory or link swapped in between a check and the following file operation can still
 //!   redirect that read or write.
-//! - The web bundle (five allowlisted files) is checked and read into memory once at startup,
+//! - The web bundle (six allowlisted files) is checked and read into memory once at startup,
 //!   from a folder outside the project; static requests never touch the file system.
 //! - Unix only (Linux, macOS): the root identity and hard-link checks use Unix metadata, so the
 //!   server refuses to start elsewhere.
@@ -48,6 +48,7 @@ use std::sync::Arc;
 const BUNDLE: &[(&str, &str, &str)] = &[
     ("/", "index.html", "text/html; charset=utf-8"),
     ("/app.js", "app.js", "text/javascript; charset=utf-8"),
+    ("/page.js", "page.js", "text/javascript; charset=utf-8"),
     (
         "/session.js",
         "session.js",

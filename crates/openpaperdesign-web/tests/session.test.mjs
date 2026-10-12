@@ -173,3 +173,67 @@ test('an answer arriving after the editor was swapped is dropped', async () => {
   assert.deepEqual(second.calls, []);
   assert.deepEqual(first.calls.filter((c) => c.startsWith('save')), []);
 });
+
+// ---- the page glue (static/page.js) for a fallback that fails
+
+import { frameStep } from '../static/page.js';
+
+function mockUi() {
+  const ui = { shown: [], fatals: [], ready() { this.shown.push('Ready'); },
+    fatal(m) { this.fatals.push(m); this.shown.push(`FATAL ${m}`); },
+    status(t) { this.shown.push(t); }, tick() {} };
+  return ui;
+}
+
+/** Run frames like app.js does until the loop stops (or `max` frames). */
+async function runFrames(s, ui, max = 20) {
+  let frames = 0;
+  while (frames < max) {
+    frames += 1;
+    if (!frameStep(s, ui, frames * 16)) return frames;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  return frames;
+}
+
+for (const [what, failing] of [
+  ['the page fetch fails', (deps) => { deps.fetchPage = async () => { throw new Error('page fetch: HTTP 500'); }; }],
+  ['WebGL init fails', (deps) => { deps.boot = async () => { throw new Error('no WebGL2 context'); }; }],
+]) {
+  test(`a fallback that fails (${what}) ends in a visible red error and stops the frame loop`, async () => {
+    const gpu = editor('gpu', { ready: false, gpuError: 'WGSL invalid' });
+    const { s } = setup([gpu]);
+    await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+    failing(s.deps);
+    const ui = mockUi();
+    const frames = await runFrames(s, ui);
+    assert.ok(frames < 20, 'the frame loop stopped');
+    assert.ok(ui.shown.includes('WebGPU failed; switching to WebGL…'));
+    assert.equal(ui.fatals.length, 1, 'the error is shown once');
+    assert.match(ui.fatals[0], /Renderer failed: .*(HTTP 500|no WebGL2 context)/);
+    assert.equal(ui.shown.at(-1), `FATAL ${ui.fatals[0]}`, 'not left at "switching"');
+    assert.equal(s.state.switching, false);
+    assert.equal(s.editable(), false);
+    // Later frames stay stopped and quiet.
+    assert.equal(frameStep(s, ui, 999), false);
+    assert.equal(ui.fatals.length, 1);
+  });
+}
+
+test('the page glue shows Ready once and keeps the loop running', async () => {
+  const ed = editor('gpu', { ready: false });
+  const { s } = setup([ed]);
+  await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+  const ui = mockUi();
+  assert.equal(frameStep(s, ui, 0), true);
+  ed.isReady = true;
+  assert.equal(frameStep(s, ui, 16), true);
+  assert.equal(frameStep(s, ui, 32), true);
+  assert.deepEqual(ui.shown, ['Ready']);
+  // A GPU error after Ready is terminal: shown once, loop stops.
+  ed.gpuError = 'device lost';
+  assert.equal(frameStep(s, ui, 48), false);
+  assert.deepEqual(ui.fatals, ['Renderer error: device lost']);
+  assert.equal(frameStep(s, ui, 64), false);
+  assert.equal(ui.fatals.length, 1);
+});

@@ -3,6 +3,7 @@
 // editor lifecycle (gating, fallback, saving) is in session.js.
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
+import { frameStep } from './page.js';
 
 const SAVE_POLL_MS = 300;
 
@@ -44,6 +45,7 @@ function fail(msg) {
   state.ready = false;
   state.error = msg;
   status(msg, true);
+  renderer(`Not running: ${msg}`, true);
   console.error(msg);
 }
 
@@ -184,21 +186,24 @@ async function main() {
   });
 
   // Ready only once the renderer validated, presented a frame, and has no GPU problem.
-  const frame = (t) => {
-    requestAnimationFrame(frame);
-    const r = session.frame(t);
-    if (r === 'ready') {
+  const ui = {
+    ready: () => {
       window.__opdEditor = session.ed;
       showRenderer();
       status('Ready');
       session.canvas.focus();
-    } else if (r === 'error') {
-      status(state.error, true);
-      renderer(`Renderer failed: ${state.error}`, true);
-    } else if (r === 'fallback') {
-      status('WebGPU failed; switching to WebGL…');
-    }
-    syncToolbar();
+    },
+    // Terminal: shown once, in red, and the frame loop stops.
+    fatal: (msg) => {
+      status(msg, true);
+      renderer(`Renderer failed: ${msg}`, true);
+      console.error(msg);
+    },
+    status: (text) => status(text),
+    tick: syncToolbar,
+  };
+  const frame = (t) => {
+    if (frameStep(session, ui, t)) requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
 }
