@@ -55,7 +55,8 @@ surface), plugin publishing, other hosts.
   - `plugin.json`, the only manifest (see "Packaging" below): `$schema` agent-plugins 1.0.0,
     MIT OR Apache-2.0, repository onlinesourdough/openpaperdesign, version 0.1.0, and
     `extensions.com.openai` with `interface` and `onboardingSkill`;
-  - `mcp.json`: stdio `{"command": "openpaperdesign-mcp", "args": [], "cwd": "."}`;
+  - `mcp.json`: one server, `{"type": "stdio", "command": "openpaperdesign-mcp", "args": []}`,
+    with no `cwd` (see "Packaging");
   - `NOTICE.md`;
   - skills `openpaperdesign` (bind, edit, `open_editor`, in-app browser, limits), `setup`
     (build, install, `doctor`), and the ported `design` and `review-design`.
@@ -78,15 +79,16 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
   characters. It is now "Agent + human design canvas" (27).
 - **One manifest:** the `.codex-plugin/plugin.json` overlay was removed. Nothing showed that
   the local Codex needs it, and an `extensions.com.openai` object replaces the overlay
-  entirely rather than merging with it. Two copies could only contradict each other. **Codex
-  reads `plugin/openpaperdesign/plugin.json`**: the common fields at the top level and the
-  Codex presentation in `extensions.com.openai`. If the operator's Codex doesn't list the
-  plugin without the overlay, that is a finding to report; don't add the overlay back
-  without a decision.
-- **Limits not checked here:** the reference wasn't available in this sandbox. Only the
-  30-character cap (from the operator) is enforced. The other fields set are
-  `interface.displayName`, `longDescription` (233 characters), `developerName`, `category`,
-  and `onboardingSkill`. Their limits still need checking against the reference.
+  entirely rather than merging with it. Two copies could only contradict each other.
+  - **Intended:** per the packaging reference, Codex reads `plugin/openpaperdesign/plugin.json`
+    (common fields at the top level, Codex presentation in `extensions.com.openai`) and
+    discovers `skills/` and `mcp.json` itself.
+  - **Unproven until installed:** whether the operator's Codex actually does so. If it
+    doesn't list the plugin without the overlay, that is a finding to report; don't add the
+    overlay back without a decision.
+- **Field limits:** the staged reference (`codex-plugin-packages-0.1.26.md`, checked by the
+  B2b review) caps only `shortDescription` (30 characters). `defaultPrompt` and the icon
+  fields have rules of their own but aren't set. No other caps apply to the fields set here.
 
 ### Ported design methods (AIOS #54)
 
@@ -218,14 +220,34 @@ contain `<image>`. Re-run after the rebase: serve 4 unit + 13 agent + 5 launcher
 plugin tests plus the Node CI command; `cargo fmt --all --check`; serve clippy; `git diff
 --check`.
 
+### B2b review round 1 (on `b4d41e3`)
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| 1. A moved workspace whose old path became a symlink: `create_project` wrote into the link's target | At start the launcher records the workspace's canonical path and (device, inode). Before every bind and create it re-checks: still a real directory, same canonical path and identity. `design/`, `design/<name>/` and `pages/` are made with `create_dir` (no final-symlink following); an existing `design/` must be a real folder. Everything made is verified before any file is written. Upstream `Store::create` isn't used for this. | `a_replaced_workspace_is_refused_not_followed` (the reviewer's sequence, plus a plain directory put back at the same path). It fails on `b4d41e3`, where the project lands in the replacement target. |
+| 2. `audit.py`: a companion named `DESIGN.md` overrode a stale reviewed hash (false PASS) | Canonical hashes are checked on their own. Companion entries naming canonical evidence (`BRIEF.md`, `DESIGN.md`, `REVIEW.md`, `proof.json`, `HANDOFF.md`, any case, `./` forms) fail. A defect in the ported AIOS method, recorded in `NOTICE.md` as fixed on port. | `test_companion_entries_never_stand_in_for_canonical_evidence` (REVIEW.md and proof.json forms). It fails with `b4d41e3`'s `audit.py`. |
+| 3. Stale `cwd: "."` in this record | Corrected. Intended packaging is separated from unproven installed behaviour. | — |
+| 4. Read before write (B2a `9c3ba69`) | The skill says to read the target page before the first change (`get_tree_summary` root, `get_node_info`), not to rely on the bind summary. The launcher tests read first. | `the_stdio_session_must_read_before_it_writes`: after a browser-style save through the editor port, the stdio session's write is refused and the page is unchanged; after a read it lands. It verifies the wiring, so it also passes on `b4d41e3`, which already tracked sessions. |
+
+Remaining limit: verifying and then writing is a check-then-use sequence. A file-system actor
+racing between the check and the write isn't excluded (as with B1's documented check/use
+race). Fully directory-relative creation would need `openat`-style calls, which the
+standard library doesn't offer and which would mean a new dependency.
+
+Checks (2026-10-12): `cargo fmt --all --check`; serve clippy, 0 warnings; serve 4 unit + 13
+agent + 7 launcher + 17; plugin tests plus the Node CI command, 28 passed; Python design
+tests, 13 passed; `git diff --check`.
+
 ## Not proven
 
 - **Codex itself:** the plugin tests are source-only checks. They cover the forbidden
   top-level keys, the 30-character cap, `mcp.json` with its one stdio entry, every `./` path
   existing, and the marketplace path resolving to this folder inside the repository. Nothing
   here proves that Codex discovers, installs or enables the plugin, or reads only
-  `plugin.json`. The other interface limits weren't checked against the reference. So is the app starting the stdio server: `command` on PATH and `cwd` ".", whose
-  resolution relative to the workspace (openai/codex#22842) is unverified.
+  `plugin.json`. Nor that it starts the stdio server: whether `openpaperdesign-mcp` is on the
+  `PATH` Codex uses, and which directory Codex starts it in (with no `cwd` set;
+  openai/codex#22842), are unverified. `openpaperdesign_status` reports the workspace that
+  was actually used.
 - **Opening the editor:** opening the `open_editor` URL in the in-app browser from a skill
   hasn't been tried.
 - **Embedding:** proven here on Linux only; the Mac build and install are the operator's to

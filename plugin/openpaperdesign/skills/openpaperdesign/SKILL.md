@@ -22,11 +22,13 @@ see each other's changes live.
    until you call it again with `force: true`. Ask the person first (let their edits save, or
    confirm losing them), and never pass `force` on your own. The same is true when this
    session ends.
-3. **Read, then edit.** Read the page first (`get_basic_info`, `get_tree_summary` with `nodeId`
-   `"root"`, `get_node_info`): a change to a page you haven't read in this session is refused
-   as a `conflict`. Then edit with the design tools (`write_html`, `create_shape`,
-   `update_styles`, `move_nodes`, `delete_nodes`, `rename_pages`, …). Each change is saved to
-   the project at once.
+3. **Read the page, then edit.** Before your first change to a page, read that page:
+   `get_tree_summary` with `nodeId` `"root"` (add `pageId` for another page), then
+   `get_node_info` for what you will change. Don't rely on the summary `bind_project`
+   returned. A change to a page you haven't read in this session, or that changed since you
+   read it, is refused as a `conflict` and nothing is written. Then edit with the design
+   tools (`write_html`, `create_shape`, `update_styles`, `move_nodes`, `delete_nodes`,
+   `rename_pages`, …). Each change is saved to the project at once.
 4. **Open the canvas.** Call `open_editor` and open the returned
    `http://127.0.0.1:<port>/#token=…` URL in the in-app browser. The token is for this
    session only: don't write it into files or commits.

@@ -111,7 +111,9 @@ workspace and embeds the web bundle at build time, so run `./scripts/build-web.s
 discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `skills`,
 `mcpServers`, `apps` or `interface`. Codex presentation goes in `extensions.com.openai`
 (`interface.shortDescription` ≤ 30 characters). Don't add a `.codex-plugin/` overlay.
-`mcp.json` is explicit `type: "stdio"` with no `cwd`. A failed `bind_project` must leave the
+`mcp.json` is explicit `type: "stdio"` with no `cwd`. The launcher records the workspace's
+canonical path and identity at start and refuses a moved or replaced workspace. It creates
+`design/<name>/` itself without following links. A failed `bind_project` must leave the
 current binding working. Never claim browser edits are saved on a switch or exit: once
 `open_editor` was called, switching needs `force: true`. Keep the ported `design` and `review-design` skills' provenance notes and
 LICENSE files, and the plugin's `NOTICE.md`, intact.
