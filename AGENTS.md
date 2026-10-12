@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.11 · Updated: 2026-10-12
+Revision: 0.12 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -22,6 +22,9 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
   - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`
     and `PageSlot` (B2a review round 5). Derive-only, no behaviour change. It lets the agent
     host restore the exact editor state after a failed MCP call.
+  - `src/mcp/exec.rs`: `pub fn with_no_stretch` gives access to the process-wide record of
+    containers that don't stretch their children (B2a final review). Accessor only, no
+    behaviour change. The host copies and restores its own pages' entries with the editor.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.

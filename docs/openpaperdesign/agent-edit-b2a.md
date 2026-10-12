@@ -68,8 +68,14 @@ check your client's docs if one is refused. The token changes on every start.
     - Read tools change nothing, so a failed read needs no restore.
     - Only a caught panic, which may leave the editor mid-operation, falls back to
       reloading from disk (the undo history then restarts).
-    - The copy needs `Clone` on upstream `History`, `PageSlot` and `PageStash`. That is
-      three added derives, the only upstream change in this round.
+    - The copy needs `Clone` on upstream `History`, `PageSlot` and `PageStash`: three added
+      derives (review round 5).
+    - It also covers upstream's process-wide record of which flex containers don't stretch
+      their children (`no_stretch` in `src/mcp/exec.rs`). A refused `alignItems` change used
+      to stay there and change the next accepted child (0px wide instead of 300px). Only
+      this project's pages' entries are copied and put back; other projects in the same
+      process (another launcher binding, tests) keep theirs. Reading it needs one added
+      upstream function, `exec::with_no_stretch` (final review).
   - **On disk, one commit** (`crate::commit`) per call, used by browser saves too (page plus
     manifest):
     1. The current bytes of every target are read first.
@@ -81,7 +87,10 @@ check your client's docs if one is refused. The token changes on every start.
     Every step can fail, directory syncs included. If one does, the temporary files are
     removed, every file already replaced is put back from its old bytes the same way (or
     removed if it was new), and those directories are synced again. Every project file is
-    then byte-identical to before, and the answer says "nothing was written".
+    then byte-identical to before, and the answer says "nothing was written". Nothing that
+    can fail comes after a successful commit: the browser's answer takes the new revision
+    from the bytes it just wrote rather than reading the page back, so a completed save is
+    never reported as failed.
   - **Fail closed:** if putting a file back (or syncing its directory) fails too, the
     answer says so, naming the files that may now be inconsistent, and that writes are
     disabled. From then on the server refuses every write, browser (503) and MCP alike,
@@ -269,6 +278,30 @@ them, but it can still overwrite this server's writes.
 | 5. A late poll answer rolls the editor back | non-overlapping polls, generation counter | `a late poll answer never replaces a newer saved state (reviewer sequence)`, `polls never overlap, and a discard makes an older poll answer stale` |
 
 Findings 6 and 7 were in the merge, which was removed (see the decision above).
+
+### Final review (on combined `0ed4be0`, B2a `9cb0230`)
+
+| Finding | Fix | Tests (each fails on `9cb0230`'s code) |
+| --- | --- | --- |
+| P2 1. A refused change survived in upstream's process-wide stretch record and altered a later accepted write | The host's copy and restore include this project's pages' entries of that record (via the new upstream `exec::with_no_stretch`), never the whole set | `a_refused_change_leaves_layout_state_unchanged` (the reviewer's sequence over MCP); unit tests `a_failed_save_leaves_layout_state_unchanged` and `restoring_layout_state_leaves_other_hosts_alone` (another host's entries, including one added between the copy and the restore, stay) |
+| P2 2. Browser PUT read the page back after committing and could answer 500 for a completed save | The revision comes from the committed bytes; nothing fallible follows the commit | `tests::a_completed_browser_save_is_reported_as_saved` |
+
+Checks (2026-10-12; serve crate plus the upstream accessor, so the full native set was
+run again):
+- **Serve:** `cargo fmt --all --check`; clippy for serve and web, 0 warnings; serve tests
+  14 unit, 24 agent, 17 serve.
+- **Root:** native build; root clippy with only the known `tests/perf.rs` warning; serial,
+  162 passed; headless with `PAPER_RS_REQUIRE_GPU=1`, 9 passed; `cargo tree -p paper-rs -e
+  features` unchanged.
+- **Web:** wasm32 check; web tests 111 unit + 2 shader. `docs/screenshots` was restored.
+
+For the unit tests on `9cb0230`, two scaffolds were added to that copy only, because the
+tests need them to compile and inject:
+- the accessor `exec::with_no_stretch`, which the old adapter doesn't call;
+- a fault point at its post-commit read.
+
+The integration test needed neither. Evidence:
+`target/evidence/b2a-final-tests-on-9cb0230.txt`.
 
 ### Review round 5 (on `2fcd739`)
 
