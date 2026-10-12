@@ -18,3 +18,24 @@ export function frameStep(session, ui, t) {
   ui.tick();
   return true;
 }
+
+/**
+ * One save tick. `ui` also needs `conflict(ids)` (shows the conflict banner). The save's
+ * bookkeeping (ack, revision, conflict state) always happens in `session.save()`. Once the
+ * session has hit a terminal error, the status line and footer keep showing it: a save that
+ * was in flight when the error happened doesn't replace it with "Saved" or "retrying".
+ */
+export async function saveStep(session, ui) {
+  const st = session.state;
+  if (session.editable() && !st.saving && !st.conflict && session.ed.dirty()) {
+    ui.status('Saving…');
+  }
+  const r = await session.save();
+  if (r === 'conflict') ui.conflict(st.conflicts || null);
+  if (st.error) return r;
+  if (r === 'saved') ui.status('Saved');
+  else if (r === 'conflict') ui.status('Not saved: conflict');
+  else if (r === 'failed') ui.status('Save failed; retrying');
+  else if (r === 'unreachable') ui.status('Save failed (server unreachable); retrying');
+  return r;
+}

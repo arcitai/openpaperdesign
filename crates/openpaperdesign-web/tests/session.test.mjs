@@ -24,8 +24,9 @@ function editor(name, { gpuError = null, ready = true, snapshot = '{"page":1}' }
 
 function deferred() {
   let resolve;
-  const promise = new Promise((r) => { resolve = r; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((r, j) => { resolve = r; reject = j; });
+  return { promise, resolve, reject };
 }
 
 /** A session with mock deps. `editors` are handed out by boot() in order. */
@@ -237,3 +238,43 @@ test('the page glue shows Ready once and keeps the loop running', async () => {
   assert.equal(frameStep(s, ui, 64), false);
   assert.equal(ui.fatals.length, 1);
 });
+
+// ---- a terminal error while a save is in flight (static/page.js saveStep + frameStep)
+
+import { saveStep } from '../static/page.js';
+
+for (const [outcome, settle, check] of [
+  ['success', (d) => d.resolve({ ok: true, status: 200, revision: '"r2"' }),
+    (s, ed) => { assert.ok(ed.calls.includes('saved')); assert.equal(s.state.revision, '"r2"'); }],
+  ['409 conflict', (d) => d.resolve({ ok: false, status: 409, conflicts: ['3'] }),
+    (s, ed) => { assert.ok(ed.calls.includes('save_failed')); assert.equal(s.state.conflict, true); }],
+  ['HTTP failure', (d) => d.resolve({ ok: false, status: 500 }),
+    (s, ed) => { assert.ok(ed.calls.includes('save_failed')); }],
+  ['network rejection', (d) => d.reject(new Error('connection reset')),
+    (s, ed) => { assert.ok(ed.calls.includes('save_failed')); }],
+]) {
+  test(`a save in flight when the renderer fails (${outcome}) keeps the red terminal status`, async () => {
+    const ed = editor('gpu', { ready: true });
+    const answer = deferred();
+    const { s } = setup([ed], { put: async () => answer.promise });
+    await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+    const ui = mockUi();
+    ui.conflicts = [];
+    ui.conflict = (ids) => ui.conflicts.push(ids);
+    assert.equal(frameStep(s, ui, 0), true); // Ready
+    const saving = saveStep(s, ui);          // PUT in flight
+    assert.equal(ui.shown.at(-1), 'Saving…');
+    ed.gpuError = 'device lost';             // terminal while waiting
+    assert.equal(frameStep(s, ui, 16), false);
+    const fatal = ui.shown.at(-1);
+    assert.match(fatal, /^FATAL Renderer error: device lost/);
+    settle(answer);
+    await saving;
+    assert.equal(ui.shown.at(-1), fatal, `"${outcome}" must not replace the terminal status`);
+    assert.ok(!ui.shown.slice(ui.shown.indexOf(fatal) + 1).length, 'nothing shown after it');
+    check(s, ed);                            // bookkeeping still done
+    if (outcome === '409 conflict') assert.equal(ui.conflicts.length, 1, 'banner still shown');
+    assert.equal(await saveStep(s, ui), undefined, 'no further saves once terminal');
+    assert.equal(ui.shown.at(-1), fatal);
+  });
+}

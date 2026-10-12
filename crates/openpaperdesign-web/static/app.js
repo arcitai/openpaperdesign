@@ -3,7 +3,7 @@
 // editor lifecycle (gating, fallback, saving) is in session.js.
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
-import { frameStep } from './page.js';
+import { frameStep, saveStep } from './page.js';
 
 const SAVE_POLL_MS = 300;
 
@@ -165,27 +165,8 @@ async function main() {
     }
   });
 
-  // ---- saving: one request at a time, always with the revision we last saw.
-  setInterval(async () => {
-    const pending = session.editable() && !state.saving && !state.conflict;
-    if (pending && session.ed.dirty()) status('Saving…');
-    const r = await session.save();
-    if (r === 'saved') status('Saved');
-    else if (r === 'conflict') {
-      status('Not saved: conflict');
-      const c = $('conflict');
-      c.textContent = 'This page was changed on disk by something else since it was loaded. '
-        + 'Nothing was overwritten, and edits made here since then are not saved. '
-        + 'Reload to continue from the version on disk.';
-      c.classList.add('show');
-    } else if (r === 'failed') status('Save failed; retrying');
-    else if (r === 'unreachable') status('Save failed (server unreachable); retrying');
-  }, SAVE_POLL_MS);
-  window.addEventListener('beforeunload', (e) => {
-    if (session.ed && session.ed.dirty()) e.preventDefault();
-  });
-
-  // Ready only once the renderer validated, presented a frame, and has no GPU problem.
+  // What the page shows (see page.js). Ready only once the renderer validated, presented a
+  // frame, and has no GPU problem.
   const ui = {
     ready: () => {
       window.__opdEditor = session.ed;
@@ -201,7 +182,20 @@ async function main() {
     },
     status: (text) => status(text),
     tick: syncToolbar,
+    conflict: () => {
+      const c = $('conflict');
+      c.textContent = 'This page was changed on disk by something else since it was loaded. '
+        + 'Nothing was overwritten, and edits made here since then are not saved. '
+        + 'Reload to continue from the version on disk.';
+      c.classList.add('show');
+    },
   };
+  // ---- saving: one request at a time, always with the revision we last saw.
+  setInterval(() => saveStep(session, ui), SAVE_POLL_MS);
+  window.addEventListener('beforeunload', (e) => {
+    if (session.ed && session.ed.dirty()) e.preventDefault();
+  });
+
   const frame = (t) => {
     if (frameStep(session, ui, t)) requestAnimationFrame(frame);
   };
