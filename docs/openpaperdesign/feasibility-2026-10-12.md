@@ -43,7 +43,7 @@ during wgpu `Headless::new`. With a process-local `VK_DRIVER_FILES` selecting th
 both tests pass and print no GPU-skip message. That narrows the failure to driver discovery
 or GPU initialization on that host. It does not prove the exact defect, and no host setting,
 package or source was changed. The override is host-specific and is not used in CI, which
-keeps serial tests on GitHub's runners (no Radeon ICD there).
+keeps serial tests on GitHub's runners.
 
 The tests rewrite tracked `docs/screenshots/*.png`. Those files were restored to HEAD after
 every run.
