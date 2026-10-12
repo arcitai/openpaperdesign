@@ -52,7 +52,8 @@ async fn call(c: &Client, name: &str, args: Value) -> (bool, String) {
     (r.is_error != Some(true), text)
 }
 
-/// What an agent does before its first change to a page: read it (here the whole page tree).
+/// What an agent does before its first change to a page: read it (here the whole tree of the
+/// page the user views, which in these one-page projects is the page changed).
 async fn read_page(c: &Client) {
     let (ok, out) = call(c, "get_tree_summary", json!({"nodeId": "root"})).await;
     assert!(ok, "{out}");
@@ -103,9 +104,14 @@ async fn the_stdio_session_must_read_before_it_writes() {
     let page = p.manifest.pages[0].id.clone();
     let c = launcher(&ws, &home).await;
     let (ok, out) = call(&c, "bind_project", json!({"path": "design/A"})).await;
-    assert!(ok, "{out}");
-    read_page(&c).await;
+    assert!(ok && out.contains("get_tree_summary"), "{out}");
     let shape = json!({"type": "rectangle", "x": 1, "y": 1, "width": 9, "height": 9});
+    // B2b review round 2: the summary bind returned is not a read of the page.
+    let before = std::fs::read(p.page_path(&page)).unwrap();
+    let (ok, out) = call(&c, "create_shape", shape.clone()).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(std::fs::read(p.page_path(&page)).unwrap(), before);
+    read_page(&c).await;
     let (ok, out) = call(&c, "create_shape", shape.clone()).await;
     assert!(ok, "{out}");
     let (ok, out) = call(&c, "open_editor", json!({})).await;

@@ -148,7 +148,10 @@ codex plugin add openpaperdesign@openpaperdesign-local --json
 5. Fixture (a task-owned synthetic project only), in that workspace:
    - `create_project` with the name "Fixture", giving `design/Fixture/`. Or bind an existing
      synthetic project with `bind_project design/<name>`;
-   - a `create_shape` call; `design/<name>/pages/*.json` changes;
+   - a successful read of the target page, `get_tree_summary` with `nodeId` `"root"` and its
+     `pageId`. The summary `bind_project`/`create_project` returns doesn't count; without
+     the read the next change is refused as a `conflict`;
+   - a `create_shape` call on that page; `design/<name>/pages/*.json` changes;
    - `open_editor`; open the URL in the in-app browser. The canvas shows the shape;
    - move it in the browser and wait for "Saved", then let the agent edit again (it reads
      first). Reload: both changes are there;
@@ -214,8 +217,9 @@ rebind nothing is bound, a switch after `open_editor` needs no force, and a proj
 created inside the plugin folder.
 
 Rebased on the B2a review round 2 fixes (`9c3ba69`, 2026-10-12). An MCP session must read a
-page before it changes it. The launcher's own `get_basic_info` at bind time counts as that
-read for the stdio session, and the skill now says to read first. Inline SVG may not
+page before it changes it, and the skill now says to read first. (At this rebase the
+launcher's bind-time `get_basic_info` still counted as a read; since the B2b review round 2
+fixes it doesn't, see below.) Inline SVG may not
 contain `<image>`. Re-run after the rebase: serve 4 unit + 13 agent + 5 launcher + 17;
 plugin tests plus the Node CI command; `cargo fmt --all --check`; serve clippy; `git diff
 --check`.
@@ -240,8 +244,23 @@ tests, 13 passed; `git diff --check`.
 
 Rebased on the B2a review round 3 fixes (`b730f4c`, 2026-10-12). Reads now count per page
 and only when they succeed, and the page list is read via `get_basic_info`. The skill says
-so. The launcher's bind-time `get_basic_info` acknowledges only the viewed page and the page
-list; its tests read the page they write. Re-run: serve 4 unit + 18 agent + 7 launcher + 17;
+so. Its tests read the page they write.
+
+B2b review round 2 (on `66a825f`), 2026-10-12:
+- **Duplicate evidence:** in the audit, `proof.json` is parsed with duplicate keys rejected
+  at any depth (FAIL), and repeated Markdown records fail rather than keeping one. That
+  covers reviewed companions, snapshot entries, derived exports, and any field label used
+  twice. `create-handoff.mjs` likewise refuses a REVIEW.md that repeats a companion record
+  or a field. A duplicate key in its `proof.json` input isn't detectable with `JSON.parse`,
+  but every snapshot it makes is checked by the audit, which fails on it. Tests:
+  `test_duplicate_evidence_is_never_collapsed` (the reviewer's five cases, plus repeated
+  `Result`) and `test_repeated_review_records_refuse_the_handoff`; both fail with
+  `535df68`'s scripts (identical to `66a825f`'s).
+- **Target-page read:** the summary returned by `bind_project`/`create_project` now runs in
+  a one-off session, so it is not the agent's read. Its `next` text, the MCP instructions,
+  the skill and the operator fixture all require a successful read of the target page
+  (`get_tree_summary` root with its `pageId`) before the first change. The launcher tests
+  assert that a change straight after binding is refused. Re-run: serve 4 unit + 18 agent + 7 launcher + 17;
 plugin tests plus the Node CI command; Python design tests; fmt, serve clippy and
 `git diff --check`.
 

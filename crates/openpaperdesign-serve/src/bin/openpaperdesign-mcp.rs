@@ -304,8 +304,15 @@ impl Launcher {
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        // The summary returned with the bind is not the agent's read of any page: it runs in
+        // a one-off session, so the agent's session still has to read a page before changing
+        // it.
         let info = server
-            .call_tool(self.session, "get_basic_info", json!({}))
+            .call_tool(
+                openpaperdesign_serve::agent::new_session(),
+                "get_basic_info",
+                json!({}),
+            )
             .await;
         let rel = self.relative(server.dir());
         // Only now stop the previous project's server.
@@ -319,7 +326,10 @@ impl Launcher {
         let mut out = vec![Out::Text(
             json!({
                 "bound": rel,
-                "next": "edit with the design tools; call open_editor for the browser canvas",
+                "next": "before changing a page, read it: get_tree_summary with nodeId \"root\" \
+                    and its pageId (this summary doesn't count); get_basic_info before renaming, \
+                    adding or removing pages. Then edit with the design tools; call open_editor \
+                    for the browser canvas.",
             })
             .to_string(),
         )];
@@ -428,8 +438,11 @@ impl ServerHandler for Launcher {
             .with_instructions(format!(
                 "openpaperdesign: an editable design canvas (paper-rs) for this workspace. First \
                  bind a project deliberately (bind_project for an existing one inside the \
-                 workspace, or create_project under design/). Then edit with the tools below, \
-                 and call open_editor to get the canvas URL for the in-app browser, where the \
+                 workspace, or create_project under design/). Before changing a page, read \
+                 that page in this session (get_tree_summary with nodeId \"root\" and its \
+                 pageId); changes to unread or since-changed pages are refused as conflicts. \
+                 Then edit with the tools below, and call open_editor to get the canvas URL for \
+                 the in-app browser, where the \
                  person can edit too. Export and project switching outside the workspace are \
                  disabled; images must be data: URIs.\n\n{}",
                 tools::INSTRUCTIONS

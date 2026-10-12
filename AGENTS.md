@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.12 · Updated: 2026-10-12
+Revision: 0.13 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -115,7 +115,10 @@ discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `ski
 canonical path and identity at start and refuses a moved or replaced workspace. It creates
 `design/<name>/` itself without following links. A failed `bind_project` must leave the
 current binding working. Never claim browser edits are saved on a switch or exit: once
-`open_editor` was called, switching needs `force: true`. Keep the ported `design` and `review-design` skills' provenance notes and
+`open_editor` was called, switching needs `force: true`. The summary bind returns runs in a
+one-off session and is not the agent's read: instructions must have the agent read the
+target page (`get_tree_summary` root with its `pageId`) before its first change. The ported
+audit rejects duplicate evidence (JSON keys, repeated records). Keep the ported `design` and `review-design` skills' provenance notes and
 LICENSE files, and the plugin's `NOTICE.md`, intact.
 
 ## Model profile
