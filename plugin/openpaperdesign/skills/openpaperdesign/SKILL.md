@@ -16,7 +16,12 @@ see each other's changes live.
 2. **Bind deliberately.** Nothing is open until you bind. Use `bind_project` with an existing
    project folder inside the workspace (a folder with `project.json`, usually under
    `design/`), or `create_project` for a new one under `design/<name>/`. If several projects
-   could be meant, ask which. Binding again switches; changes are already saved.
+   could be meant, ask which. Binding again switches projects; a failed bind keeps the
+   current one. Once you've called `open_editor`, switching stops the server the browser tab
+   saves to, so the person's unsaved edits there would be lost. The switch is then refused
+   until you call it again with `force: true`. Ask the person first (let their edits save, or
+   confirm losing them), and never pass `force` on your own. The same is true when this
+   session ends.
 3. **Edit** with the design tools (`get_basic_info`, `write_html`, `create_shape`,
    `update_styles`, `move_nodes`, `delete_nodes`, `get_screenshot`, …). Each change is saved
    to the project at once.

@@ -14,6 +14,14 @@
 //! write lock, atomic saves and revisions as its HTTP `/mcp` endpoint. `open_editor` returns
 //! the loopback editor URL (with the token in its fragment) to open in the host's browser;
 //! the URL is never written to disk. One project per process; binding again switches.
+//!
+//! Switching is safe in two ways. The new project is opened and fully checked (containment,
+//! `project.json`, page ids, links) before the current one is touched, so a failed bind
+//! leaves the current binding, its server and its editor URL as they were. And once the
+//! browser editor has been opened, switching stops the server that tab saves to, so an edit
+//! there that isn't saved yet could no longer be saved: the switch then needs `force: true`,
+//! and the refusal says why. Edits made through the tools are saved by each call. When this
+//! process exits, the same applies to an open tab, without a prompt.
 
 use openpaperdesign_serve::agent::offered_tools;
 use openpaperdesign_serve::{Server, bundle_file_names, new_token, router};
@@ -32,6 +40,12 @@ use std::sync::Arc;
 include!(concat!(env!("OUT_DIR"), "/bundle.rs"));
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const SWITCH_NEEDS_FORCE: &str = "The browser editor for the bound project was opened \
+    (open_editor). Switching stops the server that browser tab saves to, so any edit there that \
+    isn't saved yet (the page shows an unsaved change or \"Saving…\") would be lost. Your own \
+    tool edits are already saved by each call. Ask the person to let their edits save (the \
+    page shows \"Saved\") or to accept losing them, then call again with force: true.";
 
 const NOT_BOUND: &str = "No design project is bound yet. Call bind_project with the path of an \
     existing paper-rs project folder inside this workspace, or create_project to make a new one \
@@ -54,6 +68,15 @@ fn workspace_problem(ws: &Path) -> Option<String> {
     if home.as_deref() == Some(ws) {
         return Some("the workspace is your home folder".into());
     }
+    // A host that starts the server in the installed plugin's folder (how it resolves the
+    // server's working directory is not verified) must not get design/ created in there.
+    if ws.join("mcp.json").is_file() && ws.join("skills/openpaperdesign/SKILL.md").is_file() {
+        return Some(
+            "the workspace is the openpaperdesign plugin folder, not your project (the host \
+             started the server there)"
+                .into(),
+        );
+    }
     None
 }
 
@@ -62,6 +85,8 @@ struct Bound {
     port: u16,
     token: String,
     task: tokio::task::JoinHandle<()>,
+    /// `open_editor` gave out this server's URL, so a browser tab may be editing it.
+    editor_opened: bool,
 }
 
 impl Drop for Bound {
@@ -89,18 +114,24 @@ fn own_tools() -> Vec<Tool> {
             "description": "Bind the design project to edit: an existing paper-rs project folder \
                 (it has a project.json) inside this workspace, as a path relative to the \
                 workspace or absolute. Paths outside the workspace, symlinks leading out of it, \
-                and the home folder are refused. Binding again switches projects (everything is \
-                already saved). Required before any editing tool.",
+                and the home folder are refused. Binding again switches projects; a failed bind \
+                keeps the current one. If the browser editor was opened, switching needs \
+                force: true, because unsaved edits in that browser tab would be lost. Required \
+                before any editing tool.",
             "inputSchema": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Project folder, e.g. design/landing"}
+                "path": {"type": "string", "description": "Project folder, e.g. design/landing"},
+                "force": {"type": "boolean", "description": "Switch even though the browser editor of the current project was opened; unsaved edits in that tab are lost."}
             }, "required": ["path"]}
         }),
         json!({
             "name": "create_project",
             "description": "Create a new, empty paper-rs project under <workspace>/design/<name>/ \
-                and bind it. Refuses a name whose folder already exists (bind that instead).",
+                and bind it. Refuses a name whose folder already exists (bind that instead). \
+                Switching away from a project whose browser editor was opened needs force: true, \
+                as for bind_project.",
             "inputSchema": {"type": "object", "properties": {
-                "name": {"type": "string"}
+                "name": {"type": "string"},
+                "force": {"type": "boolean", "description": "As for bind_project."}
             }, "required": ["name"]}
         }),
         json!({
@@ -125,6 +156,15 @@ fn own_tools() -> Vec<Tool> {
 }
 
 impl Launcher {
+    fn relative(&self, dir: &Path) -> String {
+        let rel = dir
+            .strip_prefix(&self.workspace)
+            .unwrap_or(dir)
+            .display()
+            .to_string();
+        if rel.is_empty() { ".".into() } else { rel }
+    }
+
     fn resolve_inside(&self, path: &str) -> Result<PathBuf, String> {
         if let Some(p) = workspace_problem(&self.workspace) {
             return Err(format!(
@@ -153,10 +193,28 @@ impl Launcher {
         Ok(real)
     }
 
-    async fn bind(&self, dir: PathBuf) -> ToolResult {
+    /// Refuse to switch away from a project whose browser editor was opened, unless forced.
+    fn may_switch(bound: &Option<Bound>, to: Option<&Path>, force: bool) -> Result<(), String> {
+        match bound {
+            Some(b) if b.editor_opened && !force && to != Some(b.server.dir()) => {
+                Err(SWITCH_NEEDS_FORCE.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn bind(&self, dir: PathBuf, force: bool) -> ToolResult {
         let mut bound = self.bound.lock().await;
-        // Switching: the previous project's changes are already saved; stop its server.
-        *bound = None;
+        if let Some(b) = bound.as_ref()
+            && b.server.dir() == dir
+        {
+            return text(
+                json!({"bound": self.relative(&dir), "note": "already bound; nothing changed"}),
+            );
+        }
+        Self::may_switch(&bound, Some(&dir), force)?;
+        // Open and check the new project completely before touching the current binding: any
+        // error below returns with the current one (and its server) unchanged.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(|e| format!("cannot listen on 127.0.0.1: {e}"))?;
@@ -171,21 +229,18 @@ impl Launcher {
         let info = server
             .call_tool(self.session, "get_basic_info", json!({}))
             .await;
-        let rel = server
-            .dir()
-            .strip_prefix(&self.workspace)
-            .unwrap_or(server.dir())
-            .display()
-            .to_string();
+        let rel = self.relative(server.dir());
+        // Only now stop the previous project's server.
         *bound = Some(Bound {
             server,
             port,
             token,
             task,
+            editor_opened: false,
         });
         let mut out = vec![Out::Text(
             json!({
-                "bound": if rel.is_empty() { ".".to_string() } else { rel },
+                "bound": rel,
                 "next": "edit with the design tools; call open_editor for the browser canvas",
             })
             .to_string(),
@@ -203,6 +258,7 @@ impl Launcher {
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| format!("missing required string argument `{k}`"))
         };
+        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         match name {
             "bind_project" => {
                 let dir = self.resolve_inside(arg("path")?)?;
@@ -213,10 +269,12 @@ impl Launcher {
                         dir.display()
                     ));
                 }
-                self.bind(dir).await
+                self.bind(dir, force).await
             }
             "create_project" => {
                 let name = arg("name")?;
+                // Before creating anything.
+                Self::may_switch(&*self.bound.lock().await, None, force)?;
                 if let Some(p) = workspace_problem(&self.workspace) {
                     return Err(format!("refusing to create a project: {p}"));
                 }
@@ -235,11 +293,11 @@ impl Launcher {
                 }
                 let store = paper_rs::project::Store::open(&design).map_err(|e| e.to_string())?;
                 let (p, _) = store.create(name).map_err(|e| e.to_string())?;
-                self.bind(p.dir).await
+                self.bind(p.dir, force).await
             }
             "open_editor" => {
-                let bound = self.bound.lock().await;
-                let Some(b) = bound.as_ref() else {
+                let mut bound = self.bound.lock().await;
+                let Some(b) = bound.as_mut() else {
                     return Err(NOT_BOUND.into());
                 };
                 if !bundle_complete() {
@@ -251,6 +309,7 @@ impl Launcher {
                             .into(),
                     );
                 }
+                b.editor_opened = true;
                 text(json!({
                     "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
                     "open_in": "the host's in-app browser (loopback only)",
@@ -264,6 +323,7 @@ impl Launcher {
                     "workspace": self.workspace,
                     "workspace_usable": workspace_problem(&self.workspace).is_none(),
                     "bound_project": bound.as_ref().map(|b| b.server.dir().to_path_buf()),
+                    "editor_opened": bound.as_ref().is_some_and(|b| b.editor_opened),
                     "browser_editor": if bundle_complete() { "built in" } else { "not built (open_editor unavailable)" },
                 }))
             }

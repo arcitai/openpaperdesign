@@ -80,12 +80,15 @@ test('mcp.json starts the stdio launcher from PATH', () => {
   assert.deepEqual(Object.keys(m.mcpServers), ['openpaperdesign']);
   assert.equal(m.$schema, 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json');
   const s = m.mcpServers.openpaperdesign;
-  assert.equal(s.type ?? 'stdio', 'stdio', 'a stdio server (no url)');
+  assert.equal(s.type, 'stdio', 'an explicit stdio server (no url)');
   assert.ok(!('url' in s));
   assert.equal(s.command, 'openpaperdesign-mcp');
   assert.ok(!s.command.includes('/'), 'a command on PATH, never a bundled relative path');
   assert.deepEqual(s.args, []);
-  assert.equal(s.cwd, '.');
+  // No cwd: "." might be resolved against the plugin folder rather than the user's workspace
+  // (openai/codex#22842); the server uses the directory the host starts it in, and refuses
+  // the plugin folder itself.
+  assert.ok(!('cwd' in s));
   assert.ok(!JSON.stringify(m).includes('token'), 'no token in config');
 });
 

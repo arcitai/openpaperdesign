@@ -25,7 +25,17 @@ openpaperdesign-mcp doctor                    # "browser_editor": "built in"
 ```
 
 `cargo install` puts the command in `~/.cargo/bin`; make sure the host app's `PATH`
-includes it, then restart the app so it starts the plugin's MCP server. Build the web
+includes it. With a shared `CARGO_TARGET_DIR`, set `OPD_WEB_BUNDLE_DIR` to the built bundle
+(`<checkout>/target/openpaperdesign-web`) for `cargo install`, and check `doctor` afterwards.
+
+Then add the plugin in Codex, from the same checkout:
+
+```sh
+codex plugin marketplace add <checkout> --json
+codex plugin add openpaperdesign@openpaperdesign-local --json
+```
+
+Restart the app so it starts the plugin's MCP server. Build the web
 bundle before installing: it is compiled into the command, and without it `open_editor`
 refuses ("build the web bundle first") while the editing tools still work.
 

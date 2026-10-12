@@ -199,14 +199,185 @@ async fn bind_edit_and_open_the_editor_inside_the_workspace_only() {
         .collect();
     assert!(token_files.is_empty(), "{token_files:?}");
 
-    // create_project makes design/<name> and switches to it.
-    let (ok, out) = call(&c, "create_project", json!({"name": "New board"})).await;
+    // create_project makes design/<name> and switches to it. Once the browser editor was
+    // opened, switching needs force (unsaved edits in that tab would be lost).
+    let editor_opened = status["browser_editor"] == "built in";
+    if editor_opened {
+        let (ok, out) = call(&c, "create_project", json!({"name": "New board"})).await;
+        assert!(!ok && out.contains("force: true"), "{out}");
+        assert!(!ws.join("design/New board").exists(), "nothing created");
+    }
+    let (ok, out) = call(
+        &c,
+        "create_project",
+        json!({"name": "New board", "force": editor_opened}),
+    )
+    .await;
     assert!(ok, "{out}");
     assert!(ws.join("design/New board/project.json").is_file());
     let (_, status) = call(&c, "openpaperdesign_status", json!({})).await;
     assert!(status.contains("New board"), "{status}");
     let (ok, out) = call(&c, "create_project", json!({"name": "New board"})).await;
     assert!(!ok && out.contains("already exists"), "{out}");
+    c.cancel().await.unwrap();
+}
+
+/// Every file under `dir` with its bytes (links not followed).
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut v: Vec<_> = walk(dir)
+        .into_iter()
+        .map(|p| {
+            let b = std::fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// The editor URL's port and token.
+fn editor(out: &str) -> (u16, String) {
+    let v: Value = serde_json::from_str(out).unwrap();
+    let url = v["url"].as_str().unwrap();
+    let rest = url.strip_prefix("http://127.0.0.1:").unwrap();
+    let (port, token) = rest.split_once("/#token=").unwrap();
+    (port.parse().unwrap(), token.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rebind_keeps_the_current_project_and_its_editor() {
+    let t = tmp();
+    let ws = t.0.join("workspace");
+    let home = t.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Store::open(ws.join("design")).unwrap();
+    let (a, _) = store.create("A").unwrap();
+    let (b, _) = store.create("B").unwrap();
+    // Invalid targets: an unsafe page id, a linked page file, no project.json, a link out.
+    let (bad_id, _) = store.create("Bad id").unwrap();
+    let mpath = bad_id.dir.join("project.json");
+    let mut m: Value = serde_json::from_slice(&std::fs::read(&mpath).unwrap()).unwrap();
+    m["pages"][0]["id"] = json!("../../../outside/x");
+    std::fs::write(&mpath, serde_json::to_vec(&m).unwrap()).unwrap();
+    let (linked, _) = store.create("Linked").unwrap();
+    let outside = t.0.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("page.json"), "not json").unwrap();
+    let page_id = linked.manifest.pages[0].id.clone();
+    std::fs::create_dir_all(linked.dir.join("pages")).unwrap();
+    let _ = std::fs::remove_file(linked.page_path(&page_id));
+    std::os::unix::fs::symlink(outside.join("page.json"), linked.page_path(&page_id)).unwrap();
+    std::fs::create_dir_all(ws.join("notes")).unwrap();
+    let (far, _) = Store::open(t.0.join("elsewhere"))
+        .unwrap()
+        .create("Far")
+        .unwrap();
+    std::os::unix::fs::symlink(&far.dir, ws.join("escape")).unwrap();
+
+    let c = launcher(&ws, &home).await;
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/A"})).await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "rectangle", "x": 1, "y": 1, "width": 9, "height": 9}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(&c, "open_editor", json!({})).await;
+    let url = ok.then(|| editor(&out));
+    let before = (snapshot(&ws), snapshot(&outside), snapshot(&far.dir));
+    let a_dir = json!(a.dir.canonicalize().unwrap());
+
+    for (path, why) in [
+        ("design/Bad id", "page id"),
+        ("design/Linked", "symbolic link"),
+        ("notes", "not a paper-rs project"),
+        ("escape", "outside the workspace"),
+        ("missing", "No such file"),
+    ] {
+        // Even forced, a failed bind changes nothing.
+        let (ok, out) = call(&c, "bind_project", json!({"path": path, "force": true})).await;
+        assert!(!ok && out.contains(why), "{path}: {out}");
+        let (_, st) = call(&c, "openpaperdesign_status", json!({})).await;
+        let st: Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(st["bound_project"], a_dir, "{path}: A is still bound");
+        if let Some((port, token)) = &url {
+            assert_eq!(
+                http_status(*port, "/api/project", token).await,
+                200,
+                "{path}: A's editor works"
+            );
+        }
+        let (ok, out) = call(&c, "get_basic_info", json!({})).await;
+        assert!(ok && out.contains("\"A\""), "{path}: {out}");
+    }
+    assert_eq!(
+        (snapshot(&ws), snapshot(&outside), snapshot(&far.dir)),
+        before,
+        "no files changed"
+    );
+
+    // Binding the bound project again changes nothing and needs no force.
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/A"})).await;
+    assert!(ok && out.contains("already bound"), "{out}");
+    if let Some((port, token)) = &url {
+        assert_eq!(http_status(*port, "/api/project", token).await, 200);
+        // Switching to a valid project: refused without force, A untouched.
+        let (ok, out) = call(&c, "bind_project", json!({"path": "design/B"})).await;
+        assert!(
+            !ok && out.contains("force: true") && out.contains("lost"),
+            "{out}"
+        );
+        assert_eq!(http_status(*port, "/api/project", token).await, 200);
+        // Forced: B is bound and A's editor server is stopped.
+        let (ok, out) = call(
+            &c,
+            "bind_project",
+            json!({"path": "design/B", "force": true}),
+        )
+        .await;
+        assert!(ok, "{out}");
+        let mut stopped = false;
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                .await
+                .is_err()
+            {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(stopped, "A's server still listens");
+    } else {
+        let (ok, out) = call(&c, "bind_project", json!({"path": "design/B"})).await;
+        assert!(ok, "{out}");
+    }
+    let (_, st) = call(&c, "openpaperdesign_status", json!({})).await;
+    assert!(
+        st.contains(&b.dir.canonicalize().unwrap().display().to_string()),
+        "{st}"
+    );
+    c.cancel().await.unwrap();
+}
+
+/// A host that starts the server in the installed plugin's folder: nothing is created there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_plugin_folder_is_not_a_workspace() {
+    let t = tmp();
+    let plugin = t.0.join("plugin");
+    std::fs::create_dir_all(plugin.join("skills/openpaperdesign")).unwrap();
+    std::fs::write(plugin.join("mcp.json"), "{}").unwrap();
+    std::fs::write(plugin.join("skills/openpaperdesign/SKILL.md"), "x").unwrap();
+    let home = t.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let c = launcher(&plugin, &home).await;
+    let (ok, out) = call(&c, "create_project", json!({"name": "X"})).await;
+    assert!(!ok && out.contains("plugin folder"), "{out}");
+    assert!(!plugin.join("design").exists());
+    let (_, st) = call(&c, "openpaperdesign_status", json!({})).await;
+    assert!(st.contains("\"workspace_usable\": false"), "{st}");
     c.cancel().await.unwrap();
 }
 
