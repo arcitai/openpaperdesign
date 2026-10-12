@@ -279,8 +279,9 @@ macOS-arm64 server and used in the actual Codex in-app browser with native UI in
   privately outside the repository.
 
 This proves the run-8 changes only. It doesn't prove acceptance of e770d46, an installed
-plugin or MCP. Changes made after run 8 (round-2 review items A–C below) haven't been run in
-a browser.
+plugin or MCP. *(Historical note, as of run 8: the round-2 changes A–C below had not been run in
+a browser yet. They were later operator-observed on 260ac38, see "Fix round 3". The current
+browser status of the final revision is under "Not proven / open".)*
 
 ### Round-2 review of e770d46 (REJECT; round-1 findings confirmed fixed)
 
@@ -359,7 +360,7 @@ established by this check.
 | Finding | Resolution | Tests |
 |---|---|---|
 | P2: a fallback freed the editor and reopened the initially loaded JSON while edits and saves were allowed before Ready, so it could restore old content under a newer revision. Probes showed a null-editor exception, and a save's answer applied to the replacement editor | The editor lifecycle moved to `static/session.js`. Editing input, toolbar actions and saves only reach the editor once it is Ready and no fallback is running. A fallback waits for a save in flight, then reopens the page **as the server has it now** (content and revision). A save's answer only applies to the editor that took the snapshot | `tests/session.test.mjs` (Node `node:test`, mocked editors/canvas/DOM, no browser): `input, toolbar and saves are ignored until Ready`; `a startup failure falls back to WebGL on a fresh canvas with the current server page`; `a fallback waits for a save in flight and never applies its answer to the new editor`; `an answer arriving after the editor was swapped is dropped`; `forced WebGL failing is an error, not a fallback`. `session.js` is new, so there is nothing on 2b5c9ae to run them against: there the logic was inline in `app.js`, ungated |
-| P2: the ResizeObserver stayed on the replaced canvas and toolbar handlers stayed active, so `ed.resize()`/`ed.set_tool()` were called on null | The old observer is disconnected, and a new one observes the new canvas, which also gets its own input listeners. Every handler goes through the session's guards (`edit` for input/toolbar, `withEditor` for resize/frames/blur) | `a GPU error before Ready falls back once; the old observer and editor are retired` (the old observer is disconnected, its late callback touches nothing, the new observer resizes the new editor, and nothing reaches an editor while switching) |
+| P2: the ResizeObserver stayed on the replaced canvas and toolbar handlers stayed active, so `ed.resize()`/`ed.set_tool()` were called on null | The old observer is disconnected, and a new one observes the new canvas, which also gets its own input listeners. Every handler goes through the session's guards (`edit` for input/toolbar, `withEditor` for resize/frames/blur) | `a GPU error before Ready falls back once; the old observer and editor are retired` (the old observer is disconnected; a late callback from it never reaches the freed editor and can only resize the current replacement editor, which is safe; the new observer resizes the new editor; nothing reaches an editor while switching) |
 | P2: `resolve()` applied `..` before resolving symlinks, so with `alias` → `project/sub`, a missing `alias/../not-built` resolved to an unrelated sibling bundle, which was served | No lexical resolution any more (see "Server security"). This supersedes the missing-folder rule from round 3 | `missing_web_dir_with_dotdot_after_a_symlink_is_not_guessed` fails on 2b5c9ae's server code with `served: UNREQUESTED SIBLING BUNDLE`, and passes now. `web_dir_inside_the_project_is_refused` was updated (a missing folder without `..` now serves nothing instead of being refused) |
 | P3: "Codex built-in browser" listed as unproven without qualification | Scoped to the final revision ("Not proven / open") | — |
 
@@ -390,7 +391,7 @@ build from a different path may well hash differently.
 | `cargo clippy` new crates (host, all targets) | 0 warnings |
 | `cargo clippy` core and web (wasm32) | only upstream `src/io/atomic.rs:30`, once per crate |
 | `cargo test -p openpaperdesign-serve` / web lib / `tests/shader.rs` | 17 / 109 / 2 passed |
-| `node --test crates/openpaperdesign-web/tests/` (Node 26.8.1, mocked DOM) | 6 passed |
+| `node --test crates/openpaperdesign-web/tests/` (Node 26.8.1, mocked DOM) | 6 passed (this directory form fails on Node 22, see round 5) |
 | `cargo check` core and web for wasm32 | pass |
 | Native `cargo build --all-targets` | pass |
 | `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed, 0 failed, 0 ignored; no skips, no quota errors |
@@ -398,6 +399,28 @@ build from a different path may well hash differently.
 | Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
 | `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
 | Bundle | `openpaperdesign_web_bg.wasm` 11,662,088 B and `openpaperdesign_web.js` 126,514 B: SHA-256 identical to the round-3 build (no Rust change since, same environment). `app.js` 8,246 B, `session.js` 5,334 B, `index.html` 3,002 B |
+
+## Fix round 5 (2026-10-12, after independent review of e1ee940)
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| P2: a fallback that failed (page fetch or WebGL init rejected) left the page at "switching to WebGL…". The error was recorded but later frames returned nothing, so it was never shown | `Session.frame()` reports `'error'` once after any recorded failure, including an asynchronous fallback failure, then `'stopped'`. The new `static/page.js` (`frameStep`) shows it in red in the status line and footer and stops the frame loop. `app.js` uses it, and startup failures also mark the footer red. `page.js` is shipped and allowlisted | `tests/session.test.mjs` through `frameStep` with mocked UI: `a fallback that fails (the page fetch fails) …`, `a fallback that fails (WebGL init fails) … ends in a visible red error and stops the frame loop`, `the page glue shows Ready once and keeps the loop running`. All three fail with e1ee940's `session.js` |
+| P2: `node --test crates/openpaperdesign-web/tests/` (a directory) failed with MODULE_NOT_FOUND on Node 22 (reviewer: 22.23.3, the ubuntu-24.04 runner's documented Node; operator: 22.22.3 on the Mac) | CI runs the explicit file `node --test crates/openpaperdesign-web/tests/session.test.mjs` and prints `node --version`. Supported: Node ≥ 22, the runner's preinstalled Node (no setup-node action, no package.json) | The exact command passes here on Node 26.8.1. The Node 22 behaviour is the reviewer's and operator's observation and was not reproduced here |
+| P3: the run-8 browser caveat read as current; "a late observer callback touches nothing" overstated | Marked historical; narrowed (see the round-4 table) | — |
+
+### Round-5 results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, `TMPDIR=<worktree>/target/tmp`)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `git diff --check` | clean |
+| `cargo clippy` new crates (host) / core and web (wasm32) | 0 warnings / only upstream `src/io/atomic.rs:30` |
+| `cargo test -p openpaperdesign-serve` / web lib / `tests/shader.rs` | 17 / 109 / 2 passed |
+| `node --test crates/openpaperdesign-web/tests/session.test.mjs` (the CI command; Node 26.8.1) | 9 passed |
+| `cargo check` wasm32; native `cargo build --all-targets` | pass; pass |
+| `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed, 0 failed, 0 ignored; no skips |
+| `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline); no quota errors |
+| Root clippy; `cargo tree -p paper-rs -e features` | 1 upstream warning; unchanged |
+| Bundle | wasm and wasm-bindgen JS unchanged (same SHA-256 as rounds 3–4); `app.js` 8,361 B, `session.js` 5,619 B, `page.js` 760 B, `index.html` 3,002 B |
 
 ## Not proven / open
 
