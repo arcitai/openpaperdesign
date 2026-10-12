@@ -418,3 +418,244 @@ async fn project_lists_pages() {
         "no host paths"
     );
 }
+
+// ------------------------------------------------------------------ links out of the project
+
+/// A sibling folder outside the project with a copy of the page and a stale-temp-looking
+/// sentinel that upstream's cleanup would delete if it ever ran there.
+#[cfg(unix)]
+fn outside(t: &Tmp, p: &Project, id: &str) -> PathBuf {
+    let out = t.0.join("outside");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::copy(p.page_path(id), out.join(format!("{id}.json"))).unwrap();
+    std::fs::write(out.join(".keep.tmp"), "sentinel").unwrap();
+    std::fs::write(out.join("secret.json"), "{\"secret\": \"outside bytes\"}").unwrap();
+    out
+}
+
+#[cfg(unix)]
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_pages_dir_is_refused_before_cleanup_and_after_open() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let out = outside(&t, &p, &id);
+    let before = snapshot(&out);
+    let pages = p.dir.join(PAGES_DIR);
+
+    // Installed before the server starts: refused, and upstream cleanup never runs there.
+    std::fs::rename(&pages, t.0.join("pages-real")).unwrap();
+    symlink(&out, &pages).unwrap();
+    let err = Server::open(Config {
+        project: p.dir.clone(),
+        web_dir: t.0.join("no-bundle"),
+        port: PORT,
+        token: TOKEN.into(),
+    })
+    .err()
+    .expect("refused");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+    assert!(
+        out.join(".keep.tmp").exists(),
+        "outside sentinel not deleted"
+    );
+    assert_eq!(snapshot(&out), before);
+
+    // Installed after the server started: every read and write is refused.
+    std::fs::remove_file(&pages).unwrap();
+    std::fs::rename(t.0.join("pages-real"), &pages).unwrap();
+    let s = server(&p.dir);
+    let (_, tag, body) = get_page(&s, &id).await;
+    std::fs::rename(&pages, t.0.join("pages-real")).unwrap();
+    symlink(&out, &pages).unwrap();
+    assert_eq!(get_page(&s, &id).await.0, StatusCode::FORBIDDEN);
+    let (st, _, _) = put_page(&s, &id, tag.as_deref(), moved(&body, 9.0, 9.0)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _, _) = send(&s, req("GET", "/api/project").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(snapshot(&out), before, "outside folder untouched");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_or_hard_linked_page_file_is_refused() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let out = outside(&t, &p, &id);
+    let s = server(&p.dir);
+    let (_, tag, body) = get_page(&s, &id).await;
+    let page = p.page_path(&id);
+
+    for link in ["symlink", "hard link"] {
+        std::fs::remove_file(&page).unwrap();
+        if link == "symlink" {
+            symlink(out.join("secret.json"), &page).unwrap();
+        } else {
+            std::fs::hard_link(out.join("secret.json"), &page).unwrap();
+        }
+        let before = snapshot(&out);
+        let (st, _, got) = get_page(&s, &id).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{link}");
+        assert!(
+            !got.contains("outside bytes"),
+            "{link}: no outside bytes served"
+        );
+        let (st, _, _) = put_page(&s, &id, tag.as_deref(), moved(&body, 9.0, 9.0)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{link}");
+        let current = etag(&std::fs::read(out.join("secret.json")).unwrap());
+        let (st, _, _) = put_page(&s, &id, Some(&current), moved(&body, 9.0, 9.0)).await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "{link}, even with its current revision"
+        );
+        assert_eq!(snapshot(&out), before, "{link}: outside file untouched");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_manifest_is_refused() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let out = outside(&t, &p, &id);
+    let manifest = p.dir.join("project.json");
+    std::fs::copy(&manifest, out.join("project.json")).unwrap();
+    let open = || {
+        Server::open(Config {
+            project: p.dir.clone(),
+            web_dir: t.0.join("no-bundle"),
+            port: PORT,
+            token: TOKEN.into(),
+        })
+    };
+
+    // After open.
+    let s = open().unwrap();
+    std::fs::rename(&manifest, t.0.join("project-real.json")).unwrap();
+    symlink(out.join("project.json"), &manifest).unwrap();
+    let (st, _, _) = send(&s, req("GET", "/api/project").body(Body::empty()).unwrap()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(get_page(&s, &id).await.0, StatusCode::FORBIDDEN);
+    // Before open.
+    assert!(open().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_bundle_file_is_not_served() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let out = outside(&t, &p, &id);
+    let web = t.0.join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(web.join("index.html"), "<!doctype html>ok").unwrap();
+    symlink(out.join("secret.json"), web.join("app.js")).unwrap();
+    let s = Server::open(Config {
+        project: p.dir.clone(),
+        web_dir: web,
+        port: PORT,
+        token: TOKEN.into(),
+    })
+    .unwrap();
+    let get = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, HOST)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (st, _, body) = send(&s, get("/")).await;
+    assert_eq!((st, body.as_str()), (StatusCode::OK, "<!doctype html>ok"));
+    let (st, _, body) = send(&s, get("/app.js")).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(!body.contains("outside bytes"));
+}
+
+// ------------------------------------------------------------------ headers
+
+#[tokio::test]
+async fn security_headers_are_on_every_response() {
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let s = server(&p.dir);
+    let (_, tag, body) = get_page(&s, &id).await;
+    let stale = moved(&body, 1.0, 1.0);
+    put_page(&s, &id, tag.as_deref(), stale.clone()).await;
+    let uri = format!("/api/pages/{id}");
+    let cases = [
+        (
+            "ok",
+            req("GET", &uri).body(Body::empty()).unwrap(),
+            StatusCode::OK,
+        ),
+        (
+            "no token",
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, HOST)
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "foreign host",
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, "evil.example")
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "unknown path",
+            req("GET", "/nope").body(Body::empty()).unwrap(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "stale write",
+            req("PUT", &uri)
+                .header(header::IF_MATCH, tag.as_deref().unwrap())
+                .body(Body::from(stale))
+                .unwrap(),
+            StatusCode::CONFLICT,
+        ),
+        (
+            "body too large",
+            req("PUT", &uri)
+                .header(header::IF_MATCH, "\"x\"")
+                .body(Body::from(vec![b' '; (64 << 20) + 1]))
+                .unwrap(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ];
+    for (what, r, want) in cases {
+        let res = router(s.clone()).oneshot(r).await.unwrap();
+        assert_eq!(res.status(), want, "{what}");
+        let h = res.headers();
+        assert_eq!(h[header::CACHE_CONTROL], "no-store", "{what}");
+        assert_eq!(h["x-content-type-options"], "nosniff", "{what}");
+        assert_eq!(h["referrer-policy"], "no-referrer", "{what}");
+        let csp = h[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"), "{what}: {csp}");
+    }
+}

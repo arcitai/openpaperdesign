@@ -5,6 +5,11 @@
 //!   `Host` (DNS rebinding) or a cross-origin `Origin`/`Sec-Fetch-Site` are refused.
 //! - Pages are addressed by the ids listed in the project's manifest only; the server builds
 //!   every path itself, so no client input reaches the file system as a path.
+//! - Symbolic links are refused, fail closed: `project.json`, `pages/`, every page file and
+//!   every bundle file must be a real file or directory (and files must have a single hard
+//!   link). This is checked before upstream `Project::open` runs (its stale-temp cleanup must
+//!   never follow a link out of the project) and again on every read and write. Atomic saves
+//!   rename over the page file, so a write never lands outside `pages/`.
 //! - Writes are revision-checked: a page's revision (ETag) is a hash of its file **as it is
 //!   on disk**, `PUT` needs a matching `If-Match`, and a stale one gets `409 Conflict` with
 //!   the file left untouched. Saves go through upstream `project::Project::save_page`
@@ -26,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use paper_rs::model::Document;
 use paper_rs::project::format::{page_from_json, page_to_json};
-use paper_rs::project::{MANIFEST, Manifest, PageData, Project, now_ms};
+use paper_rs::project::{MANIFEST, Manifest, PAGES_DIR, PageData, Project, now_ms};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -80,6 +85,7 @@ pub struct Server {
 #[derive(Debug)]
 pub enum OpenError {
     NotAProject(PathBuf, String),
+    Unsafe(String),
 }
 
 impl std::fmt::Display for OpenError {
@@ -88,11 +94,67 @@ impl std::fmt::Display for OpenError {
             OpenError::NotAProject(p, e) => {
                 write!(f, "{} is not a paper-rs project folder: {e}", p.display())
             }
+            OpenError::Unsafe(e) => write!(f, "refusing to serve this project: {e}"),
         }
     }
 }
 
 impl std::error::Error for OpenError {}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    File,
+    Dir,
+}
+
+/// `Ok(true)` if `path` is a real file/dir of the wanted kind, `Ok(false)` if it doesn't
+/// exist, and an error for a symlink, the wrong kind, or a file with more than one hard link
+/// (which could alias a file outside the project).
+fn plain(path: &Path, want: Kind) -> Result<bool, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let m = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    let t = m.file_type();
+    if t.is_symlink() {
+        return Err(format!("{name} is a symbolic link"));
+    }
+    match want {
+        Kind::Dir if !t.is_dir() => Err(format!("{name} is not a directory")),
+        Kind::File if !t.is_file() => Err(format!("{name} is not a regular file")),
+        Kind::File if links(&m) > 1 => Err(format!("{name} has more than one hard link")),
+        _ => Ok(true),
+    }
+}
+
+#[cfg(unix)]
+fn links(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink()
+}
+
+#[cfg(not(unix))]
+fn links(_m: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// The project's own entries must be real: `project.json` (required) and `pages/` (optional).
+fn check_project_dir(dir: &Path) -> Result<(), String> {
+    if !plain(&dir.join(MANIFEST), Kind::File)? {
+        return Err(format!("{MANIFEST} is missing"));
+    }
+    plain(&dir.join(PAGES_DIR), Kind::Dir)?;
+    Ok(())
+}
+
+fn forbidden(e: String) -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, format!("refused: {e}"))
+}
 
 impl Server {
     /// Open an existing project folder. Nothing is created: a folder without a valid
@@ -102,6 +164,9 @@ impl Server {
             .project
             .canonicalize()
             .map_err(|e| OpenError::NotAProject(cfg.project.clone(), e.to_string()))?;
+        // Before upstream `Project::open`: its stale-temp cleanup deletes files in `pages/`, so
+        // that must not be a link to somewhere else.
+        check_project_dir(&dir).map_err(OpenError::Unsafe)?;
         // Same check (and stale temp-file cleanup) as when the native app opens a project.
         Project::open(&dir).map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
         let p = cfg.port;
@@ -125,6 +190,7 @@ impl Server {
     fn project(&self) -> Result<Project, ApiError> {
         // Re-read per request: the manifest may change while we run (e.g. pages renamed
         // natively). Not `Project::open`, which also deletes other writers' temp files.
+        check_project_dir(&self.dir).map_err(forbidden)?;
         let manifest = std::fs::read_to_string(self.dir.join(MANIFEST))
             .map_err(|e| e.to_string())
             .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))
@@ -221,7 +287,12 @@ async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Respon
             return error(StatusCode::UNAUTHORIZED, "missing or wrong token");
         }
     }
-    let mut res = next.run(req).await;
+    next.run(req).await
+}
+
+/// On every response, including refusals from `guard`, unmatched paths and body-limit
+/// errors.
+async fn security_headers(mut res: Response) -> Response {
     let h = res.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(
@@ -244,18 +315,28 @@ pub fn router(s: Arc<Server>) -> Router {
         r = r.route(
             url,
             get(move |State(s): State<Arc<Server>>| async move {
-                match std::fs::read(s.web_dir.join(file)) {
+                let path = s.web_dir.join(file);
+                match plain(&path, Kind::File) {
+                    Err(e) => return forbidden(e).into_response(),
+                    Ok(false) => {
+                        return error(
+                            StatusCode::NOT_FOUND,
+                            &format!("web bundle file {file} not found; build it first"),
+                        );
+                    }
+                    Ok(true) => {}
+                }
+                match std::fs::read(path) {
                     Ok(b) => ([(header::CONTENT_TYPE, mime)], b).into_response(),
-                    Err(e) => error(
-                        StatusCode::NOT_FOUND,
-                        &format!("web bundle file {file} not found ({e}); build it first"),
-                    ),
+                    Err(e) => error(StatusCode::NOT_FOUND, &format!("{file}: {e}")),
                 }
             }),
         );
     }
-    r.layer(middleware::from_fn_with_state(s.clone(), guard))
+    r.fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
+        .layer(middleware::from_fn_with_state(s.clone(), guard))
         .layer(DefaultBodyLimit::max(MAX_PAGE_BYTES))
+        .layer(middleware::map_response(security_headers))
         .with_state(s)
 }
 
@@ -298,7 +379,13 @@ fn page_ref(p: &Project, id: &str) -> Result<String, ApiError> {
 
 /// Current file bytes of a page (None when it was never written).
 fn read_page(p: &Project, id: &str) -> Result<Option<Vec<u8>>, ApiError> {
-    match std::fs::read(p.page_path(id)) {
+    let path = p.page_path(id);
+    if !plain(&p.dir.join(PAGES_DIR), Kind::Dir).map_err(forbidden)?
+        || !plain(&path, Kind::File).map_err(forbidden)?
+    {
+        return Ok(None);
+    }
+    match std::fs::read(path) {
         Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ApiError::new(
@@ -383,6 +470,8 @@ async fn put_page(
         // The manifest owns page names (as in upstream `Project::load_page`).
         page.name = name.clone();
         page.doc.name = name;
+        // Checked again just before writing (`read_page` above checked the page file).
+        check_project_dir(&p.dir).map_err(forbidden)?;
         p.save_page(&page)
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         // Like the native session: a page write bumps the project's modified time.
