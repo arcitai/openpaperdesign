@@ -60,18 +60,41 @@ check your client's docs if one is refused. The token changes on every start.
 - **Errors change nothing** (lead contract, review round 4): a call that returns an error
   leaves the project exactly as it was, in memory and on disk.
   - **In memory:** nothing reaches the disk during a call (`Host::save` is a no-op; export
-    and file creation are refused). After a tool error, a caught panic, a conflict or a
-    failed save, the host reloads from disk, which it matched before the call. As after any
-    reload, the agent's undo history restarts.
+    and file creation are refused).
+    - Before any tool that can change the editor, the host copies its state: every page's
+      document and undo history, the page list, selection, view and active page. After a
+      tool error, a conflict or a failed save, it puts that copy back, so the undo history
+      and selection survive too.
+    - Read tools change nothing, so a failed read needs no restore.
+    - Only a caught panic, which may leave the editor mid-operation, falls back to
+      reloading from disk (the undo history then restarts).
+    - The copy needs `Clone` on upstream `History`, `PageSlot` and `PageStash`. That is
+      three added derives, the only upstream change in this round.
   - **On disk, one commit** (`crate::commit`) per call, used by browser saves too (page plus
-    manifest): the current bytes of every target are read first. Every new file (images,
-    pages, then the manifest) is written to a temporary file and synced, then renamed in
-    that order. If any step fails, the temporary files are removed and every file already
-    replaced is put back from its old bytes the same way (or removed if it was new). Every
-    project file is then byte-identical to before.
-  - **Fail closed:** if putting a file back fails too, the server records it, naming the
-    files, and from then on refuses every write, browser (503) and MCP alike, until it is
-    restarted after the files were checked. It never reports success or partial success.
+    manifest):
+    1. The current bytes of every target are read first.
+    2. Every new file (images, pages, then the manifest) is written to a temporary file and
+       synced.
+    3. The temporary files are renamed in that order.
+    4. Each directory involved is synced.
+
+    Every step can fail, directory syncs included. If one does, the temporary files are
+    removed, every file already replaced is put back from its old bytes the same way (or
+    removed if it was new), and those directories are synced again. Every project file is
+    then byte-identical to before, and the answer says "nothing was written".
+  - **Fail closed:** if putting a file back (or syncing its directory) fails too, the
+    answer says so, naming the files that may now be inconsistent, and that writes are
+    disabled. From then on the server refuses every write, browser (503) and MCP alike,
+    naming the same files. It never reports success or partial success. This state is kept
+    **in memory only**. Restarting the server clears it without checking anything, so check
+    or restore the named files before restarting.
+  - **Not crash-safe:** this handles errors the running process sees; it is not a durable
+    multi-file transaction. There is no journal, and the old bytes live only in memory. A
+    crash or power loss in the middle of a commit can leave some page files new and others
+    old, and the manifest out of step with them. Each file is itself complete, being
+    replaced by an atomic rename. Nothing recovers this automatically; restore from a copy
+    if it happens. Temporary files a crash leaves are removed by upstream `Project::open`
+    at the next start.
 - **Timeouts** (review round 4): calls are queued for the host thread. A call that hasn't
   started within 120 s is abandoned (Queued → Abandoned, decided atomically against the host
   starting it) and is never run. A call that has started (Queued → Running) is always waited
@@ -247,6 +270,15 @@ them, but it can still overwrite this server's writes.
 
 Findings 6 and 7 were in the merge, which was removed (see the decision above).
 
+### Review round 5 (on `2fcd739`)
+
+| Finding | Fix | Tests (each fails on `2fcd739`'s code) |
+| --- | --- | --- |
+| F1. Directory fsync errors were ignored (a commit returned success), and a rollback never synced its directories | Directory syncs are steps that can fail. A failure during commit rolls back, and the rollback syncs its directories too; any failure there means Broken (fail closed). | `directory_sync_failures_roll_back_or_fail_closed`; the commit step loops in `a_failed_save_leaves_every_file_unchanged` and `tests::browser_saves_are_all_or_nothing_and_fail_closed` now include the directory syncs |
+| F2. A failed read reloaded the editor, losing selection and undo history | Copy and restore of the editor state before changing tools (see "In memory"); reads need none | `a_failed_call_keeps_selection_and_undo_history` (the reviewer's failed read, plus a failed cross-page move) |
+| F3. A failed rollback was reported as "nothing was written" | Failed (nothing written) and Broken (files listed, writes disabled until checked and restarted) are worded separately, for MCP and the browser | `a_failed_rollback_refuses_every_later_write` (MCP), `tests::browser_saves_are_all_or_nothing_and_fail_closed` (browser) |
+| Docs | The fail-closed state is in memory and clears on restart; no crash-atomic multi-file recovery | — |
+
 ### Review round 4 (on `b730f4c`)
 
 | Finding | Fix | Tests (each fails on `b730f4c`'s code) |
@@ -377,6 +409,23 @@ page JavaScript only):
   Node: the reviewer sequence applies the older page, and the overlap test times out.
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run.
+
+Results of the review round 5 fixes (2026-10-12; serve crate and three upstream derives).
+Because upstream `src/` changed, the full native checks were run again:
+- **Serve:** `cargo fmt --all --check`; clippy for serve and web, 0 warnings; serve tests
+  11 unit, 23 agent, 17 serve.
+- **Root:** native build; root clippy with only the known upstream `tests/perf.rs`
+  `drop_non_drop` warning; serial `cargo test --locked -- --test-threads=1`, 162 passed;
+  `PAPER_RS_REQUIRE_GPU=1 cargo test --locked --test headless`, 9 passed (on a GPU, not
+  skipped); `cargo tree -p paper-rs -e features` identical to `2fcd739`'s.
+- **Web:** wasm32 check (core, web); web tests 111 unit + 2 shader. `docs/screenshots`
+  was restored after the serial run.
+- **On `2fcd739`'s code** (the new test modules copied in): all five changed or new
+  regressions fail. These are `a_failed_save_leaves_every_file_unchanged` (directory-sync
+  steps), `a_failed_rollback_refuses_every_later_write` (wording),
+  `directory_sync_failures_roll_back_or_fail_closed`,
+  `tests::browser_saves_are_all_or_nothing_and_fail_closed` (directory sync, wording) and
+  `a_failed_call_keeps_selection_and_undo_history`.
 
 Results of the review round 4 fixes (2026-10-12; serve crate only):
 - **Run now:** `cargo fmt --all --check`; serve clippy (0 warnings); serve build; serve tests
