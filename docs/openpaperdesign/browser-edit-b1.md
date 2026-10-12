@@ -74,11 +74,14 @@ apart from `manifest.modified`.
   `Sec-Fetch-Site` values other than `same-origin`/`none`. Every response carries `no-store`,
   `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. That includes
   refusals, unknown paths and body-limit errors, because the headers are added by the
-  outermost layer. Only the four bundle files are served. They are checked (plain,
-  single-link files in a folder that is not inside the project) and read into memory once
-  at startup, and every request is served from memory, so replacing the bundle folder or a
-  file in it later can't change what is sent. A `--web-dir` inside or equal to the project
-  folder is refused at startup.
+  outermost layer. Only the five bundle files are served (`index.html`, `app.js`,
+  `session.js`, the wasm-bindgen JS and the wasm). They are checked (plain, single-link files
+  in a folder that is not inside the project) and read into memory once at startup, and
+  every request is served from memory, so replacing the bundle folder or a file in it later
+  can't change what is sent. A `--web-dir` inside or equal to the project folder is refused
+  at startup. An existing `--web-dir` is resolved by the operating system (symlinks
+  included). A missing one serves nothing ("build it first"), and is refused if it contains
+  `..`: there is no lexical guessing.
 - **No links out of the project (fail closed):** `project.json`, `pages/`, each page file
   and each bundle file must be a real file or directory, not a symbolic link. Files must
   also have a single hard link. The project root must stay the directory opened at startup:
@@ -351,6 +354,51 @@ established by this check.
 | `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
 | Bundle (`target/openpaperdesign-web/`) | `openpaperdesign_web_bg.wasm` 11,662,088 B (4,234,028 B gzip -9), `openpaperdesign_web.js` 126,514 B, `app.js` 8,648 B, `index.html` 3,002 B |
 
+## Fix round 4 (2026-10-12, after independent review of 2b5c9ae)
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| P2: a fallback freed the editor and reopened the initially loaded JSON while edits and saves were allowed before Ready, so it could restore old content under a newer revision. Probes showed a null-editor exception, and a save's answer applied to the replacement editor | The editor lifecycle moved to `static/session.js`. Editing input, toolbar actions and saves only reach the editor once it is Ready and no fallback is running. A fallback waits for a save in flight, then reopens the page **as the server has it now** (content and revision). A save's answer only applies to the editor that took the snapshot | `tests/session.test.mjs` (Node `node:test`, mocked editors/canvas/DOM, no browser): `input, toolbar and saves are ignored until Ready`; `a startup failure falls back to WebGL on a fresh canvas with the current server page`; `a fallback waits for a save in flight and never applies its answer to the new editor`; `an answer arriving after the editor was swapped is dropped`; `forced WebGL failing is an error, not a fallback`. `session.js` is new, so there is nothing on 2b5c9ae to run them against: there the logic was inline in `app.js`, ungated |
+| P2: the ResizeObserver stayed on the replaced canvas and toolbar handlers stayed active, so `ed.resize()`/`ed.set_tool()` were called on null | The old observer is disconnected, and a new one observes the new canvas, which also gets its own input listeners. Every handler goes through the session's guards (`edit` for input/toolbar, `withEditor` for resize/frames/blur) | `a GPU error before Ready falls back once; the old observer and editor are retired` (the old observer is disconnected, its late callback touches nothing, the new observer resizes the new editor, and nothing reaches an editor while switching) |
+| P2: `resolve()` applied `..` before resolving symlinks, so with `alias` → `project/sub`, a missing `alias/../not-built` resolved to an unrelated sibling bundle, which was served | No lexical resolution any more (see "Server security"). This supersedes the missing-folder rule from round 3 | `missing_web_dir_with_dotdot_after_a_symlink_is_not_guessed` fails on 2b5c9ae's server code with `served: UNREQUESTED SIBLING BUNDLE`, and passes now. `web_dir_inside_the_project_is_refused` was updated (a missing folder without `..` now serves nothing instead of being refused) |
+| P3: "Codex built-in browser" listed as unproven without qualification | Scoped to the final revision ("Not proven / open") | — |
+
+**Build command and environment for the bundle**, recorded so reproducibility can be
+assessed (reproducibility is not claimed):
+
+```sh
+export RUSTUP_HOME=$PWD/.toolchain/rustup CARGO_HOME=$PWD/.toolchain/cargo PATH=$PWD/.toolchain/cargo/bin:$PATH
+export TMPDIR=$PWD/target/tmp
+./scripts/build-web.sh --offline
+# = cargo build --locked --release -p openpaperdesign-web --target wasm32-unknown-unknown --offline
+#   wasm-bindgen --target web --no-typescript --out-dir target/openpaperdesign-web \
+#       target/wasm32-unknown-unknown/release/openpaperdesign_web.wasm
+```
+
+Rust 1.95.0 (59807616e), wasm-bindgen CLI 0.2.129 (operator-staged in `.toolchain/cargo/bin`),
+Linux x86_64 host, worktree path
+`/home/factory/.t3/worktrees/openpaperdesign/foundation-wasm-core-feasibility`, default
+`target/` dir, and no `RUSTFLAGS` or `SOURCE_DATE_EPOCH` set. Absolute paths (worktree,
+`CARGO_HOME`) can be embedded in the wasm, for example in panic location strings, so a
+build from a different path may well hash differently.
+
+### Round-4 results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, `TMPDIR=<worktree>/target/tmp`)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `git diff --check` | clean |
+| `cargo clippy` new crates (host, all targets) | 0 warnings |
+| `cargo clippy` core and web (wasm32) | only upstream `src/io/atomic.rs:30`, once per crate |
+| `cargo test -p openpaperdesign-serve` / web lib / `tests/shader.rs` | 17 / 109 / 2 passed |
+| `node --test crates/openpaperdesign-web/tests/` (Node 26.8.1, mocked DOM) | 6 passed |
+| `cargo check` core and web for wasm32 | pass |
+| Native `cargo build --all-targets` | pass |
+| `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed, 0 failed, 0 ignored; no skips, no quota errors |
+| `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline); no quota errors |
+| Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
+| `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
+| Bundle | `openpaperdesign_web_bg.wasm` 11,662,088 B and `openpaperdesign_web.js` 126,514 B: SHA-256 identical to the round-3 build (no Rust change since, same environment). `app.js` 8,246 B, `session.js` 5,334 B, `index.html` 3,002 B |
+
 ## Not proven / open
 
 - Browser runs are operator-observed only, all in the Codex in-app browser on a Mac (Apple
@@ -366,4 +414,7 @@ established by this check.
 - The Mac browser ⌘ mapping is unit-tested and was operator-observed in Codex on the run-8
   tree (⌘A, ⌘Z). Other Mac browsers are untested.
 - ~4.2 MB gzip download: the fonts alone are 2.5 MB uncompressed. Size work is open.
-- Codex built-in browser, MCP App panel, plugin packaging and B2 agent writes.
+- The Codex in-app browser on the **final revision**: earlier revisions were
+  operator-observed there (above), but the round-4 changes (input gating, fallback
+  rework, `--web-dir` resolution) have not been run in any browser.
+- MCP App panel, plugin packaging and B2 agent writes.

@@ -32,6 +32,8 @@ jobs:
         run: cargo test --locked -- --test-threads=1
       - name: Test openpaperdesign crates (serve API, web input mapping)
         run: cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
+      - name: Test the page's editor lifecycle (Node, mocked DOM)
+        run: node --test crates/openpaperdesign-web/tests/
 
   wasm-core:
     runs-on: ubuntu-24.04
