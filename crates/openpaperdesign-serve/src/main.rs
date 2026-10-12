@@ -3,6 +3,8 @@
 //! Serves one existing paper-rs project folder to a browser on 127.0.0.1 only and prints the
 //! URL to open. The URL fragment carries the per-launch API token; fragments are not sent to
 //! the server or in `Referer`, and the page moves the token into an `Authorization` header.
+//! The same token authorizes MCP clients at `/mcp` (`Authorization: Bearer <token>`); the
+//! server prints client settings for it and writes them nowhere.
 
 use openpaperdesign_serve::{Config, Server, new_token, router};
 use std::path::PathBuf;
@@ -67,6 +69,17 @@ async fn main() {
         eprintln!("warning: no web bundle found; build it with scripts/build-web.sh");
     }
     println!("open http://127.0.0.1:{port}/#token={token}");
+    // Ready-to-paste MCP client settings. Printed only; nothing is written anywhere.
+    let mcp = format!("http://127.0.0.1:{port}{}", openpaperdesign_serve::MCP_PATH);
+    println!("MCP (streamable HTTP): {mcp}  with header  Authorization: Bearer {token}");
+    println!(
+        "  Claude Code: claude mcp add --transport http openpaperdesign {mcp} \
+         --header \"Authorization: Bearer {token}\""
+    );
+    println!(
+        "  Codex: export OPD_MCP_TOKEN={token}; in ~/.codex/config.toml: \
+         [mcp_servers.openpaperdesign] url = \"{mcp}\" bearer_token_env_var = \"OPD_MCP_TOKEN\""
+    );
     if let Err(e) = axum::serve(listener, router(server)).await {
         eprintln!("server error: {e}");
         std::process::exit(1);

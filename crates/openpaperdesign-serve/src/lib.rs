@@ -30,6 +30,9 @@
 //! browser's saves, and a write landing between this server's check and its rename is not
 //! detected. Run one writer at a time.
 
+pub mod agent;
+pub mod merge;
+
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Request, State};
@@ -37,12 +40,58 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use paper_rs::mcp::Call;
 use paper_rs::model::Document;
 use paper_rs::project::format::{page_from_json, page_to_json};
-use paper_rs::project::{MANIFEST, Manifest, PAGES_DIR, PageData, Project, now_ms};
+use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData, Project, now_ms};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+
+pub(crate) const ASSETS: &str = ASSETS_DIR;
+/// The MCP endpoint (same listener, same token).
+pub const MCP_PATH: &str = "/mcp";
+
+/// Recent bytes of each page revision, so a browser save based on an older revision can be
+/// merged. Bounded by count and size; an evicted base means a plain 409.
+#[derive(Default)]
+pub struct Revisions {
+    entries: VecDeque<(String, String, Arc<Vec<u8>>)>,
+    bytes: usize,
+}
+
+const MAX_REVISIONS: usize = 64;
+const MAX_REVISION_BYTES: usize = 256 << 20;
+
+impl Revisions {
+    pub fn record(&mut self, page: &str, tag: &str, bytes: Vec<u8>) {
+        if self.get(page, tag).is_some() {
+            return;
+        }
+        self.bytes += bytes.len();
+        self.entries
+            .push_back((page.to_string(), tag.to_string(), Arc::new(bytes)));
+        while self.entries.len() > MAX_REVISIONS || self.bytes > MAX_REVISION_BYTES {
+            match self.entries.pop_front() {
+                Some((_, _, b)) => self.bytes -= b.len(),
+                None => break,
+            }
+        }
+    }
+
+    pub fn get(&self, page: &str, tag: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(p, t, _)| p == page && t == tag)
+            .map(|(_, _, b)| b.clone())
+    }
+}
 
 /// Files of the web bundle, by URL path. Nothing else is served from disk.
 const BUNDLE: &[(&str, &str, &str)] = &[
@@ -97,8 +146,12 @@ pub struct Server {
     token: String,
     hosts: [String; 2],
     origins: [String; 2],
-    /// Serializes revision check + write, so two saves through this server can't interleave.
-    write_lock: tokio::sync::Mutex<()>,
+    /// Serializes revision check + write for every writer through this server: browser saves
+    /// and agent calls (the MCP host thread takes the same lock).
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    revisions: Arc<Mutex<Revisions>>,
+    /// Tool calls for the MCP host thread.
+    calls: Sender<Call>,
 }
 
 #[derive(Debug)]
@@ -121,7 +174,7 @@ impl std::fmt::Display for OpenError {
 impl std::error::Error for OpenError {}
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     File,
     Dir,
 }
@@ -129,7 +182,7 @@ enum Kind {
 /// `Ok(true)` if `path` is a real file/dir of the wanted kind, `Ok(false)` if it doesn't
 /// exist, and an error for a symlink, the wrong kind, or a file with more than one hard link
 /// (which could alias a file outside the project).
-fn plain(path: &Path, want: Kind) -> Result<bool, String> {
+pub(crate) fn plain(path: &Path, want: Kind) -> Result<bool, String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -170,14 +223,14 @@ fn links(_m: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn check_root(_dir: &Path, _id: (u64, u64)) -> Result<(), String> {
+pub(crate) fn check_root(_dir: &Path, _id: (u64, u64)) -> Result<(), String> {
     Err("only supported on Unix".into())
 }
 
 /// The root must still be the directory opened at startup: a real directory (not a link),
 /// with the same canonical path (catches swapped ancestors too) and the same (device, inode).
 #[cfg(unix)]
-fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
+pub(crate) fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
     let m = std::fs::symlink_metadata(dir).map_err(|e| format!("project folder: {e}"))?;
     if m.file_type().is_symlink() || !m.is_dir() {
         return Err("the project folder was replaced (not a real directory any more)".into());
@@ -239,12 +292,24 @@ fn load_bundle(web_dir: &Path, project: &Path) -> Result<Bundle, String> {
 }
 
 /// The project's own entries must be real: `project.json` (required) and `pages/` (optional).
-fn check_project_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn check_project_dir(dir: &Path) -> Result<(), String> {
     if !plain(&dir.join(MANIFEST), Kind::File)? {
         return Err(format!("{MANIFEST} is missing"));
     }
     plain(&dir.join(PAGES_DIR), Kind::Dir)?;
+    plain(&dir.join(ASSETS), Kind::Dir)?;
     Ok(())
+}
+
+/// The manifest, read only from a real `project.json`.
+pub(crate) fn read_manifest_checked(dir: &Path) -> Result<Manifest, String> {
+    let path = dir.join(MANIFEST);
+    if !plain(&path, Kind::File)? {
+        return Err(format!("{MANIFEST} is missing"));
+    }
+    std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))
 }
 
 fn forbidden(e: String) -> ApiError {
@@ -280,6 +345,10 @@ impl Server {
         // Same check (and stale temp-file cleanup) as when the native app opens a project.
         Project::open(&dir).map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
         let bundle = load_bundle(&cfg.web_dir, &dir).map_err(OpenError::Unsafe)?;
+        let write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let revisions = Arc::new(Mutex::new(Revisions::default()));
+        let calls = agent::spawn_host(dir.clone(), root_id, write_lock.clone(), revisions.clone())
+            .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = cfg.port;
         Ok(Arc::new(Server {
             dir,
@@ -291,7 +360,9 @@ impl Server {
                 format!("http://127.0.0.1:{p}"),
                 format!("http://localhost:{p}"),
             ],
-            write_lock: tokio::sync::Mutex::new(()),
+            write_lock,
+            revisions,
+            calls,
         }))
     }
 
@@ -314,9 +385,7 @@ impl Server {
         // Re-read per request: the manifest may change while we run (e.g. pages renamed
         // natively). Not `Project::open`, which also deletes other writers' temp files.
         self.check()?;
-        let manifest = std::fs::read_to_string(self.dir.join(MANIFEST))
-            .map_err(|e| e.to_string())
-            .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))
+        let manifest = read_manifest_checked(&self.dir)
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         Ok(Project {
             dir: self.dir.clone(),
@@ -349,6 +418,8 @@ struct ApiError {
     status: StatusCode,
     msg: String,
     etag: Option<String>,
+    /// Node ids that conflicted in a merge ("root" = the page's top-level order).
+    conflicts: Option<Vec<String>>,
 }
 
 impl ApiError {
@@ -357,13 +428,18 @@ impl ApiError {
             status,
             msg: msg.into(),
             etag: None,
+            conflicts: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "error": self.msg }).to_string();
+        let mut body = serde_json::json!({ "error": self.msg });
+        if let Some(c) = &self.conflicts {
+            body["conflicts"] = serde_json::json!(c);
+        }
+        let body = body.to_string();
         let mut r = (
             self.status,
             [(header::CONTENT_TYPE, "application/json")],
@@ -402,7 +478,8 @@ async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Respon
     {
         return error(StatusCode::FORBIDDEN, "cross-site request");
     }
-    if req.uri().path().starts_with("/api/") {
+    let path = req.uri().path();
+    if path.starts_with("/api/") || path == MCP_PATH || path.starts_with("/mcp/") {
         let ok = header_str(h, header::AUTHORIZATION)
             .and_then(|v| v.strip_prefix("Bearer "))
             .is_some_and(|t| same_bytes(t.as_bytes(), s.token.as_bytes()));
@@ -430,10 +507,43 @@ async fn security_headers(mut res: Response) -> Response {
     res
 }
 
+/// Streamable HTTP clients must accept JSON and SSE; add the header when a client omits it
+/// (as upstream's MCP server does).
+async fn fix_accept(mut req: Request, next: Next) -> Response {
+    if req.method() == axum::http::Method::POST {
+        let accept = header_str(req.headers(), header::ACCEPT).unwrap_or("");
+        if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
+            req.headers_mut().insert(
+                header::ACCEPT,
+                HeaderValue::from_static("application/json, text/event-stream"),
+            );
+        }
+    }
+    next.run(req).await
+}
+
 pub fn router(s: Arc<Server>) -> Router {
+    let calls = s.calls.clone();
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_origins(s.origins.clone())
+        .enforce_origin_validation()
+        .with_max_request_body_bytes(MAX_PAGE_BYTES);
+    let mcp: StreamableHttpService<agent::AgentServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(agent::AgentServer::new(calls.clone())),
+            Default::default(),
+            config,
+        );
     let mut r = Router::new()
         .route("/api/project", get(get_project))
-        .route("/api/pages/{id}", get(get_page).put(put_page));
+        .route("/api/pages/{id}", get(get_page).put(put_page))
+        .route("/api/pages/{id}/revision", get(get_revision))
+        .nest_service(
+            MCP_PATH,
+            tower::ServiceBuilder::new()
+                .layer(middleware::from_fn(fix_accept))
+                .service(mcp),
+        );
     for &(url, file, mime) in BUNDLE {
         r = r.route(
             url,
@@ -520,6 +630,9 @@ async fn get_page(State(s): State<Arc<Server>>, UrlPath(id): UrlPath<String>) ->
         let name = page_ref(&p, &id)?;
         let bytes = read_page(&p, &id)?;
         let rev = revision(&bytes);
+        if let Some(b) = &bytes {
+            s.revisions.lock().unwrap().record(&id, &rev, b.clone());
+        }
         let body = match bytes {
             Some(b) => b,
             // Same as upstream `Project::load_pages`: a listed page without a file is empty.
@@ -548,6 +661,24 @@ async fn get_page(State(s): State<Arc<Server>>, UrlPath(id): UrlPath<String>) ->
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
+/// The page's current revision only (cheap polling for the browser).
+async fn get_revision(State(s): State<Arc<Server>>, UrlPath(id): UrlPath<String>) -> Response {
+    let result = (|| {
+        let p = s.project()?;
+        page_ref(&p, &id)?;
+        let rev = revision(&read_page(&p, &id)?);
+        Ok::<_, ApiError>(
+            (
+                [(header::ETAG, rev.clone())],
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "revision": rev }).to_string(),
+            )
+                .into_response(),
+        )
+    })();
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
 async fn put_page(
     State(s): State<Arc<Server>>,
     UrlPath(id): UrlPath<String>,
@@ -564,8 +695,13 @@ async fn put_page(
     let result = (|| {
         let mut p = s.project()?;
         let name = page_ref(&p, &id)?;
-        let current = revision(&read_page(&p, &id)?);
-        if if_match != current {
+        let current_bytes = read_page(&p, &id)?;
+        let current = revision(&current_bytes);
+        // A stale revision can still be merged when its bytes are retained.
+        let base = (if_match != current)
+            .then(|| s.revisions.lock().unwrap().get(&id, &if_match))
+            .flatten();
+        if if_match != current && (base.is_none() || current_bytes.is_none()) {
             return Err(ApiError {
                 etag: Some(current),
                 ..ApiError::new(
@@ -582,6 +718,35 @@ async fn put_page(
                 "page id in the body does not match the URL",
             ));
         }
+        let merged = match (&base, &current_bytes) {
+            (Some(base), Some(cur)) => {
+                let parse = |b: &[u8]| {
+                    std::str::from_utf8(b)
+                        .map_err(|e| e.to_string())
+                        .and_then(|t| page_from_json(t).map_err(|e| e.to_string()))
+                        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e))
+                };
+                let (b, t) = (parse(base)?, parse(cur)?);
+                match merge::merge(&b.doc, &t.doc, &page.doc) {
+                    Ok(doc) => {
+                        page.doc = doc;
+                        true
+                    }
+                    Err(c) => {
+                        return Err(ApiError {
+                            etag: Some(current),
+                            conflicts: Some(c.ids()),
+                            ..ApiError::new(
+                                StatusCode::CONFLICT,
+                                "this change and another one touch the same layers; nothing \
+                                 was written",
+                            )
+                        });
+                    }
+                }
+            }
+            _ => false,
+        };
         // The manifest owns page names (as in upstream `Project::load_page`).
         page.name = name.clone();
         page.doc.name = name;
@@ -593,7 +758,25 @@ async fn put_page(
         p.manifest.modified = now_ms();
         p.write_manifest()
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let rev = revision(&read_page(&p, &id)?);
+        let written = read_page(&p, &id)?.unwrap_or_default();
+        let rev = etag(&written);
+        s.revisions
+            .lock()
+            .unwrap()
+            .record(&id, &rev, written.clone());
+        if merged {
+            // The merged page: the browser loads it, since it holds changes it didn't have.
+            return Ok((
+                StatusCode::OK,
+                [
+                    (header::ETAG, rev),
+                    (header::HeaderName::from_static("x-opd-merged"), "1".into()),
+                    (header::CONTENT_TYPE, "application/json".into()),
+                ],
+                written,
+            )
+                .into_response());
+        }
         Ok((
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
