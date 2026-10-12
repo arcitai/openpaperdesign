@@ -27,7 +27,10 @@ see each other's changes live.
    unsaved there. If the person has an unsaved edit while you write the same page, their save
    is refused and the page shows a conflict; nothing is overwritten either way. Let the person
    decide: their "Reload (discard my unsaved change)" shows your version. Prefer to edit
-   after they've saved.
+   after they've saved. If the person saved a page after you last read it, your next change
+   to that page fails with a `conflict` error and nothing is written: read the page again
+   (`get_tree_summary` with `nodeId` `"root"`, `get_node_info`) and redo the change on what
+   is there now.
 
 Limits (state them when relevant):
 

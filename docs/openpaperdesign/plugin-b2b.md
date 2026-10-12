@@ -29,7 +29,9 @@ surface), plugin publishing, other hosts.
   - **Serving:** the bound project is served by the B2a server, in the same process, on
     127.0.0.1 with a fresh 32-byte token. Tool calls go to that server's single host, with the
     same write lock, policy, atomic saves and revisions as its HTTP `/mcp`, so the browser and
-    the agent edit the same document.
+    the agent edit the same document. The stdio client is one MCP session of that host, so
+    B2a's stale-write check applies: a change to a page the person saved since the agent last
+    read it is refused as a `conflict`, and nothing is written.
   - **`openpaperdesign-mcp doctor`** prints the setup as JSON (exit 0 only when the editor is
     built in and the platform is supported). `--version` prints the version.
 - **The web bundle is compiled into the command.** `build.rs` embeds
@@ -115,6 +117,14 @@ The three launcher tests:
   - `create_project` creates `design/New board` and switches to it, and refuses a duplicate.
 - `home_folder_workspace_and_escaping_design_folder_are_refused`.
 - `embedded_bundle_list_matches_the_server_allowlist`.
+
+Rebased on the B2a review round 1 fixes (`a96b32c`, 2026-10-12). The launcher now passes its
+session to the host (`Server::call_tool(session, …)`) and the skill tells the agent to read
+again after a `conflict`. Re-run after the rebase (proportionate: serve crate, plugin files):
+`cargo fmt --all --check`; clippy for serve and web, 0 warnings; serve 4 unit + 9 agent + 3
+launcher + 17; `node --test plugin/tests/plugin.test.mjs`; Python design tests; native build;
+`git diff --check`. The rows above are from the pre-rebase run; serial and headless are
+inherited from it (no root-package file changed).
 
 ## Not proven
 
