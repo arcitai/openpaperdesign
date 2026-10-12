@@ -389,3 +389,39 @@ test('no polling before Ready or while switching', async () => {
   assert.equal(await s.poll(), undefined);
   assert.equal(asked, 0);
 });
+
+test('a late poll answer never replaces a newer saved state (reviewer sequence)', async () => {
+  const fetched = deferred();
+  const { s, ed, server } = await readySession({
+    put: async () => ({ ok: true, status: 200, revision: '"r3"' }),
+  });
+  server.revision = '"r2"';                 // someone else saved r2
+  s.deps.fetchPage = () => fetched.promise; // the poll's fetch is still pending...
+  const poll = s.poll();
+  await new Promise((r) => setTimeout(r, 0));
+  ed.pending = '{"human":1}';               // ...while a human edit is saved as r3
+  assert.equal(await s.save(), 'saved');
+  assert.equal(s.state.revision, '"r3"');
+  fetched.resolve({ text: 'older r2 page', revision: '"r2"' });
+  await poll;
+  assert.ok(!ed.calls.includes('reload:older r2 page'), 'the older page was not applied');
+  assert.equal(s.state.revision, '"r3"', 'no rollback');
+});
+
+test('polls never overlap, and a discard makes an older poll answer stale', async () => {
+  const fetched = deferred();
+  const { s, ed, server } = await readySession();
+  server.revision = '"r2"';
+  s.deps.fetchPage = () => fetched.promise;
+  const first = s.poll();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(await s.poll(), undefined, 'a second poll does not start while one is pending');
+  // A discard starts after the poll (e.g. the person clicked it): the poll's answer is stale.
+  s.state.conflict = true;
+  s.deps.fetchPage = async () => ({ text: 'discarded-to', revision: '"r4"' });
+  assert.equal(await s.discard(), 'discarded');
+  fetched.resolve({ text: 'stale poll page', revision: '"r2"' });
+  await first;
+  assert.ok(!ed.calls.includes('reload:stale poll page'));
+  assert.equal(s.state.revision, '"r4"');
+});

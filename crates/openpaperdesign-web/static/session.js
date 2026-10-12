@@ -39,6 +39,10 @@ export class Session {
     this.observer = null;
     this.forceWebgl = false;
     this.errorReported = false;
+    // Bumped whenever something that can change the editor's page starts (a save, a poll, a
+    // discard): an answer only applies if nothing started after its own request.
+    this.generation = 0;
+    this.polling = false;
     this.saveDone = Promise.resolve();
   }
 
@@ -147,20 +151,35 @@ export class Session {
    */
   async poll() {
     const s = this.state;
-    if (!this.editable() || s.saving || s.conflict) return undefined;
+    if (this.polling || !this.editable() || s.saving || s.conflict) return undefined;
+    this.polling = true;
+    try {
+      return await this.pollOnce();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  async pollOnce() {
+    const s = this.state;
+    const gen = ++this.generation;
+    const ed = this.ed;
+    // Apply an answer only to the editor that asked, if no save, discard or other load
+    // started since this request, and nothing is unsaved.
+    const current = () => this.ed === ed && gen === this.generation && this.editable()
+      && !s.saving && !s.conflict;
     const rev = await this.deps.revision();
+    if (!current()) return undefined;
     if (rev === s.revision) {
       s.behind = false;
       return undefined;
     }
-    const ed = this.ed;
-    if (!this.editable() || !ed.can_reload() || s.saving) {
+    if (!ed.can_reload()) {
       s.behind = true;
       return 'behind';
     }
     const page = await this.deps.fetchPage();
-    // Re-check: an edit or save may have started while fetching.
-    if (this.ed !== ed || !this.editable() || !ed.can_reload() || s.saving) {
+    if (!current() || !ed.can_reload()) {
       s.behind = true;
       return 'behind';
     }
@@ -180,9 +199,12 @@ export class Session {
     const s = this.state;
     const ed = this.ed;
     if (!ed || s.switching || s.error || s.saving) return undefined;
+    const gen = ++this.generation;
     const page = await this.deps.fetchPage();
-    // Apply only to the editor that asked, and only if nothing else changed meanwhile.
-    if (this.ed !== ed || s.switching || s.error || s.saving) return undefined;
+    // Apply only to the editor that asked, and only if nothing else started meanwhile.
+    if (this.ed !== ed || gen !== this.generation || s.switching || s.error || s.saving) {
+      return undefined;
+    }
     ed.reload(page.text);
     s.revision = page.revision;
     s.conflict = false;
@@ -199,6 +221,7 @@ export class Session {
     const snapshot = ed.save_snapshot();
     if (snapshot === undefined) return undefined;
     s.saving = true;
+    this.generation += 1;
     let done;
     this.saveDone = new Promise((r) => { done = r; });
     try {
