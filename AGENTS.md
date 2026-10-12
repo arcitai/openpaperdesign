@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.6 · Updated: 2026-10-12
+Revision: 0.7 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -70,8 +70,11 @@ Agents edit the same project over MCP at `/mcp` on that server, with the per-lau
 creation are refused, and images must be `data:` URIs
 (`docs/openpaperdesign/agent-edit-b2a.md`). Never write the token into repository files or commit it.
 Conflicts are strict, and nothing merges. A browser save on a stale revision is refused (409).
-An agent change to a page that changed since that MCP session last read it is refused as a
-`conflict`. Page ids come only from the manifest and must be safe file names.
+An MCP session must read a page before it changes it (no first-call exception). A change to
+a page the session hasn't read, or whose content, name or position changed since it read it,
+is refused as a `conflict`. Page ids come only from the manifest, must be safe file names,
+and must differ in more than ASCII case (macOS file systems alias them). Inline SVG may not
+contain `<image>`/`<feImage>`.
 The dropped three-way-merge experiment is at the local tag `experiment/b2a-three-way-merge`;
 don't bring it back without an explicit decision (collaboration is issue #2).
 

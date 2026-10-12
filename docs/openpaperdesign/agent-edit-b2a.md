@@ -11,7 +11,8 @@ plugin packaging, skills, discovery, the MCP App panel (B2b), several projects, 
 
 Updated 2026-10-12: the automatic three-way merge was dropped in favour of strict revisions
 (see "Decision: strict revisions, no merge"). Then review round 1 findings 1–5 were fixed (see
-"Review round 1").
+"Review round 1"), then review round 2 findings 1–6 and the operator's Mac case-alias
+finding (see "Review round 2").
 
 ## Run it
 
@@ -74,18 +75,28 @@ check your client's docs if one is refused. The token changes on every start.
   upstream `mcp::html::parse`, so attributes are checked after entity decoding, case-insensitive.
   Every other string argument (styles maps) is scanned for `url(`. Anything else is refused, so
   no local path, relative or absolute, is ever read.
-- **Inline `<svg>`:** usvg's default resolver reads `<image href>` files from disk, and it
-  treats an image href such as `#private.png` as a file name too. So inline SVG must be
-  well-formed XML, parsed with roxmltree, the same parser usvg uses, with no DTD and no
-  `@import`. `<image>` and `<feImage>` hrefs must be `data:` URIs. Every other `href` and
-  `url(...)` must be `#id` of an element in the same SVG.
-- **Page ids and files:** page ids come only from the manifest, and every one must be 1–64
-  ASCII letters, digits, `-` or `_`, with no duplicates; otherwise the project is refused
-  (server start, browser requests and agent calls alike). The host reads pages itself rather
-  than with upstream `load_pages`: `pages/` and each page file are checked (no symlink, a single
-  hard link) **before** any byte is read, and a page takes its id from its manifest entry,
-  whatever its file says, so the id inside a file can't choose where it is saved. Before
-  saving, every page id is checked again and each destination is checked not to be a link.
+- **Inline `<svg>`:** usvg's default resolver reads `<image href>` files from disk. It treats
+  `#private.png` as a file name, and it falls back to reading a file when a `data:` href
+  doesn't parse (`data:private.png`). So inline SVG must be well-formed XML, parsed with
+  roxmltree, the same parser usvg uses, with no DTD and no `@import`. It may contain no
+  `<image>` or `<feImage>` element at all; agents put images in HTML `<img>` with a `data:`
+  URI instead. Every `href` and `url(...)` must be `#id` of an element in the same SVG.
+- **Page ids and files:**
+  - Page ids come only from the manifest. Each must be 1–64 ASCII letters, digits, `-` or
+    `_`, and no two may be equal **ignoring ASCII case**. Otherwise the project is refused
+    everywhere: server start, browser requests and agent calls alike.
+  - Case matters because on case-insensitive file systems (macOS APFS by default) `CasePage`
+    and `casepage` are the same page file. The operator observed this on `a96b32c`: the server
+    started with both ids aliasing one file (`.toolchain/operator-evidence/mac-case-alias.json`).
+    The rule doesn't depend on the file system, so it is tested on Linux too.
+  - The host reads pages itself rather than with upstream `load_pages`. `pages/` and each page
+    file are checked (no symlink, a single hard link) **before** any byte is read, and two
+    pages that turn out to be the same file (same device and inode) are refused.
+  - A page takes its id and name from its manifest entry, whatever its file says, as upstream
+    `Project::load_page` does. So the id inside a file can't choose where it is saved, and a
+    reload doesn't revert a saved rename (renames only write the manifest).
+  - Before saving, every page id is checked again (format, case-folded uniqueness), and each
+    destination is checked not to be a link.
 - **Project assets:** loaded by the adapter, not by upstream `assets::load_dir`, which follows
   symlinks. Only plain single-link files in a real `assets/` folder are registered. `assets/`
   joins the B1 entry checks (not a symlink), and agent-saved images are written there only
@@ -105,16 +116,25 @@ check your client's docs if one is refused. The token changes on every start.
   atomically, which gives a new revision.
   - A browser save can't overwrite an agent write: its `If-Match` names the older revision
     and is refused.
-  - An agent write can't overwrite a browser save the agent hasn't seen. Each MCP session has
-    the revisions it last saw. A call that changes nothing (a summary, node info, a
-    screenshot, a refused call) counts as reading: it records the current revisions. A call
-    that changes a page, or deletes it, is refused with a `conflict` error if that page's
-    revision moved since the session last saw it, and nothing is written. The agent reads
-    again and redoes the change. A session's own writes count as seen. A session's first call
-    takes the revisions at that moment as seen, so it is never refused itself.
-  - This is per page, not per node: a browser save to one layer also refuses an agent edit
-    of another layer on that page until the agent reads again. Pages the agent creates are
-    new, so never stale.
+  - **An MCP session must read a page before it changes it,** and an agent write can't
+    overwrite a change the session hasn't read. There is no exception for a first call.
+  - **What counts as reading:** a call by the session that writes nothing (a summary, node
+    info, a screenshot, a selection) records the current revisions of every page's content
+    and metadata as read by that session. Calls refused by the policy or as a conflict
+    record nothing.
+  - **What is refused:** a call that changes an existing page's content, renames or moves it,
+    or deletes it, if the session hasn't read that page, or if the page's content or
+    metadata (name, position in the page list) changed since the session last read it. It
+    gets a `conflict` error, the change is discarded, and nothing is written (neither the
+    page nor the manifest). The agent reads and redoes the change.
+  - **Own writes** count as read. Pages a call creates are new, so never stale.
+  - **Forgotten sessions:** the host remembers the reads of the last 256 sessions. A session
+    it forgot (or never saw) has read nothing, so it must read again before changing a page:
+    forgetting fails closed.
+  - **Granularity:** checks are per page, not per node. A browser save to one layer also
+    refuses an agent edit of another layer on that page until the agent reads again.
+  - **Not covered:** the active page in the manifest (set by `open_file` `pageId`) is view
+    state, not checked.
 
 ### Browser (`static/session.js`, `static/page.js`, `src/state.rs`)
 
@@ -127,7 +147,8 @@ check your client's docs if one is refused. The token changes on every start.
   revision, so the server answers 409. The banner appears, and the unsaved state stays on
   screen.
 - **Discard:** only the person's explicit click on "Reload (discard my unsaved change)"
-  replaces the page. It loads the server's version **in place** (`Session.discard` via
+  replaces the page. While the server's version loads, editing input, toolbar actions and
+  saves are suspended, so no edit can be made after the click that the load would then erase. It loads the server's version **in place** (`Session.discard` via
   `page.js` `discardStep`), with no navigation. That fixes the operator's Codex finding on
   ba93173: `location.reload()` together with the always-on leave-page guard gave
   `net::ERR_ABORTED` and left the banner up. Ordinary navigation with unsaved edits stays
@@ -173,9 +194,27 @@ them, but it can still overwrite this server's writes.
 
 Findings 6 and 7 were in the merge, which was removed (see the decision above).
 
+### Review round 2 (on `a96b32c`), findings 1–6, and the operator's Mac case-alias finding
+
+Lead decisions: refuse SVG image elements outright, and require a read before any change
+(no first-call exception).
+
+| Finding | Fix | Tests (each fails on `a96b32c`'s code) |
+| --- | --- | --- |
+| 1. A malformed `data:` SVG image href (`data:private.png`) is read as a file | no `<image>`/`<feImage>` in inline SVG; references only to existing `#id` | `svg_image_elements_are_refused_and_references_stay_inside` (unit, malformed-data, `xlink:href`, `feImage` variants), `svg_image_fragments_are_refused` (over MCP) |
+| 2. A session evicted from the 256 remembered let its stale write through | a session must have read a page before it changes it; an unknown or forgotten session must read again | `a_forgotten_session_must_read_again` (257 other sessions), and the first call in `agent_edits_land_on_disk_and_change_the_revision` (refused, page and manifest unchanged) |
+| 3. A reload reverts a saved page name | manifest owns id and name on load | `reloads_keep_saved_page_names` |
+| 4. Stale page renames aren't refused | page metadata (name, position) is part of what a session read and what a call touched | `stale_page_renames_are_refused` (including a batch with one stale entry: nothing written) |
+| 5. A discard erases an edit made after the click | input, toolbar and saves are suspended while the discard loads | `editing is suspended while a discard loads, so it cannot erase a newer edit (reviewer sequence)` |
+| 6. `scripts/browser-check.mjs` agent step writes without reading | the step reads (`get_basic_info`) before each write; so does the `mcp-client.mjs` command line | the same sequence run against the server binary over a socket (no Chromium): without the read `conflict`, with it `ok` |
+| Mac: page ids `CasePage` and `casepage` alias one file on APFS | ids compared ASCII-case-folded at load and before saving; distinct pages must be distinct files (device, inode) | `page_ids_differing_only_in_case_are_refused` (runs on Linux) |
+
+The reviewer also flagged two stale comments that still said "merged"
+(`web/src/state.rs`, `serve/tests/serve.rs`); they are corrected.
+
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, `TMPDIR=<worktree>/target/tmp`)
 
-- **`tests/agent.rs` (9 passed):** real loopback listener, upstream-compatible rmcp
+- **`tests/agent.rs` (13 passed; see the review round tables for the newer tests):** real loopback listener, upstream-compatible rmcp
   streamable-HTTP client.
   - `mcp_needs_the_token_and_a_loopback_host_and_origin`: 401 without or with a wrong token,
     403 for a foreign Host or Origin, 200 with the token, and a client without the token can't
@@ -214,7 +253,7 @@ Findings 6 and 7 were in the merge, which was removed (see the decision above).
   `#private.png`, `feImage`, `xlink:href`, missing ids).
 - **`state::tests` (2 new, 10 total passed):** `reload_only_when_clean_and_it_keeps_the_view`,
   `never_reload_over_unsaved_or_in_flight_edits`.
-- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (20 passed; mocked
+- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (21 passed; mocked
   editor/server/page, no browser).** The B2a tests:
   - `a change made elsewhere is loaded in place when nothing is unsaved`
   - `never reloads over unsaved edits; the stale save is a conflict and the edit stays`
@@ -258,6 +297,25 @@ page JavaScript only):
   Node: the reviewer sequence applies the older page, and the overlap test times out.
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run.
+
+Results of the review round 2 fixes (2026-10-12; serve crate, page JavaScript, the two
+scripts, and one doc comment in web Rust):
+- **Run now:** `cargo fmt --all --check`; clippy for serve and web (0 warnings); serve tests
+  4 unit, 13 agent, 17 serve; web 111 unit + 2 shader (for the comment change); the CI Node
+  command, 21 passed (Node 26.8.1); `node --check` on the page JavaScript and scripts;
+  wasm32 check, native build, the bundle rebuild, `git diff --check`.
+- **Live sequence:** the browser-check agent sequence was run against the
+  `openpaperdesign-serve` binary over a real socket with `scripts/mcp-client.mjs`. It was
+  read, `create_shape`, a conditional browser save (200), then `update_styles` without a
+  read (`conflict`), then a read and `update_styles` (`ok`). Chromium wasn't run.
+- **On `a96b32c`'s code** (a `git archive` extraction with the new tests copied in): all
+  eight new regressions fail. Serve: the SVG unit test (the malformed-data SVG is accepted),
+  `svg_image_fragments_…`, `a_forgotten_session_…`, `agent_edits_land_…` (its first-call
+  write succeeds), `reloads_keep_saved_page_names` (the rename is reverted),
+  `stale_page_renames_…` and `page_ids_differing_only_in_case_…` ("the server opened").
+  Node: the discard sequence applies the edit during the load.
+- **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
+  from the 2da2f52 run. No root-package file changed.
 
 ## Not proven
 
