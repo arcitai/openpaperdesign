@@ -48,6 +48,7 @@ pub mod render {
     pub mod tess;
 }
 
+pub mod health;
 pub mod keys;
 pub mod state;
 #[cfg(target_arch = "wasm32")]

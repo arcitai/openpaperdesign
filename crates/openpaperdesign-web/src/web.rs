@@ -10,6 +10,7 @@
 use crate::editor::Button;
 use crate::editor::shortcuts::Action;
 use crate::geom::V2;
+use crate::health::{self, Acquired, Health, Step};
 use crate::render::gpu::CanvasRenderer;
 use crate::render::scene::{self, SceneCache};
 use crate::state::WebState;
@@ -35,8 +36,8 @@ pub struct WebEditor {
     cache: SceneCache,
     gpu: Gpu,
     backend: String,
-    /// First GPU error reported after startup, if any.
-    gpu_error: Arc<Mutex<Option<String>>>,
+    /// Presented frames and the first terminal GPU problem (shared with wgpu's callbacks).
+    health: Arc<Mutex<Health>>,
 }
 
 fn install_panic_hook() {
@@ -105,14 +106,23 @@ pub async fn start(
         })
         .await
         .map_err(|e| js_err(format!("failed to create device: {e}")))?;
-    // GPU errors outside the startup scope below (later frames): logged and kept, so the
-    // page can show an error state instead of a silently broken canvas.
-    let gpu_error = Arc::new(Mutex::new(None::<String>));
-    let sink = gpu_error.clone();
+    // GPU errors outside the startup scope below, and device loss: logged and recorded, so
+    // drawing stops and the page shows an error instead of a silently broken canvas.
+    let health = Arc::new(Mutex::new(Health::default()));
+    let sink = health.clone();
     device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
         web_sys::console::error_1(&format!("wgpu: {e}").into());
-        sink.lock().unwrap().get_or_insert_with(|| e.to_string());
+        sink.lock().unwrap().fail(format!("GPU error: {e}"));
     }));
+    let sink = health.clone();
+    device.set_device_lost_callback(move |reason, msg| {
+        let msg = format!("GPU device lost ({reason:?}): {msg}");
+        // `Destroyed` is our own drop (e.g. the WebGPU editor discarded for a fallback).
+        if reason != wgpu::DeviceLostReason::Destroyed {
+            web_sys::console::error_1(&msg.clone().into());
+        }
+        sink.lock().unwrap().fail(msg);
+    });
     // Shader, pipelines, surface setup and the first frame must validate before the page may
     // say it is ready (browser WebGPU validates WGSL more strictly than native wgpu).
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -156,7 +166,7 @@ pub async fn start(
         cache: SceneCache::default(),
         gpu,
         backend,
-        gpu_error,
+        health,
     };
     w.resize(css_width, css_height, dpr);
     w.frame(0.0);
@@ -164,6 +174,12 @@ pub async fn start(
         let msg = format!("GPU validation failed on {}: {e}", w.backend);
         web_sys::console::error_1(&msg.clone().into());
         return Err(JsError::new(&msg));
+    }
+    // A problem recorded during startup (device lost, terminal surface error) fails startup
+    // too. A first frame that was merely skipped (hidden tab) is retried; `ready()` stays false
+    // until a frame has been presented.
+    if let Some(e) = w.health.lock().unwrap().error() {
+        return Err(JsError::new(&format!("{} on {}", e, w.backend)));
     }
     Ok(w)
 }
@@ -185,9 +201,14 @@ impl WebEditor {
         self.backend.clone()
     }
 
-    /// The first GPU error since startup; drawing stops when there is one.
+    /// The first terminal GPU problem (error, device loss, lost surface); drawing stops then.
     pub fn gpu_error(&self) -> Option<String> {
-        self.gpu_error.lock().unwrap().clone()
+        self.health.lock().unwrap().error()
+    }
+
+    /// GPU objects validated, a frame was presented, and no GPU problem since.
+    pub fn ready(&self) -> bool {
+        self.health.lock().unwrap().ready()
     }
 
     pub fn resize(&mut self, css_width: f64, css_height: f64, dpr: f64) {
@@ -206,19 +227,42 @@ impl WebEditor {
 
     /// Advance animations and draw if anything changed. Call once per animation frame.
     pub fn frame(&mut self, now_ms: f64) {
-        if !self.state.tick(now_ms) || self.gpu_error.lock().unwrap().is_some() {
+        if !self.state.tick(now_ms) || !self.health.lock().unwrap().can_draw() {
             return;
         }
         let g = &mut self.gpu;
-        let tex = match g.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            _ => {
-                // Stays pending: drawn on the next frame.
-                g.surface.configure(&g.device, &g.config);
-                return;
-            }
+        use wgpu::CurrentSurfaceTexture as C;
+        let (tex, acquired) = match g.surface.get_current_texture() {
+            C::Success(t) => (Some(t), Acquired::Success),
+            C::Suboptimal(t) => (Some(t), Acquired::Suboptimal),
+            C::Timeout => (None, Acquired::Timeout),
+            C::Occluded => (None, Acquired::Occluded),
+            C::Outdated => (None, Acquired::Outdated),
+            C::Lost => (None, Acquired::Lost),
+            C::Validation => (None, Acquired::Validation),
         };
+        // Skipped or failed frames leave the redraw pending (no `drawn()`).
+        let reconfigure_after = match (health::step(acquired), tex) {
+            (Step::Draw { reconfigure_after }, Some(t)) => {
+                self.draw(t);
+                reconfigure_after
+            }
+            (Step::Reconfigure, _) => true,
+            (Step::Fail(msg), _) => {
+                web_sys::console::error_1(&msg.clone().into());
+                self.health.lock().unwrap().fail(msg);
+                false
+            }
+            _ => false,
+        };
+        if reconfigure_after {
+            let g = &mut self.gpu;
+            g.surface.configure(&g.device, &g.config);
+        }
+    }
+
+    fn draw(&mut self, tex: wgpu::SurfaceTexture) {
+        let g = &mut self.gpu;
         let view = tex.texture.create_view(&Default::default());
         let frame = scene::canvas(&self.state.ed, &mut self.cache, V2::ZERO, true);
         let bg = scene::CANVAS_BG.to_f32(1.0);
@@ -236,6 +280,7 @@ impl WebEditor {
         g.queue.submit([enc.finish()]);
         g.queue.present(tex);
         self.state.drawn();
+        self.health.lock().unwrap().presented();
     }
 
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {

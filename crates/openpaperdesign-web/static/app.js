@@ -66,61 +66,75 @@ async function main() {
   const rect = () => canvas.getBoundingClientRect();
   const seed = crypto.getRandomValues(new Uint32Array(2));
   const forceWebgl = new URLSearchParams(location.search).get('backend') === 'webgl';
-  const open = (webgl) => {
+  const boot = (webgl) => {
     const r = rect();
     return start(canvas, text, page.id, page.name, seed[0], seed[1], isMac(), webgl,
       r.width, r.height, devicePixelRatio);
   };
-  let ed;
-  try {
-    ed = await open(forceWebgl);
-  } catch (e) {
-    if (forceWebgl) throw e;
-    // WebGPU didn't validate (or start). A canvas that handed out a WebGPU context can't give
-    // a WebGL one, so retry on a fresh canvas, and say so. The error is logged, not hidden.
-    const reason = e && e.message ? e.message : String(e);
+  let ed = null;
+  let switching = false;
+  const showRenderer = () => renderer(state.fallback
+    ? `WebGPU failed: ${state.fallback} — using WebGL (${state.backend})`
+    : `Renderer: ${state.backend}`, Boolean(state.fallback));
+
+  // ---- input (wired to the current canvas; `ed` is looked up at event time)
+  const mods = (e) => ed.modifiers(e.shiftKey, e.ctrlKey, e.altKey, e.metaKey);
+  const local = (e) => { const r = rect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  const wire = (c) => {
+    c.addEventListener('pointerdown', (e) => {
+      c.focus();
+      c.setPointerCapture(e.pointerId);
+      mods(e);
+      ed.pointer_down(...local(e), e.button, e.timeStamp);
+      e.preventDefault();
+    });
+    c.addEventListener('pointermove', (e) => { mods(e); ed.pointer_move(...local(e), e.timeStamp); });
+    const up = (e) => { mods(e); ed.pointer_up(...local(e), e.button, e.timeStamp); };
+    c.addEventListener('pointerup', up);
+    c.addEventListener('pointercancel', up);
+    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    c.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      mods(e);
+      const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? rect().height : 1;
+      ed.wheel(e.deltaX * k, e.deltaY * k, ...local(e));
+    }, { passive: false });
+    c.addEventListener('keydown', (e) => {
+      mods(e);
+      if (ed.key_down(e.key, e.code, e.repeat)) e.preventDefault();
+    });
+    c.addEventListener('keyup', (e) => { mods(e); ed.key_up(e.key, e.code); });
+    c.addEventListener('blur', () => ed.modifiers(false, false, false, false));
+    new ResizeObserver(() => { const r = rect(); ed.resize(r.width, r.height, devicePixelRatio); })
+      .observe(c);
+  };
+
+  // WebGPU failed during startup: retry with WebGL2 on a fresh canvas (one that handed out a
+  // WebGPU context can't give a WebGL one), and say so. The failure is logged, not hidden.
+  const fallBack = async (reason) => {
     console.error(`WebGPU failed, falling back to WebGL: ${reason}`);
     state.fallback = reason;
+    if (ed) { ed.free(); ed = null; }
     const fresh = canvas.cloneNode(false);
     canvas.replaceWith(fresh);
     canvas = fresh;
-    ed = await open(true);
-  }
-  state.backend = ed.backend();
-  renderer(state.fallback
-    ? `WebGPU failed: ${state.fallback} — using WebGL (${state.backend})`
-    : `Renderer: ${state.backend}`, Boolean(state.fallback));
-  window.__opdEditor = ed;
+    ed = await boot(true);
+    state.backend = ed.backend();
+    wire(canvas);
+    showRenderer();
+  };
 
-  // ---- input
-  const mods = (e) => ed.modifiers(e.shiftKey, e.ctrlKey, e.altKey, e.metaKey);
-  const local = (e) => { const r = rect(); return [e.clientX - r.left, e.clientY - r.top]; };
-  canvas.addEventListener('pointerdown', (e) => {
-    canvas.focus();
-    canvas.setPointerCapture(e.pointerId);
-    mods(e);
-    ed.pointer_down(...local(e), e.button, e.timeStamp);
-    e.preventDefault();
-  });
-  canvas.addEventListener('pointermove', (e) => { mods(e); ed.pointer_move(...local(e), e.timeStamp); });
-  const up = (e) => { mods(e); ed.pointer_up(...local(e), e.button, e.timeStamp); };
-  canvas.addEventListener('pointerup', up);
-  canvas.addEventListener('pointercancel', up);
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-  canvas.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    mods(e);
-    const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? rect().height : 1;
-    ed.wheel(e.deltaX * k, e.deltaY * k, ...local(e));
-  }, { passive: false });
-  canvas.addEventListener('keydown', (e) => {
-    mods(e);
-    if (ed.key_down(e.key, e.code, e.repeat)) e.preventDefault();
-  });
-  canvas.addEventListener('keyup', (e) => { mods(e); ed.key_up(e.key, e.code); });
-  canvas.addEventListener('blur', () => ed.modifiers(false, false, false, false));
-  new ResizeObserver(() => { const r = rect(); ed.resize(r.width, r.height, devicePixelRatio); })
-    .observe(canvas);
+  try {
+    ed = await boot(forceWebgl);
+    state.backend = ed.backend();
+    wire(canvas);
+    showRenderer();
+  } catch (e) {
+    if (forceWebgl) throw e;
+    await fallBack(e && e.message ? e.message : String(e));
+  }
+  window.__opdEditor = ed;
+  status('Starting renderer…');
 
   // ---- toolbar
   for (const b of document.querySelectorAll('[data-tool]')) {
@@ -138,7 +152,7 @@ async function main() {
 
   // ---- saving: one request at a time, always with the revision we last saw.
   const save = async () => {
-    if (state.saving || state.conflict) return;
+    if (!ed || switching || state.saving || state.conflict) return;
     const snapshot = ed.save_snapshot();
     if (snapshot === undefined) return;
     state.saving = true;
@@ -174,22 +188,36 @@ async function main() {
     }
   };
   setInterval(save, SAVE_POLL_MS);
-  window.addEventListener('beforeunload', (e) => { if (ed.dirty()) e.preventDefault(); });
+  window.addEventListener('beforeunload', (e) => { if (ed && ed.dirty()) e.preventDefault(); });
 
+  // Ready only once the renderer validated, presented a frame, and has no GPU problem.
   const frame = (t) => {
+    requestAnimationFrame(frame);
+    if (switching || state.error) return;
     ed.frame(t);
     const gpuError = ed.gpu_error();
-    if (gpuError && !state.error) {
+    if (gpuError) {
+      if (!state.ready && !forceWebgl && !state.fallback) {
+        switching = true;
+        fallBack(gpuError)
+          .then(() => { window.__opdEditor = ed; })
+          .catch((e) => fail(`Renderer failed: ${e && e.message ? e.message : e}`))
+          .finally(() => { switching = false; });
+        return;
+      }
+      state.ready = false;
       fail(`Renderer error: ${gpuError}`);
       renderer(`Renderer failed: ${gpuError}`, true);
+      return;
+    }
+    if (!state.ready && ed.ready()) {
+      state.ready = true;
+      status('Ready');
+      canvas.focus();
     }
     syncToolbar();
-    requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
-  state.ready = true;
-  status('Ready');
-  canvas.focus();
 }
 
 main().catch((e) => fail(`Failed to start: ${e && e.message ? e.message : e}`));
