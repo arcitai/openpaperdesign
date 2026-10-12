@@ -23,3 +23,8 @@ handoff (archive SHA-256 `c07f55536371d2d17b27a435f6d350ddcf4d490a46af71cdf14e37
   not ship), and the openpaperdesign editor named as the editable companion instead.
 - Their tests are ported to `plugin/tests/design/` in the repository (without the OpenPencil
   cases).
+- Fixed on port (2026-10-12): in `review-design/scripts/audit.py`, a reviewed companion entry
+  named like canonical evidence (for example `DESIGN.md`) replaced the canonical reviewed
+  hash, so a stale review could audit as PASS. Canonical hashes are now checked separately
+  and such companion entries fail. The AIOS original is unchanged; its owners may want the
+  same fix.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -95,8 +96,18 @@ class Audit:
         if result != "PASS":
             self.gap("BLOCKED" if result in (None, "", "BLOCKED") else "FAIL", root,
                      f"No bound PASS: {result or 'missing'}")
-        for name, digest in {**hashes, **companions}.items():
-            if selected is None or name in hashes or name in selected:
+        # Canonical evidence is checked on its own; a companion entry may never stand in for
+        # it (fixed when ported: a companion named DESIGN.md used to override a stale
+        # reviewed DESIGN.md hash and turn the audit into a false PASS).
+        canonical = {"brief.md", "design.md", "review.md", "proof.json", "handoff.md"}
+        for name, digest in hashes.items():
+            self.hash_matches(root, name, digest)
+        for name, digest in list(companions.items()):
+            folded = os.path.normpath(str(name).replace("\\", "/")).lower()
+            if folded in canonical:
+                self.gap("FAIL", root, f"Companion entry names canonical evidence: {name}")
+                continue
+            if selected is None or name in selected:
                 self.hash_matches(root, name, digest)
         self.evidence.append({"kind": "design", "path": str(root), "review_mode": mode,
                               "review_owner": owner, "result": result})

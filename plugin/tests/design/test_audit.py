@@ -3,7 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from support import InstalledCase, fixture, fingerprint
+from support import InstalledCase, digest, fixture, fingerprint
 
 
 class AuditTests(InstalledCase):
@@ -33,6 +33,53 @@ class AuditTests(InstalledCase):
             self.assertEqual(failed["status"], "FAIL")
             self.assertTrue(any("Stale hash" in gap["message"] for gap in failed["gaps"]))
             self.assertEqual(fingerprint(root), before)
+
+    def test_companion_entries_never_stand_in_for_canonical_evidence(self):
+        """Fixed on port (B2b review round 1): a companion named DESIGN.md overrode the
+        stale reviewed DESIGN.md hash and the audit returned a false PASS."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # REVIEW.md form: DESIGN.md changed after review, a companion carries the new hash.
+            design = fixture(root / "review form")
+            old = digest(design / "DESIGN.md")
+            path = design / "DESIGN.md"
+            path.write_text(path.read_text() + "\nChanged after review.\n")
+            review = design / "REVIEW.md"
+            review.write_text(review.read_text()
+                              + f"Reviewed source companion: `DESIGN.md` — SHA-256 `{digest(path)}`\n")
+            out = self.audit("--design-dir", design)
+            self.assertEqual(out["status"], "FAIL")
+            messages = [gap["message"] for gap in out["gaps"]]
+            self.assertTrue(any("Stale hash" in m for m in messages), messages)
+            self.assertTrue(any("canonical evidence" in m for m in messages), messages)
+            # proof.json form, with every canonical name (and a ./ variant) as a companion.
+            proofed = fixture(root / "proof form")
+            (proofed / "REVIEW.md").unlink()
+            path = proofed / "DESIGN.md"
+            path.write_text(path.read_text() + "\nChanged after review.\n")
+            proof = {
+                "reviewer": "Independent reviewer", "review": "PASS",
+                "reviewed_brief_sha256": digest(proofed / "BRIEF.md"),
+                "reviewed_design_sha256": old,
+                "reviewed_source_companions": {"./DESIGN.md": digest(path)},
+            }
+            (proofed / "proof.json").write_text(json.dumps(proof))
+            out = self.audit("--design-dir", proofed)
+            self.assertEqual(out["status"], "FAIL")
+            messages = [gap["message"] for gap in out["gaps"]]
+            self.assertTrue(any("Stale hash" in m for m in messages), messages)
+            for name in ("proof.json", "REVIEW.md", "brief.md"):
+                path.write_text(path.read_text())  # unchanged; only the companion key varies
+                proof["reviewed_design_sha256"] = digest(path)
+                proof["reviewed_source_companions"] = {name: "0" * 64}
+                (proofed / "proof.json").write_text(json.dumps(proof))
+                out = self.audit("--design-dir", proofed)
+                self.assertEqual(out["status"], "FAIL", name)
+                self.assertTrue(any("canonical evidence" in g["message"] for g in out["gaps"]), name)
+            # Without the collision the same proof passes.
+            proof["reviewed_source_companions"] = {}
+            (proofed / "proof.json").write_text(json.dumps(proof))
+            self.assertEqual(self.audit("--design-dir", proofed)["status"], "PASS")
 
     def test_snapshot_integrity_acceptance_and_tampering(self):
         with tempfile.TemporaryDirectory() as temp:
