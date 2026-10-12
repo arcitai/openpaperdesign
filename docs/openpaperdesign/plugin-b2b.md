@@ -18,8 +18,9 @@ surface), plugin publishing, other hosts.
 turns**, and the actual Codex in-app browser. Independent R6 accepted this source with no
 material findings (13 focused Rust checks and seven package checks). Installation for
 qualification began at 2026-10-12 22:46 UTC while R6 was still running; qualification
-completed at 23:05 UTC (2026-10-13 in Copenhagen). Source acceptance precedes release;
-publication remains pending. Distribution is source/local build, not a turnkey installer.
+completed at 23:05 UTC (2026-10-13 in Copenhagen). Distribution is source-only / local build,
+with no packaged installer or public marketplace listing. See
+[repository Releases](https://github.com/onlinesourdough/openpaperdesign/releases) for delivery status.
 
 | Check | Observed result |
 | --- | --- |
@@ -231,8 +232,8 @@ onlinesourdough) was verified: all 28 files matched their manifest hashes.
 
 The replacement's local installed qualification now passes on `0078487`, including
 discovery of these portable methods. AIOS #54 remains separately owned. Legacy removal
-requires replacement publication plus installed readback; this record supplies the local
-installed qualification, while publication and legacy removal remain pending.
+requires a published replacement plus installed readback. This record provides verified
+local installation, not an assertion that legacy removal is complete.
 
 ## Install on a Mac (operator steps)
 
@@ -240,9 +241,9 @@ These follow the operator's installation contract for the local Codex CLI (opera
 2026-10-12): `codex plugin marketplace add <local-repo> --json` and
 `codex plugin add openpaperdesign@openpaperdesign-local --json`. Installation and discovery
 passed on `0921280`; its selected-workspace editing attempt failed closed. The corrected
-`0078487` installed model/browser qualification passed as recorded above. These remain
-local-build steps; no source-release tag, packaged installer or public marketplace listing
-is published yet.
+`0078487` installed model/browser qualification passed as recorded above. These are
+source-only / local-build steps; they do not provide a packaged installer or public
+marketplace listing.
 
 ```sh
 # 1. Build the browser editor and install the command (Rust 1.95 + wasm32 target,
@@ -443,8 +444,9 @@ earlier revision's proof.
   fresh CLI app-server model sessions and the actual Codex in-app browser.
 - Support is the experimental Codex 0.162.1 contract and exact profiles above, not universal
   host support or OS sandboxing. Idle host permission changes are not detected instantly.
-- No signed/unsigned installer, public marketplace listing or source-release delivery has
-  been published. Other hosts, an MCP App panel and a remote Z13 canvas are unqualified.
+- Distribution is source-only / local build, with no packaged installer (signed or
+  unsigned) or public marketplace listing. Other hosts, an MCP App panel and a remote Z13
+  canvas are unqualified.
 - No live GPU-loss or physical crash/power-loss test. Untested renderer and interaction
   surfaces in the B1/B2a records remain unqualified beyond the specific observations above.
 - Concurrent native/external writers remain outside the guarantee; no multiplayer/cloud.
