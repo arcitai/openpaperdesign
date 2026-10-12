@@ -14,6 +14,8 @@
 //!   rename over the page file, so a write never lands outside `pages/`. Residual race: a
 //!   directory or link swapped in between a check and the following file operation can still
 //!   redirect that read or write.
+//! - The web bundle (four allowlisted files) is checked and read into memory once at startup,
+//!   from a folder outside the project; static requests never touch the file system.
 //! - Unix only (Linux, macOS): the root identity and hard-link checks use Unix metadata, so the
 //!   server refuses to start elsewhere.
 //! - Writes are revision-checked: a page's revision (ETag) is a hash of its file **as it is
@@ -79,11 +81,13 @@ pub struct Config {
 }
 
 pub struct Server {
+    /// The web bundle, read once at startup: (URL path, content type, bytes). Static files are
+    /// never read from disk per request.
+    bundle: Bundle,
     /// Canonical project root at startup.
     dir: PathBuf,
     /// (device, inode) of the root at startup.
     root_id: (u64, u64),
-    web_dir: PathBuf,
     token: String,
     hosts: [String; 2],
     origins: [String; 2],
@@ -181,6 +185,63 @@ fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
     Ok(())
 }
 
+/// (URL path, content type, bytes) of each bundle file found at startup.
+type Bundle = Vec<(&'static str, &'static str, Vec<u8>)>;
+
+/// Where `path` really is: canonical if it exists; otherwise its longest existing ancestor
+/// canonicalized, plus the rest with `.`/`..` resolved lexically.
+fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(p) = path.canonicalize() {
+        return Ok(p);
+    }
+    let mut norm = PathBuf::new();
+    for c in std::path::absolute(path)?.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c),
+        }
+    }
+    let mut existing = norm;
+    let mut rest = Vec::new();
+    while existing.canonicalize().is_err() {
+        match existing.file_name() {
+            Some(n) => {
+                rest.push(n.to_owned());
+                existing.pop();
+            }
+            None => break,
+        }
+    }
+    let mut out = existing.canonicalize().unwrap_or(existing);
+    out.extend(rest.iter().rev());
+    Ok(out)
+}
+
+/// Read the bundle allowlist into memory. The bundle directory must not be (or be inside) the
+/// project folder, and every file present must be a plain single-link file. A missing
+/// directory or file is not an error (that file then answers 404 "build it first").
+fn load_bundle(web_dir: &Path, project: &Path) -> Result<Bundle, String> {
+    let web = resolve(web_dir).map_err(|e| format!("web bundle folder: {e}"))?;
+    if web.starts_with(project) {
+        return Err("the web bundle folder must not be inside the project folder".into());
+    }
+    if !plain(&web, Kind::Dir)? {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for &(url, file, mime) in BUNDLE {
+        let path = web.join(file);
+        if plain(&path, Kind::File)? {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{file}: {e}"))?;
+            out.push((url, mime, bytes));
+        }
+    }
+    Ok(out)
+}
+
 /// The project's own entries must be real: `project.json` (required) and `pages/` (optional).
 fn check_project_dir(dir: &Path) -> Result<(), String> {
     if !plain(&dir.join(MANIFEST), Kind::File)? {
@@ -222,11 +283,12 @@ impl Server {
         check_project_dir(&dir).map_err(OpenError::Unsafe)?;
         // Same check (and stale temp-file cleanup) as when the native app opens a project.
         Project::open(&dir).map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
+        let bundle = load_bundle(&cfg.web_dir, &dir).map_err(OpenError::Unsafe)?;
         let p = cfg.port;
         Ok(Arc::new(Server {
             dir,
             root_id,
-            web_dir: cfg.web_dir,
+            bundle,
             token: cfg.token,
             hosts: [format!("127.0.0.1:{p}"), format!("localhost:{p}")],
             origins: [
@@ -239,6 +301,11 @@ impl Server {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// How many bundle files were found at startup (0 = not built).
+    pub fn bundle_files(&self) -> usize {
+        self.bundle.len()
     }
 
     /// Root identity plus the project's own entries; run before every read and write.
@@ -375,20 +442,12 @@ pub fn router(s: Arc<Server>) -> Router {
         r = r.route(
             url,
             get(move |State(s): State<Arc<Server>>| async move {
-                let path = s.web_dir.join(file);
-                match plain(&path, Kind::File) {
-                    Err(e) => return forbidden(e).into_response(),
-                    Ok(false) => {
-                        return error(
-                            StatusCode::NOT_FOUND,
-                            &format!("web bundle file {file} not found; build it first"),
-                        );
-                    }
-                    Ok(true) => {}
-                }
-                match std::fs::read(path) {
-                    Ok(b) => ([(header::CONTENT_TYPE, mime)], b).into_response(),
-                    Err(e) => error(StatusCode::NOT_FOUND, &format!("{file}: {e}")),
+                match s.bundle.iter().find(|(u, _, _)| *u == url) {
+                    Some((_, _, b)) => ([(header::CONTENT_TYPE, mime)], b.clone()).into_response(),
+                    None => error(
+                        StatusCode::NOT_FOUND,
+                        &format!("web bundle file {file} not found; build it first"),
+                    ),
                 }
             }),
         );

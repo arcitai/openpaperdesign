@@ -74,7 +74,8 @@ fn project(root: &Path) -> (Project, String) {
 fn server(dir: &Path) -> Arc<Server> {
     Server::open(Config {
         project: dir.to_path_buf(),
-        web_dir: dir.join("no-bundle"),
+        // Beside the project, never inside it (that is refused).
+        web_dir: dir.parent().unwrap().join("no-bundle"),
         port: PORT,
         token: TOKEN.into(),
     })
@@ -559,36 +560,119 @@ async fn symlinked_manifest_is_refused() {
     assert!(open().is_err());
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn symlinked_bundle_file_is_not_served() {
-    use std::os::unix::fs::symlink;
-    let t = tmp();
-    let (p, id) = project(&t.0);
-    let out = outside(&t, &p, &id);
-    let web = t.0.join("web");
+fn get(path: &str) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .header(header::HOST, HOST)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A bundle folder beside the project with a recognizable index.html.
+fn bundle_dir(t: &Tmp, name: &str, index: &str) -> PathBuf {
+    let web = t.0.join(name);
     std::fs::create_dir_all(&web).unwrap();
-    std::fs::write(web.join("index.html"), "<!doctype html>ok").unwrap();
-    symlink(out.join("secret.json"), web.join("app.js")).unwrap();
-    let s = Server::open(Config {
+    std::fs::write(web.join("index.html"), index).unwrap();
+    std::fs::write(web.join("app.js"), "// app").unwrap();
+    web
+}
+
+fn open_with_web(
+    p: &Project,
+    web: PathBuf,
+) -> Result<Arc<Server>, openpaperdesign_serve::OpenError> {
+    Server::open(Config {
         project: p.dir.clone(),
         web_dir: web,
         port: PORT,
         token: TOKEN.into(),
     })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_bundle_file_is_refused_at_startup() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, id) = project(&t.0);
+    let out = outside(&t, &p, &id);
+    let web = bundle_dir(&t, "web", "<!doctype html>ok");
+    std::fs::remove_file(web.join("app.js")).unwrap();
+    symlink(out.join("secret.json"), web.join("app.js")).unwrap();
+    let err = open_with_web(&p, web).err().expect("refused");
+    assert!(err.to_string().contains("symbolic link"), "{err}");
+}
+
+/// The bundle is read once at startup: replacing its folder (or a file in it) afterwards
+/// can't make the server send other bytes.
+#[cfg(unix)]
+#[tokio::test]
+async fn bundle_is_served_from_memory_after_its_folder_is_replaced() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, _) = project(&t.0);
+    let web = bundle_dir(&t, "web", "<!doctype html>original");
+    let s = open_with_web(&p, web.clone()).unwrap();
+    assert_eq!(send(&s, get("/")).await.2, "<!doctype html>original");
+
+    // Reviewer case (b): the whole folder replaced by a symlink to an outside folder.
+    let outside_web = bundle_dir(&t, "outside-web", "OUTSIDE SENTINEL");
+    std::fs::write(
+        outside_web.join("openpaperdesign_web.js"),
+        "OUTSIDE SENTINEL js",
+    )
     .unwrap();
-    let get = |path: &str| {
-        Request::builder()
-            .uri(path)
-            .header(header::HOST, HOST)
-            .body(Body::empty())
-            .unwrap()
-    };
+    std::fs::rename(&web, t.0.join("web-away")).unwrap();
+    symlink(&outside_web, &web).unwrap();
     let (st, _, body) = send(&s, get("/")).await;
-    assert_eq!((st, body.as_str()), (StatusCode::OK, "<!doctype html>ok"));
+    assert_eq!(
+        (st, body.as_str()),
+        (StatusCode::OK, "<!doctype html>original"),
+        "outside bytes must never be served"
+    );
     let (st, _, body) = send(&s, get("/app.js")).await;
-    assert_eq!(st, StatusCode::FORBIDDEN);
-    assert!(!body.contains("outside bytes"));
+    assert_eq!((st, body.as_str()), (StatusCode::OK, "// app"));
+    // A file that wasn't there at startup stays absent even though the outside folder has it.
+    let (st, _, body) = send(&s, get("/openpaperdesign_web.js")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert!(!body.contains("SENTINEL"));
+
+    // The real folder back, with a file rewritten in place.
+    std::fs::remove_file(&web).unwrap();
+    std::fs::rename(t.0.join("web-away"), &web).unwrap();
+    std::fs::write(web.join("index.html"), "rewritten").unwrap();
+    assert_eq!(send(&s, get("/")).await.2, "<!doctype html>original");
+}
+
+/// A bundle folder inside the project would follow the project root if that were replaced;
+/// it is refused at startup, as is the project folder itself.
+#[cfg(unix)]
+#[tokio::test]
+async fn web_dir_inside_the_project_is_refused() {
+    let t = tmp();
+    let (p, _) = project(&t.0);
+    let inside = p.dir.join("web");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::write(inside.join("index.html"), "x").unwrap();
+    for (what, web) in [
+        ("inside", inside),
+        ("the project folder", p.dir.clone()),
+        ("missing, inside", p.dir.join("not-built")),
+        (
+            "via ..",
+            t.0.join("elsewhere/..")
+                .join(p.dir.file_name().unwrap())
+                .join("web"),
+        ),
+    ] {
+        let err = open_with_web(&p, web)
+            .err()
+            .unwrap_or_else(|| panic!("{what}: refused"));
+        assert!(
+            err.to_string().contains("inside the project"),
+            "{what}: {err}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------ headers

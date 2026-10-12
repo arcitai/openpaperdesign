@@ -63,6 +63,9 @@ async fn main() {
         std::process::exit(1);
     });
     println!("openpaperdesign-serve: editing {}", server.dir().display());
+    if server.bundle_files() == 0 {
+        eprintln!("warning: no web bundle found; build it with scripts/build-web.sh");
+    }
     println!("open http://127.0.0.1:{port}/#token={token}");
     if let Err(e) = axum::serve(listener, router(server)).await {
         eprintln!("server error: {e}");
