@@ -52,12 +52,14 @@ Limits (state them when relevant):
 
 - One bound project per session, inside this workspace only. Export, project creation
   outside `design/` and other projects are refused.
-- Only the observed managed workspace-write profile and exact host `disabled` profile
-  are supported. Read-only/unknown profiles cannot bind or open a writable browser.
+- Only the observed managed workspace-write profile (network `restricted` or `enabled`)
+  and exact host `disabled` profile are supported. Read-only/unknown profiles cannot bind
+  or open a writable browser.
   `disabled` never disables plugin scope checks. Missing/changed context after pinning
   retires the session and its browser server; use a fresh supported session. Checks happen
   on tool calls, so idle host permission changes are not detected instantly. This adapter
-  does not provide OS sandboxing. Protected metadata paths remain off limits.
+  does not provide OS sandboxing. Protected metadata paths remain off limits. A Git
+  worktree's regular `.git` file is opaque; its pointer never expands project scope.
 - Images must be `data:` URIs in HTML `<img>` or CSS; local file paths are refused, and
   inline `<svg>` may not contain `<image>`.
 - A native paper-rs app editing the same project at the same time is not protected.

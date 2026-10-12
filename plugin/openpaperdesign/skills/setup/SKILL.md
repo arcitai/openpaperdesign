@@ -26,7 +26,10 @@ model and require the intended workspace, `workspace_source: codex/sandbox-state
 and `workspace_usable: true` before binding.
 
 Supported permission profiles are the observed managed/restricted workspace-write shape
-and exact `{"type":"disabled"}`. The latter describes the host sandbox, not plugin scope.
+with network `restricted` or `enabled`, and exact `{"type":"disabled"}`. Neither network
+value changes adapter networking. The latter profile describes the host sandbox, not
+plugin scope. A Git worktree's regular `.git` file stays opaque; its pointer is never
+read or followed. Protected paths and symlinked metadata remain refused.
 Read-only, missing and unknown profiles refuse binding/editing/browser access. Keep the
 reported failure visible; do not change grants, inject metadata or edit cached config.
 The source checkout's `docs/openpaperdesign/plugin-b2b.md` records the precise supported

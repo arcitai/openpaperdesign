@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub(super) const CAPABILITY: &str = "codex/sandbox-state-meta";
 const PROTECTED: [&str; 4] = [".git", ".agents", ".codex", ".aws"];
-const PERMISSION_ERROR: &str = "Codex permissions are read-only or unsupported. This adapter accepts only the observed exact disabled profile or managed/restricted workspace-write profile: one write grant for the selected workspace, root read, temporary-directory grants, and the four standard read-only metadata paths. No project or writable browser is admitted; permissions are not expanded.";
+const PERMISSION_ERROR: &str = "Codex permissions are read-only or unsupported. This adapter accepts only the observed exact disabled profile or managed/restricted workspace-write profile: one write grant for the selected workspace, root read, temporary-directory grants, the four standard read-only metadata paths, and network restricted or enabled. No project or writable browser is admitted; permissions are not expanded.";
 
 #[derive(Clone)]
 pub(super) struct Workspace {
@@ -80,6 +80,12 @@ fn supported_permissions(profile: Option<&Value>, ws: &Workspace) -> Result<&'st
         check_protected_paths(ws)?;
         return Ok("host-sandbox-disabled");
     }
+    // Both strings are live-observed host values. Neither changes this adapter's
+    // loopback-only listener or authorizes any outbound network behavior.
+    let network = match profile.get("network").and_then(Value::as_str) {
+        Some(network @ ("restricted" | "enabled")) => network,
+        _ => return Err(PERMISSION_ERROR.into()),
+    };
     let entries = profile
         .pointer("/file_system/entries")
         .and_then(Value::as_array)
@@ -107,7 +113,7 @@ fn supported_permissions(profile: Option<&Value>, ws: &Workspace) -> Result<&'st
     let mut actual = entries.clone();
     actual.sort_by_key(Value::to_string);
     expected.sort_by_key(Value::to_string);
-    let envelope = json!({"type":"managed","file_system":{"type":"restricted","entries":entries},"network":"restricted"});
+    let envelope = json!({"type":"managed","file_system":{"type":"restricted","entries":entries},"network":network});
     if profile != &envelope || actual != expected {
         return Err(PERMISSION_ERROR.into());
     }
@@ -116,12 +122,14 @@ fn supported_permissions(profile: Option<&Value>, ws: &Workspace) -> Result<&'st
 
 fn check_protected_paths(ws: &Workspace) -> Result<(), String> {
     for name in PROTECTED {
-        // Do not guess symlinked carveouts or gitdir pointer targets. This stricter
-        // plugin rule applies to both accepted host profiles.
+        // A worktree's regular .git file is opaque: never open it, parse its
+        // gitdir pointer or use that pointer as authority. Project paths cannot
+        // enter any protected name. Symlinked carveouts remain unsupported.
         match std::fs::symlink_metadata(ws.path.join(name)) {
             Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(m) if name == ".git" && m.is_file() && !m.file_type().is_symlink() => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err("unsupported protected metadata path: .git, .agents, .codex and .aws must be absent or real directories (no links or gitdir pointer files)".into()),
+            _ => return Err("unsupported protected metadata path: .git, .agents, .codex and .aws must be absent or real directories; only .git may also be an opaque regular file (no links)".into()),
         }
     }
     Ok(())

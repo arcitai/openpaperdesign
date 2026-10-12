@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.15 · Updated: 2026-10-13
+Revision: 0.16 · Updated: 2026-10-13
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -117,6 +117,9 @@ launcher pins canonical workspace/identity from Codex 0.162.1's experimental
 `codex/sandbox-state-meta` in `RequestContext.meta` on real model tool calls. Direct
 app-server calls omit it; arguments are never authority. Accept only the observed managed
 workspace-write shape or exact `{"type":"disabled"}` profile; never infer missing grants.
+Managed network must be `restricted` or `enabled`; neither changes adapter networking.
+Root `.git` may be an opaque regular file for a Git worktree: never read or follow its
+pointer. Protected project paths and symlinked metadata remain refused.
 Read-only/unsupported profiles cannot bind or open a writable browser. Plugin scope and
 protected-path checks apply even when the host sandbox is disabled. Missing, changed or
 no-longer-writable context after pinning permanently retires the binding through the same

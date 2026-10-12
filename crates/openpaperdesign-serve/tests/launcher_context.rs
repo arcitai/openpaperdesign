@@ -169,6 +169,24 @@ async fn synthetic_readonly_unknown_and_argument_metadata_never_authorize_writes
         m.get_mut(context::KEY).unwrap()["permissionProfile"] = profile;
         cases.push(m);
     }
+    for network in [
+        None,
+        Some(Value::Null),
+        Some(json!(true)),
+        Some(json!("custom")),
+        Some(json!({"enabled":true})),
+    ] {
+        let mut m = writable.clone();
+        let profile = m.get_mut(context::KEY).unwrap()["permissionProfile"]
+            .as_object_mut()
+            .unwrap();
+        if let Some(network) = network {
+            profile.insert("network".into(), network);
+        } else {
+            profile.remove("network");
+        }
+        cases.push(m);
+    }
     for modification in 0..6 {
         let mut m = writable.clone();
         let entries =
@@ -438,12 +456,142 @@ async fn synthetic_context_refuses_protected_aliases_and_escaping_design() {
         false
     );
     c.cancel().await.unwrap();
-    std::fs::write(f.ws.join(".git"), "gitdir: hidden-gitdir\n").unwrap();
+    symlink(&f.home, f.ws.join(".git")).unwrap();
     let c = f.host().await;
     assert_eq!(
         status(&c, context::writable(&f.ws)).await["workspace_usable"],
         false
     );
+    assert_eq!(
+        status(&c, context::disabled(&f.ws)).await["workspace_usable"],
+        false
+    );
     c.cancel().await.unwrap();
     f.no_cache_writes();
+}
+
+#[tokio::test]
+async fn synthetic_worktree_observed_network_values_keep_the_same_scope() {
+    let f = Fixture::new();
+    let c = f.host().await;
+    // These two strings are separately live-observed. Neither expands scope or
+    // changes the adapter's loopback listener / absence of outbound requests.
+    for network in ["restricted", "enabled"] {
+        let mut meta = context::writable(&f.ws);
+        meta.get_mut(context::KEY).unwrap()["permissionProfile"]["network"] = network.into();
+        let s = status(&c, meta.clone()).await;
+        assert_eq!(s["workspace_usable"], true, "{network}: {s}");
+        assert_eq!(s["workspace"], f.ws.to_str().unwrap());
+        assert!(
+            !call(&c, "bind_project", json!({"path":f.home}), meta)
+                .await
+                .0
+        );
+    }
+    f.no_cache_writes();
+    c.cancel().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn synthetic_worktree_pointer_is_opaque_and_edits_stay_inside_workspace() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    // Faithful worktree pointer fixture, not a Git subprocess or live Codex host.
+    // Snapshot every sibling file and directory so even an added file is detected.
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    out.insert(path.clone(), None);
+                    visit(&path, out);
+                } else {
+                    out.insert(path.clone(), Some(std::fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut out = Default::default();
+        visit(root, &mut out);
+        out
+    }
+    for profile in ["restricted", "enabled", "disabled"] {
+        let f = Fixture::new();
+        let sibling = f.root.join("main");
+        let gitdir = sibling.join(".git/worktrees/task");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("sentinel"), b"external git metadata\n").unwrap();
+        let (outside, _) = paper_rs::project::Store::open(sibling.join("design"))
+            .unwrap()
+            .create("Outside")
+            .unwrap();
+        let before_sibling = snapshot(&sibling);
+        let pointer = f.ws.join(".git");
+        let pointer_bytes = b"gitdir: ../main/.git/worktrees/task\n";
+        std::fs::write(&pointer, pointer_bytes).unwrap();
+        // The launcher must not read the pointer even when its bytes are unreadable.
+        std::fs::set_permissions(&pointer, std::fs::Permissions::from_mode(0o000)).unwrap();
+        symlink(&sibling, f.ws.join("outside-alias")).unwrap();
+        let c = f.host().await;
+        let mut meta = context::writable(&f.ws);
+        if profile == "disabled" {
+            meta = context::disabled(&f.ws);
+        } else {
+            meta.get_mut(context::KEY).unwrap()["permissionProfile"]["network"] = profile.into();
+        }
+        let s = status(&c, meta.clone()).await;
+        assert_eq!(s["workspace_usable"], true, "{profile}: {s}");
+        assert_eq!(s["workspace"], f.ws.to_str().unwrap());
+        let (ok, s) = call(&c, "create_project", json!({"name":"Canvas"}), meta.clone()).await;
+        assert!(ok, "{s}");
+        let project = f.ws.join("design/Canvas");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(project.join("project.json")).unwrap()).unwrap();
+        let page = manifest["pages"][0]["id"].as_str().unwrap();
+        let (ok, s) = call(
+            &c,
+            "get_tree_summary",
+            json!({"nodeId":"root","pageId":page}),
+            meta.clone(),
+        )
+        .await;
+        assert!(ok, "{s}");
+        let (ok, s) = call(&c, "create_artboard", json!({"name":"Scoped worktree canvas","pageId":page,"styles":{"width":"300px","height":"200px"}}), meta.clone()).await;
+        assert!(ok, "{s}");
+        let saved = std::fs::read(project.join("pages").join(format!("{page}.json"))).unwrap();
+        assert!(String::from_utf8_lossy(&saved).contains("Scoped worktree canvas"));
+        let (ok, s) = call(
+            &c,
+            "get_tree_summary",
+            json!({"nodeId":"root","pageId":page}),
+            meta.clone(),
+        )
+        .await;
+        assert!(ok && s.contains("Scoped worktree canvas"), "{s}");
+        for path in [
+            ".git",
+            ".git/../design/Canvas",
+            ".agents",
+            ".codex",
+            ".aws",
+            "outside-alias/design/Outside",
+            outside.dir.to_str().unwrap(),
+            gitdir.to_str().unwrap(),
+        ] {
+            let (ok, s) = call(&c, "bind_project", json!({"path":path}), meta.clone()).await;
+            assert!(!ok, "{path}: {s}");
+            assert_eq!(
+                status(&c, meta.clone()).await["bound_project"],
+                project.to_str().unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read(project.join("pages").join(format!("{page}.json"))).unwrap(),
+            saved
+        );
+        c.cancel().await.unwrap();
+        std::fs::set_permissions(&pointer, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&pointer).unwrap(), pointer_bytes);
+        assert_eq!(snapshot(&sibling), before_sibling);
+        f.no_cache_writes();
+    }
 }

@@ -92,17 +92,21 @@ and [permission semantics](https://github.com/openai/codex/blob/092d3acd6bec3e3a
 - Exact `{"type":"disabled"}`: the host sandbox is disabled; plugin containment, identity,
   protected-path rules and lifecycle checks remain enforced. This is not a request to
   enable full access.
-- `type: managed`, `network: restricted`, `file_system.type: restricted`, with exactly
-  eight entries (order does not matter): special `root` read; one explicit absolute path
+- `type: managed`, `network: restricted` or `enabled`, `file_system.type: restricted`, with
+  exactly eight entries (order does not matter): special `root` read; one explicit absolute path
   write matching the selected workspace; special `slash_tmp` and `tmpdir` write; and
   `<write-path>/.git`, `.agents`, `.codex`, `.aws` read, each with
   `missing_path_behavior: skip`. Temporary grants never expand project scope.
+  Both network strings are observed host values; neither changes the adapter's
+  loopback-only listener or initiates outbound requests. Other/missing values refuse.
 
 Read-only, absent, unknown, custom or ambiguous profiles refuse all editing/binding and
 writable-browser access. Extra entries/fields, missing exclusions and alternative grant
 shapes are unsupported. The four protected path names are refused in project paths,
-including canonical aliases; protected entries must be absent or real directories.
-Symlinked exclusions and `.git` pointer files are conservatively unsupported. These are
+including canonical aliases; protected entries must be absent or real directories,
+except that root `.git` may also be an opaque regular file, as in a Git worktree. The
+adapter never reads/parses that file or follows its gitdir pointer; a sibling repository
+gains no authority. Symlinked protected entries remain unsupported. These are
 also plugin-specific restrictions for the `disabled` variant, not claimed host exclusions.
 The URI parser accepts normalized absolute UTF-8 local `file:///` or `file://localhost/`
 paths, with strict percent decoding; remote hosts, dot segments, encoded separators,
@@ -127,11 +131,14 @@ binary/bundle check, not host context or installed-editing proof.
 Historical evidence: reviewed `0921280` installed successfully; Codex found four skills
 and 33 tools. Its process used plugin-cache cwd, status reported unusable and creation
 was refused. Later no-op diagnostics confirmed read-only, managed workspace-write and
-exact disabled metadata shapes; they did not edit through this product. This candidate's
-installed model and IAB qualification remains pending after independent review. Synthetic
+exact disabled metadata shapes. A further no-op model receipt confirmed the same eight
+filesystem entries for a selected Git worktree, with `network: enabled`; the operator
+separately attested that its `.git` was a regular pointer file. These diagnostics did not
+edit through this product. This candidate's installed model and IAB qualification remains
+pending after independent review. Synthetic
 stdio tests use sanitized versions of those shapes and are labeled synthetic.
 
-Linux implementation verification for this correction: the serve suite passed 83 tests
+Linux implementation verification retained for `e004da4`: the serve suite passed 83 tests
 (28 library, 24 agent, eight standalone launcher, six synthetic-context launcher, 17 API),
 with real loopback enabled for the lifecycle tests. The final protected-workspace guard
 was rechecked with all 28 library and six context tests. The 28 library tests also passed
@@ -140,6 +147,20 @@ package assertions passed. Default-sandbox TCP attempts initially returned EPERM
 loopback approval allowed actual execution. No root/GPU/wasm/browser bundle baseline was
 repeated; those inputs and the reviewed core lifecycle remain unchanged. These are Linux
 adapter checks, not installed Codex or Mac/IAB qualification.
+
+Intermediate Mac evidence for exact `e004da4`: a fresh release build, all 83 serve tests
+and a separate five-test context lifecycle subset over real TCP passed. That binary used
+the unchanged inherited `cffeec6` browser bundle. It was not installed or published, and
+does not qualify the subsequent worktree/network correction below.
+
+The subsequent opaque-worktree/network correction passed the 28 library and eight
+synthetic-context tests with real loopback, plus serve all-target clippy, format/diff and
+seven package assertions. Its two new regressions first failed against `e004da4` for the
+pointer-file refusal and `enabled` network value. The fixture creates/reads/edits only
+`design/` under the selected root while its `.git` file is unreadable, and checks unchanged
+pointer bytes and sibling files. Protected/outside binding, symlinked `.git` and unknown
+network values remain refused. This is synthetic adapter proof; the exact installed
+candidate still needs real model calls from a selected worktree and Mac/IAB qualification.
 
 ### Packaging (corrected 2026-10-12)
 
@@ -248,7 +269,9 @@ not been run for this candidate.
      until forced;
    - shutdown: quitting the session stops the editor server (the tab can't save any more).
 
-   Also check one actual model status call under the operator's unchanged existing
+   Include a selected Git worktree under ordinary workspace-write, with its root `.git`
+   kept opaque and sibling metadata unchanged. Also check one actual model status call
+   under the operator's unchanged existing
    `disabled` profile: `workspace_permission_mode: host-sandbox-disabled`, same scope
    guards. This does not authorize changing permissions to make a test pass.
    Don't paste the token URL into reports.
