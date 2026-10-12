@@ -9,5 +9,6 @@ out=target/openpaperdesign-web
 mkdir -p "$out"
 wasm-bindgen --target web --no-typescript --out-dir "$out" \
     target/wasm32-unknown-unknown/release/openpaperdesign_web.wasm
-cp crates/openpaperdesign-web/static/index.html crates/openpaperdesign-web/static/app.js "$out/"
+cp crates/openpaperdesign-web/static/index.html crates/openpaperdesign-web/static/app.js \
+    crates/openpaperdesign-web/static/session.js "$out/"
 ls -l "$out"
