@@ -1,5 +1,7 @@
 # B1: editing a paper-rs project in a browser — 2026-10-12
 
+Updated 2026-10-12 after review round 1 (see "Fix round 1" below).
+
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B1. A
 loopback server opens one existing paper-rs project folder. A browser page runs the upstream
 editor and canvas renderer as wasm and saves through the server with revision checks.
@@ -14,8 +16,22 @@ cargo run --locked -p openpaperdesign-serve -- --project "<project folder>" [--p
 ```
 
 The page shows the project's active page. It supports select, drag-move, the Rectangle and
-Ellipse tools, Delete, and undo/redo (toolbar or ⌘/Ctrl+Z, ⌘/Ctrl+Shift+Z). All of upstream's
-other canvas shortcuts work as well. Each change is saved about 300 ms after the gesture ends.
+Ellipse tools, Delete, and undo/redo from the toolbar. Each change is saved about 300 ms after
+the gesture ends.
+
+Keys go through upstream's own routing (`Editor::key_down` and its shortcut table). The page
+consumes a key (prevents the browser default) only when the editor acts on it. Shortcuts that
+only open app chrome (save/open/export dialogs, palette, rename, help, page list) aren't in
+this slice, so they aren't sent and stay the browser's: ⌘/Ctrl+R still reloads. Covered by
+host tests (`state.rs`): tool keys (R, Escape), Delete, Ctrl/⌘+Z, Ctrl+Shift+Z, Ctrl/⌘+A
+(consumed), Space, and the chrome shortcuts Ctrl+R/S/O/K (not consumed). Other upstream
+shortcuts are routed the same way but untested here.
+
+**First save migrates the page file.** Pages are saved in upstream's current format (page
+v3). An older page file (for example a v1 `.paper-rs` document in `pages/`) is rewritten as
+v3 on the browser's first save, exactly as native paper-rs does on its own first save.
+Review confirmed that node content, asset references, other pages and the manifest are kept,
+apart from `manifest.modified`.
 
 ## Pieces
 
@@ -54,9 +70,18 @@ other canvas shortcuts work as well. Each change is saved about 300 ms after the
   then gets 401.
 - **Request checks:** the server refuses a `Host` other than `127.0.0.1:<port>` /
   `localhost:<port>` (DNS rebinding), an `Origin` other than those, and
-  `Sec-Fetch-Site` values other than `same-origin`/`none`. Responses carry `no-store`,
-  `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. Only the four
-  bundle files are served.
+  `Sec-Fetch-Site` values other than `same-origin`/`none`. Every response carries `no-store`,
+  `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. That includes
+  refusals, unknown paths and body-limit errors, because the headers are added by the
+  outermost layer. Only the four bundle files are served.
+- **No links out of the project (fail closed):** `project.json`, `pages/`, each page file
+  and each bundle file must be a real file or directory, not a symbolic link. Files must
+  also have a single hard link. This is checked before upstream `Project::open` (whose
+  stale-temp cleanup deletes `.*.tmp` files in `pages/`) and again on every read and write.
+  Otherwise the server refuses to start or answers 403. Saves are atomic renames over the
+  page file, so they replace a file inside `pages/` and never write through a link. Residual
+  risk: a link swapped in between a check and the following read is not detected. Someone
+  who can do that can already edit the project folder directly.
 - **Pages:** pages are addressed only by ids listed in the manifest, which must also be plain
   `[A-Za-z0-9_-]`, max 64 characters. The server builds every path. The body's page id must
   match the URL. The body must parse and validate as an upstream page. The manifest's page
@@ -84,7 +109,23 @@ its atomic rename is also not detected. Reopening the project in native paper-rs
 server stops is supported, and was checked below. Editing it in both at the same time is not
 supported.
 
-## Results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0)
+## Results after fix round 1 (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | clean |
+| `cargo clippy` on the new crates (host, all targets) | 0 warnings |
+| `cargo clippy` on core and web (wasm32) | only upstream `src/io/atomic.rs:30` (`drop_non_drop`) |
+| `cargo test -p openpaperdesign-serve` | 13 passed (8 earlier + 4 link tests + headers test) |
+| `cargo test -p openpaperdesign-web` (host) | 103 passed (97 earlier + 6 `state` tests) |
+| `cargo check` core and web for wasm32 | pass |
+| Native `cargo build --all-targets`; `cargo test -- --test-threads=1` | pass; 162 passed, 0 failed, 0 ignored (= baseline) |
+| Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
+| `cargo tree -p paper-rs -e features` | byte-identical before and after the fixes |
+| Bundle (`scripts/build-web.sh --offline`) | `openpaperdesign_web_bg.wasm` 11,634,501 B (4,223,115 B gzip -9), `openpaperdesign_web.js` 123,949 B, `app.js` 6,508 B, `index.html` 2,139 B |
+| Browser run | still not possible in this sandbox (below); `browser-check.mjs` passes `node --check` only |
+
+## Results at 13b2430 (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0)
 
 | Check | Result |
 |---|---|
@@ -115,14 +156,36 @@ actually used and screenshots are **not yet proven**. Run them on the host, wher
 and browser share loopback:
 
 ```sh
-node scripts/browser-check.mjs '<printed URL>' target/evidence/b1-browser edit
+./scripts/build-web.sh --offline
+cargo run --locked -p openpaperdesign-serve -- --project "<project folder>"     # prints URL 1
+node scripts/browser-check.mjs '<URL 1>' target/evidence/b1-browser edit
+# stop the server (Ctrl+C), start it again (new token, prints URL 2), then:
+node scripts/browser-check.mjs '<URL 2>' target/evidence/b1-browser verify /usr/bin/chromium \
+    target/evidence/b1-browser/result-edit.json
+paper-rs --screenshot target/evidence/b1-browser/native.png "<project folder>"   # native reopen
 ```
 
-The script drives the real page through CDP. It drags a node, draws a rectangle with the
-toolbar tool, deletes it, undoes with Ctrl+Z, then redoes and undoes from the toolbar. It
-waits for each save, takes screenshots, reloads, and records the backend, adapter and node
-positions to `result-edit.json`. Afterwards, check the page file on disk, restart the server
-and run `… verify`, then open the folder in native `paper-rs`.
+The script drives the real page through CDP and asserts every step. It drags a node (it must
+move by the drag distance, within snapping slack), draws a rectangle with the toolbar tool,
+deletes it with the Delete key, undoes with Ctrl+Z, then redoes and undoes from the toolbar.
+Node ids and counts are checked after each step. It waits for each save, takes screenshots,
+reloads, and requires the same revision and node positions after the reload. `verify` with
+the edit run's result file requires the same after a server restart. Any console error, page
+exception or missing GPU adapter fails the run, and so does any failed check: the exit code
+is then 1. `result-<mode>.json` records the backend and adapter. The fifth argument and the
+assertions are new in fix round 1; the first four positional arguments are unchanged.
+
+## Fix round 1 (2026-10-12, after independent review of 13b2430)
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| Major: symlinks could lead reads, writes and upstream's temp cleanup outside the project, and a symlinked bundle file was served | Links refused, fail closed, before `Project::open` and on every access (above) | `symlinked_pages_dir_is_refused_before_cleanup_and_after_open` (outside `.keep.tmp` sentinel survives; also installed after start), `symlinked_or_hard_linked_page_file_is_refused`, `symlinked_manifest_is_refused` (before and after start), `symlinked_bundle_file_is_not_served`. All 5 new serve tests fail on the 13b2430 server code and pass now |
+| Major: selection, hover, marquee and modifier changes didn't redraw (`Editor::revision` unchanged) | Editor logic moved to host-testable `state.rs`; every input or state-changing call marks a redraw, and idle frames are skipped only when nothing happened and no laser is animating | `selection_click_redraws_although_revision_is_unchanged` (asserts upstream's revision stays the same while the overlay changes), `hover_and_modifier_changes_redraw` |
+| Minor: key consumption was inferred from side effects (Ctrl+A not consumed) | Decided from upstream's key routing and shortcut table before handling; chrome-only shortcuts left to the browser | `select_all_is_consumed`, `editing_keys_are_consumed_and_act`, `chrome_shortcuts_and_unbound_keys_stay_with_the_browser` |
+| Minor: security headers missing on refusals | Outermost `map_response` layer plus an explicit fallback | `security_headers_are_on_every_response` (200, 401, 403, 404, 409, 413) |
+| Minor: browser script recorded but didn't assert | Asserts every step, across reload and restart, and fails on console/GPU errors with exit 1 | (operator host run) |
+
+Results after the fixes are under "Results" below.
 
 ## Not proven / open
 
