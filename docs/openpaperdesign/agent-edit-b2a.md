@@ -10,7 +10,8 @@ Out of scope: Codex
 plugin packaging, skills, discovery, the MCP App panel (B2b), several projects, remote use.
 
 Updated 2026-10-12: the automatic three-way merge was dropped in favour of strict revisions
-(see "Decision: strict revisions, no merge").
+(see "Decision: strict revisions, no merge"). Then review round 1 findings 1–5 were fixed (see
+"Review round 1").
 
 ## Run it
 
@@ -48,7 +49,9 @@ check your client's docs if one is refused. The token changes on every start.
      read or wrote it. A browser save is the usual cause. The agent's undo history then starts
      over;
   3. applies the policy below and runs the tool;
-  4. saves each changed page through upstream `Project::save_page` (atomic write), updates the
+  4. refuses the change if it touches a page whose revision moved since this MCP session last
+     read it (see "Agent writes" below). The change is discarded and nothing is written;
+  5. otherwise saves each changed page through upstream `Project::save_page` (atomic write), updates the
      manifest like the native session does, and records the new revision.
 - **One transaction per write:** each agent write is one upstream transaction, saved before the
   call returns, so it changes that page's revision (the hash of its file on disk).
@@ -71,9 +74,18 @@ check your client's docs if one is refused. The token changes on every start.
   upstream `mcp::html::parse`, so attributes are checked after entity decoding, case-insensitive.
   Every other string argument (styles maps) is scanned for `url(`. Anything else is refused, so
   no local path, relative or absolute, is ever read.
-- **Inline `<svg>`:** usvg's default resolver reads `<image href>` files from disk, so inline
-  SVG must be well-formed XML, parsed with roxmltree, the same parser usvg uses. Every `href`
-  and `url(...)` in it must be `#id` or `data:`, and there may be no DTD and no `@import`.
+- **Inline `<svg>`:** usvg's default resolver reads `<image href>` files from disk, and it
+  treats an image href such as `#private.png` as a file name too. So inline SVG must be
+  well-formed XML, parsed with roxmltree, the same parser usvg uses, with no DTD and no
+  `@import`. `<image>` and `<feImage>` hrefs must be `data:` URIs. Every other `href` and
+  `url(...)` must be `#id` of an element in the same SVG.
+- **Page ids and files:** page ids come only from the manifest, and every one must be 1–64
+  ASCII letters, digits, `-` or `_`, with no duplicates; otherwise the project is refused
+  (server start, browser requests and agent calls alike). The host reads pages itself rather
+  than with upstream `load_pages`: `pages/` and each page file are checked (no symlink, a single
+  hard link) **before** any byte is read, and a page takes its id from its manifest entry,
+  whatever its file says, so the id inside a file can't choose where it is saved. Before
+  saving, every page id is checked again and each destination is checked not to be a link.
 - **Project assets:** loaded by the adapter, not by upstream `assets::load_dir`, which follows
   symlinks. Only plain single-link files in a real `assets/` folder are registered. `assets/`
   joins the B1 entry checks (not a symlink), and agent-saved images are written there only
@@ -91,9 +103,18 @@ check your client's docs if one is refused. The token changes on every start.
 - **Agent writes** go through the single host thread under the **same write lock** as browser
   saves. The host reloads from disk before each call when anything changed, and saves
   atomically, which gives a new revision.
-  - So an agent write can't overwrite a browser save: the host has reloaded it first.
-  - And a browser save can't overwrite an agent write: its `If-Match` names the older revision
+  - A browser save can't overwrite an agent write: its `If-Match` names the older revision
     and is refused.
+  - An agent write can't overwrite a browser save the agent hasn't seen. Each MCP session has
+    the revisions it last saw. A call that changes nothing (a summary, node info, a
+    screenshot, a refused call) counts as reading: it records the current revisions. A call
+    that changes a page, or deletes it, is refused with a `conflict` error if that page's
+    revision moved since the session last saw it, and nothing is written. The agent reads
+    again and redoes the change. A session's own writes count as seen. A session's first call
+    takes the revisions at that moment as seen, so it is never refused itself.
+  - This is per page, not per node: a browser save to one layer also refuses an agent edit
+    of another layer on that page until the agent reads again. Pages the agent creates are
+    new, so never stale.
 
 ### Browser (`static/session.js`, `static/page.js`, `src/state.rs`)
 
@@ -112,7 +133,9 @@ check your client's docs if one is refused. The token changes on every start.
   `net::ERR_ABORTED` and left the banner up. Ordinary navigation with unsaved edits stays
   guarded.
 - **Stale answers:** a save, poll or discard answer only applies to the editor that asked,
-  with the state it had. Anything else is dropped.
+  with the state it had. Anything else is dropped. Polls never overlap, and a poll's answer
+  is also dropped if a save, another poll or a discard started after it asked (a generation
+  counter), so a late answer can't roll the editor back to an older revision.
 
 ### Decision: strict revisions, no merge (2026-10-12)
 
@@ -124,8 +147,10 @@ needs:
 - explicit boundaries.
 
 It doesn't need a collaboration engine; that is issue #2. The independent review was finding
-defects in the node-level merge (children lost, duplicated or deleted), which confirmed the
-maintenance risk. So the three-way merge, its id renumbering and the retained-revision history
+defects in the node-level merge, which confirmed the maintenance risk. Round 1 (on `37cd0ed`)
+reproduced two: a new child disappeared when only its colliding parent was renumbered
+(finding 6), and a second save against the old base duplicated or resurrected human nodes
+after a merged save (finding 7). Removing the merge closes both. So the three-way merge, its id renumbering and the retained-revision history
 (64 entries, 256 MiB) were removed. Their code and tests stay retrievable at the local tag
 `experiment/b2a-three-way-merge` (commit `2da2f52`, the pre-decision B2a head).
 
@@ -136,9 +161,21 @@ revision-checked. A concurrently running native paper-rs, or any other external 
 protected. Its changes are detected through the on-disk revision, and the agent host reloads
 them, but it can still overwrite this server's writes.
 
+### Review round 1 (on `37cd0ed`), findings 1–5
+
+| Finding | Fix | Tests (each fails on `37cd0ed`'s code) |
+| --- | --- | --- |
+| 1. Page ids escape the project | manifest ids validated, no duplicates; a page's id is its manifest entry's; save destinations checked | `page_ids_cannot_reach_outside_the_project` |
+| 2. SVG `<image href="#private.png">` reads a file | images only `data:`; `#id` must exist in the SVG | `svg_images_take_only_data_uris_and_references_only_existing_ids`, `svg_image_fragments_are_refused` |
+| 3. Start-up reads linked page files | own page reader checks links before reading | `page_links_are_refused_before_reading` |
+| 4. A stale agent write overwrites a browser save | per-session seen revisions, `conflict` refusal | `a_stale_agent_write_after_a_browser_save_is_refused_and_writes_nothing` |
+| 5. A late poll answer rolls the editor back | non-overlapping polls, generation counter | `a late poll answer never replaces a newer saved state (reviewer sequence)`, `polls never overlap, and a discard makes an older poll answer stale` |
+
+Findings 6 and 7 were in the merge, which was removed (see the decision above).
+
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, `TMPDIR=<worktree>/target/tmp`)
 
-- **`tests/agent.rs` (5 passed):** real loopback listener, upstream-compatible rmcp
+- **`tests/agent.rs` (9 passed):** real loopback listener, upstream-compatible rmcp
   streamable-HTTP client.
   - `mcp_needs_the_token_and_a_loopback_host_and_origin`: 401 without or with a wrong token,
     403 for a foreign Host or Origin, 200 with the token, and a client without the token can't
@@ -161,12 +198,23 @@ them, but it can still overwrite this server's writes.
     written outside, refused calls write nothing, and only the bound project is listed. A
     `data:` image still works. With the policy disabled, this test fails (`create_file`
     succeeds).
-- **`agent::tests` (3 passed):** refused tools and other projects; local image paths in
+  - Review round 1: `a_stale_agent_write_after_a_browser_save_is_refused_and_writes_nothing`
+    (two sessions read, the browser saves, both writes and a retry without reading are
+    refused with page and manifest bytes unchanged; after a read the write lands on top of the
+    browser's save; a session's own write doesn't make it stale),
+    `page_ids_cannot_reach_outside_the_project` (a page file whose id is an outside path is
+    saved in place, nothing appears outside; absolute, `..`, slash, empty and duplicate
+    manifest ids refuse start-up), `page_links_are_refused_before_reading` (symlink and hard
+    link to a non-JSON outside file: the error is the link refusal, not a parse error) and
+    `svg_image_fragments_are_refused` (the reviewer's SVG over MCP).
+- **`agent::tests` (4 passed):** refused tools and other projects; local image paths in
   `<img>`, CSS and styles, including entity-encoded, uppercase-tag and `DATA:` forms; inline SVG
-  `href`, `url()`, `@import`, DTD and malformed XML.
+  `href`, `url()`, `@import`, DTD and malformed XML; and
+  `svg_images_take_only_data_uris_and_references_only_existing_ids` (the reviewer's
+  `#private.png`, `feImage`, `xlink:href`, missing ids).
 - **`state::tests` (2 new, 10 total passed):** `reload_only_when_clean_and_it_keeps_the_view`,
   `never_reload_over_unsaved_or_in_flight_edits`.
-- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (18 passed; mocked
+- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (20 passed; mocked
   editor/server/page, no browser).** The B2a tests:
   - `a change made elsewhere is loaded in place when nothing is unsaved`
   - `never reloads over unsaved edits; the stale save is a conflict and the edit stays`
@@ -175,6 +223,8 @@ them, but it can still overwrite this server's writes.
   - `a discard answer is dropped when the editor changed meanwhile, and a failed one changes
     nothing`
   - `no polling before Ready or while switching`
+  - `a late poll answer never replaces a newer saved state (reviewer sequence)` and
+    `polls never overlap, and a discard makes an older poll answer stale` (review round 1)
 - **B1 serve tests:** all pass (17).
 - **Live smoke test:** the server binary on a demo project, driven by `scripts/mcp-client.mjs`
   (a dependency-free JSON-RPC client) over a real socket. `get_basic_info` answered,
@@ -194,6 +244,20 @@ manifest or lockfile changed.
   - the bundle rebuild. The wasm is unchanged; `app.js`, `page.js` and `session.js` changed.
 - **Inherited from the 2da2f52 run (not re-run):** serial 162, headless 9, root clippy and
   `cargo tree -p paper-rs`.
+
+Results of the review round 1 fixes (2026-10-12, same proportionate rule; serve crate and
+page JavaScript only):
+- **Run now:** `cargo fmt --all --check`; clippy for serve and web (0 warnings); serve tests
+  4 unit, 9 agent, 17 serve; the CI Node command, 20 passed (Node 26.8.1); `node --check` on
+  the page JavaScript; wasm32 check, native build, `git diff --check`; the bundle rebuild
+  (`session.js` changed).
+- **On `37cd0ed`'s code** (a `git archive` extraction with the new tests copied in): all seven
+  new tests fail. Serve: the unit SVG test accepts the reviewer's SVG; `page_ids_…` writes a
+  file outside; `page_links_…` reports a parse error (outside bytes read);
+  `svg_image_fragments_…` passes the policy; `a_stale_agent_write_…` gets `{"updated": 1}`.
+  Node: the reviewer sequence applies the older page, and the overlap test times out.
+- **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
+  from the 2da2f52 run.
 
 ## Not proven
 
