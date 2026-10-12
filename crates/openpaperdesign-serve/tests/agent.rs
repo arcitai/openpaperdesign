@@ -319,23 +319,34 @@ async fn agent_edits_land_on_disk_and_change_the_revision() {
     c.cancel().await.unwrap();
 }
 
+/// GET the page as the browser does: (revision, body).
+async fn browser_get(r: &Running, page: &str) -> (String, String) {
+    let (st, tag, _, body) =
+        http(r, "GET", &format!("/api/pages/{page}"), None, String::new()).await;
+    assert_eq!(st, StatusCode::OK);
+    (tag.unwrap(), body)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stale_browser_save_merges_with_the_agents_change() {
+async fn sequential_human_and_agent_edits_are_both_kept() {
     let t = tmp();
     let (p, page) = project(&t.0, "Agent");
     let r = serve(&p.dir).await;
     let c = client(r.port).await;
-    // The browser loaded revision 1.
-    let (_, base_tag, _, base) = http(
+    let rect = *doc(&p, &page).nodes.keys().next().unwrap();
+    let x0 = doc(&p, &page).nodes[&rect].rect.x;
+
+    // Human, then agent: the browser saves on the current revision, the agent then edits.
+    let (tag, body) = browser_get(&r, &page).await;
+    let (st, _, _, out) = http(
         &r,
-        "GET",
+        "PUT",
         &format!("/api/pages/{page}"),
-        None,
-        String::new(),
+        Some(&tag),
+        moved(&body, rect.0, 33.0),
     )
     .await;
-    let rect = *doc(&p, &page).nodes.keys().next().unwrap();
-    // The agent adds a shape (revision 2).
+    assert_eq!(st, StatusCode::OK, "{out}");
     let before = doc(&p, &page);
     let (ok, out) = call(
         &c,
@@ -345,113 +356,90 @@ async fn a_stale_browser_save_merges_with_the_agents_change() {
     .await;
     assert!(ok, "{out}");
     let agent_node = new_node(&before, &doc(&p, &page));
-    // The browser, still on revision 1, moves the original rectangle.
-    let (st, tag, h, body) = http(
+    let d = doc(&p, &page);
+    assert_eq!(
+        d.nodes[&rect].rect.x,
+        x0 + 33.0,
+        "the human's move survived the agent's write"
+    );
+    assert!(d.nodes.contains_key(&paper_rs::model::NodeId(agent_node)));
+
+    // Agent, then human: the browser picks up the new revision (as its poll would) and saves.
+    let (tag, body) = browser_get(&r, &page).await;
+    assert_eq!(tag, etag(&file(&p, &page)));
+    let (st, _, _, out) = http(
         &r,
         "PUT",
         &format!("/api/pages/{page}"),
-        base_tag.as_deref(),
-        moved(&base, rect.0, 33.0),
+        Some(&tag),
+        moved(&body, rect.0, 7.0),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "{body}");
-    assert_eq!(
-        h.get("x-opd-merged").map(|v| v.to_str().unwrap()),
-        Some("1")
-    );
-    let on_disk = doc(&p, &page);
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let d = doc(&p, &page);
+    assert_eq!(d.nodes[&rect].rect.x, x0 + 40.0);
     assert!(
-        on_disk
-            .nodes
-            .contains_key(&paper_rs::model::NodeId(agent_node)),
-        "agent's shape kept"
+        d.nodes.contains_key(&paper_rs::model::NodeId(agent_node)),
+        "the agent's shape survived the human's save"
     );
-    assert_eq!(
-        on_disk.nodes[&rect].rect.x,
-        before.nodes[&rect].rect.x + 33.0,
-        "browser's move kept"
-    );
-    assert_eq!(tag.unwrap(), etag(&file(&p, &page)));
-    assert_eq!(
-        page_from_json(&body).unwrap().doc,
-        on_disk,
-        "the response is the merged page"
-    );
-    // The agent sees the merged page on its next call.
-    let (ok, out) = call(
-        &c,
-        "get_node_info",
-        json!({"nodeId": key(&page, agent_node)}),
-    )
-    .await;
-    assert!(ok, "{out}");
+    // And the agent sees the human's last save on its next call (it reloads from disk).
+    let (ok, out) = call(&c, "get_node_info", json!({"nodeId": key(&page, rect.0)})).await;
+    assert!(ok && out.contains(&format!("{}", x0 + 40.0)), "{out}");
     c.cancel().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overlapping_edits_conflict_and_nothing_is_written() {
+async fn a_stale_browser_save_after_an_agent_write_is_refused_and_writes_nothing() {
     let t = tmp();
     let (p, page) = project(&t.0, "Agent");
     let r = serve(&p.dir).await;
     let c = client(r.port).await;
-    let (_, base_tag, _, base) = http(
-        &r,
-        "GET",
-        &format!("/api/pages/{page}"),
-        None,
-        String::new(),
-    )
-    .await;
+    // The browser loaded revision 1 and then has an unsaved local edit.
+    let (base_tag, base) = browser_get(&r, &page).await;
     let rect = doc(&p, &page).nodes.keys().next().unwrap().0;
 
-    // Same node changed on both sides.
-    let (ok, out) = call(
-        &c,
-        "update_styles",
-        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"left": "700px"}}]}),
-    )
-    .await;
-    assert!(ok, "{out}");
+    for (what, agent) in [
+        (
+            "a different layer",
+            json!(["create_shape", {"type": "rectangle", "x": 600, "y": 0, "width": 50, "height": 50}]),
+        ),
+        (
+            "the same layer",
+            json!(["update_styles", {"updates": [{"nodeIds": [key(&page, rect)], "styles": {"left": "700px"}}]}]),
+        ),
+        (
+            "deleting the layer",
+            json!(["delete_nodes", {"nodeIds": [key(&page, rect)]}]),
+        ),
+    ] {
+        // The agent writes (a new revision).
+        let (ok, out) = call(&c, agent[0].as_str().unwrap(), agent[1].clone()).await;
+        assert!(ok, "{what}: {out}");
+        let agent_version = file(&p, &page);
+        // The browser's save is based on an older revision: 409, nothing written.
+        let (st, current, _, body) = http(
+            &r,
+            "PUT",
+            &format!("/api/pages/{page}"),
+            Some(&base_tag),
+            moved(&base, rect, 5.0),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{what}: {body}");
+        assert_eq!(
+            current.unwrap(),
+            etag(&agent_version),
+            "{what}: the answer names the current revision"
+        );
+        assert_eq!(
+            file(&p, &page),
+            agent_version,
+            "{what}: disk keeps the agent's version"
+        );
+    }
+    // An unknown revision is refused the same way.
     let disk = file(&p, &page);
-    let (st, _, _, body) = http(
-        &r,
-        "PUT",
-        &format!("/api/pages/{page}"),
-        base_tag.as_deref(),
-        moved(&base, rect, 5.0),
-    )
-    .await;
-    assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    let v: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["conflicts"], json!([rect.to_string()]));
-    assert_eq!(file(&p, &page), disk, "nothing written");
-
-    // Deleted by the agent, edited by the browser.
-    let (_, base_tag, _, base) = http(
-        &r,
-        "GET",
-        &format!("/api/pages/{page}"),
-        None,
-        String::new(),
-    )
-    .await;
-    let (ok, out) = call(&c, "delete_nodes", json!({"nodeIds": [key(&page, rect)]})).await;
-    assert!(ok, "{out}");
-    let disk = file(&p, &page);
-    let (st, _, _, body) = http(
-        &r,
-        "PUT",
-        &format!("/api/pages/{page}"),
-        base_tag.as_deref(),
-        moved(&base, rect, 5.0),
-    )
-    .await;
-    assert_eq!(st, StatusCode::CONFLICT, "{body}");
-    assert!(body.contains(&rect.to_string()), "{body}");
-    assert_eq!(file(&p, &page), disk, "nothing written");
-
-    // An unknown base revision is a plain 409.
-    let (st, _, _, body) = http(
+    let (st, _, _, _) = http(
         &r,
         "PUT",
         &format!("/api/pages/{page}"),
@@ -460,7 +448,12 @@ async fn overlapping_edits_conflict_and_nothing_is_written() {
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
-    assert!(!body.contains("conflicts"), "{body}");
+    assert_eq!(file(&p, &page), disk);
+    // After an explicit discard the browser loads the agent's version and can save again.
+    let (tag, body) = browser_get(&r, &page).await;
+    assert_eq!(body.as_bytes(), disk);
+    let (st, _, _, out) = http(&r, "PUT", &format!("/api/pages/{page}"), Some(&tag), body).await;
+    assert_eq!(st, StatusCode::OK, "{out}");
     c.cancel().await.unwrap();
 }
 

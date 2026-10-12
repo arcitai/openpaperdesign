@@ -21,9 +21,7 @@
 //! URIs, with no DTD and no `@import`. Anything else is refused before upstream code runs, so
 //! no local path is ever read.
 
-use crate::{
-    ASSETS, Kind, Revisions, check_project_dir, check_root, etag, plain, read_manifest_checked,
-};
+use crate::{ASSETS, Kind, check_project_dir, check_root, etag, plain, read_manifest_checked};
 use paper_rs::editor::Editor;
 use paper_rs::mcp::html::{self, Html};
 use paper_rs::mcp::server::{to_result, tool_list};
@@ -338,17 +336,16 @@ impl BoundHost {
     }
 
     /// Save every changed page (and the manifest when needed) like the native session does.
-    /// Returns (page id, revision, bytes) of each page written.
-    pub fn save_changes(&mut self) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    /// Each written page gets a new revision (its on-disk hash).
+    pub fn save_changes(&mut self) -> Result<(), String> {
         let ed = &mut self.ed;
         ed.commit_pending();
         let dirty = ed.dirty_pages();
         if dirty.is_empty() && !ed.meta_dirty {
-            return Ok(Vec::new());
+            return Ok(());
         }
         check_project_dir(&self.project.dir)?;
         plain(&self.project.dir.join(ASSETS), Kind::Dir)?;
-        let mut written = Vec::new();
         for &i in &dirty {
             let data = ed.page_data(i);
             paper_rs::assets::save_to_dir(
@@ -358,9 +355,6 @@ impl BoundHost {
             .map_err(|e| e.to_string())?;
             self.project.save_page(&data).map_err(|e| e.to_string())?;
             ed.mark_page_saved(i);
-            let path = self.project.page_path(&data.id);
-            let b = std::fs::read(&path).map_err(|e| e.to_string())?;
-            written.push((data.id.clone(), etag(&b), b));
         }
         self.project.manifest.pages = ed
             .pages
@@ -374,7 +368,7 @@ impl BoundHost {
         self.project.write_manifest().map_err(|e| e.to_string())?;
         ed.meta_dirty = false;
         self.known = disk_revisions(&self.project)?;
-        Ok(written)
+        Ok(())
     }
 }
 
@@ -435,13 +429,7 @@ fn list_resources(host: &BoundHost) -> ToolResult {
 }
 
 /// One tool call on the host thread, with the write lock held by the caller.
-pub fn run(
-    host: &mut BoundHost,
-    root_id: (u64, u64),
-    revs: &Mutex<Revisions>,
-    name: &str,
-    args: &Value,
-) -> ToolResult {
+pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) -> ToolResult {
     let dir = host.project.dir.clone();
     check_root(&dir, root_id)?;
     check_project_dir(&dir)?;
@@ -457,15 +445,8 @@ pub fn run(
         }
         _ => exec::call(host, name, &args),
     };
-    let written = host.save_changes();
-    let mut revs = revs.lock().unwrap();
-    match written {
-        Ok(pages) => {
-            for (id, tag, bytes) in pages {
-                revs.record(&id, &tag, bytes);
-            }
-            r
-        }
+    match host.save_changes() {
+        Ok(()) => r,
         Err(e) => Err(match r {
             Ok(_) => format!("the change was made but could not be saved: {e}"),
             Err(r) => format!("{r}; saving also failed: {e}"),
@@ -478,7 +459,6 @@ pub fn spawn_host(
     dir: PathBuf,
     root_id: (u64, u64),
     lock: Arc<tokio::sync::Mutex<()>>,
-    revs: Arc<Mutex<Revisions>>,
 ) -> Result<Sender<Call>, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Call>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -502,7 +482,7 @@ pub fn spawn_host(
             while let Ok(call) = rx.recv() {
                 let r = {
                     let _g = lock.blocking_lock();
-                    run(&mut host, root_id, &revs, &call.name, &call.args)
+                    run(&mut host, root_id, &call.name, &call.args)
                 };
                 let _ = call.reply.send(r);
             }
