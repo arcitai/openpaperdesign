@@ -1,8 +1,12 @@
 // The plugin's manifests, MCP entry, skills and the repository marketplace (no network, no
 // dependencies). Run: node --test plugin/tests/plugin.test.mjs
+//
+// Source-only checks: they read the files in this repository. Whether Codex discovers and
+// installs the plugin, and starts `openpaperdesign-mcp` (command on PATH, `cwd` handling,
+// openai/codex#22842), is only proven by installing it in Codex.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,6 +21,14 @@ const inside = (root, p) => {
   return abs;
 };
 
+/** Every string value starting with ./ anywhere in `v`. */
+const dotPaths = (v) =>
+  typeof v === 'string'
+    ? v.startsWith('./') ? [v] : []
+    : v && typeof v === 'object'
+      ? Object.values(v).flatMap(dotPaths)
+      : [];
+
 test('plugin.json has the required fields and its paths exist', () => {
   const m = json(join(plugin, 'plugin.json'));
   assert.equal(m.$schema, 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json');
@@ -26,22 +38,50 @@ test('plugin.json has the required fields and its paths exist', () => {
   assert.equal(m.license, 'MIT OR Apache-2.0');
   assert.equal(m.repository, 'https://github.com/onlinesourdough/openpaperdesign');
   assert.ok(m.description && m.author && m.author.name);
-  assert.ok(statSync(inside(plugin, m.skills)).isDirectory());
-  assert.ok(statSync(inside(plugin, m.mcpServers)).isFile());
+  // Discovery is fixed (the skills/ folder and the root mcp.json): the portable manifest
+  // must not declare components itself.
+  for (const k of ['skills', 'mcpServers', 'apps', 'interface']) {
+    assert.ok(!(k in m), `no top-level ${k} in the portable plugin.json`);
+  }
+  assert.ok(statSync(join(plugin, 'skills')).isDirectory());
   const ext = m.extensions['com.openai'];
   assert.ok(ext.interface.displayName && ext.interface.shortDescription);
+  assert.ok(
+    [...ext.interface.shortDescription].length <= 30,
+    `shortDescription is ${[...ext.interface.shortDescription].length} characters (max 30)`,
+  );
   assert.ok(existsSync(join(inside(plugin, ext.onboardingSkill), 'SKILL.md')));
   assert.ok(!/paper\.design/.test(m.name), 'no Paper branding');
 });
 
-test('the .codex-plugin overlay matches plugin.json', () => {
-  assert.deepEqual(json(join(plugin, '.codex-plugin/plugin.json')), json(join(plugin, 'plugin.json')));
+test('every ./ path in the manifests exists inside its root', () => {
+  const files = [
+    [plugin, join(plugin, 'plugin.json')],
+    [plugin, join(plugin, 'mcp.json')],
+    [repo, join(repo, '.agents/plugins/marketplace.json')],
+  ];
+  let n = 0;
+  for (const [root, f] of files) {
+    for (const p of dotPaths(json(f))) {
+      assert.ok(existsSync(inside(root, p)), `${f}: ${p} is missing`);
+      n += 1;
+    }
+  }
+  assert.ok(n >= 2, 'the onboarding skill and the marketplace path were checked');
+});
+
+test('one manifest: no .codex-plugin overlay to contradict plugin.json', () => {
+  assert.ok(!existsSync(join(plugin, '.codex-plugin')));
 });
 
 test('mcp.json starts the stdio launcher from PATH', () => {
+  assert.ok(statSync(join(plugin, 'mcp.json')).isFile());
   const m = json(join(plugin, 'mcp.json'));
+  assert.deepEqual(Object.keys(m.mcpServers), ['openpaperdesign']);
   assert.equal(m.$schema, 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json');
   const s = m.mcpServers.openpaperdesign;
+  assert.equal(s.type ?? 'stdio', 'stdio', 'a stdio server (no url)');
+  assert.ok(!('url' in s));
   assert.equal(s.command, 'openpaperdesign-mcp');
   assert.ok(!s.command.includes('/'), 'a command on PATH, never a bundled relative path');
   assert.deepEqual(s.args, []);
@@ -74,6 +114,10 @@ test('the repository marketplace points at the plugin', () => {
   assert.equal(p.source.source, 'local');
   const dir = inside(repo, p.source.path);
   assert.equal(dir, plugin);
+  // Also after resolving links: the path really is this folder, inside the repository.
+  const real = realpathSync(dir);
+  assert.equal(real, realpathSync(plugin));
+  assert.ok(real.startsWith(`${realpathSync(repo)}/`));
   assert.equal(json(join(dir, 'plugin.json')).name, p.name);
   assert.ok(p.policy.installation && p.policy.authentication && p.category);
 });

@@ -39,15 +39,36 @@ surface), plugin publishing, other hosts.
   the list is empty and `open_editor` says "build the web bundle first", without guessing a
   path at run time. Editing through the tools still works without it.
 - **`plugin/openpaperdesign/`:**
-  - `plugin.json` (`$schema` agent-plugins 1.0.0, MIT OR Apache-2.0, repository
-    onlinesourdough/openpaperdesign, version 0.1.0, `extensions.com.openai.interface` and
-    `onboardingSkill`), and an identical `.codex-plugin/plugin.json` overlay;
+  - `plugin.json`, the only manifest (see "Packaging" below): `$schema` agent-plugins 1.0.0,
+    MIT OR Apache-2.0, repository onlinesourdough/openpaperdesign, version 0.1.0, and
+    `extensions.com.openai` with `interface` and `onboardingSkill`;
   - `mcp.json`: stdio `{"command": "openpaperdesign-mcp", "args": [], "cwd": "."}`;
   - `NOTICE.md`;
   - skills `openpaperdesign` (bind, edit, `open_editor`, in-app browser, limits), `setup`
     (build, install, `doctor`), and the ported `design` and `review-design`.
 - **`.agents/plugins/marketplace.json`**: the local marketplace `openpaperdesign-local`,
   pointing at `./plugin/openpaperdesign`.
+
+### Packaging (corrected 2026-10-12)
+
+The operator checked draft `1714a58` against the installed Codex plugin-creator 0.1.26
+(`references/plugin-packages.md`). The corrections:
+- **Fixed discovery:** skills come from the `skills/` folder and the MCP server from the root
+  `mcp.json`. So the portable `plugin.json` has no top-level `skills`, `mcpServers`, `apps` or
+  `interface`.
+- **Short description:** `extensions.com.openai.interface.shortDescription` is at most 30
+  characters. It is now "Agent + human design canvas" (27).
+- **One manifest:** the `.codex-plugin/plugin.json` overlay was removed. Nothing showed that
+  the local Codex needs it, and an `extensions.com.openai` object replaces the overlay
+  entirely rather than merging with it. Two copies could only contradict each other. **Codex
+  reads `plugin/openpaperdesign/plugin.json`**: the common fields at the top level and the
+  Codex presentation in `extensions.com.openai`. If the operator's Codex doesn't list the
+  plugin without the overlay, that is a finding to report; don't add the overlay back
+  without a decision.
+- **Limits not checked here:** the reference wasn't available in this sandbox. Only the
+  30-character cap (from the operator) is enforced. The other fields set are
+  `interface.displayName`, `longDescription` (233 characters), `developerName`, `category`,
+  and `onboardingSkill`. Their limits still need checking against the reference.
 
 ### Ported design methods (AIOS #54)
 
@@ -78,27 +99,43 @@ openpaperdesign-mcp --version && openpaperdesign-mcp doctor    # "browser_editor
 ```
 
 2. The command lands in `~/.cargo/bin`. The Codex app must see it on its `PATH`.
-3. Add the repository's local marketplace in Codex (it reads
-   `<repo>/.agents/plugins/marketplace.json`), install `openpaperdesign`, and enable it
-   (`[plugins."openpaperdesign@openpaperdesign-local"] enabled = true` in
-   `.codex/config.toml`).
-4. Restart the Codex app.
-5. Check that the plugin and its four skills are listed, and that the `openpaperdesign` MCP
-   server started.
-6. In a workspace with a fixture project under `design/`, ask the agent to:
-   - bind it (`bind_project design/<name>`);
-   - edit it (for example `create_shape`);
-   - call `open_editor` and open the URL in the in-app browser.
+   `command -v openpaperdesign-mcp` in a new terminal must print it. The app may not inherit
+   your shell `PATH`; record what it actually uses.
+3. Add the local marketplace: the repository checkout's `.agents/plugins/marketplace.json`
+   (marketplace `openpaperdesign-local`, plugin source `./plugin/openpaperdesign`). Use the
+   path form your Codex's plugin UI or CLI offers, and record the exact command or menu used.
+4. Install `openpaperdesign` from it, and make sure it is enabled. In `~/.codex/config.toml`
+   that is:
 
-   Edit in the browser, then let the agent edit again. Both changes must persist across a
-   reload.
+   ```toml
+   [plugins."openpaperdesign@openpaperdesign-local"]
+   enabled = true
+   ```
+5. Quit and restart the Codex app.
+6. Read back and record:
+   - the plugin `openpaperdesign` (shown as "openpaperdesign", "Agent + human design canvas");
+   - the four skills: `openpaperdesign`, `setup`, `design`, `review-design`;
+   - the MCP server `openpaperdesign`, running, with its tools including `bind_project`,
+     `create_project`, `open_editor` and `openpaperdesign_status`;
+   - `openpaperdesign_status`: version 0.1.0, the workspace Codex started it in (this shows
+     how `cwd` "." was resolved; openai/codex#22842), and `"browser_editor": "built in"`.
+7. Fixture: in a workspace, create one with `create_project` (name "Fixture", giving
+   `design/Fixture/`), or bind an existing one with `bind_project design/<name>`. Then:
+   - ask for an edit (for example `create_shape` of a rectangle) and check that
+     `design/<name>/pages/*.json` changed;
+   - call `open_editor` and open the returned `http://127.0.0.1:<port>/#token=…` URL in the
+     in-app browser. The canvas loads and shows the shape;
+   - move something in the browser and wait for "Saved", then let the agent edit again (it
+     reads first). Reload: both changes are there.
+
+   Don't paste the token URL into reports.
 
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, Python 3)
 
 | Check | Result |
 |---|---|
 | `tests/launcher.rs` (the real binary over stdio, rmcp child-process client) | 3 passed (details below) |
-| `node --test plugin/tests/plugin.test.mjs` | 6 passed: plugin.json fields and `./` paths, overlay equal, `mcp.json` command on PATH and no token, skills' frontmatter and size, marketplace → plugin, notices and licenses |
+| `node --test plugin/tests/plugin.test.mjs` | 7 passed (after the packaging correction): plugin.json fields, no top-level `skills`/`mcpServers`/`apps`/`interface`, shortDescription ≤ 30; every `./` path exists inside its root; no `.codex-plugin` overlay; `mcp.json` has exactly one stdio entry with the command on PATH and no token; skills' frontmatter and size; the marketplace path resolves (after links) to the plugin folder inside the repository; notices and licenses. On `1714a58`'s files, 2 fail (top-level `skills`, the overlay) |
 | `plugin/tests/design` (`python3 -m unittest`) | 12 passed |
 | `cargo install --locked --offline --path crates/openpaperdesign-serve --bin openpaperdesign-mcp --root <tmp>` (the setup skill's command, offline here) | installed; release binary 39,032,168 B; `--version` 0.1.0; `doctor`: `"browser_editor": "built in"`, no missing files |
 | Full check list | `cargo fmt --all --check`; clippy 0 warnings on the new crates (host) and only upstream `atomic.rs:30` on wasm32; serve 10 unit + 5 agent + 3 launcher + 17, web 111, shader 2; Node 18 (`session.test.mjs`) + 6 (`plugin.test.mjs`); Python 12; wasm32 check; native build; headless 9/0/0; serial 162/0/0 (= baseline, no quota errors); root clippy 1 upstream warning; `cargo tree -p paper-rs -e features` unchanged; `git diff --check` clean |
@@ -128,10 +165,11 @@ inherited from it (no root-package file changed).
 
 ## Not proven
 
-- **Codex itself:** discovering and installing the plugin from the local marketplace, the
-  exact `plugin.json`/marketplace field names (from the lead's reading of the docs; not
-  checked against the schemas, which weren't available offline), and enabling it are
-  untested. So is the app starting the stdio server: `command` on PATH and `cwd` ".", whose
+- **Codex itself:** the plugin tests are source-only checks. They cover the forbidden
+  top-level keys, the 30-character cap, `mcp.json` with its one stdio entry, every `./` path
+  existing, and the marketplace path resolving to this folder inside the repository. Nothing
+  here proves that Codex discovers, installs or enables the plugin, or reads only
+  `plugin.json`. The other interface limits weren't checked against the reference. So is the app starting the stdio server: `command` on PATH and `cwd` ".", whose
   resolution relative to the workspace (openai/codex#22842) is unverified.
 - **Opening the editor:** opening the `open_editor` URL in the in-app browser from a skill
   hasn't been tried.
