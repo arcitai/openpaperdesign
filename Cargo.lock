@@ -2478,6 +2478,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openpaperdesign-clipboard-stub"
+version = "0.1.0"
+
+[[package]]
 name = "openpaperdesign-core"
 version = "0.1.0"
 dependencies = [
@@ -2490,6 +2494,46 @@ dependencies = [
  "serde",
  "serde_json",
  "ttf-parser",
+]
+
+[[package]]
+name = "openpaperdesign-serve"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "getrandom 0.3.4",
+ "http-body-util",
+ "paper-rs",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "openpaperdesign-web"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "dirs",
+ "egui",
+ "fastrand",
+ "i_overlay",
+ "image",
+ "js-sys",
+ "log",
+ "lyon",
+ "miniz_oxide 0.9.1",
+ "naga",
+ "openpaperdesign-clipboard-stub",
+ "pollster",
+ "serde",
+ "serde_json",
+ "ttf-parser",
+ "usvg",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wgpu",
 ]
 
 [[package]]

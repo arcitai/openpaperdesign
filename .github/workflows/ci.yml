@@ -30,6 +30,14 @@ jobs:
         env:
           PAPER_RS_REQUIRE_GPU: "1"
         run: cargo test --locked -- --test-threads=1
+      - name: Test openpaperdesign crates (serve API, web input mapping)
+        run: cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
+      # The runner's preinstalled Node (>= 22); no setup-node, no package.json. An explicit
+      # file, because Node 22 doesn't take a directory here.
+      - name: Test the page's editor lifecycle (Node, mocked DOM)
+        run: |
+          node --version
+          node --test crates/openpaperdesign-web/tests/session.test.mjs
 
   wasm-core:
     runs-on: ubuntu-24.04
@@ -37,5 +45,5 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
-      - name: Check portable core for wasm32
-        run: cargo check --locked -p openpaperdesign-core --target wasm32-unknown-unknown
+      - name: Check portable core and web editor for wasm32
+        run: cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown

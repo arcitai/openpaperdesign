@@ -1,0 +1,12 @@
+[package]
+name = "openpaperdesign-clipboard-stub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Stand-in for the subset of the arboard API used by paper-rs, for targets without an OS clipboard"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# Imported as `arboard` (dependency rename) so upstream `src/io/clipboard.rs` compiles unchanged.
+path = "src/lib.rs"

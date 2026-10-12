@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.1 · Updated: 2026-10-12
+Revision: 0.3 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -43,7 +43,10 @@ export RUSTUP_HOME=$PWD/.toolchain/rustup CARGO_HOME=$PWD/.toolchain/cargo PATH=
 cargo build --locked --all-targets
 cargo test --locked -- --test-threads=1        # parallel run: see the known SIGSEGV below
 PAPER_RS_REQUIRE_GPU=1 cargo test --locked --test headless
-cargo check --locked -p openpaperdesign-core --target wasm32-unknown-unknown
+cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown
+cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
+node --test crates/openpaperdesign-web/tests/session.test.mjs   # page lifecycle; Node >= 22
+./scripts/build-web.sh                         # browser bundle; needs wasm-bindgen CLI 0.2.129
 cargo clippy --locked --all-targets
 cargo fmt --all --check
 ```
@@ -54,6 +57,13 @@ when two screenshot tests initialize a GPU at the same time. Serial runs pass. S
 `docs/openpaperdesign/feasibility-2026-10-12.md`. When `PAPER_RS_REQUIRE_GPU` is unset, the
 GPU tests skip themselves if there is no adapter. The MCP screenshot tests return early without
 that guard, so a pass is not proof that rendering happened.
+
+## Browser editing (issue #1)
+
+`openpaperdesign-serve --project <dir>` serves one project to a browser on loopback
+(`docs/openpaperdesign/browser-edit-b1.md`). Its revision checks protect only writers that go
+through it. Never describe it as protecting a concurrently running native app or other
+external writer.
 
 ## Model profile
 
