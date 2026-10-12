@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.9 · Updated: 2026-10-12
+Revision: 0.10 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -78,7 +78,10 @@ the page list, if it changes it) is read at its current revision. The browser po
 while its editor is clean. Page ids come only from the manifest, must be safe file names,
 must differ in more than ASCII case (macOS file systems alias them), and must not share
 their first six characters, ignoring case (node ids are `<prefix>:<n>`). A call that returns
-an error changes nothing: the host reloads from disk and saves nothing. Inline SVG may not
+an error changes nothing, in memory or on disk. Each save (agent call or browser) is one
+commit that is rolled back on any error; if the rollback fails, the server refuses every
+further write until restarted. A call that couldn't start within the timeout is never run; a
+started call is always waited for; reads count only once their result was delivered. Inline SVG may not
 contain `<image>`/`<feImage>`.
 The dropped three-way-merge experiment is at the local tag `experiment/b2a-three-way-merge`;
 don't bring it back without an explicit decision (collaboration is issue #2).

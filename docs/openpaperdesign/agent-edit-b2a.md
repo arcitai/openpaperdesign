@@ -52,10 +52,31 @@ check your client's docs if one is refused. The token changes on every start.
   3. applies the policy below and runs the tool;
   4. refuses the change if it touches a page whose revision moved since this MCP session last
      read it (see "Agent writes" below). The change is discarded and nothing is written;
-  5. otherwise saves each changed page through upstream `Project::save_page` (atomic write), updates the
-     manifest like the native session does, and records the new revision.
+  5. otherwise saves everything the call changed as **one commit** (see "Errors change
+     nothing" below), updates the manifest like the native session does, and records the new
+     revisions.
 - **One transaction per write:** each agent write is one upstream transaction, saved before the
   call returns, so it changes that page's revision (the hash of its file on disk).
+- **Errors change nothing** (lead contract, review round 4): a call that returns an error
+  leaves the project exactly as it was, in memory and on disk.
+  - **In memory:** nothing reaches the disk during a call (`Host::save` is a no-op; export
+    and file creation are refused). After a tool error, a caught panic, a conflict or a
+    failed save, the host reloads from disk, which it matched before the call. As after any
+    reload, the agent's undo history restarts.
+  - **On disk, one commit** (`crate::commit`) per call, used by browser saves too (page plus
+    manifest): the current bytes of every target are read first. Every new file (images,
+    pages, then the manifest) is written to a temporary file and synced, then renamed in
+    that order. If any step fails, the temporary files are removed and every file already
+    replaced is put back from its old bytes the same way (or removed if it was new). Every
+    project file is then byte-identical to before.
+  - **Fail closed:** if putting a file back fails too, the server records it, naming the
+    files, and from then on refuses every write, browser (503) and MCP alike, until it is
+    restarted after the files were checked. It never reports success or partial success.
+- **Timeouts** (review round 4): calls are queued for the host thread. A call that hasn't
+  started within 120 s is abandoned (Queued → Abandoned, decided atomically against the host
+  starting it) and is never run. A call that has started (Queued → Running) is always waited
+  for, and its real result is returned. What a call acknowledges is applied only after its
+  result was delivered to the caller.
 - **Endpoint:** `/mcp` is on the same loopback listener. It gets the B1 guard (`Host` must be
   `127.0.0.1:<port>`/`localhost:<port>`, any `Origin` must be ours, fetch-site checks), requires
   the token, and gets the B1 security headers. rmcp's own Origin validation is also on, allowing
@@ -116,8 +137,8 @@ check your client's docs if one is refused. The token changes on every start.
   unknown revision gets `409` with the current revision, and nothing is written. Nothing is
   merged, and no revision history is kept.
 - **Agent writes** go through the single host thread under the **same write lock** as browser
-  saves. The host reloads from disk before each call when anything changed, and saves
-  atomically, which gives a new revision.
+  saves. The host reloads from disk before each call when anything changed, and saves the
+  call's changes as one commit (all or nothing), which gives new revisions.
   - A browser save can't overwrite an agent write: its `If-Match` names the older revision
     and is refused.
   - **An MCP session must read a page before it changes it,** and an agent write can't
@@ -133,20 +154,24 @@ check your client's docs if one is refused. The token changes on every start.
     - `get_computed_styles`: the page of each node whose styles are actually in the answer
       (its node ids are keys of the returned map); a page left out isn't credited.
   - **Acknowledges nothing:** any call that failed (an error, a policy refusal, a conflict, an
-    unknown tool). Also any call that can't be attributed to one page, or that returns
+    unknown tool, a call abandoned before it started), any call whose result couldn't be
+    delivered, and any call that can't be attributed to specific pages or that returns
     matches or a selection rather than a page's content: `find_nodes`, `get_selection`,
+    `open_file` (it returns basic info, but isn't credited; call `get_basic_info`),
     `list_resources`, `get_guide`, `get_font_family_info`, `select_nodes`,
     `finish_working_on_nodes`, no-op changes.
+  - **Output really contains the page:** since page ids must differ in their first six
+    characters, every node id in an answer names exactly one page. The one answer that can
+    leave a requested page out, `get_computed_styles` (a map keyed by node id), credits only
+    the pages whose node ids are keys in it.
+  - **New pages:** `create_page` changes the page list, so it needs the page list read
+    (`get_basic_info`).
   - **Page list:** the manifest's page metadata (ids, names, order) is a separate item. Only
     `get_basic_info`, which returns it, reads it. Its revision is the hash of a canonical
     JSON array of `[id, name]` pairs, so names containing newlines or NULs can't make two
     lists look the same.
-  - **A call that returns an error changes nothing,** in memory or on disk. Nothing reaches
-    the disk during a call (`Host::save` is a no-op; export and file creation are refused).
-    After an error (or a caught panic, or a failed save) the host reloads the project from
-    disk, which it matched before the call. It saves nothing and acknowledges nothing, so
-    what the session read before stays valid. As after any reload, the agent's undo history
-    restarts.
+  - **A call that returns an error changes nothing** (see "Errors change nothing" above) and
+    acknowledges nothing, so what the session read before stays valid.
   - **What is refused:** a call that changes an existing page's content, or removes it, unless
     **every** page it writes is read at its current revision. The same applies to the page
     list if the call changes it (a rename, a new page, a removed page). Otherwise it gets a
@@ -226,9 +251,17 @@ Findings 6 and 7 were in the merge, which was removed (see the decision above).
 
 | Finding | Fix | Tests (each fails on `b730f4c`'s code) |
 | --- | --- | --- |
-| P1. Failed `rename_pages`, `move_nodes` and `set_text_content` saved their partial changes, and a failed `write_html` replace deleted its target from disk | A failed call reloads from disk and saves nothing | `a_failed_call_changes_nothing` (the reviewer's four cases: disk bytes of both pages and the manifest, and later reads, unchanged) |
-| P2. Newlines/NULs in page names made two page lists encode the same, permitting blind and stale renames | Page-list revision is the hash of a canonical JSON array | `page_list_revisions_are_unambiguous` (the reviewer's names) |
-| Lost update via colliding six-character page-id prefixes (`get_computed_styles` answered for one page and both were credited) | Such projects are refused at start/bind and before saving. `get_computed_styles` credits only pages present in its answer; `find_nodes` and `get_selection` credit nothing. | `page_ids_sharing_their_first_six_characters_are_refused` (`abcdef-A`/`abcdef-B`, and a case-folded variant) |
+| F1. Failed `rename_pages`, `move_nodes` and `set_text_content` saved their partial changes, and a failed `write_html` replace deleted its target from disk. A save failing part-way (read-only `assets/`) kept page A's change. | A failed call reloads from disk and saves nothing. Each call's files are one commit with rollback, and the server fails closed if the rollback fails. Browser saves use the same commit. | `a_failed_call_changes_nothing` (the reviewer's four cases); `a_save_failing_part_way_writes_nothing` (the reviewer's I/O case). Unit tests with a test-only fault seam: `a_failed_save_leaves_every_file_unchanged` (every staging/rename step of a 1-page, a 2-page and a manifest-only commit), `a_failed_rollback_refuses_every_later_write`, `tests::browser_saves_are_all_or_nothing_and_fail_closed`. |
+| F2. Lost update via colliding six-character page-id prefixes (`get_computed_styles` answered for one page and both were credited) | Such projects are refused at start/bind and before saving. `get_computed_styles` credits only pages present in its answer; `find_nodes` and `get_selection` credit nothing. | `page_ids_sharing_their_first_six_characters_are_refused` (`abcdef-A`/`abcdef-B`, and a case-folded variant) |
+| F3. Newlines/NULs in page names made two page lists encode the same, permitting blind and stale renames | Page-list revision is the hash of a canonical JSON array | `page_list_revisions_are_unambiguous` (the reviewer's names, blind and stale) |
+| F4. A read that timed out later ran and credited content the caller never got | Queued → Running / Queued → Abandoned; abandoned calls never run; started calls are always waited for; acknowledgments only after delivery | Unit tests: `a_call_abandoned_before_it_started_is_never_run`, `a_started_call_returns_its_real_result`, `an_undelivered_read_acknowledges_nothing` (100 ms test wait) |
+
+The six integration tests above compile against `b730f4c` and fail there. The unit tests use
+seams that don't exist there (the fault hook, `send_and_wait`), so they were checked by
+mutation instead. Restoring `b730f4c`'s lifecycle (run abandoned calls, acknowledge
+undelivered results, stop waiting at the timeout) makes the three F4 tests fail, and
+disabling the rollback makes the three F1 unit tests fail. The reviewer's
+`r4_timed_out_read_must_not_authorize_an_unseen_write` (120 s) failed on `b730f4c`.
 
 ### Review round 3 (on `9c3ba69`)
 
@@ -347,8 +380,9 @@ page JavaScript only):
 
 Results of the review round 4 fixes (2026-10-12; serve crate only):
 - **Run now:** `cargo fmt --all --check`; serve clippy (0 warnings); serve build; serve tests
-  4 unit, 21 agent, 17 serve; `git diff --check`.
-- **On `b730f4c`'s code** (with the new tests copied in): the three new tests fail.
+  10 unit, 22 agent, 17 serve; `git diff --check`.
+- **On `b730f4c`'s code** (with the new tests copied in): the four new integration tests
+  fail; the unit tests by mutation, as described in the round 4 section.
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run; the Node command (no JavaScript changed).
 
