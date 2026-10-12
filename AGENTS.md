@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.14 · Updated: 2026-10-12
+Revision: 0.15 · Updated: 2026-10-13
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -112,8 +112,18 @@ workspace and embeds the web bundle at build time, so run `./scripts/build-web.s
 discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `skills`,
 `mcpServers`, `apps` or `interface`. Codex presentation goes in `extensions.com.openai`
 (`interface.shortDescription` ≤ 30 characters). Don't add a `.codex-plugin/` overlay.
-`mcp.json` is explicit `type: "stdio"` with no `cwd`. The launcher records the workspace's
-canonical path and identity at start and refuses a moved or replaced workspace. It creates
+`mcp.json` is explicit `type: "stdio"`, args `["--codex-context"]`, with no `cwd`. The packaged
+launcher pins canonical workspace/identity from Codex 0.162.1's experimental
+`codex/sandbox-state-meta` in `RequestContext.meta` on real model tool calls. Direct
+app-server calls omit it; arguments are never authority. Accept only the observed managed
+workspace-write shape or exact `{"type":"disabled"}` profile; never infer missing grants.
+Read-only/unsupported profiles cannot bind or open a writable browser. Plugin scope and
+protected-path checks apply even when the host sandbox is disabled. Missing, changed or
+no-longer-writable context after pinning permanently retires the binding through the same
+writer fence; caller cancellation cannot interrupt retirement. Checks are per call, not
+instantaneous detection of idle host permission changes, and provide no OS sandboxing.
+Standalone `--workspace`/cwd mode is separate; reject conflicting flags. The launcher
+refuses a moved or replaced workspace. It creates
 `design/<name>/` itself without following links. A failed `bind_project` must leave the
 current binding working. Replacement preparation must not change the active host's layout
 registry. On a successful switch, retire the old server before activating the replacement;

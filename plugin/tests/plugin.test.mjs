@@ -84,10 +84,9 @@ test('mcp.json starts the stdio launcher from PATH', () => {
   assert.ok(!('url' in s));
   assert.equal(s.command, 'openpaperdesign-mcp');
   assert.ok(!s.command.includes('/'), 'a command on PATH, never a bundled relative path');
-  assert.deepEqual(s.args, []);
-  // No cwd: "." might be resolved against the plugin folder rather than the user's workspace
-  // (openai/codex#22842); the server uses the directory the host starts it in, and refuses
-  // the plugin folder itself.
+  assert.deepEqual(s.args, ['--codex-context']);
+  // Codex 0.162.1 starts plugin servers in the plugin folder. Workspace authority
+  // comes only from the experimental metadata on actual model tool calls.
   assert.ok(!('cwd' in s));
   assert.ok(!JSON.stringify(m).includes('token'), 'no token in config');
 });

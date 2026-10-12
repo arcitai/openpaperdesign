@@ -1,5 +1,7 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
+Updated 2026-10-13: current-host workspace/permission contract below; prior results retain their original provenance.
+
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
 agent deliberately binds one design project in the user's workspace, edits it over MCP, and
@@ -14,7 +16,9 @@ surface), plugin publishing, other hosts.
 - **`openpaperdesign-mcp`** (entrypoint `crates/openpaperdesign-serve/src/bin/openpaperdesign-mcp.rs`,
   shared implementation `src/launcher.rs` in that crate)
   is the plugin's MCP server, over stdio.
-  - **Workspace:** the working directory the host starts it in (or `--workspace`).
+  - **Workspace:** the package uses `--codex-context`, pinning Codex's selected workspace
+    from per-call metadata. Standalone `--workspace` or deliberate cwd is a separate mode.
+    See the versioned contract below; process cwd is not package workspace authority.
   - **Tools:** upstream's design tools, behind B2a's bound-project host and policy, plus:
     - `bind_project {path}`: an existing paper-rs project (has `project.json`) inside the
       workspace. Symlinks are resolved before the inside-check, so links leading out are
@@ -24,12 +28,12 @@ surface), plugin publishing, other hosts.
     - `open_editor`: returns `http://127.0.0.1:<port>/#token=<token>` for the in-app browser.
       The URL is never written to disk.
     - `openpaperdesign_status`: version, workspace, bound project, whether the editor is
-      built in.
-  - **Before a bind:** every editing tool answers "bind a project first".
+      built in, plus workspace source, permission mode, state and refusal reason.
+  - **Before a bind:** valid workspace/permission context is required, then editing tools require a deliberate project bind.
   - **One project per process:** binding again switches projects.
     - **Failed rebind:** the new project is opened and fully checked before the current one
       is touched (containment, `project.json`, page ids, page links). A failed bind leaves
-      the current binding, its server, and its editor URL and token working.
+      the current binding, its server, and its editor URL and token working, provided workspace/permission context remains valid.
     - **Rebinding the same project** changes nothing.
     - **In-flight work on a successful switch:** preparation does not reset layout state.
       The old binding closes admission and waits for its started writer/rollback under the
@@ -62,7 +66,7 @@ surface), plugin publishing, other hosts.
   - `plugin.json`, the only manifest (see "Packaging" below): `$schema` agent-plugins 1.0.0,
     MIT OR Apache-2.0, repository onlinesourdough/openpaperdesign, version 0.1.0, and
     `extensions.com.openai` with `interface` and `onboardingSkill`;
-  - `mcp.json`: one server, `{"type": "stdio", "command": "openpaperdesign-mcp", "args": []}`,
+  - `mcp.json`: one server, `{"type": "stdio", "command": "openpaperdesign-mcp", "args": ["--codex-context"]}`,
     with no `cwd` (see "Packaging");
   - `NOTICE.md`;
   - skills `openpaperdesign` (bind, edit, `open_editor`, in-app browser, limits), `setup`
@@ -70,18 +74,84 @@ surface), plugin publishing, other hosts.
 - **`.agents/plugins/marketplace.json`**: the local marketplace `openpaperdesign-local`,
   pointing at `./plugin/openpaperdesign`.
 
+### Current-host workspace contract (2026-10-13)
+
+This is experimental support for **Codex 0.162.1**, not a portable MCP workspace standard.
+The server advertises `capabilities.experimental["codex/sandbox-state-meta"] = {}`.
+Codex supplies `sandboxCwd` (a file URI) and `permissionProfile` in per-call `_meta` on real
+model tool calls. rmcp exposes it as `RequestContext.meta`, separate from tool arguments.
+The pinned [Codex call path](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/core/src/mcp_tool_call.rs#L853)
+and actual operator no-op model calls confirm delivery even when the MCP process cwd is
+different. Direct app-server calls do not add this context. No client roots, workspace
+interpolation, parent-process discovery or manual per-project overrides are used.
+
+Accepted profiles are deliberately narrow, checked against the pinned
+[profile types](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/protocol/src/models.rs#L299)
+and [permission semantics](https://github.com/openai/codex/blob/092d3acd6bec3e3a14bdc7e7a2810ab628ab759d/codex-rs/protocol/src/permissions.rs#L120):
+
+- Exact `{"type":"disabled"}`: the host sandbox is disabled; plugin containment, identity,
+  protected-path rules and lifecycle checks remain enforced. This is not a request to
+  enable full access.
+- `type: managed`, `network: restricted`, `file_system.type: restricted`, with exactly
+  eight entries (order does not matter): special `root` read; one explicit absolute path
+  write matching the selected workspace; special `slash_tmp` and `tmpdir` write; and
+  `<write-path>/.git`, `.agents`, `.codex`, `.aws` read, each with
+  `missing_path_behavior: skip`. Temporary grants never expand project scope.
+
+Read-only, absent, unknown, custom or ambiguous profiles refuse all editing/binding and
+writable-browser access. Extra entries/fields, missing exclusions and alternative grant
+shapes are unsupported. The four protected path names are refused in project paths,
+including canonical aliases; protected entries must be absent or real directories.
+Symlinked exclusions and `.git` pointer files are conservatively unsupported. These are
+also plugin-specific restrictions for the `disabled` variant, not claimed host exclusions.
+The URI parser accepts normalized absolute UTF-8 local `file:///` or `file://localhost/`
+paths, with strict percent decoding; remote hosts, dot segments, encoded separators,
+query/fragment, NUL and invalid encodings refuse. Existing root/home/plugin-folder,
+canonical containment, moved/replaced-directory and safe-creation checks remain.
+
+The first valid writable context pins one canonical workspace and its device/inode.
+Before that, invalid context stays unresolved and writes nothing. Every later tool call
+must provide valid context for that same directory. Missing, changed, unsupported or
+no-longer-writable context permanently invalidates the session: admission closes, the
+started writer/rollback drains, queued/retained stdio/HTTP/browser calls are fenced, and
+the listener stops. Cancellation cannot interrupt retirement. A later valid call cannot
+revive it; use a fresh supported session. Valid same-project/failed project rebind behavior
+is unchanged. Status reports source, permission mode, state and refusal reason.
+
+This is conservative adapter admission, **not OS sandboxing**. Checks observe tool calls;
+idle permission revocation is not detected instantly, and it does not protect a concurrent
+native app/external writer. Standalone `--workspace <dir>` or deliberate cwd remains
+separate; combining it with `--codex-context` refuses. A standalone doctor pass is a
+binary/bundle check, not host context or installed-editing proof.
+
+Historical evidence: reviewed `0921280` installed successfully; Codex found four skills
+and 33 tools. Its process used plugin-cache cwd, status reported unusable and creation
+was refused. Later no-op diagnostics confirmed read-only, managed workspace-write and
+exact disabled metadata shapes; they did not edit through this product. This candidate's
+installed model and IAB qualification remains pending after independent review. Synthetic
+stdio tests use sanitized versions of those shapes and are labeled synthetic.
+
+Linux implementation verification for this correction: the serve suite passed 83 tests
+(28 library, 24 agent, eight standalone launcher, six synthetic-context launcher, 17 API),
+with real loopback enabled for the lifecycle tests. The final protected-workspace guard
+was rechecked with all 28 library and six context tests. The 28 library tests also passed
+with the portable listener. Serve all-target clippy, format/diff checks and all seven
+package assertions passed. Default-sandbox TCP attempts initially returned EPERM; scoped
+loopback approval allowed actual execution. No root/GPU/wasm/browser bundle baseline was
+repeated; those inputs and the reviewed core lifecycle remain unchanged. These are Linux
+adapter checks, not installed Codex or Mac/IAB qualification.
+
 ### Packaging (corrected 2026-10-12)
 
 The operator checked draft `1714a58` against the installed Codex plugin-creator 0.1.26
 (`references/plugin-packages.md`). The corrections:
 - **Fixed discovery:** skills come from the `skills/` folder and the MCP server from the root
-  `mcp.json`. That file names the server explicitly as `type: "stdio"`, with
-  `command: "openpaperdesign-mcp"` and `args: []`. It sets no `cwd`: whether `"."` means the
-  plugin folder or the user's workspace is unverified (openai/codex#22842). So the server uses
-  the directory the host starts it in, and refuses that directory as a workspace if it is
-  the plugin folder itself (as it refuses `/` and the home folder).
-  `openpaperdesign_status` shows the workspace actually used. So the portable `plugin.json` has no top-level `skills`, `mcpServers`, `apps` or
-  `interface`.
+  `mcp.json`. It names the server as `type: "stdio"`, command `openpaperdesign-mcp`,
+  with no `cwd`. The original `args: []` relied on host process cwd, whose installed
+  behavior was unverified at that review. The 092 installation later showed plugin-cache
+  cwd and correctly refused creation. The current package uses `args: ["--codex-context"]`
+  and the explicit contract above. `plugin.json` still has no top-level `skills`,
+  `mcpServers`, `apps` or `interface`.
 - **Short description:** `extensions.com.openai.interface.shortDescription` is at most 30
   characters. It is now "Agent + human design canvas" (27).
 - **One manifest:** the `.codex-plugin/plugin.json` overlay was removed. Nothing showed that
@@ -90,9 +160,8 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
   - **Intended:** per the packaging reference, Codex reads `plugin/openpaperdesign/plugin.json`
     (common fields at the top level, Codex presentation in `extensions.com.openai`) and
     discovers `skills/` and `mcp.json` itself.
-  - **Unproven until installed:** whether the operator's Codex actually does so. If it
-    doesn't list the plugin without the overlay, that is a finding to report; don't add the
-    overlay back without a decision.
+  - **Later installed evidence:** on `0921280`, Codex discovered four skills and 33 tools
+    without an overlay. This does not qualify the replacement's editing/browser behavior.
 - **Field limits:** the staged reference (`codex-plugin-packages-0.1.26.md`, checked by the
   B2b review) caps only `shortDescription` (30 characters). `defaultPrompt` and the icon
   fields have rules of their own but aren't set. No other caps apply to the fields set here.
@@ -119,9 +188,9 @@ onlinesourdough) was verified: all 28 files matched their manifest hashes.
 
 These follow the operator's installation contract for the local Codex CLI (operator notes,
 2026-10-12): `codex plugin marketplace add <local-repo> --json` and
-`codex plugin add openpaperdesign@openpaperdesign-local --json`. Installing hasn't been
-attempted yet, and what happens at install time is for the operator to verify: discovery,
-the stdio start, `PATH` and the working directory.
+`codex plugin add openpaperdesign@openpaperdesign-local --json`. Installation and discovery
+passed on `0921280`; its selected-workspace editing attempt failed closed. The current
+candidate requires fresh independent review and exact installed model/browser proof.
 
 ```sh
 # 1. Build the browser editor and install the command (Rust 1.95 + wasm32 target,
@@ -140,16 +209,26 @@ codex plugin marketplace add <checkout> --json
 codex plugin add openpaperdesign@openpaperdesign-local --json
 ```
 
-3. Restart Codex.
-4. Read back and record:
+For an existing 0.1.0 installation, the normal CLI refresh is
+`codex plugin remove openpaperdesign@openpaperdesign-local --json`, then the `plugin add`
+command above, using the reviewed checkout. This removes only this plugin's local cache;
+never edit cached files. Package version remains 0.1.0. Refresh is an operator step and has
+not been run for this candidate.
+
+3. Start a fresh Codex session after the operator's normal plugin reload. Verify the
+   installed MCP args are `["--codex-context"]` and the binary matches the reviewed build.
+4. Use **actual model tool calls** in the selected task workspace, first with ordinary
+   workspace-write permissions. Direct app-server `mcpServer/tool/call` lacks automatic
+   context and is not an installed editing proof. Read back and record:
    - the plugin `openpaperdesign@openpaperdesign-local`, installed and enabled ("Agent + human
      design canvas");
    - its four skills: `openpaperdesign`, `setup`, `design`, `review-design`;
    - the MCP server `openpaperdesign`, started, with `bind_project`, `create_project`,
      `open_editor` and `openpaperdesign_status` among its tools;
-   - `openpaperdesign_status`: `version` 0.1.0, `workspace` (the directory Codex actually
-     started the server in; it must be your project folder, not the plugin folder, see
-     openai/codex#22842), `workspace_usable` true, `"browser_editor": "built in"`;
+   - `openpaperdesign_status`: `version` 0.1.0, intended canonical `workspace`,
+     `workspace_source: codex/sandbox-state-meta`, `workspace_state: pinned`,
+     `workspace_permission_mode: managed-workspace-write`, `workspace_usable: true`,
+     and `browser_editor: built in`;
    - that the `PATH` Codex used found `~/.cargo/bin`;
    - that no file containing the token appears in the workspace or the Codex config.
 5. Fixture (a task-owned synthetic project only), in that workspace:
@@ -169,6 +248,9 @@ codex plugin add openpaperdesign@openpaperdesign-local --json
      until forced;
    - shutdown: quitting the session stops the editor server (the tab can't save any more).
 
+   Also check one actual model status call under the operator's unchanged existing
+   `disabled` profile: `workspace_permission_mode: host-sandbox-disabled`, same scope
+   guards. This does not authorize changing permissions to make a test pass.
    Don't paste the token URL into reports.
 
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, Python 3)
@@ -292,23 +374,20 @@ scoped loopback access was then approved and those tests ran. No root/GPU/wasm/p
 baseline was repeated; their inputs are unchanged. The README addition only prepends a
 fork/setup entry; the upstream text below it is preserved byte-for-byte.
 
-The replacement candidate needs fresh independent review and exact-candidate Mac lifecycle
-proof. The operator has prepared the installed-plugin/in-app-browser probe but has not run
-it; installation and browser editing/save/conflict/reopen remain unverified.
+At that lifecycle handoff, fresh independent review, Mac lifecycle and installed-plugin/IAB
+proof were pending. Later `0921280` installation/discovery passed; workspace editing failed
+closed as recorded below. The current workspace-context replacement still awaits its own
+independent review and installed model/IAB editing/save/conflict/reopen proof.
 
 ## Not proven
 
-- **Codex itself:** the plugin tests are source-only checks. They cover the forbidden
-  top-level keys, the 30-character cap, `mcp.json` with its one stdio entry, every `./` path
-  existing, and the marketplace path resolving to this folder inside the repository. Nothing
-  here proves that Codex discovers, installs or enables the plugin, or reads only
-  `plugin.json`. Nor that it starts the stdio server: whether `openpaperdesign-mcp` is on the
-  `PATH` Codex uses, and which directory Codex starts it in (with no `cwd` set;
-  openai/codex#22842), are unverified. `openpaperdesign_status` reports the workspace that
-  was actually used.
+- **Replacement in Codex:** installation/discovery on `0921280` passed. The separate no-op
+  diagnostics prove host context delivery, not this adapter's installed behavior. The
+  current replacement's real model edit/create and browser integration are pending.
 - **Opening the editor:** opening the `open_editor` URL in the in-app browser from a skill
   hasn't been tried.
 - **Embedding:** the historical `b846b8a` Mac binary/doctor evidence is recorded above.
-  Fresh replacement-binary proof and installation remain the operator's to run.
+  The 092 installed binary also matched its reviewed release. Fresh replacement-binary
+  proof and installed model/browser qualification remain the operator's to run.
 - **Browser behaviour:** everything listed as unproven in the B1 and B2a records still
   applies (for example agent + browser editing in a real browser).

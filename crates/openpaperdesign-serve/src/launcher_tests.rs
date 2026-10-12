@@ -93,11 +93,34 @@ async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
         .expect("test timed out")
 }
 
-type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+#[path = "../tests/support/codex_context.rs"]
+mod context;
+struct Client {
+    peer: rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    meta: RequestMetaObject,
+}
+async fn connect_launcher(
+    l: Launcher,
+    meta: RequestMetaObject,
+) -> (Arc<Client>, tokio::task::JoinHandle<()>) {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(async move {
+        l.serve(server).await.unwrap().waiting().await.unwrap();
+    });
+    let c = Arc::new(Client {
+        peer: ().serve(client).await.unwrap(),
+        meta,
+    });
+    (c, task)
+}
 async fn call(c: &Client, name: &str, args: Value) -> ToolResult {
+    call_meta(c, name, args, c.meta.clone()).await
+}
+async fn call_meta(c: &Client, name: &str, args: Value, meta: RequestMetaObject) -> ToolResult {
     let mut p = CallToolRequestParams::new(name.to_string());
     p.arguments = args.as_object().cloned();
-    let r = bounded(c.call_tool(p)).await.unwrap();
+    p.meta = Some(meta);
+    let r = bounded(c.peer.call_tool(p)).await.unwrap();
     let texts: Vec<String> = r
         .content
         .iter()
@@ -163,6 +186,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_context(false).await
+    }
+    async fn with_context(host: bool) -> Self {
         use std::hash::{BuildHasher, RandomState};
         // Match the launcher's canonical paths before deriving project and hook paths.
         // macOS temp_dir() can name an alias (e.g. /var rather than /private/var).
@@ -175,26 +201,18 @@ impl Fixture {
             .create("X")
             .unwrap();
         let page = x.manifest.pages[0].id.clone();
-        let l = Launcher {
-            workspace: ws.canonicalize().unwrap(),
-            workspace_id: identity(&std::fs::metadata(&ws).unwrap()),
-            bound: Default::default(),
-            session: crate::agent::new_session(),
-        };
-        // The same rmcp async-read/write transport and ServerHandler as process stdio,
-        // backed here by duplex streams so deterministic worker gates remain test-only.
-        let (client, server) = tokio::io::duplex(1 << 20);
-        let handler = l.clone();
-        let task = tokio::spawn(async move {
-            handler
-                .serve(server)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
+        let l = Launcher::new(if host {
+            None
+        } else {
+            Some(Workspace::new(&ws, "process cwd").unwrap())
         });
-        let c = Arc::new(().serve(client).await.unwrap());
+        let meta = if host {
+            context::writable(&ws)
+        } else {
+            Default::default()
+        };
+        // Real rmcp stream protocol; only the transport/listener is in memory.
+        let (c, task) = connect_launcher(l.clone(), meta).await;
         call(&c, "bind_project", json!({"path": "design/X"}))
             .await
             .unwrap();
@@ -219,7 +237,7 @@ impl Fixture {
             .unwrap();
         let port = port.parse().unwrap();
         let token = token.to_string();
-        let old = l.bound.lock().await.as_ref().unwrap().server.clone();
+        let old = l.state.lock().await.bound.as_ref().unwrap().server.clone();
         assert!(
             call(&c, "bind_project", json!({"path": "design/Y"}))
                 .await
@@ -247,9 +265,10 @@ impl Fixture {
     }
     async fn finish(&self) {
         self.l
-            .bound
+            .state
             .lock()
             .await
+            .bound
             .as_ref()
             .unwrap()
             .server
@@ -369,8 +388,8 @@ async fn http_call(port: u16, token: &str, sid: &str, name: &str, args: Value) -
 
 /// The two round-3 failures, each through HTTP and the concurrent stdio handler. A second
 /// MCP call and a browser save are queued before retirement; neither may write afterward.
-async fn overlap(use_http: bool, accepted: bool) {
-    let f = Fixture::new().await;
+async fn overlap(use_http: bool, accepted: bool, downgrade: bool) {
+    let f = Fixture::with_context(downgrade).await;
     let sid = http_session(&f, accepted).await;
     if !use_http && !accepted {
         // Make the stdio session stale via a real browser save; HTTP uses an unread session.
@@ -438,8 +457,19 @@ async fn overlap(use_http: bool, accepted: bool) {
         tokio::spawn(async move { http(port, &token, "PUT", &page_path, &extra, &body).await });
     browser_point.reached().await;
     let c = f.c.clone();
+    let revoked = context::readonly(&f.ws);
     let switch = tokio::spawn(async move {
-        call(&c, "bind_project", json!({"path":"design/Y","force":true})).await
+        if downgrade {
+            call_meta(
+                &c,
+                "bind_project",
+                json!({"path":"design/Y","force":true}),
+                revoked,
+            )
+            .await
+        } else {
+            call(&c, "bind_project", json!({"path":"design/Y","force":true})).await
+        }
     });
     bounded(f.old.lifecycle.retiring.notified()).await;
     assert!(
@@ -492,17 +522,46 @@ async fn overlap(use_http: bool, accepted: bool) {
             .contains("retired")
     );
     assert_eq!(bounded(browser).await.unwrap().0, 503);
-    bounded(switch).await.unwrap().unwrap();
+    let switch_result = bounded(switch).await.unwrap();
+    let fresh;
+    let fresh_task;
+    let live = if downgrade {
+        assert!(switch_result.unwrap_err().contains("retired"));
+        assert!(
+            call(&f.c, "write_html", insertion(&f.frame))
+                .await
+                .unwrap_err()
+                .contains("retired")
+        );
+        assert_eq!(
+            value(call(&f.c, "openpaperdesign_status", json!({})).await)["workspace_state"],
+            "retired"
+        );
+        // Reconnection is a new one-workspace launcher after the old one retired.
+        let l = Launcher::new(None);
+        let (c, task) = connect_launcher(l.clone(), context::writable(&f.ws)).await;
+        call(&c, "bind_project", json!({"path":"design/Y"}))
+            .await
+            .unwrap();
+        fresh = Some((l, c));
+        fresh_task = Some(task);
+        &fresh.as_ref().unwrap().1
+    } else {
+        switch_result.unwrap();
+        fresh = None;
+        fresh_task = None;
+        &f.c
+    };
     let old_bytes = f.bytes();
     call(
-        &f.c,
+        live,
         "get_tree_summary",
         json!({"nodeId":"root","pageId":f.page}),
     )
     .await
     .unwrap();
     assert_eq!(
-        width(&f.c, &f.frame).await,
+        width(live, &f.frame).await,
         300.0,
         "Y never inherits X's rollback entries"
     );
@@ -529,31 +588,178 @@ async fn overlap(use_http: bool, accepted: bool) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(f.bytes(), old_bytes);
-    assert_eq!(width(&f.c, &f.frame).await, 300.0);
+    assert_eq!(width(live, &f.frame).await, 300.0);
     eprintln!(
         "{} {}: X {}, Y 300; queued MCP/browser and late handles refused",
         if use_http { "HTTP" } else { "stdio protocol" },
         if accepted { "accepted" } else { "refused" },
         if accepted { "child 0" } else { "unchanged" }
     );
-    f.finish().await;
+    if let Some((l, _)) = fresh {
+        l.state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .unwrap()
+            .server
+            .retire()
+            .await;
+        fresh_task.unwrap().abort();
+    } else {
+        f.finish().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_http_refused_rollback_is_drained() {
-    overlap(true, false).await;
+    overlap(true, false, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_http_started_insert_keeps_geometry() {
-    overlap(true, true).await;
+    overlap(true, true, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_stdio_refused_rollback_is_drained() {
-    overlap(false, false).await;
+    overlap(false, false, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_stdio_started_insert_keeps_geometry() {
-    overlap(false, true).await;
+    overlap(false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_downgrade_drains_http_rollback_and_fences_browser() {
+    overlap(true, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_downgrade_drains_stdio_insertion_and_fences_browser() {
+    overlap(false, true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_invalidation_survives_cancellation_and_never_revives() {
+    let f = Fixture::with_context(true).await;
+    assert_eq!(
+        value(
+            call_meta(
+                &f.c,
+                "openpaperdesign_status",
+                json!({}),
+                context::disabled(&f.ws)
+            )
+            .await
+        )["workspace_permission_mode"],
+        "host-sandbox-disabled"
+    );
+    let mut snapshot = Point::arm(&f.x.dir, "snapshot", true);
+    let c = f.c.clone();
+    let args = insertion(&f.frame);
+    let running = tokio::spawn(async move { call(&c, "write_html", args).await });
+    snapshot.reached().await;
+    let l = f.l.clone();
+    let retire =
+        tokio::spawn(async move { l.run("open_editor", json!({}), &Default::default()).await });
+    bounded(f.old.lifecycle.retiring.notified()).await;
+    retire.abort();
+    assert!(retire.await.unwrap_err().is_cancelled());
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    let s = value(call(&f.c, "openpaperdesign_status", json!({})).await);
+    assert_eq!(s["workspace_state"], "retired");
+    assert!(s["bound_project"].is_null());
+    let before = f.bytes();
+    assert!(
+        call(&f.c, "create_project", json!({"name":"Late"}))
+            .await
+            .is_err()
+    );
+    assert!(!f.ws.join("design/Late").exists());
+    assert!(
+        f.old
+            .call_tool(f.l.session, "write_html", insertion(&f.frame))
+            .await
+            .is_err()
+    );
+    assert_eq!(f.bytes(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_concurrent_initial_roots_cannot_cross_bind() {
+    let f = Fixture::new().await;
+    f.finish().await;
+    let other = f.ws.join("other-workspace");
+    std::fs::create_dir(&other).unwrap();
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    let a = call_meta(
+        &c,
+        "create_project",
+        json!({"name":"First"}),
+        context::writable(&f.ws),
+    );
+    let b = call_meta(
+        &c,
+        "create_project",
+        json!({"name":"Second"}),
+        context::writable(&other),
+    );
+    let (a, b) = tokio::join!(a, b);
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_ne!(
+        f.ws.join("design/First").exists(),
+        other.join("design/Second").exists()
+    );
+    let state = l.state.lock().await;
+    assert!(state.invalidated.is_some());
+    assert!(state.bound.is_none());
+    drop(state);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_invalidation_serializes_with_an_in_progress_bind() {
+    let f = Fixture::with_context(true).await;
+    let mut snapshot = Point::arm(&f.x.dir, "snapshot", true);
+    let c = f.c.clone();
+    let args = insertion(&f.frame);
+    let running = tokio::spawn(async move { call(&c, "write_html", args).await });
+    snapshot.reached().await;
+    let c = f.c.clone();
+    let switch = tokio::spawn(async move {
+        call(&c, "bind_project", json!({"path":"design/Y","force":true})).await
+    });
+    bounded(f.old.lifecycle.retiring.notified()).await;
+    // The switch owns the launcher state until the old writer drains and Y is
+    // activated. A changed workspace must retire Y too, never race its activation.
+    let c = f.c.clone();
+    let changed = context::disabled(&f.ws.join("design/Y"));
+    let invalidate =
+        tokio::spawn(async move { call_meta(&c, "open_editor", json!({}), changed).await });
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    bounded(switch).await.unwrap().unwrap();
+    assert!(
+        bounded(invalidate)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("retired")
+    );
+    let state = f.l.state.lock().await;
+    assert!(state.bound.is_none());
+    assert!(state.invalidated.is_some());
+    drop(state);
+    assert!(
+        call(
+            &f.c,
+            "bind_project",
+            json!({"path":"design/Y","force":true})
+        )
+        .await
+        .is_err()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -582,8 +788,8 @@ async fn lifecycle_failed_and_same_bind_preserve_identity_and_layout() {
             .contains("already bound")
     );
     {
-        let bound = f.l.bound.lock().await;
-        let b = bound.as_ref().unwrap();
+        let bound = f.l.state.lock().await;
+        let b = bound.bound.as_ref().unwrap();
         assert!(Arc::ptr_eq(&b.server, &f.old));
         assert_eq!((b.port, &b.token), (f.port, &f.token));
         assert!(!b.task.is_finished());
@@ -608,16 +814,23 @@ async fn lifecycle_cancelled_bind_waiter_still_completes_handoff() {
     snapshot.reached().await;
     let l = f.l.clone();
     let switch = tokio::spawn(async move {
-        l.run("bind_project", json!({"path":"design/Y","force":true}))
-            .await
+        l.run(
+            "bind_project",
+            json!({"path":"design/Y","force":true}),
+            &Default::default(),
+        )
+        .await
     });
     bounded(f.old.lifecycle.retiring.notified()).await;
     switch.abort();
     assert!(switch.await.unwrap_err().is_cancelled());
     snapshot.resume();
     bounded(running).await.unwrap().unwrap();
-    let b = bounded(f.l.bound.lock()).await;
-    assert_eq!(b.as_ref().unwrap().server.dir(), f.ws.join("design/Y"));
+    let b = bounded(f.l.state.lock()).await;
+    assert_eq!(
+        b.bound.as_ref().unwrap().server.dir(),
+        f.ws.join("design/Y")
+    );
     drop(b);
     call(
         &f.c,

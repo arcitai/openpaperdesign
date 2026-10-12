@@ -7,12 +7,18 @@ metadata:
 
 # openpaperdesign editor
 
+Workspace contract updated 2026-10-13 (Codex 0.162.1 experimental support).
+
 An editable design canvas (paper-rs) for one project in this workspace. You edit through the
 `openpaperdesign` MCP tools; the person edits the same project in the in-app browser. Both
 see each other's changes live.
 
 1. **Check setup.** Call `openpaperdesign_status`. If the tools are missing or the browser
    editor is "not built", use the [setup skill](../setup/SKILL.md) and say what is missing.
+   Require `workspace_usable: true` and the intended `workspace`. The packaged server uses
+   host-generated context on real model tool calls, not its plugin-folder cwd or tool
+   arguments. If unusable, report `workspace_problem` and stop; do not invent metadata,
+   change permissions, or bypass the refusal with another route.
 2. **Bind deliberately.** Nothing is open until you bind. Use `bind_project` with an existing
    project folder inside the workspace (a folder with `project.json`, usually under
    `design/`), or `create_project` for a new one under `design/<name>/`. If several projects
@@ -46,6 +52,12 @@ Limits (state them when relevant):
 
 - One bound project per session, inside this workspace only. Export, project creation
   outside `design/` and other projects are refused.
+- Only the observed managed workspace-write profile and exact host `disabled` profile
+  are supported. Read-only/unknown profiles cannot bind or open a writable browser.
+  `disabled` never disables plugin scope checks. Missing/changed context after pinning
+  retires the session and its browser server; use a fresh supported session. Checks happen
+  on tool calls, so idle host permission changes are not detected instantly. This adapter
+  does not provide OS sandboxing. Protected metadata paths remain off limits.
 - Images must be `data:` URIs in HTML `<img>` or CSS; local file paths are refused, and
   inline `<svg>` may not contain `<image>`.
 - A native paper-rs app editing the same project at the same time is not protected.
