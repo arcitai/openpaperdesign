@@ -264,6 +264,11 @@ pub(crate) fn check_project_dir(dir: &Path) -> Result<(), String> {
 
 /// A page id that can safely name a file under `pages/`: `[A-Za-z0-9_-]{1,64}` (no
 /// separators, dots or absolute paths). Upstream ids are 16 hex digits.
+/// A page id's node-id prefix (upstream `<first six characters>:<n>`), case-folded.
+pub(crate) fn page_prefix(id: &str) -> String {
+    id.chars().take(6).collect::<String>().to_ascii_lowercase()
+}
+
 pub(crate) fn valid_page_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -283,6 +288,7 @@ pub(crate) fn read_manifest_checked(dir: &Path) -> Result<Manifest, String> {
         .map_err(|e| e.to_string())
         .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
+    let mut prefixes = std::collections::HashSet::new();
     for p in &m.pages {
         if !valid_page_id(&p.id) {
             return Err(format!("{MANIFEST} lists an unsafe page id {:?}", p.id));
@@ -292,6 +298,15 @@ pub(crate) fn read_manifest_checked(dir: &Path) -> Result<Manifest, String> {
         if !seen.insert(p.id.to_ascii_lowercase()) {
             return Err(format!(
                 "{MANIFEST} lists page id {:?} twice (page ids must differ in more than case)",
+                p.id
+            ));
+        }
+        // Node ids name their page by its first six characters (`<prefix>:<n>`), so two
+        // pages sharing them would be ambiguous to every tool.
+        if !prefixes.insert(page_prefix(&p.id)) {
+            return Err(format!(
+                "{MANIFEST} lists page id {:?}, whose first six characters (ignoring case) \
+                 are another page's; node ids couldn't tell the pages apart",
                 p.id
             ));
         }

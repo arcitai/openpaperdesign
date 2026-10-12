@@ -35,7 +35,8 @@
 //! Anything else is refused before upstream code runs, so no local path is ever read.
 
 use crate::{
-    ASSETS, Kind, check_project_dir, check_root, etag, plain, read_manifest_checked, valid_page_id,
+    ASSETS, Kind, check_project_dir, check_root, etag, page_prefix, plain, read_manifest_checked,
+    valid_page_id,
 };
 use paper_rs::editor::Editor;
 use paper_rs::mcp::html::{self, Html};
@@ -286,15 +287,11 @@ const MANIFEST_KEY: &str = "\0manifest";
 /// maps, observed and checked as one item.
 const PAGES_KEY: &str = "\0pages";
 
+/// The page list's revision: the hash of a canonical JSON array of `[id, name]` pairs, so
+/// no two different lists share an encoding (whatever characters names contain).
 fn pages_rev<'a>(pages: impl Iterator<Item = (&'a str, &'a str)>) -> String {
-    let mut b = Vec::new();
-    for (id, name) in pages {
-        b.extend_from_slice(id.as_bytes());
-        b.push(0);
-        b.extend_from_slice(name.as_bytes());
-        b.push(b'\n');
-    }
-    etag(&b)
+    let list: Vec<[&str; 2]> = pages.map(|(id, name)| [id, name]).collect();
+    etag(&serde_json::to_vec(&list).expect("strings serialize"))
 }
 
 /// A listed page that has no file yet: still a page whose content can be stale.
@@ -475,6 +472,17 @@ impl BoundHost {
                 dup.id
             ));
         }
+        let mut prefixes = std::collections::HashSet::new();
+        if let Some(dup) = ed
+            .pages
+            .iter()
+            .find(|p| !prefixes.insert(page_prefix(&p.id)))
+        {
+            return Err(format!(
+                "refusing to save: page id {:?} shares its first six characters with another",
+                dup.id
+            ));
+        }
         for &i in &dirty {
             let data = ed.page_data(i);
             plain(&self.project.page_path(&data.id), Kind::File)?;
@@ -622,8 +630,9 @@ fn stale_change(
 /// What a successful read call returned, as revision keys: the pages whose content or state
 /// it returned (resolved like upstream: `pageId`, else the page the user is viewing; node
 /// keys `<page prefix>:<n>` name their own page), and the page list for `get_basic_info`.
-/// Calls that can't be attributed to specific pages (an unscoped search, guides, fonts,
-/// selection changes, ...) return nothing here, so they acknowledge nothing.
+/// Calls that can't be attributed to specific pages, or that return matches or a selection
+/// rather than a page's content (`find_nodes`, `get_selection`, guides, fonts, ...), return
+/// nothing here, so they acknowledge nothing. See also `returned`.
 fn read_keys(ed: &Editor, name: &str, args: &Value) -> Vec<String> {
     let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim);
     let find = |key: &str| -> Option<usize> {
@@ -658,7 +667,6 @@ fn read_keys(ed: &Editor, name: &str, args: &Value) -> Vec<String> {
     };
     let pages: Vec<Option<usize>> = match name {
         "get_basic_info" => vec![default],
-        "get_selection" => vec![Some(ed.active_page)],
         "get_node_info" | "get_jsx" | "get_fill_image" => vec![s("nodeId").and_then(node)],
         "get_children" | "get_tree_summary" | "get_screenshot" => vec![root_or_node(s("nodeId"))],
         "get_computed_styles" => match args.get("nodeIds").and_then(Value::as_array) {
@@ -670,12 +678,6 @@ fn read_keys(ed: &Editor, name: &str, args: &Value) -> Vec<String> {
                     _ => None,
                 })
                 .collect(),
-            None => vec![None],
-        },
-        "find_nodes" => match s("nodeId").filter(|k| !k.is_empty()) {
-            Some(k) => vec![node(k)],
-            None if s("pageId").is_some() => vec![default],
-            // Searching every page returns matches, not any one page's state.
             None => vec![None],
         },
         _ => vec![None],
@@ -694,6 +696,27 @@ fn read_keys(ed: &Editor, name: &str, args: &Value) -> Vec<String> {
     keys
 }
 
+/// Whether a successful read's output really contains page `key`, for tools whose output
+/// can leave a requested page out: `get_computed_styles` answers with one map keyed by node
+/// id, so a page counts only if one of its node ids is a key there.
+fn returned(name: &str, out: &[paper_rs::mcp::Out], key: &str) -> bool {
+    if name != "get_computed_styles" || key.starts_with('\0') {
+        return true;
+    }
+    let prefix = page_prefix(key);
+    out.iter().any(|o| match o {
+        paper_rs::mcp::Out::Text(t) => serde_json::from_str::<Map<String, Value>>(t)
+            .map(|m| {
+                m.keys().any(|k| {
+                    k.split_once(':')
+                        .is_some_and(|(p, _)| p.to_ascii_lowercase() == prefix)
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
 /// One tool call on the host thread, with the write lock held by the caller.
 pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) -> ToolResult {
     let dir = host.project.dir.clone();
@@ -709,7 +732,9 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
     let args = check_call(name, &args, &host.bound())?;
     // Worked out before the call, on the pages as they are; used only if it succeeds.
     let reads = read_keys(&host.ed, name, &args);
-    let r = match name {
+    // Nothing reaches the disk during the call (`Host::save` is a no-op, export and file
+    // creation are refused): changes are saved below, only after a successful result.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
         "list_resources" => list_resources(host),
         "open_file" => {
             // Upstream resolves an absolute project path itself: hand it only ours.
@@ -718,7 +743,15 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
             exec::call(host, name, &Value::Object(a))
         }
         _ => exec::call(host, name, &args),
-    };
+    }))
+    .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")));
+    if r.is_err() {
+        // A call that fails changes nothing: drop whatever it changed in memory (the editor
+        // was in step with the disk before the call, so reloading restores it), save
+        // nothing and acknowledge nothing.
+        host.load()?;
+        return r;
+    }
     if let Some(s) = session
         && let Some(why) = stale_change(host, s, &before)
     {
@@ -732,6 +765,10 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         ));
     }
     let saved = host.save_changes();
+    if saved.is_err() {
+        // Not saved: drop the call's changes, as for a failed call.
+        host.load()?;
+    }
     // Only a call that succeeded acknowledges anything: a failed or refused call, or a
     // failed save, leaves what the session has observed as it was.
     if let Some(s) = session
@@ -745,7 +782,8 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         let seen = host.seen.entry(s).or_default();
         if before == host.known {
             // Nothing written: acknowledge exactly the pages (and page list) it returned.
-            for k in &reads {
+            let out = r.as_deref().unwrap_or(&[]);
+            for k in reads.iter().filter(|k| returned(name, out, k)) {
                 if let Some(v) = host.known.get(k) {
                     seen.insert(k.clone(), v.clone());
                 }

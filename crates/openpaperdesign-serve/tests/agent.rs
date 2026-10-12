@@ -972,6 +972,152 @@ async fn unattributable_reads_acknowledge_nothing() {
     c.cancel().await.unwrap();
 }
 
+fn node_id(out: &str) -> String {
+    serde_json::from_str::<Value>(out).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Review round 4: a call that returns an error changes nothing, in memory or on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_call_changes_nothing() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read(&c).await;
+    read_page(&c, &a).await;
+    read_page(&c, &b).await;
+    // Page A: the rectangle, a text layer and a frame.
+    let rect_a = first_node(&p, &a);
+    let rect_b = first_node(&p, &b);
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "text", "x": 0, "y": 300, "width": 80, "height": 20, "text": "Original", "pageId": a}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let text_a = node_id(&out);
+    let (ok, out) = call(
+        &c,
+        "create_artboard",
+        json!({"name": "Frame", "pageId": a, "styles": {"left": "500px", "top": "0px", "width": "100px", "height": "100px"}}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let frame_a = node_id(&out);
+
+    let cases = [
+        // The first rename is valid, the second page doesn't exist.
+        (
+            "rename_pages",
+            json!({"updates": [{"pageId": a, "name": "Partial rename"}, {"pageId": "missing-page", "name": "Never"}]}),
+        ),
+        // The first move is valid, the second crosses pages (refused upstream).
+        (
+            "move_nodes",
+            json!({"moves": [{"nodeId": rect_a, "parentId": frame_a}, {"nodeId": rect_b, "parentId": frame_a}]}),
+        ),
+        // The first text change is valid, the second targets a rectangle.
+        (
+            "set_text_content",
+            json!({"updates": [{"nodeId": text_a, "textContent": "PARTIAL REPLACEMENT"}, {"nodeId": rect_b, "textContent": "x"}]}),
+        ),
+        // Replacing the rectangle with an SVG that has nothing visible fails after the
+        // target was removed.
+        (
+            "write_html",
+            json!({"targetNodeId": rect_a, "mode": "replace", "html": "<svg width='0' height='0'><rect width='10' height='10'/></svg>"}),
+        ),
+    ];
+    for (tool, args) in cases {
+        let disk = (
+            file(&p, &a),
+            file(&p, &b),
+            std::fs::read(p.dir.join("project.json")).unwrap(),
+        );
+        let (ok, out) = call(&c, tool, args).await;
+        assert!(!ok, "{tool} must fail: {out}");
+        assert_eq!(
+            (
+                file(&p, &a),
+                file(&p, &b),
+                std::fs::read(p.dir.join("project.json")).unwrap()
+            ),
+            disk,
+            "{tool}: nothing written"
+        );
+        // And nothing changed in memory: the next calls see the state before the failed one.
+        let (ok, out) = call(&c, "get_basic_info", json!({"pageId": a})).await;
+        assert!(ok && !out.contains("Partial rename"), "{tool}: {out}");
+        let (ok, out) = call(&c, "get_node_info", json!({"nodeId": rect_a})).await;
+        assert!(ok, "{tool}: the rectangle is still there: {out}");
+        let (ok, out) = call(&c, "get_node_info", json!({"nodeId": text_a})).await;
+        assert!(ok && out.contains("Original"), "{tool}: {out}");
+        // A later successful change saves only itself, not the failed call's leftovers.
+        let (ok, out) = call(
+            &c,
+            "update_styles",
+            json!({"updates": [{"nodeIds": [frame_a], "styles": {"opacity": "0.9"}}]}),
+        )
+        .await;
+        assert!(ok, "{tool}: {out}");
+        let d = doc(&p, &a);
+        let rect =
+            &d.nodes[&paper_rs::model::NodeId(rect_a.split(':').nth(1).unwrap().parse().unwrap())];
+        assert_eq!(rect.parent, None, "{tool}: the rectangle wasn't moved");
+        assert_eq!(page_names(&p), ["Page 1", "B"], "{tool}");
+    }
+    c.cancel().await.unwrap();
+}
+
+/// Review round 4: the page list's revision can't collide whatever the names contain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_list_revisions_are_unambiguous() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    // The reviewer's names: under the old encoding both lists below hashed the same.
+    let path = p.dir.join("project.json");
+    let mut m = manifest(&p);
+    m["pages"][0]["name"] = json!(format!("x\n{b}\0y"));
+    m["pages"][1]["name"] = json!("z");
+    std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+    let stale = client(r.port).await;
+    read(&stale).await;
+    // A session that never read the list can't rename to the colliding list.
+    let blind = client(r.port).await;
+    let before = std::fs::read(&path).unwrap();
+    let (ok, out) = call(
+        &blind,
+        "rename_pages",
+        json!({"updates": [{"pageId": a, "name": "x"}, {"pageId": b, "name": format!("y\n{b}\0z")}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    // Someone else renames to the colliding list; the session that read before is stale.
+    read(&blind).await;
+    let (ok, out) = call(
+        &blind,
+        "rename_pages",
+        json!({"updates": [{"pageId": a, "name": "x"}, {"pageId": b, "name": format!("y\n{b}\0z")}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let after = std::fs::read(&path).unwrap();
+    let (ok, out) = call(
+        &stale,
+        "rename_pages",
+        json!({"updates": [{"pageId": b, "name": "stale overwrote name"}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(std::fs::read(&path).unwrap(), after);
+    stale.cancel().await.unwrap();
+    blind.cancel().await.unwrap();
+}
+
 fn set_manifest_pages(p: &Project, pages: Value) {
     let path = p.dir.join("project.json");
     let mut m: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1072,6 +1218,40 @@ async fn page_ids_differing_only_in_case_are_refused() {
         json!({"type": "rectangle", "x": 0, "y": 0, "width": 5, "height": 5}),
     )
     .await;
+    assert!(ok, "{out}");
+    c.cancel().await.unwrap();
+}
+
+/// Review round 4: node ids name their page by its first six characters, so page ids that
+/// share them (ignoring case) are refused before anything is read or written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_ids_sharing_their_first_six_characters_are_refused() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let mut data = page_from_json(&String::from_utf8(file(&p, &page)).unwrap()).unwrap();
+    for (one, two) in [("abcdef-A", "abcdef-B"), ("abcdef-A", "ABCDEF-B")] {
+        for id in [one, two] {
+            data.id = id.into();
+            std::fs::write(p.page_path(id), page_to_json(&data)).unwrap();
+        }
+        set_manifest_pages(
+            &p,
+            json!([{"id": one, "name": "A"}, {"id": two, "name": "B"}]),
+        );
+        let e = open_error(&p.dir);
+        assert!(e.contains("first six characters"), "{one}/{two}: {e}");
+    }
+    // Ids that differ within their first six characters are fine.
+    set_manifest_pages(
+        &p,
+        json!([{"id": "abcdef-A", "name": "A"}, {"id": "abcdeg-B", "name": "B"}]),
+    );
+    data.id = "abcdeg-B".into();
+    std::fs::write(p.page_path("abcdeg-B"), page_to_json(&data)).unwrap();
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    read_page(&c, "abcdeg-B").await;
+    let (ok, out) = call(&c, "create_shape", shape_on("abcdeg-B")).await;
     assert!(ok, "{out}");
     c.cancel().await.unwrap();
 }
