@@ -5,12 +5,15 @@ import init, { start } from './openpaperdesign_web.js';
 const SAVE_POLL_MS = 300;
 
 // State for people and for automated checks (read-only from outside).
-const state = { ready: false, backend: null, pageId: null, revision: null, saves: 0,
+const state = { ready: false, backend: null, fallback: null, pageId: null, revision: null, saves: 0,
   saving: false, conflict: false, error: null };
 window.__opd = state;
 
 const $ = (id) => document.getElementById(id);
-const status = (s) => { $('status').textContent = s; };
+// Long text is cut with an ellipsis; the full text is in the tooltip.
+const setText = (el, s) => { el.textContent = s; el.title = s; };
+const status = (s, error = false) => { setText($('status'), s); $('status').classList.toggle('error', error); };
+const renderer = (s, error = false) => { setText($('renderer'), s); $('renderer').classList.toggle('error', error); };
 
 function token() {
   // The URL fragment carries the per-launch token. Keep it for reloads in this tab only and
@@ -38,8 +41,9 @@ function isMac() {
 }
 
 function fail(msg) {
+  state.ready = false;
   state.error = msg;
-  status(msg);
+  status(msg, true);
   console.error(msg);
 }
 
@@ -58,14 +62,34 @@ async function main() {
   $('title').textContent = `${project.name} — ${page.name}`;
   document.title = `${project.name} — openpaperdesign`;
 
-  const canvas = $('canvas');
+  let canvas = $('canvas');
   const rect = () => canvas.getBoundingClientRect();
   const seed = crypto.getRandomValues(new Uint32Array(2));
   const forceWebgl = new URLSearchParams(location.search).get('backend') === 'webgl';
-  const r0 = rect();
-  const ed = await start(canvas, text, page.id, page.name, seed[0], seed[1], isMac(), forceWebgl,
-    r0.width, r0.height, devicePixelRatio);
+  const open = (webgl) => {
+    const r = rect();
+    return start(canvas, text, page.id, page.name, seed[0], seed[1], isMac(), webgl,
+      r.width, r.height, devicePixelRatio);
+  };
+  let ed;
+  try {
+    ed = await open(forceWebgl);
+  } catch (e) {
+    if (forceWebgl) throw e;
+    // WebGPU didn't validate (or start). A canvas that handed out a WebGPU context can't give
+    // a WebGL one, so retry on a fresh canvas, and say so. The error is logged, not hidden.
+    const reason = e && e.message ? e.message : String(e);
+    console.error(`WebGPU failed, falling back to WebGL: ${reason}`);
+    state.fallback = reason;
+    const fresh = canvas.cloneNode(false);
+    canvas.replaceWith(fresh);
+    canvas = fresh;
+    ed = await open(true);
+  }
   state.backend = ed.backend();
+  renderer(state.fallback
+    ? `WebGPU failed: ${state.fallback} — using WebGL (${state.backend})`
+    : `Renderer: ${state.backend}`, Boolean(state.fallback));
   window.__opdEditor = ed;
 
   // ---- input
@@ -154,13 +178,17 @@ async function main() {
 
   const frame = (t) => {
     ed.frame(t);
+    const gpuError = ed.gpu_error();
+    if (gpuError && !state.error) {
+      fail(`Renderer error: ${gpuError}`);
+      renderer(`Renderer failed: ${gpuError}`, true);
+    }
     syncToolbar();
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
   state.ready = true;
-  status(`Ready · ${state.backend}`);
-  $('footer').append(` · Renderer: ${state.backend}`);
+  status('Ready');
   canvas.focus();
 }
 

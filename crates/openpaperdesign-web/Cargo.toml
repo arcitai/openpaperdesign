@@ -34,3 +34,8 @@ wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "console"] }
+
+[dev-dependencies]
+# Same naga as wgpu 30 uses: checks that the upstream canvas shader is valid WGSL
+# (tests/shader.rs). It does not catch the browser's uniformity error; that test is structural.
+naga = { version = "30", features = ["wgsl-in"] }

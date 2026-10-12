@@ -7,24 +7,33 @@
 <style>
   html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; background: #eeeef0; }
   body { display: flex; flex-direction: column; }
-  header { display: flex; gap: 6px; align-items: center; padding: 6px 10px; background: #fff;
-           border-bottom: 1px solid #ddd; }
-  header button { font: inherit; padding: 4px 10px; border: 1px solid #ccc; border-radius: 6px;
-                  background: #fff; cursor: pointer; }
+  /* Fixed-height chrome: status and renderer text never change the canvas size or position. */
+  header { flex: 0 0 40px; box-sizing: border-box; height: 40px; display: flex; flex-wrap: nowrap;
+           gap: 6px; align-items: center; padding: 0 10px; background: #fff;
+           border-bottom: 1px solid #ddd; overflow: hidden; }
+  header button { flex: 0 0 auto; font: inherit; padding: 4px 10px; border: 1px solid #ccc;
+                  border-radius: 6px; background: #fff; cursor: pointer; }
   header button[aria-pressed="true"] { background: #2f6fed; border-color: #2f6fed; color: #fff; }
   header .sep { width: 1px; height: 20px; background: #ddd; margin: 0 4px; }
-  #title { font-weight: 600; margin-right: 8px; }
-  #status { margin-left: auto; color: #555; }
-  #conflict { display: none; padding: 8px 10px; background: #fdecea; color: #8a1c13;
-              border-bottom: 1px solid #f3b8b2; }
+  .clip { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #title { flex: 0 1 auto; font-weight: 600; margin-right: 8px; }
+  #status { flex: 1 1 0; margin-left: 8px; text-align: right; color: #555; }
+  #status.error { color: #b3261e; font-weight: 600; }
+  #stage { flex: 1 1 0; min-height: 0; position: relative; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none;
+            touch-action: none; }
+  /* Over the canvas, not in the flow, so showing it doesn't move the canvas. */
+  #conflict { display: none; position: absolute; top: 0; left: 0; right: 0; padding: 8px 10px;
+              background: #fdecea; color: #8a1c13; border-bottom: 1px solid #f3b8b2; }
   #conflict.show { display: block; }
-  #canvas { flex: 1; width: 100%; min-height: 0; display: block; outline: none; touch-action: none; }
-  footer { padding: 3px 10px; color: #777; font-size: 11px; background: #fff; border-top: 1px solid #ddd; }
+  footer { flex: 0 0 22px; box-sizing: border-box; height: 22px; line-height: 22px; padding: 0 10px;
+           color: #777; font-size: 11px; background: #fff; border-top: 1px solid #ddd; }
+  #renderer.error { color: #b3261e; }
 </style>
 </head>
 <body>
 <header>
-  <span id="title">openpaperdesign</span>
+  <span id="title" class="clip">openpaperdesign</span>
   <button data-tool="select" title="Select (V)">Select</button>
   <button data-tool="hand" title="Hand (H)">Hand</button>
   <button data-tool="rect" title="Rectangle (R)">Rectangle</button>
@@ -33,12 +42,14 @@
   <button data-action="undo" title="Undo">Undo</button>
   <button data-action="redo" title="Redo">Redo</button>
   <button data-action="delete" title="Delete selection">Delete</button>
-  <span id="status">Loading…</span>
+  <span id="status" class="clip">Loading…</span>
 </header>
-<div id="conflict" role="alert"></div>
-<canvas id="canvas" tabindex="0"></canvas>
-<footer id="footer">openpaperdesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL OFL 1.1.
-  Not affiliated with Paper.</footer>
+<div id="stage">
+  <canvas id="canvas" tabindex="0"></canvas>
+  <div id="conflict" role="alert"></div>
+</div>
+<footer id="footer" class="clip">openpaperdesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font:
+  SIL OFL 1.1. Not affiliated with Paper. · <span id="renderer">Renderer: starting…</span></footer>
 <script type="module" src="app.js"></script>
 </body>
 </html>

@@ -13,6 +13,7 @@ use crate::geom::V2;
 use crate::render::gpu::CanvasRenderer;
 use crate::render::scene::{self, SceneCache};
 use crate::state::WebState;
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
@@ -34,6 +35,8 @@ pub struct WebEditor {
     cache: SceneCache,
     gpu: Gpu,
     backend: String,
+    /// First GPU error reported after startup, if any.
+    gpu_error: Arc<Mutex<Option<String>>>,
 }
 
 fn install_panic_hook() {
@@ -102,9 +105,17 @@ pub async fn start(
         })
         .await
         .map_err(|e| js_err(format!("failed to create device: {e}")))?;
-    device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+    // GPU errors outside the startup scope below (later frames): logged and kept, so the
+    // page can show an error state instead of a silently broken canvas.
+    let gpu_error = Arc::new(Mutex::new(None::<String>));
+    let sink = gpu_error.clone();
+    device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
         web_sys::console::error_1(&format!("wgpu: {e}").into());
+        sink.lock().unwrap().get_or_insert_with(|| e.to_string());
     }));
+    // Shader, pipelines, surface setup and the first frame must validate before the page may
+    // say it is ready (browser WebGPU validates WGSL more strictly than native wgpu).
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let caps = surface.get_capabilities(&adapter);
     // Like the native app: blend in gamma space, so prefer a non-sRGB target.
     let format = caps
@@ -145,8 +156,15 @@ pub async fn start(
         cache: SceneCache::default(),
         gpu,
         backend,
+        gpu_error,
     };
     w.resize(css_width, css_height, dpr);
+    w.frame(0.0);
+    if let Some(e) = scope.pop().await {
+        let msg = format!("GPU validation failed on {}: {e}", w.backend);
+        web_sys::console::error_1(&msg.clone().into());
+        return Err(JsError::new(&msg));
+    }
     Ok(w)
 }
 
@@ -167,6 +185,11 @@ impl WebEditor {
         self.backend.clone()
     }
 
+    /// The first GPU error since startup; drawing stops when there is one.
+    pub fn gpu_error(&self) -> Option<String> {
+        self.gpu_error.lock().unwrap().clone()
+    }
+
     pub fn resize(&mut self, css_width: f64, css_height: f64, dpr: f64) {
         let g = &mut self.gpu;
         let max = g.device.limits().max_texture_dimension_2d;
@@ -183,7 +206,7 @@ impl WebEditor {
 
     /// Advance animations and draw if anything changed. Call once per animation frame.
     pub fn frame(&mut self, now_ms: f64) {
-        if !self.state.tick(now_ms) {
+        if !self.state.tick(now_ms) || self.gpu_error.lock().unwrap().is_some() {
             return;
         }
         let g = &mut self.gpu;

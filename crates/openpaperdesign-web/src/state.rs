@@ -111,7 +111,13 @@ impl WebState {
 
     /// Advance time; returns whether a frame should be drawn now.
     pub fn tick(&mut self, now_ms: f64) -> bool {
+        let trail = self.ed.laser.len();
         self.ed.tick(now_ms);
+        // Expired laser points leave the scene: that change needs a frame of its own (after
+        // the last point expires `animating()` is already false). Stays pending until drawn.
+        if self.ed.laser.len() != trail {
+            self.redraw = true;
+        }
         // Requests for app chrome (export, open, palette, rename...) have no handler in this
         // slice; drop them instead of letting them pile up.
         self.ed.requests.clear();
@@ -336,6 +342,48 @@ mod tests {
         assert!(s.tick(40.0), "so the adapter must draw");
         s.drawn();
         assert!(!s.tick(56.0));
+    }
+
+    /// Laser points at world (400, 400) .. (420, 410), drawn at t = 0..20 ms, then a frame.
+    fn with_laser_trail() -> WebState {
+        let mut s = state();
+        s.run(Action::Tool(Tool::Laser));
+        s.pointer_down(400.0, 400.0, Button::Primary, 0.0);
+        s.pointer_move(410.0, 405.0, 10.0);
+        s.pointer_up(420.0, 410.0, Button::Primary, 20.0);
+        assert!(!s.ed.laser.is_empty());
+        assert!(s.tick(100.0));
+        s.drawn();
+        assert!(overlay_vertices(&s) > 0, "trail on screen");
+        s
+    }
+
+    #[test]
+    fn laser_expiry_draws_the_clearing_frame() {
+        let mut s = with_laser_trail();
+        let mut t = 100.0;
+        // Animate frame by frame until the trail is gone; the frame that removes it must draw.
+        while !s.ed.laser.is_empty() {
+            t += 16.0;
+            assert!(s.tick(t), "frame at {t} ms while the trail fades");
+            s.drawn();
+            assert!(t < 5000.0);
+        }
+        assert_eq!(overlay_vertices(&s), 0, "nothing left to draw");
+        assert!(!s.tick(t + 16.0), "idle afterwards");
+    }
+
+    #[test]
+    fn laser_expiry_after_a_long_gap_still_draws() {
+        let mut s = with_laser_trail();
+        // E.g. a background tab: the next frame comes long after every point expired.
+        assert!(s.tick(60_000.0), "the stale trail must be cleared");
+        assert!(s.ed.laser.is_empty());
+        assert_eq!(overlay_vertices(&s), 0);
+        // Not drawn (e.g. the surface was unavailable): still pending on the next frame.
+        assert!(s.tick(60_016.0), "pending until a frame is actually drawn");
+        s.drawn();
+        assert!(!s.tick(60_032.0));
     }
 
     #[test]
