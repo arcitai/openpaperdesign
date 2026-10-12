@@ -211,6 +211,13 @@ steps), 2026-10-12. Run: `cargo fmt --all --check`; serve clippy, 0 warnings; se
 rebind nothing is bound, a switch after `open_editor` needs no force, and a project is
 created inside the plugin folder.
 
+Rebased on the B2a review round 2 fixes (`9c3ba69`, 2026-10-12). An MCP session must read a
+page before it changes it. The launcher's own `get_basic_info` at bind time counts as that
+read for the stdio session, and the skill now says to read first. Inline SVG may not
+contain `<image>`. Re-run after the rebase: serve 4 unit + 13 agent + 5 launcher + 17;
+plugin tests plus the Node CI command; `cargo fmt --all --check`; serve clippy; `git diff
+--check`.
+
 ## Not proven
 
 - **Codex itself:** the plugin tests are source-only checks. They cover the forbidden

@@ -22,9 +22,11 @@ see each other's changes live.
    until you call it again with `force: true`. Ask the person first (let their edits save, or
    confirm losing them), and never pass `force` on your own. The same is true when this
    session ends.
-3. **Edit** with the design tools (`get_basic_info`, `write_html`, `create_shape`,
-   `update_styles`, `move_nodes`, `delete_nodes`, `get_screenshot`, …). Each change is saved
-   to the project at once.
+3. **Read, then edit.** Read the page first (`get_basic_info`, `get_tree_summary` with `nodeId`
+   `"root"`, `get_node_info`): a change to a page you haven't read in this session is refused
+   as a `conflict`. Then edit with the design tools (`write_html`, `create_shape`,
+   `update_styles`, `move_nodes`, `delete_nodes`, `rename_pages`, …). Each change is saved to
+   the project at once.
 4. **Open the canvas.** Call `open_editor` and open the returned
    `http://127.0.0.1:<port>/#token=…` URL in the in-app browser. The token is for this
    session only: don't write it into files or commits.
@@ -32,16 +34,16 @@ see each other's changes live.
    unsaved there. If the person has an unsaved edit while you write the same page, their save
    is refused and the page shows a conflict; nothing is overwritten either way. Let the person
    decide: their "Reload (discard my unsaved change)" shows your version. Prefer to edit
-   after they've saved. If the person saved a page after you last read it, your next change
-   to that page fails with a `conflict` error and nothing is written: read the page again
-   (`get_tree_summary` with `nodeId` `"root"`, `get_node_info`) and redo the change on what
-   is there now.
+   after they've saved. If the page changed after you last read it (the person saved, or it
+   was renamed), your next change to that page fails with a `conflict` error and nothing is
+   written: read the page again and redo the change on what is there now.
 
 Limits (state them when relevant):
 
 - One bound project per session, inside this workspace only. Export, project creation
   outside `design/` and other projects are refused.
-- Images must be `data:` URIs; local file paths are refused.
+- Images must be `data:` URIs in HTML `<img>` or CSS; local file paths are refused, and
+  inline `<svg>` may not contain `<image>`.
 - A native paper-rs app editing the same project at the same time is not protected.
 - Image fills aren't drawn in the browser canvas yet; multi-page editing in the browser is
   limited to the active page.
