@@ -117,7 +117,8 @@ async fn the_stdio_session_must_read_before_it_writes() {
     let (ok, out) = call(&c, "open_editor", json!({})).await;
     if !ok {
         // Built without the editor: no browser to save through.
-        assert!(out.contains("build the web bundle"), "{out}");
+        assert!(out.contains("Build the web bundle"), "{out}");
+        c.cancel().await.unwrap();
         return;
     }
     let (port, token) = editor(&out);
@@ -404,7 +405,7 @@ async fn bind_edit_and_open_the_editor_inside_the_workspace_only() {
         assert_eq!(http_status(port, "/api/project", "wrong").await, 401);
         assert_eq!(http_status(port, "/", "").await, 200, "the page itself");
     } else {
-        assert!(!ok && out.contains("build the web bundle"), "{out}");
+        assert!(!ok && out.contains("Build the web bundle"), "{out}");
     }
     // The token is not written anywhere in the workspace.
     let token_files: Vec<_> = walk(&ws)
