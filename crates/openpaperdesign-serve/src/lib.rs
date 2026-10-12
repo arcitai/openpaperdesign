@@ -262,15 +262,36 @@ pub(crate) fn check_project_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The manifest, read only from a real `project.json`.
+/// A page id that can safely name a file under `pages/`: `[A-Za-z0-9_-]{1,64}` (no
+/// separators, dots or absolute paths). Upstream ids are 16 hex digits.
+pub(crate) fn valid_page_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The manifest, read only from a real `project.json`, with every page id checked (and no
+/// duplicates) before any page is touched.
 pub(crate) fn read_manifest_checked(dir: &Path) -> Result<Manifest, String> {
     let path = dir.join(MANIFEST);
     if !plain(&path, Kind::File)? {
         return Err(format!("{MANIFEST} is missing"));
     }
-    std::fs::read_to_string(&path)
+    let m = std::fs::read_to_string(&path)
         .map_err(|e| e.to_string())
-        .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))
+        .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))?;
+    let mut seen = std::collections::HashSet::new();
+    for p in &m.pages {
+        if !valid_page_id(&p.id) {
+            return Err(format!("{MANIFEST} lists an unsafe page id {:?}", p.id));
+        }
+        if !seen.insert(p.id.as_str()) {
+            return Err(format!("{MANIFEST} lists page id {:?} twice", p.id));
+        }
+    }
+    Ok(m)
 }
 
 fn forbidden(e: String) -> ApiError {
@@ -538,12 +559,7 @@ async fn get_project(State(s): State<Arc<Server>>) -> Response {
 /// The manifest's entry for `id`, or an error response. Ids are checked against the
 /// manifest (and for a plain character set), never used as client-chosen paths.
 fn page_ref(p: &Project, id: &str) -> Result<String, ApiError> {
-    let plain = !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !plain {
+    if !valid_page_id(id) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid page id"));
     }
     p.manifest

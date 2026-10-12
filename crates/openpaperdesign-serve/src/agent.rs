@@ -8,25 +8,35 @@
 //! 1. re-verifies the project root and entries (same checks as every browser request),
 //! 2. reloads the project if any page file or the manifest changed on disk since the host last
 //!    read or wrote it (e.g. a browser save),
-//! 3. applies the policy below, runs the tool, and
-//! 4. saves every changed page atomically through upstream `Project::save_page`, which changes
-//!    that page's revision, so the browser picks the change up.
+//! 3. applies the policy below, runs the tool,
+//! 4. refuses the change (and discards it) if it touches a page whose revision moved since
+//!    this MCP session last read it, e.g. a browser save landed after the agent looked, and
+//! 5. otherwise saves every changed page atomically through upstream `Project::save_page`,
+//!    which changes that page's revision, so the browser picks the change up.
+//!
+//! "Read" in step 4 means any call by the session that changed nothing (a summary, node
+//! info, a screenshot, ...): it records the revisions the session has now seen. A session's
+//! first call counts the revisions at that moment as seen, so a first write is only refused
+//! if another writer saved between that moment and the write (never, within one call).
 //!
 //! Policy: `export` and `export_combined_pdf` are refused (they write files where the agent
 //! says), and so is `create_file`. `list_resources`, `open_file` and any `fileId` argument only
 //! accept the bound project. Image references (`<img src>`, CSS `url(...)`) must be `data:`
 //! URIs, http(s) URLs (never fetched upstream) or ids of assets already loaded (the bound
 //! project's own `assets/`, or images an agent sent as `data:` URIs). Inline `<svg>` must be
-//! well-formed XML whose `href`s and `url(...)`s point inside the SVG (`#id`) or are `data:`
-//! URIs, with no DTD and no `@import`. Anything else is refused before upstream code runs, so
+//! well-formed XML with no DTD and no `@import`; its `<image>`/`<feImage>` hrefs must be
+//! `data:` URIs, and every other `href` or `url(...)` must be `#id` of an element in that SVG. Anything else is refused before upstream code runs, so
 //! no local path is ever read.
 
-use crate::{ASSETS, Kind, check_project_dir, check_root, etag, plain, read_manifest_checked};
+use crate::{
+    ASSETS, Kind, check_project_dir, check_root, etag, plain, read_manifest_checked, valid_page_id,
+};
 use paper_rs::editor::Editor;
 use paper_rs::mcp::html::{self, Html};
 use paper_rs::mcp::server::{to_result, tool_list};
 use paper_rs::mcp::{Call, ToolResult, exec, tools};
-use paper_rs::project::{PageRef, Project, Store, now_ms};
+use paper_rs::project::format::page_from_json;
+use paper_rs::project::{PAGES_DIR, PageData, PageRef, Project, Store, now_ms};
 use paper_rs::render::gpu::Headless;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
@@ -120,24 +130,44 @@ fn check_svg(raw: &str) -> Result<(), String> {
     }
     let doc = roxmltree::Document::parse(raw)
         .map_err(|e| format!("inline SVG must be well-formed XML ({e})"))?;
-    let local = |v: &str| v.trim_start().starts_with('#') || v.trim_start().starts_with("data:");
+    let ids: std::collections::HashSet<&str> = doc
+        .descendants()
+        .filter_map(|n| n.attribute("id"))
+        .collect();
+    // `#id` must name an element of this same SVG. Images never take `#…`: usvg resolves an
+    // image href such as `#private.png` as a file name.
+    let internal = |v: &str| {
+        v.trim()
+            .strip_prefix('#')
+            .is_some_and(|id| !id.is_empty() && ids.contains(id))
+    };
     for n in doc.descendants() {
+        let tag = n.tag_name().name();
+        let image = tag.eq_ignore_ascii_case("image") || tag.eq_ignore_ascii_case("feimage");
         for a in n.attributes() {
-            if a.name() == "href" && !local(a.value()) {
-                return Err(format!(
-                    "inline SVG reference `{}` refused: only #id and data: URIs are allowed",
-                    a.value()
-                ));
+            if a.name() == "href" {
+                let v = a.value().trim();
+                if image && !v.starts_with("data:") {
+                    return Err(format!(
+                        "inline SVG <{tag}> href `{v}` refused: images must be data: URIs"
+                    ));
+                }
+                if !image && !internal(v) {
+                    return Err(format!(
+                        "inline SVG reference `{v}` refused: only #id of an element in the same \
+                         SVG is allowed"
+                    ));
+                }
             }
             for u in css_urls(a.value()) {
-                if !local(&u) {
+                if !internal(&u) {
                     return Err(format!("inline SVG url({u}) refused"));
                 }
             }
         }
         if let Some(t) = n.text() {
             for u in css_urls(t) {
-                if !local(&u) {
+                if !internal(&u) {
                     return Err(format!("inline SVG url({u}) refused"));
                 }
             }
@@ -242,25 +272,62 @@ pub struct BoundHost {
     store: Store,
     /// Revision of each page file (and of the manifest) as the editor last read or wrote it.
     known: HashMap<String, String>,
+    /// Page revisions each MCP session last saw (see the module docs, step 4).
+    seen: std::collections::BTreeMap<u64, HashMap<String, String>>,
     gpu: Option<Headless>,
     gpu_tried: bool,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
 
-fn disk_revisions(project: &Project) -> Result<HashMap<String, String>, String> {
-    let mut out = HashMap::new();
+/// Argument key the MCP handler sets to its session number (overwriting any client value);
+/// stripped before the call is checked or run.
+pub const SESSION_ARG: &str = "_openpaperdesignSession";
+/// Sessions whose seen revisions are remembered; the oldest is forgotten beyond this.
+const MAX_SESSIONS: usize = 256;
+
+/// The project's pages, read safely: ids come from the checked manifest, and `pages/` and each
+/// page file are checked (no links, a single hard link) before any byte is read. Each page
+/// takes its id from its manifest entry. Also returns the
+/// revision of each page file (from the same bytes) and of the manifest.
+fn read_pages(project: &Project) -> Result<(Vec<PageData>, HashMap<String, String>), String> {
+    let mut revs = HashMap::new();
     let m = std::fs::read(project.dir.join(paper_rs::project::MANIFEST))
         .map_err(|e| format!("project.json: {e}"))?;
-    out.insert(MANIFEST_KEY.to_string(), etag(&m));
+    revs.insert(MANIFEST_KEY.to_string(), etag(&m));
+    let have_dir = plain(&project.dir.join(PAGES_DIR), Kind::Dir)?;
+    let mut pages = Vec::new();
     for r in &project.manifest.pages {
-        let path = project.page_path(&r.id);
-        if plain(&path, Kind::File)? {
-            let b = std::fs::read(&path).map_err(|e| format!("{}: {e}", r.id))?;
-            out.insert(r.id.clone(), etag(&b));
+        if !valid_page_id(&r.id) {
+            return Err(format!("unsafe page id {:?}", r.id));
         }
+        let path = project.page_path(&r.id);
+        let mut page = if have_dir && plain(&path, Kind::File)? {
+            let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", r.id))?;
+            revs.insert(r.id.clone(), etag(&bytes));
+            let text = String::from_utf8(bytes).map_err(|e| format!("{}: {e}", r.id))?;
+            page_from_json(&text).map_err(|e| format!("{}: {e}", r.id))?
+        } else {
+            // A listed page without a file starts empty, as in upstream `load_pages`.
+            PageData {
+                id: String::new(),
+                name: r.name.clone(),
+                doc: paper_rs::model::Document {
+                    name: r.name.clone(),
+                    ..Default::default()
+                },
+                camera: None,
+            }
+        };
+        // The manifest entry decides where the page is saved, whatever the file says.
+        page.id = r.id.clone();
+        pages.push(page);
     }
-    Ok(out)
+    Ok((pages, revs))
+}
+
+fn disk_revisions(project: &Project) -> Result<HashMap<String, String>, String> {
+    read_pages(project).map(|(_, revs)| revs)
 }
 
 /// Register the project's own images: plain single-link files in `assets/` only.
@@ -293,6 +360,7 @@ impl BoundHost {
                 root: dir.to_path_buf(),
             },
             known: HashMap::new(),
+            seen: Default::default(),
             gpu: None,
             gpu_tried: false,
         };
@@ -312,13 +380,13 @@ impl BoundHost {
     fn load(&mut self) -> Result<(), String> {
         self.project.manifest = read_manifest_checked(&self.project.dir)?;
         load_assets(&self.project.dir)?;
-        let pages = self.project.load_pages().map_err(|e| e.to_string())?;
+        let (pages, revs) = read_pages(&self.project)?;
         let active = self.project.manifest.active_page.clone();
         self.ed.open_pages(pages, active.as_deref());
         for i in 0..self.ed.pages.len() {
             self.ed.mark_page_saved(i);
         }
-        self.known = disk_revisions(&self.project)?;
+        self.known = revs;
         Ok(())
     }
 
@@ -346,8 +414,18 @@ impl BoundHost {
         }
         check_project_dir(&self.project.dir)?;
         plain(&self.project.dir.join(ASSETS), Kind::Dir)?;
+        plain(&self.project.dir.join(PAGES_DIR), Kind::Dir)?;
+        // Write only to safe names (listed pages come from the checked manifest, new ones get
+        // upstream's random hex ids) and never through a link.
+        if let Some(bad) = ed.pages.iter().find(|p| !valid_page_id(&p.id)) {
+            return Err(format!(
+                "refusing to save a page with unsafe id {:?}",
+                bad.id
+            ));
+        }
         for &i in &dirty {
             let data = ed.page_data(i);
+            plain(&self.project.page_path(&data.id), Kind::File)?;
             paper_rs::assets::save_to_dir(
                 &self.project.dir.join(ASSETS),
                 paper_rs::assets::used_by(&data.doc),
@@ -428,13 +506,59 @@ fn list_resources(host: &BoundHost) -> ToolResult {
     )])
 }
 
+/// A page this call changed or removed whose revision moved since `session` last saw it.
+fn stale_page(
+    host: &mut BoundHost,
+    session: u64,
+    before: &HashMap<String, String>,
+) -> Option<String> {
+    host.ed.commit_pending();
+    let seen = host.seen.get(&session)?;
+    let now: std::collections::HashSet<&str> =
+        host.ed.pages.iter().map(|p| p.id.as_str()).collect();
+    let touched = host
+        .ed
+        .dirty_pages()
+        .into_iter()
+        .map(|i| host.ed.pages[i].id.clone())
+        .chain(
+            before
+                .keys()
+                .filter(|k| *k != MANIFEST_KEY && !now.contains(k.as_str()))
+                .cloned(),
+        );
+    for id in touched {
+        // Pages new in this call have no revision before it.
+        if let Some(rev) = before.get(&id)
+            && seen.get(&id) != Some(rev)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// One tool call on the host thread, with the write lock held by the caller.
 pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) -> ToolResult {
     let dir = host.project.dir.clone();
     check_root(&dir, root_id)?;
     check_project_dir(&dir)?;
     host.sync()?;
-    let args = check_call(name, args, &host.bound())?;
+    let mut args = args.clone();
+    let session = args
+        .as_object_mut()
+        .and_then(|a| a.remove(SESSION_ARG))
+        .and_then(|v| v.as_u64());
+    let before = host.known.clone();
+    if let Some(s) = session
+        && !host.seen.contains_key(&s)
+    {
+        if host.seen.len() >= MAX_SESSIONS {
+            host.seen.pop_first();
+        }
+        host.seen.insert(s, before.clone());
+    }
+    let args = check_call(name, &args, &host.bound())?;
     let r = match name {
         "list_resources" => list_resources(host),
         "open_file" => {
@@ -445,7 +569,43 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         }
         _ => exec::call(host, name, &args),
     };
-    match host.save_changes() {
+    if let Some(s) = session
+        && let Some(id) = stale_page(host, s, &before)
+    {
+        // Drop the change: it was decided on a version of the page that is no longer there.
+        host.load()?;
+        let page = host
+            .project
+            .manifest
+            .pages
+            .iter()
+            .find(|p| p.id == id)
+            .map_or(id.clone(), |p| format!("{} ({id})", p.name));
+        return Err(format!(
+            "conflict: page {page} was changed by someone else (e.g. in the browser) since you \
+             last read it, so this change was not applied and nothing was written. Read the \
+             page again (get_tree_summary with nodeId \"root\", get_node_info) and redo the change on what is \
+             there now."
+        ));
+    }
+    let saved = host.save_changes();
+    if let Some(s) = session
+        && saved.is_ok()
+        && let Some(seen) = host.seen.get_mut(&s)
+    {
+        if before == host.known {
+            // Nothing written: everything as it is now has been seen.
+            *seen = host.known.clone();
+        } else {
+            // Written pages are seen as written; others keep what was last read.
+            for (k, v) in &host.known {
+                if before.get(k) != Some(v) {
+                    seen.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    match saved {
         Ok(()) => r,
         Err(e) => Err(match r {
             Ok(_) => format!("the change was made but could not be saved: {e}"),
@@ -507,12 +667,16 @@ pub fn offered_tools() -> Vec<Tool> {
 #[derive(Clone)]
 pub struct AgentServer {
     calls: Arc<Mutex<Sender<Call>>>,
+    /// One per MCP session (the service makes a handler per session).
+    session: u64,
 }
 
 impl AgentServer {
     pub fn new(calls: Sender<Call>) -> AgentServer {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         AgentServer {
             calls: Arc::new(Mutex::new(calls)),
+            session: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -547,9 +711,11 @@ impl ServerHandler for AgentServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let (reply, rx) = tokio::sync::oneshot::channel();
+        let mut args = request.arguments.unwrap_or_default();
+        args.insert(SESSION_ARG.into(), json!(self.session));
         let call = Call {
             name: request.name.to_string(),
-            args: Value::Object(request.arguments.unwrap_or_default()),
+            args: Value::Object(args),
             reply,
         };
         let sent = self.calls.lock().unwrap().send(call).is_ok();
@@ -651,5 +817,25 @@ mod tests {
         ] {
             assert!(svg(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn svg_images_take_only_data_uris_and_references_only_existing_ids() {
+        let b = bound();
+        let svg = |s: &str| check_call("write_html", &json!({"html": s}), &b);
+        // Review round 1, finding 2: usvg reads an image href like this as a file name.
+        let reviewer = "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='20'><image href='#private.png' width='30' height='20'/></svg>";
+        for bad in [
+            reviewer,
+            "<svg><filter id=\"f\"><feImage href=\"#private.png\"/></filter></svg>",
+            "<svg xmlns:xlink=\"http://www.w3.org/1999/xlink\"><image xlink:href=\"#x\"/><g id=\"x\"/></svg>",
+            "<svg><use href=\"#missing.png\"/></svg>",
+            "<svg><rect fill=\"url(#missing.png)\"/></svg>",
+            "<svg><use href=\"#\"/></svg>",
+        ] {
+            assert!(svg(bad).is_err(), "{bad}");
+        }
+        assert!(svg("<svg><defs><rect id=\"r\" width=\"5\" height=\"5\"/></defs><use href=\"#r\"/></svg>").is_ok());
+        assert!(svg("<svg><image href=\"data:image/png;base64,iVBORw0KGgo=\"/></svg>").is_ok());
     }
 }

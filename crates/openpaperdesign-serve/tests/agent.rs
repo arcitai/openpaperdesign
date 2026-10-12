@@ -457,6 +457,208 @@ async fn a_stale_browser_save_after_an_agent_write_is_refused_and_writes_nothing
     c.cancel().await.unwrap();
 }
 
+/// Review round 1, finding 4: an agent that read a page, then a browser save, then an agent
+/// write based on what it read: the write is refused and the browser's save stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_agent_write_after_a_browser_save_is_refused_and_writes_nothing() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    let other = client(r.port).await;
+    let rect = doc(&p, &page).nodes.keys().next().unwrap().0;
+    let x0 = doc(&p, &page).nodes[&paper_rs::model::NodeId(rect)].rect.x;
+
+    // Both agents read the page.
+    for a in [&c, &other] {
+        let (ok, out) = call(a, "get_node_info", json!({"nodeId": key(&page, rect)})).await;
+        assert!(ok, "{out}");
+    }
+    // The browser saves on the current revision.
+    let (tag, body) = browser_get(&r, &page).await;
+    let (st, _, _, out) = http(
+        &r,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        Some(&tag),
+        moved(&body, rect, 90.0),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+    let browser_version = file(&p, &page);
+    let manifest = std::fs::read(p.dir.join("project.json")).unwrap();
+
+    // Each agent's write was decided before that save: refused, nothing written.
+    for (a, args) in [
+        (
+            &c,
+            json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"left": "200px"}}]}),
+        ),
+        (
+            &other,
+            json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"width": "10px"}}]}),
+        ),
+    ] {
+        let (ok, out) = call(a, "update_styles", args).await;
+        assert!(!ok && out.contains("conflict"), "{out}");
+        assert_eq!(
+            file(&p, &page),
+            browser_version,
+            "disk keeps the browser's save"
+        );
+        assert_eq!(std::fs::read(p.dir.join("project.json")).unwrap(), manifest);
+    }
+    // Retrying without reading is refused again.
+    let (ok, out) = call(&c, "delete_nodes", json!({"nodeIds": [key(&page, rect)]})).await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(file(&p, &page), browser_version);
+
+    // After reading again, the agent's write goes through on top of the browser's save.
+    let (ok, out) = call(&c, "get_basic_info", json!({})).await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"width": "10px"}}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let n = &doc(&p, &page).nodes[&paper_rs::model::NodeId(rect)];
+    assert_eq!(n.rect.x, x0 + 90.0, "the browser's move is kept");
+    assert_eq!(n.rect.w, 10.0, "the agent's change landed");
+    // Its own write doesn't make its next write stale; the other agent's still is.
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"height": "12px"}}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(
+        &other,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [key(&page, rect)], "styles": {"height": "99px"}}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(
+        doc(&p, &page).nodes[&paper_rs::model::NodeId(rect)].rect.h,
+        12.0
+    );
+    c.cancel().await.unwrap();
+    other.cancel().await.unwrap();
+}
+
+fn set_manifest_pages(p: &Project, pages: Value) {
+    let path = p.dir.join("project.json");
+    let mut m: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    m["pages"] = pages;
+    std::fs::write(&path, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+}
+
+fn open_error(dir: &Path) -> String {
+    match Server::open(Config {
+        project: dir.to_path_buf(),
+        web_dir: dir.parent().unwrap().join("no-bundle"),
+        port: 1,
+        token: TOKEN.into(),
+    }) {
+        Ok(_) => panic!("the server opened"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Review round 1, finding 1: page ids never become paths outside the project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn page_ids_cannot_reach_outside_the_project() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let outside = t.0.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    // A page file whose own id is an outside path: the manifest's id decides where it saves.
+    let victim = outside.join("outside-victim");
+    let mut data = page_from_json(&String::from_utf8(file(&p, &page)).unwrap()).unwrap();
+    data.id = victim.to_string_lossy().into_owned();
+    std::fs::write(p.page_path(&page), page_to_json(&data)).unwrap();
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    let (ok, out) = call(
+        &c,
+        "create_shape",
+        json!({"type": "rectangle", "x": 600, "y": 0, "width": 50, "height": 50}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing written outside"
+    );
+    let saved = page_from_json(&String::from_utf8(file(&p, &page)).unwrap()).unwrap();
+    assert_eq!(saved.id, page, "saved in place, under the manifest's id");
+    assert_eq!(saved.doc.nodes.len(), 2);
+    c.cancel().await.unwrap();
+    drop(r);
+
+    // A manifest with an unsafe or duplicate id is refused before any page is read.
+    std::fs::write(outside.join("x.json"), page_to_json(&data)).unwrap();
+    let abs = outside.join("x").to_string_lossy().into_owned();
+    for (what, pages) in [
+        ("absolute", json!([{"id": abs, "name": "A"}])),
+        ("dot-dot", json!([{"id": "../../outside/x", "name": "A"}])),
+        ("slash", json!([{"id": "a/b", "name": "A"}])),
+        ("empty", json!([{"id": "", "name": "A"}])),
+        (
+            "duplicate",
+            json!([{"id": page, "name": "A"}, {"id": page, "name": "B"}]),
+        ),
+    ] {
+        set_manifest_pages(&p, pages);
+        let e = open_error(&p.dir);
+        assert!(e.contains("page id"), "{what}: {e}");
+    }
+}
+
+/// Review round 1, finding 3: a linked page file is refused before its bytes are read.
+#[cfg(unix)]
+#[test]
+fn page_links_are_refused_before_reading() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let outside = t.0.join("outside.json");
+    // Not JSON: if it were read, the error would be a parse error.
+    std::fs::write(&outside, "not json").unwrap();
+    let path = p.page_path(&page);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    let e = open_error(&p.dir);
+    assert!(e.contains("symbolic link"), "{e}");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::hard_link(&outside, &path).unwrap();
+    let e = open_error(&p.dir);
+    assert!(e.contains("hard link"), "{e}");
+}
+
+/// Review round 1, finding 2, end to end: the reviewer's SVG is refused before upstream runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn svg_image_fragments_are_refused() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let c = client(r.port).await;
+    let disk = file(&p, &page);
+    let (ok, out) = call(
+        &c,
+        "write_html",
+        json!({"targetNodeId": "root", "mode": "insert-children", "html": "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='20'><image href='#private.png' width='30' height='20'/></svg>"}),
+    )
+    .await;
+    assert!(!ok && out.contains("refused"), "{out}");
+    assert_eq!(file(&p, &page), disk);
+    c.cancel().await.unwrap();
+}
+
 /// A 1×1 PNG (would be registered as an asset if it were ever read).
 const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
