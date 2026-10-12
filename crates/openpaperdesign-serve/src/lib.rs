@@ -750,7 +750,9 @@ async fn put_page(
             }
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.describe())
         })?;
-        let rev = revision(&read_page(&p, &id)?);
+        // Committed: the revision is the hash of the bytes just written. Nothing that can
+        // fail comes after the commit, so a saved page is never reported as not saved.
+        let rev = etag(&writes[0].data);
         Ok((
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
@@ -850,6 +852,46 @@ mod tests {
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         assert!(msg.contains(&format!("{id}.json")), "{msg}");
         assert_eq!(files(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Final review, P2 2: once both files are committed the save is reported as saved, with
+    /// the revision of the bytes written; no fallible step follows the commit (a failure
+    /// injected right after it, step 6, has nothing to hit).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_completed_browser_save_is_reported_as_saved() {
+        use std::hash::{BuildHasher, RandomState};
+        let root = std::env::temp_dir().join(format!(
+            "opd-unit-put2-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (p, _) = paper_rs::project::Store::open(&root)
+            .unwrap()
+            .create("Put")
+            .unwrap();
+        let id = p.manifest.pages[0].id.clone();
+        let s = Server::open(Config {
+            project: p.dir.clone(),
+            web_dir: root.join("no-bundle"),
+            port: 1,
+            token: TOKEN.into(),
+        })
+        .unwrap();
+        let before = (
+            std::fs::read(p.page_path(&id)).unwrap(),
+            std::fs::read(p.dir.join(MANIFEST)).unwrap(),
+        );
+        let mut page = p.load_page(&id).unwrap();
+        page.doc.next_id += 1;
+        commit::fault::fail_at(&[6]);
+        let (st, msg) = put(&s, &id, &etag(&before.0), page_to_json(&page)).await;
+        commit::fault::fail_at(&[]);
+        let page_now = std::fs::read(p.page_path(&id)).unwrap();
+        assert_ne!(page_now, before.0);
+        assert_ne!(std::fs::read(p.dir.join(MANIFEST)).unwrap(), before.1);
+        assert_eq!(st, StatusCode::OK, "{msg}");
+        let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(v["revision"], serde_json::json!(etag(&page_now)), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

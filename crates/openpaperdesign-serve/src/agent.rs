@@ -788,7 +788,8 @@ const READ_TOOLS: &[&str] = &[
 
 /// The editor state a call can change, copied before a call that may change it, and put back
 /// when it fails: every page's document and undo history (the active page's in the editor,
-/// the others parked in their slots), the page list, selection, view and active page.
+/// the others parked in their slots), the page list, selection, view and active page, and
+/// upstream's process-wide stretch record for these pages.
 struct EditorSnapshot {
     doc: paper_rs::model::Document,
     history: paper_rs::history::History,
@@ -799,6 +800,10 @@ struct EditorSnapshot {
     meta_dirty: bool,
     doc_stamp: u64,
     revision: u64,
+    /// Upstream's process-wide record of containers whose children don't stretch
+    /// (`exec::with_no_stretch`), for this project's pages only: other projects in the same
+    /// process keep theirs.
+    no_stretch: Vec<(String, paper_rs::model::NodeId)>,
 }
 
 impl EditorSnapshot {
@@ -813,10 +818,27 @@ impl EditorSnapshot {
             meta_dirty: ed.meta_dirty,
             doc_stamp: ed.doc_stamp,
             revision: ed.revision,
+            no_stretch: exec::with_no_stretch(|s| {
+                s.iter()
+                    .filter(|(p, _)| ed.pages.iter().any(|q| q.id == *p))
+                    .cloned()
+                    .collect()
+            }),
         }
     }
 
     fn restore(self, ed: &mut Editor) {
+        // The pages before the call and any it added: their entries become what they were.
+        let ours: std::collections::HashSet<String> = ed
+            .pages
+            .iter()
+            .chain(self.pages.iter())
+            .map(|p| p.id.clone())
+            .collect();
+        exec::with_no_stretch(|s| {
+            s.retain(|(p, _)| !ours.contains(p));
+            s.extend(self.no_stretch.iter().cloned());
+        });
         ed.doc = self.doc;
         ed.history = self.history;
         ed.camera = self.camera;
@@ -921,7 +943,11 @@ fn execute_inner(
         Ok(r) => r,
         Err(()) => {
             // A panic may have left the editor mid-operation: reload what is on disk (which it
-            // matched before the call). The undo history restarts.
+            // matched before the call). The undo history restarts; the stretch record is put
+            // back from the copy.
+            if let Some(s) = snap {
+                s.restore(&mut host.ed);
+            }
             host.load()?;
             return Ok((Err(format!("{name} failed unexpectedly")), None));
         }
@@ -1167,6 +1193,7 @@ impl ServerHandler for AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paper_rs::model::NodeId;
 
     // ------------------------------------------------- test-only seams (never in builds)
 
@@ -1379,6 +1406,107 @@ mod tests {
                 .unwrap_err()
                 .contains("writes are disabled")
         );
+    }
+
+    fn stretch_entries(page: &str) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = exec::with_no_stretch(|s| {
+            s.iter()
+                .filter(|(p, _)| p == page)
+                .map(|(_, n)| *n)
+                .collect()
+        });
+        v.sort();
+        v
+    }
+
+    fn frame(h: &mut BoundHost, root_id: (u64, u64), align: &str) -> String {
+        let out = run(
+            h,
+            root_id,
+            "create_artboard",
+            &json!({"name": "F", "styles": {"display": "flex", "flexDirection": "column", "alignItems": align, "width": "300px", "height": "200px"}}),
+        )
+        .unwrap();
+        let Some(paper_rs::mcp::Out::Text(t)) = out.first() else {
+            panic!()
+        };
+        serde_json::from_str::<Value>(t).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn child_width(h: &mut BoundHost, root_id: (u64, u64), frame: &str) -> f64 {
+        let out = run(
+            h,
+            root_id,
+            "write_html",
+            &json!({"targetNodeId": frame, "mode": "insert-children", "html": "<div style='height:20px'></div>"}),
+        )
+        .unwrap();
+        let Some(paper_rs::mcp::Out::Text(t)) = out.first() else {
+            panic!()
+        };
+        let v: Value = serde_json::from_str(t).unwrap();
+        let id = v["createdNodeIds"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("{t}"))
+            .to_string();
+        let info = run(h, root_id, "get_node_info", &json!({"nodeId": id})).unwrap();
+        let Some(paper_rs::mcp::Out::Text(t)) = info.first() else {
+            panic!()
+        };
+        serde_json::from_str::<Value>(t).unwrap()["width"]
+            .as_f64()
+            .unwrap()
+    }
+
+    /// Final review, P2 1, failed-save variant: a change whose save fails leaves upstream's
+    /// stretch record as it was, so the next child still stretches.
+    #[test]
+    fn a_failed_save_leaves_layout_state_unchanged() {
+        let (_t, mut h, root_id, _, _) = two_page_host();
+        let f = frame(&mut h, root_id, "stretch");
+        crate::commit::fault::fail_at(&[0]);
+        let r = run(
+            &mut h,
+            root_id,
+            "update_styles",
+            &json!({"updates": [{"nodeIds": [f], "styles": {"alignItems": "flex-start", "width": "450px"}}]}),
+        );
+        crate::commit::fault::fail_at(&[]);
+        assert!(r.is_err());
+        assert_eq!(child_width(&mut h, root_id, &f), 300.0);
+    }
+
+    /// Final review, P2 1: restoring one host's stretch record touches only its own pages'
+    /// entries; another host's (in the same process), including one added meanwhile, stay.
+    #[test]
+    fn restoring_layout_state_leaves_other_hosts_alone() {
+        let (_ta, mut a, ra, a_page, _) = two_page_host();
+        let (_tb, mut b, rb, b_page, _) = two_page_host();
+        let fb = frame(&mut b, rb, "flex-start");
+        let b_before = stretch_entries(&b_page);
+        assert_eq!(b_before.len(), 1);
+        let fa = frame(&mut a, ra, "stretch");
+        assert!(stretch_entries(&a_page).is_empty());
+        // A's copy, then B adds another entry, then A's failed call adds one, then A restores.
+        let snap = EditorSnapshot::take(&a.ed);
+        let fb2 = frame(&mut b, rb, "flex-end");
+        let fa_n: u64 = fa.split(':').nth(1).unwrap().parse().unwrap();
+        exec::with_no_stretch(|s| s.insert((a_page.clone(), NodeId(fa_n))));
+        snap.restore(&mut a.ed);
+        assert!(stretch_entries(&a_page).is_empty(), "A's entry rolled back");
+        let b_after = stretch_entries(&b_page);
+        assert_eq!(
+            b_after.len(),
+            2,
+            "B's entries kept, the new one too: {b_after:?}"
+        );
+        for f in [&fb, &fb2] {
+            let n: u64 = f.split(':').nth(1).unwrap().parse().unwrap();
+            assert!(b_after.contains(&NodeId(n)));
+        }
     }
 
     fn host_thread() -> (

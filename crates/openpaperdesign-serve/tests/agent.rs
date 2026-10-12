@@ -1182,6 +1182,57 @@ async fn a_failed_call_keeps_selection_and_undo_history() {
     c.cancel().await.unwrap();
 }
 
+/// Final review, P2 1: a refused change leaves no trace in upstream's process-wide layout
+/// record either. The reviewer's sequence: a 300px column frame that stretches its
+/// children, a refused `alignItems: flex-start`, then an accepted child must still be 300px
+/// wide (it came out 0px).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_change_leaves_layout_state_unchanged() {
+    let t = tmp();
+    let (p, page) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let owner = client(r.port).await;
+    read(&owner).await;
+    let (ok, out) = call(
+        &owner,
+        "create_artboard",
+        json!({"name": "Frame", "styles": {"display": "flex", "flexDirection": "column", "alignItems": "stretch", "width": "300px", "height": "200px"}}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let frame = node_id(&out);
+    let blind = client(r.port).await;
+    let disk = file(&p, &page);
+    let (ok, out) = call(
+        &blind,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [frame], "styles": {"alignItems": "flex-start", "width": "450px"}}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(file(&p, &page), disk);
+    let (ok, out) = call(
+        &owner,
+        "write_html",
+        json!({"targetNodeId": frame, "mode": "insert-children", "html": "<div style='height:20px;background:#ff0000'></div>"}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let d = doc(&p, &page);
+    let frame_n: u64 = frame.split(':').nth(1).unwrap().parse().unwrap();
+    let child = d
+        .nodes
+        .values()
+        .find(|n| n.parent == Some(paper_rs::model::NodeId(frame_n)))
+        .expect("the child");
+    assert_eq!(
+        child.rect.w, 300.0,
+        "the child stretches as before the refused change"
+    );
+    owner.cancel().await.unwrap();
+    blind.cancel().await.unwrap();
+}
+
 /// Review round 4: the page list's revision can't collide whatever the names contain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_list_revisions_are_unambiguous() {
