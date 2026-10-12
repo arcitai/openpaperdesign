@@ -1,18 +1,18 @@
-//! Browser glue: a `<canvas>` rendered by upstream `render::gpu::CanvasRenderer`, driven by
-//! upstream `editor::Editor` through DOM events forwarded from the page's JavaScript.
+//! Browser glue: the JS-facing API. A `<canvas>` is rendered by upstream
+//! `render::gpu::CanvasRenderer`; everything else (input, redraw decisions, saving) lives in
+//! [`crate::state::WebState`], which is plain Rust and tested on the host.
 //!
 //! Time comes from the page (`performance.now()` / `event.timeStamp`), never from
 //! `std::time`, which panics on wasm32-unknown-unknown. Saving is pulled by the page:
 //! [`WebEditor::save_snapshot`] hands out the page file to PUT, and the server's revision
 //! check decides whether it lands.
 
+use crate::editor::Button;
 use crate::editor::shortcuts::Action;
-use crate::editor::{Button, Editor, InputEvent, Tool};
-use crate::geom::{V2, v2};
-use crate::keys;
-use crate::project::format::{page_from_json, page_to_json};
+use crate::geom::V2;
 use crate::render::gpu::CanvasRenderer;
 use crate::render::scene::{self, SceneCache};
+use crate::state::WebState;
 use wasm_bindgen::prelude::*;
 
 fn js_err(e: impl std::fmt::Display) -> JsError {
@@ -30,16 +30,10 @@ struct Gpu {
 
 #[wasm_bindgen]
 pub struct WebEditor {
-    ed: Editor,
+    state: WebState,
     cache: SceneCache,
     gpu: Gpu,
-    mac: bool,
     backend: String,
-    /// `doc_stamp` of the content last confirmed written by the server.
-    saved_stamp: u64,
-    /// `doc_stamp` of the snapshot being written, if any.
-    inflight: Option<u64>,
-    drawn_revision: Option<u64>,
 }
 
 fn install_panic_hook() {
@@ -74,12 +68,8 @@ pub async fn start(
 ) -> Result<WebEditor, JsError> {
     install_panic_hook();
     fastrand::seed(((seed_hi as u64) << 32) | seed_lo as u64);
-
-    let mut page = page_from_json(&page_json).map_err(js_err)?;
-    // The manifest owns page ids and names (a migrated legacy file gets a fresh random id).
-    page.id = page_id;
-    page.name = page_name.clone();
-    page.doc.name = page_name;
+    let state = WebState::open(&page_json, page_id, page_name, mac, css_width, css_height)
+        .map_err(js_err)?;
 
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = if force_webgl {
@@ -150,18 +140,11 @@ pub async fn start(
         scale: 1.0,
     };
 
-    let mut ed = Editor::default();
-    ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
-    ed.open_pages(vec![page], None);
     let mut w = WebEditor {
-        saved_stamp: ed.doc_stamp,
-        ed,
+        state,
         cache: SceneCache::default(),
         gpu,
-        mac,
         backend,
-        inflight: None,
-        drawn_revision: None,
     };
     w.resize(css_width, css_height, dpr);
     Ok(w)
@@ -195,23 +178,12 @@ impl WebEditor {
             g.config.height = h;
             g.surface.configure(&g.device, &g.config);
         }
-        self.ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
-        if self.ed.pending_fit && css_width > 1.0 {
-            self.ed.pending_fit = false;
-            self.ed.zoom_to_fit();
-        }
-        self.drawn_revision = None;
+        self.state.resize(css_width, css_height);
     }
 
     /// Advance animations and draw if anything changed. Call once per animation frame.
     pub fn frame(&mut self, now_ms: f64) {
-        self.ed.tick(now_ms);
-        // Requests for app chrome (export, open, palette, rename...) have no handler in this
-        // slice; drop them instead of letting them pile up.
-        self.ed.requests.clear();
-        self.ed.ui_events.clear();
-        let animating = self.ed.animating(now_ms);
-        if !animating && self.drawn_revision == Some(self.ed.revision) {
+        if !self.state.tick(now_ms) {
             return;
         }
         let g = &mut self.gpu;
@@ -219,12 +191,13 @@ impl WebEditor {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             _ => {
+                // Stays pending: drawn on the next frame.
                 g.surface.configure(&g.device, &g.config);
                 return;
             }
         };
         let view = tex.texture.create_view(&Default::default());
-        let frame = scene::canvas(&self.ed, &mut self.cache, V2::ZERO, true);
+        let frame = scene::canvas(&self.state.ed, &mut self.cache, V2::ZERO, true);
         let bg = scene::CANVAS_BG.to_f32(1.0);
         let mut enc = g.device.create_command_encoder(&Default::default());
         g.renderer.render(
@@ -239,176 +212,94 @@ impl WebEditor {
         );
         g.queue.submit([enc.finish()]);
         g.queue.present(tex);
-        self.drawn_revision = Some(self.ed.revision);
+        self.state.drawn();
     }
 
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {
-        let m = keys::modifiers(self.mac, shift, ctrl, alt, meta);
-        if m != self.ed.mods {
-            self.ed.handle(InputEvent::Modifiers(m));
-        }
+        self.state.modifiers(shift, ctrl, alt, meta);
     }
 
     pub fn pointer_down(&mut self, x: f64, y: f64, dom_button: u8, time_ms: f64) {
         if let Some(b) = button(dom_button) {
-            self.ed.handle(InputEvent::PointerDown {
-                pos: v2(x, y),
-                button: b,
-                pressure: None,
-                time_ms,
-            });
+            self.state.pointer_down(x, y, b, time_ms);
         }
     }
 
     pub fn pointer_move(&mut self, x: f64, y: f64, time_ms: f64) {
-        self.ed.handle(InputEvent::PointerMove {
-            pos: v2(x, y),
-            pressure: None,
-            time_ms,
-        });
+        self.state.pointer_move(x, y, time_ms);
     }
 
     pub fn pointer_up(&mut self, x: f64, y: f64, dom_button: u8, time_ms: f64) {
         if let Some(b) = button(dom_button) {
-            self.ed.handle(InputEvent::PointerUp {
-                pos: v2(x, y),
-                button: b,
-                time_ms,
-            });
+            self.state.pointer_up(x, y, b, time_ms);
         }
     }
 
-    /// DOM wheel delta in CSS px (positive y = scroll down). With Ctrl/⌘ held (which is how
-    /// browsers report a trackpad pinch) upstream zooms instead of panning.
+    /// DOM wheel delta in CSS px (positive y = scroll down).
     pub fn wheel(&mut self, dx: f64, dy: f64, x: f64, y: f64) {
-        let d = if self.ed.mods.shift && dx == 0.0 {
-            v2(dy, 0.0)
-        } else {
-            v2(dx, dy)
-        };
-        self.ed.handle(InputEvent::Scroll {
-            delta: d,
-            pos: v2(x, y),
-        });
+        self.state.wheel(dx, dy, x, y);
     }
 
-    /// Returns whether the key was used (the page then prevents the browser default).
+    /// Returns whether the editor took the key (the page then prevents the browser default).
     pub fn key_down(&mut self, key: &str, code: &str, repeat: bool) -> bool {
-        let editing = self.ed.text_edit.is_some();
-        let Some(k) = keys::key(self.ed.mods, editing, key, code) else {
-            return false;
-        };
-        let before = (self.ed.revision, self.ed.doc_stamp, self.ed.tool);
-        self.ed.handle(InputEvent::KeyDown { key: k, repeat });
-        if editing && !self.ed.mods.command() && key.chars().count() == 1 {
-            self.ed.handle(InputEvent::Text(key.to_string()));
-        }
-        editing || before != (self.ed.revision, self.ed.doc_stamp, self.ed.tool)
+        self.state.key_down(key, code, repeat)
     }
 
     pub fn key_up(&mut self, key: &str, code: &str) {
-        if let Some(k) = keys::key(self.ed.mods, self.ed.text_edit.is_some(), key, code) {
-            self.ed.handle(InputEvent::KeyUp { key: k });
-        }
+        self.state.key_up(key, code);
     }
 
-    /// Toolbar: "select", "hand", "rect", "ellipse", "text".
+    /// Toolbar: "select", "hand", "rect", "ellipse".
     pub fn set_tool(&mut self, name: &str) {
-        let tool = match name {
-            "select" => Tool::Select,
-            "hand" => Tool::Hand,
-            "rect" => Tool::Rect,
-            "ellipse" => Tool::Ellipse,
-            "text" => Tool::Text,
-            _ => return,
-        };
-        self.ed.run(Action::Tool(tool));
+        self.state.set_tool(name);
     }
 
     pub fn tool(&self) -> String {
-        format!("{:?}", self.ed.tool).to_lowercase()
+        self.state.tool()
     }
 
     pub fn undo(&mut self) {
-        self.ed.run(Action::Undo);
+        self.state.run(Action::Undo);
     }
 
     pub fn redo(&mut self) {
-        self.ed.run(Action::Redo);
+        self.state.run(Action::Redo);
     }
 
     pub fn delete(&mut self) {
-        self.ed.run(Action::Delete);
+        self.state.run(Action::Delete);
     }
 
     pub fn selection_len(&self) -> usize {
-        self.ed.selection.len()
+        self.state.ed.selection.len()
     }
 
     pub fn node_count(&self) -> usize {
-        self.ed.doc.nodes.len()
-    }
-
-    /// Top-level nodes as JSON `[{id, name, kind, children, world: [x,y,w,h], screen: [x,y,w,h]}]`
-    /// (screen = CSS px in the canvas), for status displays and automated checks.
-    pub fn root_nodes(&self) -> String {
-        let doc = &self.ed.doc;
-        let list: Vec<_> = doc
-            .root
-            .iter()
-            .filter_map(|&id| {
-                let n = doc.get(id)?;
-                let w = doc.world_rect(id)?;
-                let s = self.ed.camera.world_rect_to_screen(&w);
-                let kind = serde_json::to_value(&n.kind)
-                    .ok()
-                    .and_then(|v| v.get("type").cloned())
-                    .unwrap_or_default();
-                Some(serde_json::json!({
-                    "id": id.0,
-                    "name": n.name,
-                    "kind": kind,
-                    "children": n.children.len(),
-                    "world": [w.x, w.y, w.w, w.h],
-                    "screen": [s.x, s.y, s.w, s.h],
-                }))
-            })
-            .collect();
-        serde_json::Value::from(list).to_string()
+        self.state.ed.doc.nodes.len()
     }
 
     pub fn status(&self) -> String {
-        self.ed.status.clone()
+        self.state.ed.status.clone()
     }
 
-    /// Content changed since the last confirmed save (or a save is in flight).
+    /// Top-level nodes as JSON (see [`WebState::root_nodes`]).
+    pub fn root_nodes(&self) -> String {
+        self.state.root_nodes()
+    }
+
     pub fn dirty(&self) -> bool {
-        self.ed.doc_stamp != self.saved_stamp
+        self.state.dirty()
     }
 
-    /// The page file to write now, or `None` when there is nothing to save, a save is
-    /// already in flight, or a gesture/text edit still owns the open transaction.
     pub fn save_snapshot(&mut self) -> Option<String> {
-        if self.inflight.is_some() || self.ed.is_busy() || self.ed.text_edit.is_some() {
-            return None;
-        }
-        self.ed.commit_pending();
-        if self.ed.doc_stamp == self.saved_stamp {
-            return None;
-        }
-        self.inflight = Some(self.ed.doc_stamp);
-        Some(page_to_json(&self.ed.page_data(self.ed.active_page)))
+        self.state.save_snapshot()
     }
 
-    /// The server stored the last snapshot.
     pub fn save_succeeded(&mut self) {
-        if let Some(s) = self.inflight.take() {
-            self.saved_stamp = s;
-        }
+        self.state.save_succeeded();
     }
 
-    /// The last snapshot was not stored (conflict or network error); it stays dirty.
     pub fn save_failed(&mut self) {
-        self.inflight = None;
+        self.state.save_failed();
     }
 }

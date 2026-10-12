@@ -4,7 +4,8 @@
 //! mirroring the upstream crate so their `use crate::...` lines resolve unchanged. Left out:
 //! the egui/winit app shell (`app`, `ui`, `render::frame`), `session` (native clocks and
 //! storage) and `mcp`. The OS clipboard is replaced by `openpaperdesign-clipboard-stub`
-//! (imported as `arboard`). The browser glue lives in [`web`].
+//! (imported as `arboard`). The browser glue lives in `state` (host-testable) and `web`
+//! (wasm-bindgen, wasm32 only).
 
 #[path = "../../../src/assets.rs"]
 pub mod assets;
@@ -48,5 +49,6 @@ pub mod render {
 }
 
 pub mod keys;
+pub mod state;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
