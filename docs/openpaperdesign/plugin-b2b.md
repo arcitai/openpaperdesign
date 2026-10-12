@@ -238,6 +238,13 @@ Checks (2026-10-12): `cargo fmt --all --check`; serve clippy, 0 warnings; serve 
 agent + 7 launcher + 17; plugin tests plus the Node CI command, 28 passed; Python design
 tests, 13 passed; `git diff --check`.
 
+Rebased on the B2a review round 3 fixes (`b730f4c`, 2026-10-12). Reads now count per page
+and only when they succeed, and the page list is read via `get_basic_info`. The skill says
+so. The launcher's bind-time `get_basic_info` acknowledges only the viewed page and the page
+list; its tests read the page they write. Re-run: serve 4 unit + 18 agent + 7 launcher + 17;
+plugin tests plus the Node CI command; Python design tests; fmt, serve clippy and
+`git diff --check`.
+
 ## Not proven
 
 - **Codex itself:** the plugin tests are source-only checks. They cover the forbidden

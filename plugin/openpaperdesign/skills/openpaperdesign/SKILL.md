@@ -25,8 +25,10 @@ see each other's changes live.
 3. **Read the page, then edit.** Before your first change to a page, read that page:
    `get_tree_summary` with `nodeId` `"root"` (add `pageId` for another page), then
    `get_node_info` for what you will change. Don't rely on the summary `bind_project`
-   returned. A change to a page you haven't read in this session, or that changed since you
-   read it, is refused as a `conflict` and nothing is written. Then edit with the design
+   returned. Reads count per page and only when they succeed: read every page a change
+   touches, and call `get_basic_info` before renaming, adding or removing pages (it returns
+   the page list). A change to a page you haven't read in this session, or that changed
+   since you read it, is refused as a `conflict` and nothing is written. Then edit with the design
    tools (`write_html`, `create_shape`, `update_styles`, `move_nodes`, `delete_nodes`,
    `rename_pages`, …). Each change is saved to the project at once.
 4. **Open the canvas.** Call `open_editor` and open the returned
