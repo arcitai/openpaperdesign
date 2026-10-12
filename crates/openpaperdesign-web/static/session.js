@@ -9,6 +9,10 @@
 // - A fallback waits for a save in flight, then reopens the page as the server has it now
 //   (content and revision), on a fresh canvas with its own resize observer.
 // - A save's answer is only applied to the editor that took the snapshot.
+// - Changes made elsewhere (an agent over MCP, another tab) are polled for. They replace the
+//   page in place only when this tab has nothing unsaved (`can_reload`); otherwise this tab's
+//   next save carries its base revision and the server merges, or answers with a conflict that
+//   is shown, never resolved silently.
 
 export class Session {
   /**
@@ -17,7 +21,8 @@ export class Session {
    *   fetchPage() -> Promise<page>                    the page as the server has it now
    *   replaceCanvas(old) -> canvas                    a fresh canvas in place of `old`
    *   observeResize(canvas, onResize) -> { disconnect() }
-   *   put(snapshot, revision) -> Promise<{ ok, status, revision }>
+   *   put(snapshot, revision) -> Promise<{ ok, status, revision, merged?, body?, conflicts? }>
+   *   revision() -> Promise<string>                   the page's current revision (polling)
    *   log(message)                                    console.error
    * }
    */
@@ -25,7 +30,8 @@ export class Session {
     this.deps = deps;
     this.state = Object.assign(state, {
       ready: false, error: null, fallback: null, backend: null, revision: null,
-      saves: 0, saving: false, conflict: false, switching: false,
+      saves: 0, saving: false, conflict: false, switching: false, conflicts: null,
+      reloads: 0, behind: false,
     });
     this.ed = null;
     this.canvas = null;
@@ -132,6 +138,37 @@ export class Session {
     this.deps.log(msg);
   }
 
+  /**
+   * Look for a newer revision on the server. Returns 'reloaded' when the page was replaced in
+   * place, 'behind' when it changed but this tab has unsaved work (merged on save), else
+   * undefined.
+   */
+  async poll() {
+    const s = this.state;
+    if (!this.editable() || s.saving || s.conflict) return undefined;
+    const rev = await this.deps.revision();
+    if (rev === s.revision) {
+      s.behind = false;
+      return undefined;
+    }
+    const ed = this.ed;
+    if (!this.editable() || !ed.can_reload() || s.saving) {
+      s.behind = true;
+      return 'behind';
+    }
+    const page = await this.deps.fetchPage();
+    // Re-check: an edit or save may have started while fetching.
+    if (this.ed !== ed || !this.editable() || !ed.can_reload() || s.saving) {
+      s.behind = true;
+      return 'behind';
+    }
+    ed.reload(page.text);
+    s.revision = page.revision;
+    s.reloads += 1;
+    s.behind = false;
+    return 'reloaded';
+  }
+
   /** Save the editor's pending change, if any. Returns what happened, for the status line. */
   async save() {
     const s = this.state;
@@ -146,14 +183,25 @@ export class Session {
       const res = await this.deps.put(snapshot, s.revision);
       if (this.ed !== ed) return 'stale';
       if (res.ok) {
-        s.revision = res.revision;
         s.saves += 1;
         ed.save_succeeded();
-        return 'saved';
+        if (!res.merged) {
+          s.revision = res.revision;
+          return 'saved';
+        }
+        // The server merged this change with others. Take the merged page if nothing changed
+        // here since the snapshot; otherwise keep the old base, so the next save merges again.
+        if (ed.can_reload()) {
+          ed.reload(res.body);
+          s.revision = res.revision;
+          s.behind = false;
+        }
+        return 'merged';
       }
       ed.save_failed();
       if (res.status === 409) {
         s.conflict = true;
+        s.conflicts = res.conflicts || null;
         return 'conflict';
       }
       return 'failed';

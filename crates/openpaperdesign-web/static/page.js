@@ -34,6 +34,7 @@ export async function saveStep(session, ui) {
   if (r === 'conflict') ui.conflict(st.conflicts || null);
   if (st.error) return r;
   if (r === 'saved') ui.status('Saved');
+  else if (r === 'merged') ui.status('Saved (merged with changes made elsewhere)');
   else if (r === 'conflict') ui.status('Not saved: conflict');
   else if (r === 'failed') ui.status('Save failed; retrying');
   else if (r === 'unreachable') ui.status('Save failed (server unreachable); retrying');

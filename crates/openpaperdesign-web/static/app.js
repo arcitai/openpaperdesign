@@ -6,6 +6,8 @@ import { Session } from './session.js';
 import { frameStep, saveStep } from './page.js';
 
 const SAVE_POLL_MS = 300;
+// How often to look for changes made elsewhere (an agent over MCP, another tab).
+const REVISION_POLL_MS = 1000;
 
 // State for people and for automated checks (read-only from outside).
 const state = { pageId: null };
@@ -97,7 +99,19 @@ async function main() {
         method: 'PUT', body: snapshot,
         headers: { 'If-Match': revision, 'Content-Type': 'application/json' },
       });
-      return { ok: res.ok, status: res.status, revision: res.headers.get('ETag') };
+      const merged = res.ok && res.headers.get('X-Opd-Merged') === '1';
+      const out = { ok: res.ok, status: res.status, revision: res.headers.get('ETag'), merged };
+      if (merged) out.body = await res.text();
+      if (res.status === 409) {
+        const v = await res.json().catch(() => ({}));
+        out.conflicts = v.conflicts || null;
+      }
+      return out;
+    },
+    revision: async () => {
+      const res = await api(`${pageUrl}/revision`);
+      if (!res.ok) throw new Error(`revision ${res.status}`);
+      return res.headers.get('ETag');
     },
     log: (m) => console.error(m),
   }, state);
@@ -182,16 +196,33 @@ async function main() {
     },
     status: (text) => status(text),
     tick: syncToolbar,
-    conflict: () => {
+    // The conflict banner: affected layers and an explicit discard.
+    conflict: (ids) => {
       const c = $('conflict');
-      c.textContent = 'This page was changed on disk by something else since it was loaded. '
-        + 'Nothing was overwritten, and edits made here since then are not saved. '
-        + 'Reload to continue from the version on disk.';
+      c.replaceChildren();
+      const layers = ids && ids.length ? ` Affected layers: ${ids.join(', ')}.` : '';
+      c.append(`This page was changed elsewhere (for example by an agent) in a way that overlaps `
+        + `your unsaved change. Nothing was overwritten, and your change is not saved.${layers} `);
+      const b = document.createElement('button');
+      b.textContent = 'Reload (discard my unsaved change)';
+      b.addEventListener('click', () => location.reload());
+      c.append(b);
       c.classList.add('show');
     },
   };
   // ---- saving: one request at a time, always with the revision we last saw.
   setInterval(() => saveStep(session, ui), SAVE_POLL_MS);
+  // ---- changes made elsewhere (e.g. an agent): reload in place when nothing is unsaved here.
+  setInterval(async () => {
+    try {
+      const r = await session.poll();
+      if (state.error) return; // a terminal error stays on screen
+      if (r === 'reloaded') status('Updated with changes made elsewhere');
+      else if (r === 'behind') status('Changed elsewhere; your edit will be merged when saved');
+    } catch {
+      // The server is unreachable; the save loop reports that.
+    }
+  }, REVISION_POLL_MS);
   window.addEventListener('beforeunload', (e) => {
     if (session.ed && session.ed.dirty()) e.preventDefault();
   });
