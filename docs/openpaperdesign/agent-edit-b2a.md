@@ -1,5 +1,7 @@
 # B2a: an agent and a person editing one project — 2026-10-12
 
+Updated 2026-10-13: linked the later installed qualification; historical test results unchanged.
+
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B2a, on top
 of B1 (`browser-edit-b1.md`). While `openpaperdesign-serve --project <dir>` runs and the page
 is open in a browser, an AI agent connected over MCP edits the **same** project, and the
@@ -514,17 +516,17 @@ scripts, and one doc comment in web Rust):
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run. No root-package file changed.
 
-## Not proven
+## Remaining limits
 
-- **Real browser:** no run with a person in a real browser while an agent edits, so the live
-  update, the in-place reload and the conflict banner are untested in a browser. This includes
-  Codex's in-app browser and any real MCP client app (Codex, Claude Code). Chromium can't start
-  in this sandbox. `scripts/browser-check.mjs … agent` is written for the operator: an agent
-  shape must appear without a reload, then a saved page drag followed by an agent move must
-  both survive a reload. The discard fix still needs the operator's Codex re-check.
+- **Browser scope:** the later [installed `0078487` qualification](plugin-b2b.md#installed-qualification-2026-10-13)
+  proves Codex browser pointer save, stale agent refusal, fresh agent edit and reload/process
+  reopen preservation. It does not separately qualify every live-update, in-place discard
+  or browser conflict-banner path, or another MCP client app. The earlier sandbox runs
+  remain distinct from that operator proof.
 - **Client config syntax:** the printed Claude Code/Codex settings haven't been tried with those
   clients.
-- **`get_screenshot` over this server:** not exercised.
+- **`get_screenshot`:** the installed plugin returned a real PNG on `0078487`; other client
+  routes are not qualified by that result.
 - **Undo:** agent undo/redo across a browser save is limited, because the host's history
   restarts when the page changes on disk.
 - **External writers:** a concurrently running native app is still unprotected (see Boundary).
@@ -549,6 +551,8 @@ clippy all-targets, fmt and diff checks passed. The portable results and the soc
 proof. No upstream source, dependency, browser or plugin input changed.
 
 The operator's 2026-10-12 Mac proof on `b846b8a` covers 65 serve tests, doctor and sequential
-actual-stdio X-to-Y rebinding (Y child 300px). It did not cover overlapping calls. The new
-candidate awaits independent review and fresh Mac lifecycle proof. Installed-plugin
-and actual in-app-browser editing/save/conflict/reopen verification remain pending.
+actual-stdio X-to-Y rebinding (Y child 300px). It did not cover overlapping calls. Review,
+fresh Mac lifecycle and installed-plugin/browser proof were pending at that handoff.
+Later exact `0078487` passed R6 source review, 85 Mac serve tests plus five real-TCP context
+tests, and the installed model/browser qualification linked above. Earlier evidence keeps
+its original revision and scope.

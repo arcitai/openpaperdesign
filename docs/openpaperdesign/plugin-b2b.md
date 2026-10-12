@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-13: current-host workspace/permission contract below; prior results retain their original provenance.
+Updated 2026-10-13: installed qualification on exact `0078487`; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -10,6 +10,49 @@ cloud, no telemetry. Not affiliated with Paper (paper.design).
 
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
 surface), plugin publishing, other hosts.
+
+## Installed qualification (2026-10-13)
+
+**PASS for exact `0078487e9f2bea191b8156172daa5cba6d1f17f9` on macOS**, using installed
+`openpaperdesign@openpaperdesign-local` 0.1.0, fresh Codex 0.162.1 CLI app-server **model
+turns**, and the actual Codex in-app browser. Independent R6 accepted this source with no
+material findings (13 focused Rust checks and seven package checks). Installation for
+qualification began at 2026-10-12 22:46 UTC while R6 was still running; qualification
+completed at 23:05 UTC (2026-10-13 in Copenhagen). Source acceptance precedes release;
+publication remains pending. Distribution is source/local build, not a turnkey installer.
+
+| Check | Observed result |
+| --- | --- |
+| Binary and discovery | Installed binary matched the exact Mac release; doctor passed, all 23 package files matched, four skills and 33 tools were discovered. |
+| Mac checks | 85 distinct serve tests passed (28 library, 24 agent, eight launcher, eight context, 17 API), plus a separate five-test real-TCP context run. The browser bundle was inherited unchanged from `cffeec6`, not freshly rebuilt. |
+| Selected workspace and worktree | Real model status/create/read/edit passed under workspace-write. The ordinary Git worktree fixture kept all 32 protected/sibling file hashes unchanged and created its design only inside the selected worktree. |
+| Refusal and compatibility | Read-only creation refused with no design output. Direct app-server calls lacking metadata failed closed. A model status call under the unchanged inherited exact `disabled` profile passed. |
+| Browser and agent | A CUA pointer move showed Saved. A stale agent `update_styles` call was refused; the two authoritative manifest/page hashes stayed unchanged. After a fresh read, an agent color edit preserved the moved position; browser reload preserved both. MCP `get_screenshot` returned a PNG. |
+| Binding and restart | Missing/same-project binds and unforced switch/create guards behaved as expected. Forced switch closed the old port; a later old-tab save visibly failed as server unreachable without changing the saved page. Full MCP/app-server stop, new-process bind/read and a fresh WebGPU browser reopen preserved all 39 nodes; node 28 remained at (720, 566), 230 × 64, fill `#9b5de5`. Probe processes stopped and old ports closed. |
+
+Installed binary SHA-256:
+`69cfd77434f17c23c08cbe9b2c22d43151de02309431b69da6d1d24de059734d`.
+Project-private receipts are under `.toolchain/operator-evidence/installed-0078487/`
+(`installed-model-plugin-proof/qualification-summary.json`, `binary-install.json`, model
+readbacks and preservation/reopen proofs); exact Mac checks are under
+`.toolchain/operator-evidence/mac-0078487/`. Raw receipts, private paths and token URLs are
+not distributed with these docs.
+
+The initial managed-profile attempt inherited `approval_policy: never`; Codex blocked the
+MCP call before the plugin. Successful managed tests used ephemeral `on-request` with
+individually inspected, once-only approvals, without persistent policy or grant changes.
+If the host reports that approval is required but forbidden, use an owner-authorized
+per-call approval route or stop and report the host-policy limitation. Do not disable
+protection or broaden grants to make the plugin work.
+
+An unreferenced `project 2.json` copy matching the pre-test manifest appeared; its cause is
+unknown and it was left untouched. The two authoritative files and document preservation
+were verified separately; this is not a claim that every workspace byte stayed unchanged.
+
+![Launch plan reopened in the Codex browser, with the purple rectangle preserved](screenshots/codex-reopen-0078487.jpg)
+
+Observed after full process stop and reopen: Ready, WebGPU, the saved launch-plan canvas
+and purple rectangle. This is the operator's unchanged screenshot, not a generated mockup.
 
 ## What is in it
 
@@ -128,39 +171,20 @@ native app/external writer. Standalone `--workspace <dir>` or deliberate cwd rem
 separate; combining it with `--codex-context` refuses. A standalone doctor pass is a
 binary/bundle check, not host context or installed-editing proof.
 
-Historical evidence: reviewed `0921280` installed successfully; Codex found four skills
-and 33 tools. Its process used plugin-cache cwd, status reported unusable and creation
-was refused. Later no-op diagnostics confirmed read-only, managed workspace-write and
-exact disabled metadata shapes. A further no-op model receipt confirmed the same eight
-filesystem entries for a selected Git worktree, with `network: enabled`; the operator
-separately attested that its `.git` was a regular pointer file. These diagnostics did not
-edit through this product. This candidate's installed model and IAB qualification remains
-pending after independent review. Synthetic
-stdio tests use sanitized versions of those shapes and are labeled synthetic.
+Historical evidence (2026-10-12/13): `0921280` installation/discovery passed with four
+skills and 33 tools, but plugin-cache cwd made workspace status unusable and creation
+correctly refused. Later no-op model diagnostics established the current metadata shapes;
+they did not edit through this product. Synthetic adapter tests remain distinct from the
+installed qualification above.
 
-Linux implementation verification retained for `e004da4`: the serve suite passed 83 tests
-(28 library, 24 agent, eight standalone launcher, six synthetic-context launcher, 17 API),
-with real loopback enabled for the lifecycle tests. The final protected-workspace guard
-was rechecked with all 28 library and six context tests. The 28 library tests also passed
-with the portable listener. Serve all-target clippy, format/diff checks and all seven
-package assertions passed. Default-sandbox TCP attempts initially returned EPERM; scoped
-loopback approval allowed actual execution. No root/GPU/wasm/browser bundle baseline was
-repeated; those inputs and the reviewed core lifecycle remain unchanged. These are Linux
-adapter checks, not installed Codex or Mac/IAB qualification.
+| Earlier implementation evidence | Result at that revision |
+| --- | --- |
+| Linux `e004da4` | 83 serve tests; the final protected-workspace guard was rechecked with 28 library + six context tests. The library also passed with the portable listener. Serve clippy/fmt/diff and seven package checks passed. Initial TCP EPERM was resolved by scoped loopback approval. |
+| Intermediate Mac `e004da4` | Fresh release, 83 serve tests and five separate real-TCP context tests passed; inherited `cffeec6` bundle. Not installed or published. |
+| Linux `0078487` worktree/network correction | 28 library + eight synthetic-context tests with real loopback, serve clippy/fmt/diff and seven package checks passed. Two new regressions first failed on `e004da4`; the corrected fixture preserved opaque pointer bytes and sibling files while editing selected `design/`. |
 
-Intermediate Mac evidence for exact `e004da4`: a fresh release build, all 83 serve tests
-and a separate five-test context lifecycle subset over real TCP passed. That binary used
-the unchanged inherited `cffeec6` browser bundle. It was not installed or published, and
-does not qualify the subsequent worktree/network correction below.
-
-The subsequent opaque-worktree/network correction passed the 28 library and eight
-synthetic-context tests with real loopback, plus serve all-target clippy, format/diff and
-seven package assertions. Its two new regressions first failed against `e004da4` for the
-pointer-file refusal and `enabled` network value. The fixture creates/reads/edits only
-`design/` under the selected root while its `.git` file is unreadable, and checks unchanged
-pointer bytes and sibling files. Protected/outside binding, symlinked `.git` and unknown
-network values remain refused. This is synthetic adapter proof; the exact installed
-candidate still needs real model calls from a selected worktree and Mac/IAB qualification.
+These runs did not repeat unchanged root/GPU/wasm/browser-bundle baselines. Their original
+logs remain retained; exact Mac and installed results for `0078487` are recorded above.
 
 ### Packaging (corrected 2026-10-12)
 
@@ -182,7 +206,7 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
     (common fields at the top level, Codex presentation in `extensions.com.openai`) and
     discovers `skills/` and `mcp.json` itself.
   - **Later installed evidence:** on `0921280`, Codex discovered four skills and 33 tools
-    without an overlay. This does not qualify the replacement's editing/browser behavior.
+    without an overlay. That historical discovery check did not qualify editing/browser behavior.
 - **Field limits:** the staged reference (`codex-plugin-packages-0.1.26.md`, checked by the
   B2b review) caps only `shortDescription` (30 characters). `defaultPrompt` and the icon
   fields have rules of their own but aren't set. No other caps apply to the fields set here.
@@ -205,13 +229,20 @@ onlinesourdough) was verified: all 28 files matched their manifest hashes.
   plugin and drop the OpenPencil cases; the proof.json case is kept, and a preview-copy case
   replaces the mixed OpenPencil one. CI now runs them, which AIOS did not.
 
+The replacement's local installed qualification now passes on `0078487`, including
+discovery of these portable methods. AIOS #54 remains separately owned. Legacy removal
+requires replacement publication plus installed readback; this record supplies the local
+installed qualification, while publication and legacy removal remain pending.
+
 ## Install on a Mac (operator steps)
 
 These follow the operator's installation contract for the local Codex CLI (operator notes,
 2026-10-12): `codex plugin marketplace add <local-repo> --json` and
 `codex plugin add openpaperdesign@openpaperdesign-local --json`. Installation and discovery
-passed on `0921280`; its selected-workspace editing attempt failed closed. The current
-candidate requires fresh independent review and exact installed model/browser proof.
+passed on `0921280`; its selected-workspace editing attempt failed closed. The corrected
+`0078487` installed model/browser qualification passed as recorded above. These remain
+local-build steps; no source-release tag, packaged installer or public marketplace listing
+is published yet.
 
 ```sh
 # 1. Build the browser editor and install the command (Rust 1.95 + wasm32 target,
@@ -233,11 +264,14 @@ codex plugin add openpaperdesign@openpaperdesign-local --json
 For an existing 0.1.0 installation, the normal CLI refresh is
 `codex plugin remove openpaperdesign@openpaperdesign-local --json`, then the `plugin add`
 command above, using the reviewed checkout. This removes only this plugin's local cache;
-never edit cached files. Package version remains 0.1.0. Refresh is an operator step and has
-not been run for this candidate.
+never edit cached files. Package version remains 0.1.0. The qualification install matched
+all 23 package files; verify your own installation rather than assuming a current desktop
+chat has reloaded its tool catalog.
 
-3. Start a fresh Codex session after the operator's normal plugin reload. Verify the
-   installed MCP args are `["--codex-context"]` and the binary matches the reviewed build.
+3. Start a fresh Codex session after the operator's normal plugin reload. The qualified
+   surface was a fresh CLI app-server model session, not a reload of an existing desktop
+   chat catalog. Verify installed MCP args `["--codex-context"]`, package files and binary
+   identity. Observe the host-policy/once-only approval limitation above.
 4. Use **actual model tool calls** in the selected task workspace, first with ordinary
    workspace-write permissions. Direct app-server `mcpServer/tool/call` lacks automatic
    context and is not an installed editing proof. Read back and record:
@@ -399,18 +433,18 @@ fork/setup entry; the upstream text below it is preserved byte-for-byte.
 
 At that lifecycle handoff, fresh independent review, Mac lifecycle and installed-plugin/IAB
 proof were pending. Later `0921280` installation/discovery passed; workspace editing failed
-closed as recorded below. The current workspace-context replacement still awaits its own
-independent review and installed model/IAB editing/save/conflict/reopen proof.
+closed as recorded above. The later exact `0078487` passed R6 source review and the
+installed qualification at the start of this record; those results do not rewrite the
+earlier revision's proof.
 
-## Not proven
+## Remaining limits
 
-- **Replacement in Codex:** installation/discovery on `0921280` passed. The separate no-op
-  diagnostics prove host context delivery, not this adapter's installed behavior. The
-  current replacement's real model edit/create and browser integration are pending.
-- **Opening the editor:** opening the `open_editor` URL in the in-app browser from a skill
-  hasn't been tried.
-- **Embedding:** the historical `b846b8a` Mac binary/doctor evidence is recorded above.
-  The 092 installed binary also matched its reviewed release. Fresh replacement-binary
-  proof and installed model/browser qualification remain the operator's to run.
-- **Browser behaviour:** everything listed as unproven in the B1 and B2a records still
-  applies (for example agent + browser editing in a real browser).
+- The current desktop chat's tool-catalog reload was not verified; qualification used
+  fresh CLI app-server model sessions and the actual Codex in-app browser.
+- Support is the experimental Codex 0.162.1 contract and exact profiles above, not universal
+  host support or OS sandboxing. Idle host permission changes are not detected instantly.
+- No signed/unsigned installer, public marketplace listing or source-release delivery has
+  been published. Other hosts, an MCP App panel and a remote Z13 canvas are unqualified.
+- No live GPU-loss or physical crash/power-loss test. Untested renderer and interaction
+  surfaces in the B1/B2a records remain unqualified beyond the specific observations above.
+- Concurrent native/external writers remain outside the guarantee; no multiplayer/cloud.
