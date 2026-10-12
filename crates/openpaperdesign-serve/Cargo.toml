@@ -1,0 +1,27 @@
+[package]
+name = "openpaperdesign-serve"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Loopback server that lets a browser edit one paper-rs project folder with revision-checked saves"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "openpaperdesign-serve"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# Requirements and features match the root package where shared.
+[dependencies]
+paper-rs = { path = "../.." }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-std"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+getrandom = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

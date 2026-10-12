@@ -7,7 +7,13 @@ description = "A native infinite-canvas app for planning, working and sketching"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = [".", "crates/openpaperdesign-core"]
+members = [
+    ".",
+    "crates/openpaperdesign-core",
+    "crates/openpaperdesign-clipboard-stub",
+    "crates/openpaperdesign-serve",
+    "crates/openpaperdesign-web",
+]
 
 [lib]
 name = "paper_rs"
