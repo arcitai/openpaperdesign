@@ -16,8 +16,7 @@ jobs:
   native:
     runs-on: ubuntu-24.04
     steps:
-      # TODO(pin): replace the tag with a verified full commit SHA.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Software Vulkan driver (lavapipe) for the GPU tests
@@ -35,8 +34,7 @@ jobs:
   wasm-core:
     runs-on: ubuntu-24.04
     steps:
-      # TODO(pin): replace the tag with a verified full commit SHA.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
       - name: Check portable core for wasm32

@@ -33,8 +33,20 @@ cargo, rustc -> <worktree>/.toolchain/cargo/bin/
 
 The parallel SIGSEGV shows the same symptom as the operator's host baseline for the same commit. This sandbox
 renders with llvmpipe through GL, not the operator's Vulkan driver. The root cause is still not
-established. Serial runs are a workaround, not a fix. The tests rewrite tracked
-`docs/screenshots/*.png`. Those files were restored to HEAD after every run.
+established. Serial runs are a workaround, not a fix.
+
+Operator-observed on the operator's host, same day and commit (operator evidence retained
+privately outside the repository, "baseline diagnostic addendum"): running only the two
+concurrent MCP screenshot tests (`--test-threads=2`) with normal Vulkan driver discovery
+reproduces the SIGSEGV. The retained stack is in `vkEnumerateInstanceExtensionProperties`
+during wgpu `Headless::new`. With a process-local `VK_DRIVER_FILES` selecting the Radeon ICD,
+both tests pass and print no GPU-skip message. That narrows the failure to driver discovery
+or GPU initialization on that host. It does not prove the exact defect, and no host setting,
+package or source was changed. The override is host-specific and is not used in CI, which
+keeps serial tests on GitHub's runners (no Radeon ICD there).
+
+The tests rewrite tracked `docs/screenshots/*.png`. Those files were restored to HEAD after
+every run.
 
 ## wasm32 result
 
@@ -92,17 +104,16 @@ log, and a pointer there would only add sync conflicts.
 ## Native-only couplings blocking a browser editor
 
 - **Clocks** (`Instant::now` panics on wasm32-unknown-unknown; `SystemTime::now` too):
-  `src/session.rs:9,20,22,67,78,82,141,156,219`, `src/app.rs:15,85,203,214,719,1206,1218`,
+  `src/session.rs:9,20,22,67,78,82,141,156`, `src/app.rs:15,85,203,214,719,1206,1218`,
   `src/project/format.rs:240`, `src/ui/home.rs:8,34`.
 - **Blocking GPU calls**: `pollster::block_on` at `src/render/gpu.rs:736,744` and
   `src/app.rs:856,863`. Readback `map_async` followed by `poll(wait_indefinitely)` at
   `src/render/gpu.rs:809,811` needs async handling for export, screenshot and thumbnail
   (used by `session.rs`).
-- **Threads**: `src/mcp/server.rs:206` (Tokio thread), `src/project/mod.rs:412`
-  (`thread::sleep`).
-- **Filesystem** (std::fs is an inert stub on wasm32): `src/project/mod.rs` (21 uses),
-  `src/io/atomic.rs`, `src/io/file.rs:82-87`, `src/assets.rs:93,97,111`,
-  `src/library.rs`, `src/session.rs:162,234,265`, `src/mcp/exec.rs:1054,1128,1295`;
+- **Threads**: `src/mcp/server.rs:206` (Tokio thread for the MCP server).
+- **Filesystem** (std::fs is an inert stub on wasm32): `src/project/mod.rs:89-384`
+  (19 uses), `src/io/atomic.rs:27-59`, `src/io/file.rs:82-87`, `src/assets.rs:93,97,111`,
+  `src/library.rs:95,107`, `src/session.rs:162`, `src/mcp/exec.rs:1054,1128,1295`;
   `dirs` at `src/project/mod.rs:81` and `src/mcp/exec.rs:1028`.
 - **Clipboard**: `arboard` at `src/io/clipboard.rs:49-69` (compile blocker).
 - **Dialogs/windowing**: `rfd` at `src/app.rs:129-144`. winit/egui-winit/egui-wgpu in
@@ -118,9 +129,15 @@ log, and a pointer there would only add sync conflicts.
   selecting modules. A browser build of more than the core needs target-specific
   dependencies, not just skipping calls at startup.
 
+Every citation above is non-test code. Native test harness only (inside `#[cfg(test)]`
+modules; it constrains how tests could run in a browser, not the editor itself):
+`src/session.rs:219` (`Instant`), `src/session.rs:234,265` and `src/project/mod.rs:442,469`
+and `src/library.rs:268` (fs), `src/project/mod.rs:412` (`thread::sleep`).
+
 ## Architecture-review corrections carried as follow-ups
 
-From `.toolchain/operator-evidence/architecture-review.md` (SOUND WITH CORRECTIONS):
+From the independent architecture review (operator evidence retained privately outside the
+repository), verdict SOUND WITH CORRECTIONS:
 
 1. Preserve font and upstream notices (`assets/fonts/OFL.txt`, `THIRD_PARTY.md`, licenses)
    in any distributed artifact.
@@ -141,5 +158,8 @@ From `.toolchain/operator-evidence/architecture-review.md` (SOUND WITH CORRECTIO
   created on wasm32. MSAA, WGSL pipelines and blend modes are unvalidated there.
 - A Codex built-in browser surface, an MCP App panel, or any plugin.
 - Payload size and memory: fonts alone are 2,511,796 bytes before compression.
-- The CI workflow has not run. Its action is not yet pinned to a commit SHA, and lavapipe
-  availability on the runner is unverified.
+- The CI workflow has not run, and lavapipe availability on the runner is unverified. The
+  checkout action is pinned to the SHA the operator read back for the `v6` tag on
+  2026-10-12 (operator evidence retained privately outside the repository).
+- The independent reviewer's sandbox refused localhost sockets in the MCP tests. That is a
+  scoped sandbox limitation of that review run, not a code defect to bypass.

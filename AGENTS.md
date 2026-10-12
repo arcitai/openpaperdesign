@@ -1,7 +1,9 @@
 # AGENTS.md — openpaperdesign
 
-openpaperdesign is a fork of [paper-rs](https://github.com/michaelshimeles/paper-rs) by
-Michael Shimeles. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
+Revision: 0.1 · Updated: 2026-10-12
+
+openpaperdesign is a fork of the
+[michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
 built-in browser or an MCP App panel ([issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1)).
 It is not affiliated with or endorsed by Paper (paper.design). Do not suggest that it is.
 
