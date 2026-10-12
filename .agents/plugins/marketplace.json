@@ -1,0 +1,12 @@
+{
+  "name": "openpaperdesign-local",
+  "interface": { "displayName": "openpaperdesign (local)" },
+  "plugins": [
+    {
+      "name": "openpaperdesign",
+      "source": { "source": "local", "path": "./plugin/openpaperdesign" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Design"
+    }
+  ]
+}
