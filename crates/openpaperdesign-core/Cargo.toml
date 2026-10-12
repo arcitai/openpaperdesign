@@ -1,0 +1,24 @@
+[package]
+name = "openpaperdesign-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Portable paper-rs document, geometry, text and drawing modules, compiled from the upstream sources for wasm32 feasibility checks"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Same requirements and features as the root package, so the workspace lockfile
+# resolves the exact versions the native app ships with.
+[dependencies]
+egui = "0.36"
+lyon = "1"
+ttf-parser = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+fastrand = "2"

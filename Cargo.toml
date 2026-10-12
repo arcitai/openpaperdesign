@@ -6,6 +6,9 @@ rust-version = "1.95"
 description = "A native infinite-canvas app for planning, working and sketching"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = [".", "crates/openpaperdesign-core"]
+
 [lib]
 name = "paper_rs"
 path = "src/lib.rs"
