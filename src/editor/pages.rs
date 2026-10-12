@@ -7,7 +7,7 @@ use crate::history::History;
 use crate::model::{Document, NodeId};
 use crate::project::{PageData, new_id};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PageStash {
     pub doc: Document,
     pub history: History,
@@ -17,7 +17,7 @@ pub struct PageStash {
     pub needs_fit: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PageSlot {
     pub id: String,
     pub name: String,

@@ -204,7 +204,7 @@ impl<'a> Tx<'a> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct History {
     undo: Vec<Change>,
     redo: Vec<Change>,
