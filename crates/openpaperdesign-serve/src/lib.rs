@@ -115,7 +115,12 @@ pub struct Server {
     calls: Sender<agent::Job>,
     /// Set when a failed write couldn't be undone; every later write is refused.
     broken: Broken,
+    /// Every page id the host has held, for `release_layout_state`.
+    held: HeldPages,
 }
+
+/// Page ids a host has held (shared between the server and its host thread).
+pub type HeldPages = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
 
 /// Fail-closed state shared by every writer of one server: once a failed multi-file write
 /// could not be rolled back (see `commit`), the message naming the files is kept here and
@@ -371,8 +376,15 @@ impl Server {
         let bundle = load_bundle(&cfg.web_dir, &dir).map_err(OpenError::Unsafe)?;
         let write_lock = Arc::new(tokio::sync::Mutex::new(()));
         let broken = Broken::default();
-        let calls = agent::spawn_host(dir.clone(), root_id, write_lock.clone(), broken.clone())
-            .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
+        let held = HeldPages::default();
+        let calls = agent::spawn_host(
+            dir.clone(),
+            root_id,
+            write_lock.clone(),
+            broken.clone(),
+            held.clone(),
+        )
+        .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = cfg.port;
         Ok(Arc::new(Server {
             dir,
@@ -387,11 +399,21 @@ impl Server {
             write_lock,
             calls,
             broken,
+            held,
         }))
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Before this server stops for good (e.g. a launcher switching to another project): drop
+    /// the entries for every page it has held from upstream's process-wide stretch record, so
+    /// they can't affect a project bound later in the same process. Entries of other pages
+    /// are untouched.
+    pub fn release_layout_state(&self) {
+        let held = self.held.lock().unwrap().clone();
+        paper_rs::mcp::exec::with_no_stretch(|s| s.retain(|(p, _)| !held.contains(p)));
     }
 
     /// How many bundle files were found at startup (0 = not built).
@@ -852,6 +874,45 @@ mod tests {
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         assert!(msg.contains(&format!("{id}.json")), "{msg}");
         assert_eq!(files(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Operator Mac finding on cffeec6: a server that stops for good releases the stretch
+    /// entries of every page it held, and only those.
+    #[test]
+    fn releasing_a_server_drops_only_its_pages_layout_state() {
+        use std::hash::{BuildHasher, RandomState};
+        let root = std::env::temp_dir().join(format!(
+            "opd-unit-release-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (p, _) = paper_rs::project::Store::open(&root)
+            .unwrap()
+            .create("Release")
+            .unwrap();
+        let id = p.manifest.pages[0].id.clone();
+        let s = Server::open(Config {
+            project: p.dir.clone(),
+            web_dir: root.join("no-bundle"),
+            port: 1,
+            token: TOKEN.into(),
+        })
+        .unwrap();
+        let other = format!("other-{id}");
+        let n = paper_rs::model::NodeId(7);
+        paper_rs::mcp::exec::with_no_stretch(|set| {
+            set.insert((id.clone(), n));
+            set.insert((other.clone(), n));
+        });
+        s.release_layout_state();
+        let (mine, theirs) = paper_rs::mcp::exec::with_no_stretch(|set| {
+            (
+                set.contains(&(id.clone(), n)),
+                set.contains(&(other.clone(), n)),
+            )
+        });
+        assert!(!mine && theirs);
+        paper_rs::mcp::exec::with_no_stretch(|set| set.remove(&(other.clone(), n)));
         let _ = std::fs::remove_dir_all(&root);
     }
 

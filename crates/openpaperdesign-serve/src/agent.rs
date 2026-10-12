@@ -290,6 +290,8 @@ pub struct BoundHost {
     /// Set when a failed save couldn't be undone: every later write is refused (shared with
     /// the browser API, see `crate::Broken`).
     broken: crate::Broken,
+    /// Every page id this host has held (see `crate::Server::release_layout_state`).
+    held: crate::HeldPages,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
@@ -398,6 +400,18 @@ fn load_assets(dir: &Path) -> Result<(), String> {
 
 impl BoundHost {
     pub fn open(dir: &Path) -> Result<BoundHost, String> {
+        BoundHost::open_with(dir, Default::default(), Default::default())
+    }
+
+    /// Open and check the project. Only once that succeeded, the project starts with fresh
+    /// layout state: upstream's process-wide stretch record loses any entries for its page
+    /// ids (left by an earlier binding of a project with the same page ids), as if the
+    /// process had just started. A failed open changes nothing.
+    pub fn open_with(
+        dir: &Path,
+        broken: crate::Broken,
+        held: crate::HeldPages,
+    ) -> Result<BoundHost, String> {
         let mut h = BoundHost {
             ed: Editor::default(),
             project: Project {
@@ -412,10 +426,19 @@ impl BoundHost {
             seen: Default::default(),
             gpu: None,
             gpu_tried: false,
-            broken: Default::default(),
+            broken,
+            held,
         };
         h.load()?;
+        let ids: std::collections::HashSet<String> =
+            h.ed.pages.iter().map(|p| p.id.clone()).collect();
+        exec::with_no_stretch(|s| s.retain(|(p, _)| !ids.contains(p)));
         Ok(h)
+    }
+
+    fn note_held_pages(&self) {
+        let mut held = self.held.lock().unwrap();
+        held.extend(self.ed.pages.iter().map(|p| p.id.clone()));
     }
 
     pub fn bound(&self) -> Bound {
@@ -437,6 +460,7 @@ impl BoundHost {
             self.ed.mark_page_saved(i);
         }
         self.known = revs;
+        self.note_held_pages();
         Ok(())
     }
 
@@ -557,6 +581,7 @@ impl BoundHost {
         ed.meta_dirty = false;
         // Written. If the revisions can't be read back now, the next call's sync reloads.
         self.known = disk_revisions(&self.project).unwrap_or_default();
+        self.note_held_pages();
         Ok(())
     }
 }
@@ -1072,6 +1097,7 @@ pub fn spawn_host(
     root_id: (u64, u64),
     lock: Arc<tokio::sync::Mutex<()>>,
     broken: crate::Broken,
+    held: crate::HeldPages,
 ) -> Result<Sender<Job>, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1080,11 +1106,10 @@ pub fn spawn_host(
         .spawn(move || {
             let host = {
                 let _g = lock.blocking_lock();
-                BoundHost::open(&dir)
+                BoundHost::open_with(&dir, broken, held)
             };
             let mut host = match host {
-                Ok(mut h) => {
-                    h.broken = broken;
+                Ok(h) => {
                     let _ = ready_tx.send(Ok(()));
                     h
                 }
@@ -1509,6 +1534,40 @@ mod tests {
         }
     }
 
+    /// Operator Mac finding on cffeec6: a project opened in a process where an earlier
+    /// binding left stretch entries for the same page ids starts fresh; other page ids keep
+    /// theirs; and a project that fails to open clears nothing.
+    #[test]
+    fn a_new_binding_starts_with_fresh_layout_state() {
+        let (t, h, _, a, _) = two_page_host();
+        let dir = h.project.dir.clone();
+        drop(h);
+        let other = format!("other-{a}");
+        exec::with_no_stretch(|s| {
+            s.insert((a.clone(), NodeId(1)));
+            s.insert((other.clone(), NodeId(1)));
+        });
+        // A failed open (the manifest is unreadable) leaves everything as it was.
+        let manifest = dir.join(paper_rs::project::MANIFEST);
+        let good = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, "not json").unwrap();
+        assert!(BoundHost::open(&dir).is_err());
+        assert_eq!(stretch_entries(&a), vec![NodeId(1)]);
+        std::fs::write(&manifest, good).unwrap();
+        let _h = BoundHost::open(&dir).unwrap();
+        assert!(
+            stretch_entries(&a).is_empty(),
+            "fresh for the opened project's pages"
+        );
+        assert_eq!(
+            stretch_entries(&other),
+            vec![NodeId(1)],
+            "other pages untouched"
+        );
+        exec::with_no_stretch(|s| s.retain(|(p, _)| p != &other));
+        drop(t);
+    }
+
     fn host_thread() -> (
         Tmp,
         Sender<Job>,
@@ -1520,7 +1579,14 @@ mod tests {
         let dir = h.project.dir.clone();
         drop(h);
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let calls = spawn_host(dir.clone(), root_id, lock.clone(), Default::default()).unwrap();
+        let calls = spawn_host(
+            dir.clone(),
+            root_id,
+            lock.clone(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
         (t, calls, lock, dir, a)
     }
 
