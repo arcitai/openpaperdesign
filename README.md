@@ -339,6 +339,16 @@ analysis/          reverse-engineering findings and design (raw dumps are gitign
 docs/screenshots/  headless renders produced by `cargo test`
 ```
 
+## openpaperdesign: Codex plugin (this fork)
+
+This fork adds a local Codex plugin, `openpaperdesign` (`plugin/openpaperdesign/`, local
+marketplace `.agents/plugins/marketplace.json`). The agent binds a design project in your
+workspace, edits it over MCP, and opens the editable canvas in Codex's in-app browser on
+127.0.0.1. It runs locally only and is not affiliated with Paper. To set it up, run
+`./scripts/build-web.sh`, then
+`cargo install --locked --path crates/openpaperdesign-serve --bin openpaperdesign-mcp`. See
+`docs/openpaperdesign/plugin-b2b.md` for the steps and what is verified.
+
 ## License
 
 MIT OR Apache-2.0 for the code in this repository. Inter (Regular, Medium, SemiBold) is

@@ -57,6 +57,8 @@ PAPER_RS_REQUIRE_GPU=1 cargo test --locked --test headless
 cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown
 cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
 node --test crates/openpaperdesign-web/tests/session.test.mjs   # page lifecycle; Node >= 22
+node --test plugin/tests/plugin.test.mjs                        # plugin manifests and skills
+(cd plugin/tests/design && python3 -m unittest)                 # ported design-method tests
 ./scripts/build-web.sh                         # browser bundle; needs wasm-bindgen CLI 0.2.129
 cargo clippy --locked --all-targets
 cargo fmt --all --check
@@ -99,6 +101,14 @@ started call is always waited for; reads count only once their result was delive
 contain `<image>`/`<feImage>`.
 The dropped three-way-merge experiment is at the local tag `experiment/b2a-three-way-merge`;
 don't bring it back without an explicit decision (collaboration is issue #2).
+
+## Codex plugin
+
+`plugin/openpaperdesign/` is the local Codex plugin (`docs/openpaperdesign/plugin-b2b.md`). Its
+MCP server, `openpaperdesign-mcp`, must be on PATH. It binds only projects inside the
+workspace and embeds the web bundle at build time, so run `./scripts/build-web.sh` before
+`cargo install`. Keep the ported `design` and `review-design` skills' provenance notes and
+LICENSE files, and the plugin's `NOTICE.md`, intact.
 
 ## Model profile
 
