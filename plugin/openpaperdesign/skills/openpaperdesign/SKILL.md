@@ -23,8 +23,11 @@ see each other's changes live.
 4. **Open the canvas.** Call `open_editor` and open the returned
    `http://127.0.0.1:<port>/#token=…` URL in the in-app browser. The token is for this
    session only: don't write it into files or commits.
-5. **Work together.** The person's edits and yours merge per layer. If both change the same
-   layer, the page shows a conflict instead of overwriting; let the person decide.
+5. **Work together.** Your saved changes show up in the canvas when the person has nothing
+   unsaved there. If the person has an unsaved edit while you write the same page, their save
+   is refused and the page shows a conflict; nothing is overwritten either way. Let the person
+   decide: their "Reload (discard my unsaved change)" shows your version. Prefer to edit
+   after they've saved.
 
 Limits (state them when relevant):
 
