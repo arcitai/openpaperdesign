@@ -74,8 +74,8 @@ apart from `manifest.modified`.
   `Sec-Fetch-Site` values other than `same-origin`/`none`. Every response carries `no-store`,
   `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. That includes
   refusals, unknown paths and body-limit errors, because the headers are added by the
-  outermost layer. Only the five bundle files are served (`index.html`, `app.js`,
-  `session.js`, the wasm-bindgen JS and the wasm). They are checked (plain, single-link files
+  outermost layer. Only the six bundle files are served (`index.html`, `app.js`,
+  `page.js`, `session.js`, the wasm-bindgen JS and the wasm). They are checked (plain, single-link files
   in a folder that is not inside the project) and read into memory once at startup, and
   every request is served from memory, so replacing the bundle folder or a file in it later
   can't change what is sent. A `--web-dir` inside or equal to the project folder is refused
@@ -421,6 +421,38 @@ build from a different path may well hash differently.
 | `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline); no quota errors |
 | Root clippy; `cargo tree -p paper-rs -e features` | 1 upstream warning; unchanged |
 | Bundle | wasm and wasm-bindgen JS unchanged (same SHA-256 as rounds 3–4); `app.js` 8,361 B, `session.js` 5,619 B, `page.js` 760 B, `index.html` 3,002 B |
+
+## Fix round 6 (2026-10-12, after independent review of 0f759a4)
+
+### Operator-observed on exact 0f759a4 (that revision only; not re-run by the implementation worker)
+
+On the Mac, the serve tests (17) and the Node tests (9, Node 22.22.3) passed. In the Codex
+in-app browser on WebGPU an edit was saved; after a reload and a reopen on WebGL the page had
+31 nodes, and the 30 earlier ones were unchanged.
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| P2: a terminal renderer error (e.g. device loss) while a save was in flight was overwritten by that save's result ("Saved", "Not saved: conflict", "retrying"), although no more saves would happen | Saving moved into `page.js` (`saveStep`), which `app.js` runs every 300 ms. The save's bookkeeping (ack and revision, conflict state, failure) still happens in `Session.save`, and the conflict banner is still shown. Once terminal, the status line and footer keep the red error and no further save starts | `tests/session.test.mjs` (mocked page; through `saveStep`, `frameStep` and `Session`): `a save in flight when the renderer fails (success \| 409 conflict \| HTTP failure \| network rejection) keeps the red terminal status`. Against 0f759a4: its `page.js` has no `saveStep`, so the file doesn't load. With 0f759a4's `app.js` save logic transplanted verbatim into `saveStep`, all four fail and the other 9 pass |
+| P3: the bundle list said five files and left out `page.js` | Six, listed (above) | — |
+
+**Checks: current versus inherited.** This round changed JavaScript and docs only.
+`git diff --stat 0f759a4` lists `crates/openpaperdesign-web/static/{app.js,page.js}`,
+`crates/openpaperdesign-web/tests/session.test.mjs` and this file. No Rust, manifest or
+lockfile changed.
+
+- **Current (2026-10-12, this sandbox):**
+  - `node --check` on the changed JavaScript;
+  - the CI command `node --test crates/openpaperdesign-web/tests/session.test.mjs`: 13
+    passed (Node 26.8.1);
+  - the regression demonstration above;
+  - `git diff --check`;
+  - the bundle rebuild. Only `app.js` (8,016 B, SHA-256
+    `14aa2c6865e9087763ed661238f1973d9aace7f96d38e70d0c7dc0cba91f9d7a`) and `page.js`
+    (1,707 B, `ed9762b360347812960b5141f59d11378ccf0e5921c41f796d0f504e366742ed`) changed.
+    The wasm, the wasm-bindgen JS, `session.js` and `index.html` are byte-identical to 0f759a4.
+- **Inherited from the round-5 results on 0f759a4 (not re-run, by the owner's instruction):**
+  native build, serial suite (162 passed), headless GPU (9), clippy, fmt,
+  `cargo tree -p paper-rs`, the serve/web/shader tests and the wasm32 check.
 
 ## Not proven / open
 
