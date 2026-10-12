@@ -52,6 +52,127 @@ async fn call(c: &Client, name: &str, args: Value) -> (bool, String) {
     (r.is_error != Some(true), text)
 }
 
+/// What an agent does before its first change to a page: read it (here the whole page tree).
+async fn read_page(c: &Client) {
+    let (ok, out) = call(c, "get_tree_summary", json!({"nodeId": "root"})).await;
+    assert!(ok, "{out}");
+}
+
+/// A minimal HTTP/1.1 request on loopback with the token; returns (status, ETag, body).
+async fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    if_match: Option<&str>,
+    body: &str,
+) -> (u16, Option<String>, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let im = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n{im}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let etag = head.lines().find_map(|l| {
+        l.to_ascii_lowercase()
+            .starts_with("etag:")
+            .then(|| l[5..].trim().to_string())
+    });
+    // Chunked bodies aren't expected for these small JSON answers.
+    (status, etag, body.to_string())
+}
+
+/// B2b review round 1, finding 4: the stdio client is one session of the host's
+/// read-before-write tracking: a change after someone else's save is refused until it reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stdio_session_must_read_before_it_writes() {
+    let t = tmp();
+    let ws = t.0.join("workspace");
+    let home = t.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (p, _) = Store::open(ws.join("design")).unwrap().create("A").unwrap();
+    let page = p.manifest.pages[0].id.clone();
+    let c = launcher(&ws, &home).await;
+    let (ok, out) = call(&c, "bind_project", json!({"path": "design/A"})).await;
+    assert!(ok, "{out}");
+    read_page(&c).await;
+    let shape = json!({"type": "rectangle", "x": 1, "y": 1, "width": 9, "height": 9});
+    let (ok, out) = call(&c, "create_shape", shape.clone()).await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(&c, "open_editor", json!({})).await;
+    if !ok {
+        // Built without the editor: no browser to save through.
+        assert!(out.contains("build the web bundle"), "{out}");
+        return;
+    }
+    let (port, token) = editor(&out);
+    // The person saves the page in the browser (a conditional save on its revision).
+    let path = format!("/api/pages/{page}");
+    let (st, tag, body) = http(port, "GET", &path, &token, None, "").await;
+    assert_eq!(st, 200, "{body}");
+    let mut v: Value = serde_json::from_str(&body).unwrap();
+    v["next_id"] = json!(v["next_id"].as_u64().unwrap() + 1);
+    let (st, _, out) = http(port, "PUT", &path, &token, tag.as_deref(), &v.to_string()).await;
+    assert_eq!(st, 200, "{out}");
+    let saved = std::fs::read(p.page_path(&page)).unwrap();
+    // The agent's next change wasn't decided on that: refused, nothing written.
+    let (ok, out) = call(&c, "create_shape", shape.clone()).await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(std::fs::read(p.page_path(&page)).unwrap(), saved);
+    // After reading the page again it goes through.
+    read_page(&c).await;
+    let (ok, out) = call(&c, "create_shape", shape).await;
+    assert!(ok, "{out}");
+    c.cancel().await.unwrap();
+}
+
+/// B2b review round 1, finding 1 (reviewer's sequence): the workspace is moved and its old
+/// path replaced by a symlink to another folder; create_project writes nothing there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_workspace_is_refused_not_followed() {
+    let t = tmp();
+    let ws = t.0.join("replaceable");
+    let target = t.0.join("replacement-target");
+    let home = t.0.join("home");
+    for d in [&ws, &target, &home] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let c = launcher(&ws, &home).await;
+    std::fs::rename(&ws, t.0.join("original-workspace-retained")).unwrap();
+    std::os::unix::fs::symlink(&target, &ws).unwrap();
+    let (ok, out) = call(&c, "create_project", json!({"name": "Escaped"})).await;
+    assert!(!ok && out.contains("moved or replaced"), "{out}");
+    let (ok, out) = call(&c, "bind_project", json!({"path": "."})).await;
+    assert!(!ok && out.contains("moved or replaced"), "{out}");
+    assert_eq!(
+        std::fs::read_dir(&target).unwrap().count(),
+        0,
+        "nothing written there"
+    );
+    assert_eq!(
+        std::fs::read_dir(t.0.join("original-workspace-retained"))
+            .unwrap()
+            .count(),
+        0
+    );
+    // Also a plain directory put back at the same path is a different workspace.
+    std::fs::remove_file(&ws).unwrap();
+    std::fs::create_dir(&ws).unwrap();
+    let (ok, out) = call(&c, "create_project", json!({"name": "Escaped"})).await;
+    assert!(!ok && out.contains("moved or replaced"), "{out}");
+    assert_eq!(std::fs::read_dir(&ws).unwrap().count(), 0);
+    c.cancel().await.unwrap();
+}
+
 /// A minimal HTTP/1.1 GET on loopback; returns the status code.
 async fn http_status(port: u16, path: &str, token: &str) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,6 +278,7 @@ async fn bind_edit_and_open_the_editor_inside_the_workspace_only() {
     let before = page_files(&landing.dir);
     let (ok, out) = call(&c, "bind_project", json!({"path": "design/Landing"})).await;
     assert!(ok, "{out}");
+    read_page(&c).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -277,6 +399,7 @@ async fn a_failed_rebind_keeps_the_current_project_and_its_editor() {
     let c = launcher(&ws, &home).await;
     let (ok, out) = call(&c, "bind_project", json!({"path": "design/A"})).await;
     assert!(ok, "{out}");
+    read_page(&c).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -422,7 +545,7 @@ async fn home_folder_workspace_and_escaping_design_folder_are_refused() {
     std::fs::create_dir_all(&other_home).unwrap();
     let c = launcher(&ws, &other_home).await;
     let (ok, out) = call(&c, "create_project", json!({"name": "Leak"})).await;
-    assert!(!ok && out.contains("outside the workspace"), "{out}");
+    assert!(!ok && out.contains("not a real folder"), "{out}");
     assert_eq!(
         std::fs::read_dir(&outside).unwrap().count(),
         0,

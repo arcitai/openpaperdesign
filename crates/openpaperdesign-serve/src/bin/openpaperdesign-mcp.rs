@@ -80,6 +80,26 @@ fn workspace_problem(ws: &Path) -> Option<String> {
     None
 }
 
+/// A directory's identity: (device, inode).
+#[cfg(unix)]
+fn identity(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+#[cfg(not(unix))]
+fn identity(_: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// `path` is a real directory (not a symlink to one).
+fn real_dir(path: &Path) -> Result<std::fs::Metadata, String> {
+    let m = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return Err(format!("{} is not a real directory", path.display()));
+    }
+    Ok(m)
+}
+
 struct Bound {
     server: Arc<Server>,
     port: u16,
@@ -97,7 +117,11 @@ impl Drop for Bound {
 
 #[derive(Clone)]
 struct Launcher {
+    /// Canonical path, recorded at start, and its identity (device, inode) then: re-checked
+    /// before every bind and create, so a workspace moved or replaced (for example by a
+    /// symlink to somewhere else) is refused instead of followed.
     workspace: PathBuf,
+    workspace_id: (u64, u64),
     bound: Arc<tokio::sync::Mutex<Option<Bound>>>,
     /// The one MCP client on stdio, as a session of the bound project's host.
     session: u64,
@@ -165,7 +189,61 @@ impl Launcher {
         if rel.is_empty() { ".".into() } else { rel }
     }
 
+    /// The workspace is still the directory recorded at start.
+    fn check_workspace(&self) -> Result<(), String> {
+        let replaced = || {
+            format!(
+                "the workspace {} was moved or replaced since this server started; refusing. \
+                 Restart the agent in the project folder.",
+                self.workspace.display()
+            )
+        };
+        let m = real_dir(&self.workspace).map_err(|_| replaced())?;
+        if identity(&m) != self.workspace_id
+            || self.workspace.canonicalize().ok().as_deref() != Some(self.workspace.as_path())
+        {
+            return Err(replaced());
+        }
+        Ok(())
+    }
+
+    /// Create `design/<folder>/pages/` without following links: each component is made with
+    /// `create_dir` (which never follows a final symlink) or must already be a real
+    /// directory, and the result must still be inside the unchanged workspace.
+    fn create_folders(&self, folder: &str) -> Result<PathBuf, String> {
+        self.check_workspace()?;
+        let design = self.workspace.join("design");
+        match std::fs::create_dir(&design) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("design/: {e}")),
+        }
+        real_dir(&design).map_err(|_| "design/ is not a real folder (a link?); refusing")?;
+        let dir = design.join(folder);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "design/{folder} already exists; bind it with bind_project"
+                ));
+            }
+            Err(e) => return Err(format!("design/{folder}: {e}")),
+        }
+        std::fs::create_dir(dir.join(paper_rs::project::PAGES_DIR))
+            .map_err(|e| format!("design/{folder}/pages: {e}"))?;
+        // Verify what was made before writing any file into it.
+        self.check_workspace()?;
+        for d in [&design, &dir, &dir.join(paper_rs::project::PAGES_DIR)] {
+            real_dir(d)?;
+        }
+        if dir.canonicalize().ok().as_deref() != Some(dir.as_path()) {
+            return Err("the new project folder isn't where it was made; refusing".into());
+        }
+        Ok(dir)
+    }
+
     fn resolve_inside(&self, path: &str) -> Result<PathBuf, String> {
+        self.check_workspace()?;
         if let Some(p) = workspace_problem(&self.workspace) {
             return Err(format!(
                 "refusing to bind: {p}. Start the agent in a project folder instead."
@@ -275,24 +353,26 @@ impl Launcher {
                 let name = arg("name")?;
                 // Before creating anything.
                 Self::may_switch(&*self.bound.lock().await, None, force)?;
+                self.check_workspace()?;
                 if let Some(p) = workspace_problem(&self.workspace) {
                     return Err(format!("refusing to create a project: {p}"));
                 }
-                let design = self.workspace.join("design");
-                if design.exists() {
-                    let real = design.canonicalize().map_err(|e| e.to_string())?;
-                    if !real.starts_with(&self.workspace) || !real.is_dir() {
-                        return Err("design/ leads outside the workspace; refusing".into());
-                    }
-                }
                 let folder = paper_rs::project::folder_name(name);
-                if design.join(&folder).exists() {
-                    return Err(format!(
-                        "design/{folder} already exists; bind it with bind_project"
-                    ));
-                }
-                let store = paper_rs::project::Store::open(&design).map_err(|e| e.to_string())?;
-                let (p, _) = store.create(name).map_err(|e| e.to_string())?;
+                let dir = self.create_folders(&folder)?;
+                // As upstream `Store::create`, but into the folder made and checked above.
+                let manifest = paper_rs::project::Manifest::new(name.trim());
+                let page = paper_rs::project::PageData {
+                    id: manifest.pages[0].id.clone(),
+                    name: manifest.pages[0].name.clone(),
+                    doc: paper_rs::model::Document {
+                        name: manifest.pages[0].name.clone(),
+                        ..Default::default()
+                    },
+                    camera: None,
+                };
+                let p = paper_rs::project::Project { dir, manifest };
+                p.save_page(&page).map_err(|e| e.to_string())?;
+                p.write_manifest().map_err(|e| e.to_string())?;
                 self.bind(p.dir, force).await
             }
             "open_editor" => {
@@ -431,8 +511,16 @@ async fn main() {
         }
     }
     // MCP over stdio. Nothing else may write to stdout.
+    let workspace_id = match std::fs::symlink_metadata(&ws) {
+        Ok(m) => identity(&m),
+        Err(e) => {
+            eprintln!("workspace {}: {e}", ws.display());
+            std::process::exit(2);
+        }
+    };
     let launcher = Launcher {
         workspace: ws,
+        workspace_id,
         bound: Arc::new(tokio::sync::Mutex::new(None)),
         session: openpaperdesign_serve::agent::new_session(),
     };
