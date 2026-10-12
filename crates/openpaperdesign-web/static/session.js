@@ -13,7 +13,8 @@
 //   page in place only when this tab has nothing unsaved (`can_reload`). Otherwise nothing is
 //   reloaded: this tab's next save is based on an older revision, the server refuses it (409,
 //   nothing written), and the unsaved state stays on screen until the person explicitly
-//   discards it (`discard`), which loads the server's version in place.
+//   discards it (`discard`), which loads the server's version in place. Editing is suspended
+//   while that load is under way, so no edit can be made that it would then replace.
 
 export class Session {
   /**
@@ -32,7 +33,7 @@ export class Session {
     this.state = Object.assign(state, {
       ready: false, error: null, fallback: null, backend: null, revision: null,
       saves: 0, saving: false, conflict: false, switching: false,
-      reloads: 0, behind: false,
+      reloads: 0, behind: false, discarding: false,
     });
     this.ed = null;
     this.canvas = null;
@@ -49,7 +50,7 @@ export class Session {
   /** May the user edit right now? */
   editable() {
     const s = this.state;
-    return Boolean(this.ed) && s.ready && !s.switching && !s.error;
+    return Boolean(this.ed) && s.ready && !s.switching && !s.error && !s.discarding;
   }
 
   /** Run `fn(editor)` only when editing is allowed (input, toolbar). */
@@ -198,19 +199,25 @@ export class Session {
   async discard() {
     const s = this.state;
     const ed = this.ed;
-    if (!ed || s.switching || s.error || s.saving) return undefined;
+    if (!ed || s.switching || s.error || s.saving || s.discarding) return undefined;
     const gen = ++this.generation;
-    const page = await this.deps.fetchPage();
-    // Apply only to the editor that asked, and only if nothing else started meanwhile.
-    if (this.ed !== ed || gen !== this.generation || s.switching || s.error || s.saving) {
-      return undefined;
+    // No input, toolbar action or save reaches the editor until this is done.
+    s.discarding = true;
+    try {
+      const page = await this.deps.fetchPage();
+      // Apply only to the editor that asked, and only if nothing else started meanwhile.
+      if (this.ed !== ed || gen !== this.generation || s.switching || s.error || s.saving) {
+        return undefined;
+      }
+      ed.reload(page.text);
+      s.revision = page.revision;
+      s.conflict = false;
+      s.behind = false;
+      s.reloads += 1;
+      return 'discarded';
+    } finally {
+      s.discarding = false;
     }
-    ed.reload(page.text);
-    s.revision = page.revision;
-    s.conflict = false;
-    s.behind = false;
-    s.reloads += 1;
-    return 'discarded';
   }
 
   /** Save the editor's pending change, if any. Returns what happened, for the status line. */

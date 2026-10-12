@@ -425,3 +425,31 @@ test('polls never overlap, and a discard makes an older poll answer stale', asyn
   assert.ok(!ed.calls.includes('reload:stale poll page'));
   assert.equal(s.state.revision, '"r4"');
 });
+
+test('editing is suspended while a discard loads, so it cannot erase a newer edit (reviewer sequence)', async () => {
+  const { s, ed } = await readySession({ put: async () => ({ ok: false, status: 409 }) });
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.save(), 'conflict');
+  const page = deferred();
+  s.deps.fetchPage = async () => page.promise;
+  const discarding = s.discard();
+  // The person types while the server's version is loading: the edit never reaches the
+  // editor (input is suspended), so the discard can't silently replace it.
+  assert.equal(s.editable(), false);
+  let applied = false;
+  assert.equal(s.edit(() => { applied = true; }), undefined);
+  assert.equal(applied, false);
+  assert.equal(await s.save(), undefined, 'no save either');
+  assert.equal(await s.discard(), undefined, 'one discard at a time');
+  page.resolve({ text: 'server page', revision: '"r2"' });
+  assert.equal(await discarding, 'discarded');
+  assert.ok(ed.calls.includes('reload:server page'));
+  // Editing resumes once it is done, also after a failed load.
+  assert.equal(s.editable(), true);
+  assert.equal(s.edit(() => 'ok'), 'ok');
+  s.state.conflict = true;
+  s.deps.fetchPage = async () => { throw new Error('offline'); };
+  await assert.rejects(s.discard());
+  assert.equal(s.editable(), true);
+  assert.equal(s.state.conflict, true, 'the conflict and unsaved work stay');
+});

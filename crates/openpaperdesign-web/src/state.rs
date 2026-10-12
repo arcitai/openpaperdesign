@@ -275,8 +275,8 @@ impl WebState {
     }
 
     /// Whether a newer revision from the server may replace the page now: nothing unsaved,
-    /// no save in flight, no gesture or text edit under way. Otherwise the local change is
-    /// saved first (and merged by the server).
+    /// no save in flight, no gesture or text edit under way. Otherwise nothing is reloaded:
+    /// the local change's save is refused as a conflict (nothing merges).
     pub fn can_reload(&self) -> bool {
         !self.dirty()
             && self.inflight.is_none()
