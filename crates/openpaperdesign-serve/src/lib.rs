@@ -14,7 +14,7 @@
 //!   rename over the page file, so a write never lands outside `pages/`. Residual race: a
 //!   directory or link swapped in between a check and the following file operation can still
 //!   redirect that read or write.
-//! - The web bundle (four allowlisted files) is checked and read into memory once at startup,
+//! - The web bundle (five allowlisted files) is checked and read into memory once at startup,
 //!   from a folder outside the project; static requests never touch the file system.
 //! - Unix only (Linux, macOS): the root identity and hard-link checks use Unix metadata, so the
 //!   server refuses to start elsewhere.
@@ -48,6 +48,11 @@ use std::sync::Arc;
 const BUNDLE: &[(&str, &str, &str)] = &[
     ("/", "index.html", "text/html; charset=utf-8"),
     ("/app.js", "app.js", "text/javascript; charset=utf-8"),
+    (
+        "/session.js",
+        "session.js",
+        "text/javascript; charset=utf-8",
+    ),
     (
         "/openpaperdesign_web.js",
         "openpaperdesign_web.js",
@@ -188,43 +193,33 @@ fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
 /// (URL path, content type, bytes) of each bundle file found at startup.
 type Bundle = Vec<(&'static str, &'static str, Vec<u8>)>;
 
-/// Where `path` really is: canonical if it exists; otherwise its longest existing ancestor
-/// canonicalized, plus the rest with `.`/`..` resolved lexically.
-fn resolve(path: &Path) -> std::io::Result<PathBuf> {
-    if let Ok(p) = path.canonicalize() {
-        return Ok(p);
-    }
-    let mut norm = PathBuf::new();
-    for c in std::path::absolute(path)?.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                norm.pop();
+/// The bundle folder's real path (symlinks resolved by the OS), or `None` when it doesn't
+/// exist, in which case nothing is served. No lexical guessing: a path that doesn't exist and
+/// contains `..` is refused, because `..` after a symlink can't be resolved without it.
+fn resolve(path: &Path) -> Result<Option<PathBuf>, String> {
+    match path.canonicalize() {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                Err("a web bundle folder that doesn't exist may not contain `..`".into())
+            } else {
+                Ok(None)
             }
-            std::path::Component::CurDir => {}
-            c => norm.push(c),
         }
+        Err(e) => Err(format!("web bundle folder: {e}")),
     }
-    let mut existing = norm;
-    let mut rest = Vec::new();
-    while existing.canonicalize().is_err() {
-        match existing.file_name() {
-            Some(n) => {
-                rest.push(n.to_owned());
-                existing.pop();
-            }
-            None => break,
-        }
-    }
-    let mut out = existing.canonicalize().unwrap_or(existing);
-    out.extend(rest.iter().rev());
-    Ok(out)
 }
 
 /// Read the bundle allowlist into memory. The bundle directory must not be (or be inside) the
 /// project folder, and every file present must be a plain single-link file. A missing
-/// directory or file is not an error (that file then answers 404 "build it first").
+/// directory or file is not an error: nothing is served for it (404 "build it first").
 fn load_bundle(web_dir: &Path, project: &Path) -> Result<Bundle, String> {
-    let web = resolve(web_dir).map_err(|e| format!("web bundle folder: {e}"))?;
+    let Some(web) = resolve(web_dir)? else {
+        return Ok(Vec::new());
+    };
     if web.starts_with(project) {
         return Err("the web bundle folder must not be inside the project folder".into());
     }

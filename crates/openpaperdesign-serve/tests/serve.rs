@@ -654,24 +654,47 @@ async fn web_dir_inside_the_project_is_refused() {
     let inside = p.dir.join("web");
     std::fs::create_dir_all(&inside).unwrap();
     std::fs::write(inside.join("index.html"), "x").unwrap();
-    for (what, web) in [
-        ("inside", inside),
-        ("the project folder", p.dir.clone()),
-        ("missing, inside", p.dir.join("not-built")),
+    for (what, web, why) in [
+        ("inside", inside, "inside the project"),
+        ("the project folder", p.dir.clone(), "inside the project"),
         (
-            "via ..",
+            "missing, via ..",
             t.0.join("elsewhere/..")
                 .join(p.dir.file_name().unwrap())
                 .join("web"),
+            "may not contain `..`",
         ),
     ] {
         let err = open_with_web(&p, web)
             .err()
             .unwrap_or_else(|| panic!("{what}: refused"));
-        assert!(
-            err.to_string().contains("inside the project"),
-            "{what}: {err}"
-        );
+        assert!(err.to_string().contains(why), "{what}: {err}");
+    }
+    // A missing folder without `..` serves nothing ("build it first"); nothing is guessed.
+    let s = open_with_web(&p, p.dir.join("not-built")).unwrap();
+    assert_eq!(s.bundle_files(), 0);
+    assert_eq!(send(&s, get("/")).await.0, StatusCode::NOT_FOUND);
+}
+
+/// Reviewer case: `alias` links to a folder inside the project, and the missing
+/// `alias/../not-built` must not be resolved lexically to an unrelated sibling bundle.
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_web_dir_with_dotdot_after_a_symlink_is_not_guessed() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let (p, _) = project(&t.0);
+    std::fs::create_dir_all(p.dir.join("sub")).unwrap();
+    let alias = t.0.join("alias");
+    symlink(p.dir.join("sub"), &alias).unwrap();
+    // What a lexical `..` would land on: a sibling bundle nobody asked for.
+    bundle_dir(&t, "not-built", "UNREQUESTED SIBLING BUNDLE");
+    match open_with_web(&p, alias.join("..").join("not-built")) {
+        Err(e) => assert!(e.to_string().contains("may not contain `..`"), "{e}"),
+        Ok(s) => {
+            let (_, _, body) = send(&s, get("/")).await;
+            panic!("must be refused, but served: {body}");
+        }
     }
 }
 
