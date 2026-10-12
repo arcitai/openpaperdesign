@@ -31,6 +31,7 @@
 //! detected. Run one writer at a time.
 
 pub mod agent;
+mod commit;
 
 use axum::Router;
 use axum::body::Body;
@@ -39,7 +40,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use paper_rs::mcp::Call;
 use paper_rs::model::Document;
 use paper_rs::project::format::{page_from_json, page_to_json};
 use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData, Project, now_ms};
@@ -112,7 +112,29 @@ pub struct Server {
     /// and agent calls (the MCP host thread takes the same lock).
     write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Tool calls for the MCP host thread.
-    calls: Sender<Call>,
+    calls: Sender<agent::Job>,
+    /// Set when a failed write couldn't be undone; every later write is refused.
+    broken: Broken,
+}
+
+/// Fail-closed state shared by every writer of one server: once a failed multi-file write
+/// could not be rolled back (see `commit`), the message naming the files is kept here and
+/// every further write, browser or MCP, is refused with it. Restarting the server after
+/// checking those files clears it.
+pub type Broken = Arc<std::sync::Mutex<Option<String>>>;
+
+pub(crate) fn set_broken(b: &Broken, why: &str) {
+    *b.lock().unwrap() = Some(why.to_string());
+}
+
+pub(crate) fn refuse_if_broken(b: &Broken) -> Result<(), String> {
+    match b.lock().unwrap().as_ref() {
+        Some(why) => Err(format!(
+            "writes are disabled: a failed save could not be undone ({why}). Check those \
+             files, then restart the server"
+        )),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
@@ -348,7 +370,8 @@ impl Server {
         Project::open(&dir).map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
         let bundle = load_bundle(&cfg.web_dir, &dir).map_err(OpenError::Unsafe)?;
         let write_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let calls = agent::spawn_host(dir.clone(), root_id, write_lock.clone())
+        let broken = Broken::default();
+        let calls = agent::spawn_host(dir.clone(), root_id, write_lock.clone(), broken.clone())
             .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = cfg.port;
         Ok(Arc::new(Server {
@@ -363,6 +386,7 @@ impl Server {
             ],
             write_lock,
             calls,
+            broken,
         }))
     }
 
@@ -705,12 +729,30 @@ async fn put_page(
         page.doc.name = name;
         // Checked again just before writing (`read_page` above checked the page file).
         s.check()?;
-        p.save_page(&page)
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        // Like the native session: a page write bumps the project's modified time.
+        refuse_if_broken(&s.broken)
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        // Like the native session: a page write bumps the project's modified time. The page
+        // and the manifest are written as one commit: on an error neither changed.
         p.manifest.modified = now_ms();
-        p.write_manifest()
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let writes = [
+            commit::Write {
+                path: p.page_path(&page.id),
+                data: paper_rs::project::format::page_to_json(&page).into_bytes(),
+            },
+            commit::Write {
+                path: p.dir.join(MANIFEST),
+                data: p.manifest.to_json().into_bytes(),
+            },
+        ];
+        commit::commit(&writes).map_err(|e| {
+            if let commit::CommitError::Broken(m) = &e {
+                set_broken(&s.broken, m);
+            }
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("not saved, nothing was written: {}", e.message()),
+            )
+        })?;
         let rev = revision(&read_page(&p, &id)?);
         Ok((
             StatusCode::OK,
@@ -721,4 +763,83 @@ async fn put_page(
             .into_response())
     })();
     result.unwrap_or_else(IntoResponse::into_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    const TOKEN: &str = "unit-test-token-0123456789abcdef";
+
+    async fn put(s: &Arc<Server>, id: &str, tag: &str, body: String) -> StatusCode {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/pages/{id}"))
+            .header(header::HOST, "127.0.0.1:1")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::IF_MATCH, tag)
+            .body(Body::from(body))
+            .unwrap();
+        router(s.clone()).oneshot(req).await.unwrap().status()
+    }
+
+    /// Review round 4, F1, browser side: the page and the manifest are one commit, so a
+    /// failure at any step leaves both byte-identical; after an undoable failure, every
+    /// later save is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_saves_are_all_or_nothing_and_fail_closed() {
+        use std::hash::{BuildHasher, RandomState};
+        let root = std::env::temp_dir().join(format!(
+            "opd-unit-put-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (p, _) = paper_rs::project::Store::open(&root)
+            .unwrap()
+            .create("Put")
+            .unwrap();
+        let id = p.manifest.pages[0].id.clone();
+        let s = Server::open(Config {
+            project: p.dir.clone(),
+            web_dir: root.join("no-bundle"),
+            port: 1,
+            token: TOKEN.into(),
+        })
+        .unwrap();
+        let files = || {
+            (
+                std::fs::read(p.page_path(&id)).unwrap(),
+                std::fs::read(p.dir.join(MANIFEST)).unwrap(),
+            )
+        };
+        let mut page = p.load_page(&id).unwrap();
+        page.doc.next_id += 1;
+        let body = page_to_json(&page);
+        // Steps: stage page (0), stage manifest (1), rename page (2), rename manifest (3).
+        for at in 0..4 {
+            let before = files();
+            let tag = etag(&before.0);
+            commit::fault::fail_at(&[at]);
+            let st = put(&s, &id, &tag, body.clone()).await;
+            commit::fault::fail_at(&[]);
+            assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "step {at}");
+            assert_eq!(files(), before, "step {at}: nothing written");
+        }
+        // Rename of the manifest fails, and restoring the page fails too: fail closed.
+        let tag = etag(&files().0);
+        commit::fault::fail_at(&[3, 4]);
+        assert_eq!(
+            put(&s, &id, &tag, body.clone()).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        commit::fault::fail_at(&[]);
+        assert!(s.broken.lock().unwrap().is_some());
+        let before = files();
+        let st = put(&s, &id, &etag(&before.0), body).await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(files(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

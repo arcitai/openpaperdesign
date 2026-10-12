@@ -12,17 +12,24 @@
 //! 4. refuses the change (and discards it) if it touches a page this MCP session hasn't read,
 //!    or whose content or metadata (name, position) changed since the session last read it,
 //!    e.g. a browser save landed after the agent looked, and
-//! 5. otherwise saves every changed page atomically through upstream `Project::save_page`,
-//!    which changes that page's revision, so the browser picks the change up.
+//! 5. otherwise saves everything the call changed (new images, pages, the manifest) as one
+//!    commit (`crate::commit`): all of it, or after an error none of it. Each written page
+//!    gets a new revision, so the browser picks the change up.
+//!
+//! A call that returns an error changes nothing, in memory or on disk (the host reloads from
+//! disk, which it matched before the call). Calls are queued; a call that couldn't start
+//! within `CALL_TIMEOUT` is abandoned and never runs, and a call that started is always
+//! waited for (see `Job`).
 //!
 //! What a session has read is kept per page: a page counts as read at a revision only when a
 //! call that succeeded returned that page's content or state (`read_keys`), or when the
 //! session's own successful call wrote that revision. The page list (names, order) is one
-//! more item, read only through `get_basic_info`. Failed calls, and calls that can't be
-//! attributed to a page, acknowledge nothing. A change must find every page it writes (and
-//! the page list, if it changes it) read at its current revision. A session that hasn't read
-//! (a new one, or one whose record was dropped because more than `MAX_SESSIONS` sessions
-//! were seen) can't change existing pages until it reads; it can still create new ones.
+//! more item, read only through `get_basic_info`. Failed calls, calls that can't be attributed
+//! to specific pages (`open_file` included), and calls whose result wasn't delivered,
+//! acknowledge nothing. A change must find every page it writes (and the page list, if it
+//! changes it) read at its current revision. A session that hasn't read (a new one, or one
+//! whose record was dropped because more than `MAX_SESSIONS` sessions were seen) can't
+//! change existing pages until it reads, nor add a page until it has read the page list.
 //!
 //! Policy: `export` and `export_combined_pdf` are refused (they write files where the agent
 //! says), and so is `create_file`. `list_resources`, `open_file` and any `fileId` argument only
@@ -41,7 +48,7 @@ use crate::{
 use paper_rs::editor::Editor;
 use paper_rs::mcp::html::{self, Html};
 use paper_rs::mcp::server::{to_result, tool_list};
-use paper_rs::mcp::{Call, ToolResult, exec, tools};
+use paper_rs::mcp::{ToolResult, exec, tools};
 use paper_rs::project::format::page_from_json;
 use paper_rs::project::{PAGES_DIR, PageData, PageRef, Project, Store, now_ms};
 use paper_rs::render::gpu::Headless;
@@ -54,6 +61,7 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -279,6 +287,9 @@ pub struct BoundHost {
     seen: std::collections::BTreeMap<u64, HashMap<String, String>>,
     gpu: Option<Headless>,
     gpu_tried: bool,
+    /// Set when a failed save couldn't be undone: every later write is refused (shared with
+    /// the browser API, see `crate::Broken`).
+    broken: crate::Broken,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
@@ -401,6 +412,7 @@ impl BoundHost {
             seen: Default::default(),
             gpu: None,
             gpu_tried: false,
+            broken: Default::default(),
         };
         h.load()?;
         Ok(h)
@@ -483,18 +495,34 @@ impl BoundHost {
                 dup.id
             ));
         }
+        crate::refuse_if_broken(&self.broken)?;
+        // One commit for the whole call (see `crate::commit`): new images, then every changed
+        // page, then the manifest; on any error every file is as it was.
+        let assets_dir = self.project.dir.join(ASSETS);
+        let mut writes = Vec::new();
+        let mut assets = std::collections::BTreeSet::new();
         for &i in &dirty {
             let data = ed.page_data(i);
-            plain(&self.project.page_path(&data.id), Kind::File)?;
-            paper_rs::assets::save_to_dir(
-                &self.project.dir.join(ASSETS),
-                paper_rs::assets::used_by(&data.doc),
-            )
-            .map_err(|e| e.to_string())?;
-            self.project.save_page(&data).map_err(|e| e.to_string())?;
-            ed.mark_page_saved(i);
+            let path = self.project.page_path(&data.id);
+            plain(&path, Kind::File)?;
+            for id in paper_rs::assets::used_by(&data.doc) {
+                if let Some(a) = paper_rs::assets::get(&id) {
+                    let path = assets_dir.join(format!("{id}.{}", a.ext));
+                    if assets.insert(path.clone()) && !plain(&path, Kind::File)? {
+                        writes.push(crate::commit::Write {
+                            path,
+                            data: a.bytes.clone(),
+                        });
+                    }
+                }
+            }
+            writes.push(crate::commit::Write {
+                path,
+                data: paper_rs::project::format::page_to_json(&data).into_bytes(),
+            });
         }
-        self.project.manifest.pages = ed
+        let mut manifest = self.project.manifest.clone();
+        manifest.pages = ed
             .pages
             .iter()
             .map(|s| PageRef {
@@ -502,8 +530,30 @@ impl BoundHost {
                 name: s.name.clone(),
             })
             .collect();
-        self.project.manifest.modified = now_ms();
-        self.project.write_manifest().map_err(|e| e.to_string())?;
+        manifest.modified = now_ms();
+        writes.push(crate::commit::Write {
+            path: self.project.dir.join(paper_rs::project::MANIFEST),
+            data: manifest.to_json().into_bytes(),
+        });
+        // Images go into `assets/`, created (not through a link) if needed.
+        if !plain(&assets_dir, Kind::Dir)? && writes.iter().any(|w| w.path.starts_with(&assets_dir))
+        {
+            std::fs::create_dir(&assets_dir).map_err(|e| format!("assets: {e}"))?;
+        }
+        if !plain(&self.project.dir.join(PAGES_DIR), Kind::Dir)? {
+            std::fs::create_dir(self.project.dir.join(PAGES_DIR))
+                .map_err(|e| format!("pages: {e}"))?;
+        }
+        if let Err(e) = crate::commit::commit(&writes) {
+            if let crate::commit::CommitError::Broken(m) = &e {
+                crate::set_broken(&self.broken, m);
+            }
+            return Err(e.message().to_string());
+        }
+        for &i in &dirty {
+            ed.mark_page_saved(i);
+        }
+        self.project.manifest = manifest;
         ed.meta_dirty = false;
         self.known = disk_revisions(&self.project)?;
         Ok(())
@@ -718,7 +768,55 @@ fn returned(name: &str, out: &[paper_rs::mcp::Out], key: &str) -> bool {
 }
 
 /// One tool call on the host thread, with the write lock held by the caller.
+/// What a call acknowledged for its session: applied only once its result was delivered
+/// (see `spawn_host`).
+pub struct Ack {
+    session: u64,
+    entries: Vec<(String, String)>,
+}
+
+impl BoundHost {
+    fn acknowledge(&mut self, a: Ack) {
+        if !self.seen.contains_key(&a.session) && self.seen.len() >= MAX_SESSIONS {
+            // Forgetting fails closed: that session must read again before changing a page.
+            self.seen.pop_first();
+        }
+        self.seen.entry(a.session).or_default().extend(a.entries);
+    }
+}
+
+/// One tool call, acknowledged at once (for callers that deliver the result themselves).
 pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) -> ToolResult {
+    let (r, ack) = execute(host, root_id, name, args);
+    if let Some(a) = ack {
+        host.acknowledge(a);
+    }
+    r
+}
+
+/// One tool call on the host thread, with the write lock held by the caller. Returns the
+/// result and what it would acknowledge for its session.
+pub fn execute(
+    host: &mut BoundHost,
+    root_id: (u64, u64),
+    name: &str,
+    args: &Value,
+) -> (ToolResult, Option<Ack>) {
+    #[cfg(test)]
+    tests::slow_down(&host.project.dir, name);
+    match execute_inner(host, root_id, name, args) {
+        Ok(v) => v,
+        Err(e) => (Err(e), None),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn execute_inner(
+    host: &mut BoundHost,
+    root_id: (u64, u64),
+    name: &str,
+    args: &Value,
+) -> Result<(ToolResult, Option<Ack>), String> {
     let dir = host.project.dir.clone();
     check_root(&dir, root_id)?;
     check_project_dir(&dir)?;
@@ -750,18 +848,21 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         // was in step with the disk before the call, so reloading restores it), save
         // nothing and acknowledge nothing.
         host.load()?;
-        return r;
+        return Ok((r, None));
     }
     if let Some(s) = session
         && let Some(why) = stale_change(host, s, &before)
     {
         // Drop the change: it wasn't decided on the page as it is now.
         host.load()?;
-        return Err(format!(
-            "{why}, so this change was not applied and nothing was written. Read every page \
+        return Ok((
+            Err(format!(
+                "{why}, so this change was not applied and nothing was written. Read every page \
              you change (get_tree_summary with nodeId \"root\" and its pageId, or get_node_info \
              on its nodes; get_basic_info for the page list) and redo the change on what is \
              there now."
+            )),
+            None,
         ));
     }
     let saved = host.save_changes();
@@ -771,38 +872,91 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
     }
     // Only a call that succeeded acknowledges anything: a failed or refused call, or a
     // failed save, leaves what the session has observed as it was.
-    if let Some(s) = session
-        && saved.is_ok()
-        && r.is_ok()
-    {
-        if !host.seen.contains_key(&s) && host.seen.len() >= MAX_SESSIONS {
-            // Forgetting fails closed: that session must read again before changing a page.
-            host.seen.pop_first();
+    let ack = match (session, &saved, &r) {
+        (Some(s), Ok(()), Ok(out)) => {
+            let entries = if before == host.known {
+                // Nothing written: exactly the pages (and page list) it returned.
+                reads
+                    .iter()
+                    .filter(|k| returned(name, out, k))
+                    .filter_map(|k| host.known.get(k).map(|v| (k.clone(), v.clone())))
+                    .collect()
+            } else {
+                // What this call wrote is observed as written; nothing else.
+                host.known
+                    .iter()
+                    .filter(|(k, v)| *k != MANIFEST_KEY && before.get(*k) != Some(*v))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            Some(Ack {
+                session: s,
+                entries,
+            })
         }
-        let seen = host.seen.entry(s).or_default();
-        if before == host.known {
-            // Nothing written: acknowledge exactly the pages (and page list) it returned.
-            let out = r.as_deref().unwrap_or(&[]);
-            for k in reads.iter().filter(|k| returned(name, out, k)) {
-                if let Some(v) = host.known.get(k) {
-                    seen.insert(k.clone(), v.clone());
-                }
-            }
-        } else {
-            // What this call wrote is observed as written; nothing else is acknowledged.
-            for (k, v) in &host.known {
-                if k != MANIFEST_KEY && before.get(k) != Some(v) {
-                    seen.insert(k.clone(), v.clone());
-                }
-            }
-        }
+        _ => None,
+    };
+    Ok((
+        match saved {
+            Ok(()) => r,
+            Err(e) => Err(format!(
+                "the change could not be saved, and nothing was written: {e}"
+            )),
+        },
+        ack,
+    ))
+}
+
+/// A tool call queued for the host thread. Its state moves Queued → Running → (done), or
+/// Queued → Abandoned when the caller stopped waiting before it started: an abandoned call
+/// is never run. A call that has started is always waited for, however long it takes.
+pub struct Job {
+    pub name: String,
+    pub args: Value,
+    pub reply: tokio::sync::oneshot::Sender<ToolResult>,
+    state: Arc<AtomicU8>,
+}
+
+const QUEUED: u8 = 0;
+const RUNNING: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Queue a call and wait for its result. `start_within` bounds only the wait for the call
+/// to start; once it runs, its real result is returned.
+pub(crate) async fn send_and_wait(
+    calls: &Sender<Job>,
+    name: String,
+    args: Value,
+    start_within: Duration,
+) -> ToolResult {
+    let (reply, mut rx) = tokio::sync::oneshot::channel();
+    let state = Arc::new(AtomicU8::new(QUEUED));
+    let job = Job {
+        name,
+        args,
+        reply,
+        state: state.clone(),
+    };
+    if calls.send(job).is_err() {
+        return Err("the project host has stopped".into());
     }
-    match saved {
-        Ok(()) => r,
-        Err(e) => Err(match r {
-            Ok(_) => format!("the change was made but could not be saved: {e}"),
-            Err(r) => format!("{r}; saving also failed: {e}"),
-        }),
+    match tokio::time::timeout(start_within, &mut rx).await {
+        Ok(r) => r.unwrap_or_else(|_| Err("the project host dropped the call".into())),
+        Err(_) => {
+            if state
+                .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                Err(
+                    "the call could not start in time (the project was busy); it was not run \
+                     and changed nothing"
+                        .into(),
+                )
+            } else {
+                rx.await
+                    .unwrap_or_else(|_| Err("the project host dropped the call".into()))
+            }
+        }
     }
 }
 
@@ -811,8 +965,9 @@ pub fn spawn_host(
     dir: PathBuf,
     root_id: (u64, u64),
     lock: Arc<tokio::sync::Mutex<()>>,
-) -> Result<Sender<Call>, String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Call>();
+    broken: crate::Broken,
+) -> Result<Sender<Job>, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Job>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("opd-mcp-host".into())
@@ -822,7 +977,8 @@ pub fn spawn_host(
                 BoundHost::open(&dir)
             };
             let mut host = match host {
-                Ok(h) => {
+                Ok(mut h) => {
+                    h.broken = broken;
                     let _ = ready_tx.send(Ok(()));
                     h
                 }
@@ -831,12 +987,24 @@ pub fn spawn_host(
                     return;
                 }
             };
-            while let Ok(call) = rx.recv() {
-                let r = {
-                    let _g = lock.blocking_lock();
-                    run(&mut host, root_id, &call.name, &call.args)
-                };
-                let _ = call.reply.send(r);
+            while let Ok(job) = rx.recv() {
+                let _g = lock.blocking_lock();
+                // Waiting for the lock still counts as queued: a call abandoned meanwhile
+                // is skipped entirely.
+                if job
+                    .state
+                    .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let (r, ack) = execute(&mut host, root_id, &job.name, &job.args);
+                // Reads are acknowledged only if the result reached the caller.
+                if job.reply.send(r).is_ok()
+                    && let Some(a) = ack
+                {
+                    host.acknowledge(a);
+                }
             }
         })
         .map_err(|e| e.to_string())?;
@@ -858,13 +1026,13 @@ pub fn offered_tools() -> Vec<Tool> {
 
 #[derive(Clone)]
 pub struct AgentServer {
-    calls: Arc<Mutex<Sender<Call>>>,
+    calls: Arc<Mutex<Sender<Job>>>,
     /// One per MCP session (the service makes a handler per session).
     session: u64,
 }
 
 impl AgentServer {
-    pub fn new(calls: Sender<Call>) -> AgentServer {
+    pub fn new(calls: Sender<Job>) -> AgentServer {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         AgentServer {
             calls: Arc::new(Mutex::new(calls)),
@@ -902,24 +1070,16 @@ impl ServerHandler for AgentServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
         let mut args = request.arguments.unwrap_or_default();
         args.insert(SESSION_ARG.into(), json!(self.session));
-        let call = Call {
-            name: request.name.to_string(),
-            args: Value::Object(args),
-            reply,
-        };
-        let sent = self.calls.lock().unwrap().send(call).is_ok();
-        let r = if !sent {
-            Err("the project host has stopped".to_string())
-        } else {
-            match tokio::time::timeout(CALL_TIMEOUT, rx).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) => Err("the project host dropped the call".into()),
-                Err(_) => Err("the call did not finish in time".into()),
-            }
-        };
+        let calls = self.calls.lock().unwrap().clone();
+        let r = send_and_wait(
+            &calls,
+            request.name.to_string(),
+            Value::Object(args),
+            CALL_TIMEOUT,
+        )
+        .await;
         Ok(to_result(r).into())
     }
 }
@@ -927,6 +1087,295 @@ impl ServerHandler for AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------- test-only seams (never in builds)
+
+    /// Projects whose calls of a given tool are slowed down (a long-running call).
+    static SLOW: Mutex<Vec<(PathBuf, String, Duration)>> = Mutex::new(Vec::new());
+
+    pub(super) fn slow_down(dir: &Path, name: &str) {
+        let d = SLOW
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, n, _)| p == dir && n == name)
+            .map(|(_, _, d)| *d);
+        if let Some(d) = d {
+            std::thread::sleep(d);
+        }
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A project with two pages (each with one rectangle), opened by a host.
+    fn two_page_host() -> (Tmp, BoundHost, (u64, u64), String, String) {
+        use std::hash::{BuildHasher, RandomState};
+        let root = std::env::temp_dir().join(format!(
+            "opd-unit-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (p, _) = Store::open(&root).unwrap().create("Unit").unwrap();
+        let dir = p.dir.canonicalize().unwrap();
+        let root_id = crate::dev_ino(&std::fs::symlink_metadata(&dir).unwrap());
+        let mut h = BoundHost::open(&dir).unwrap();
+        let a = h.project.manifest.pages[0].id.clone();
+        run(&mut h, root_id, "create_page", &json!({"name": "B"})).unwrap();
+        let b = h.project.manifest.pages[1].id.clone();
+        for page in [&a, &b] {
+            run(
+                &mut h,
+                root_id,
+                "create_shape",
+                &json!({"type": "rectangle", "x": 0, "y": 0, "width": 9, "height": 9, "pageId": page}),
+            )
+            .unwrap();
+        }
+        (Tmp(root), h, root_id, a, b)
+    }
+
+    /// Every file under `dir` with its bytes.
+    fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files(&p));
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn rect(page: &str) -> String {
+        format!("{}:1", &page[..6])
+    }
+
+    /// Review round 4, F1: a save that fails at any step (staging any file, renaming any
+    /// file) leaves every project file byte-identical, for a one-page commit (page and
+    /// manifest), a two-page commit, and a manifest-only commit; and the editor drops the
+    /// change.
+    #[test]
+    fn a_failed_save_leaves_every_file_unchanged() {
+        let (t, mut h, root_id, a, b) = two_page_host();
+        let one_page = json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "20px"}}]});
+        let two_pages = json!({"updates": [
+            {"nodeIds": [rect(&a)], "styles": {"width": "30px"}},
+            {"nodeIds": [rect(&b)], "styles": {"width": "30px"}},
+        ]});
+        let rename = json!({"updates": [{"pageId": a, "name": "Renamed"}]});
+        // Steps: one staging per file, then one rename per file.
+        for (tool, args, steps) in [
+            ("update_styles", &one_page, 4),
+            ("update_styles", &two_pages, 6),
+            ("rename_pages", &rename, 2),
+        ] {
+            for at in 0..steps {
+                let before = files(&t.0);
+                crate::commit::fault::fail_at(&[at]);
+                let r = run(&mut h, root_id, tool, args);
+                crate::commit::fault::fail_at(&[]);
+                assert!(r.is_err(), "{tool} step {at}: {r:?}");
+                assert_eq!(files(&t.0), before, "{tool} step {at}: files unchanged");
+                // In memory too: the page list and the rectangle are as before.
+                assert_eq!(h.ed.pages[0].name, "Page 1", "{tool} step {at}");
+                let info = run(
+                    &mut h,
+                    root_id,
+                    "get_node_info",
+                    &json!({"nodeId": rect(&a)}),
+                )
+                .unwrap();
+                let Some(paper_rs::mcp::Out::Text(info)) = info.first() else {
+                    panic!()
+                };
+                assert!(info.contains("\"width\": 9.0"), "{tool} step {at}: {info}");
+            }
+            // Without a failure the same call goes through.
+            run(&mut h, root_id, tool, args).unwrap();
+            run(
+                &mut h,
+                root_id,
+                "rename_pages",
+                &json!({"updates": [{"pageId": a, "name": "Page 1"}]}),
+            )
+            .unwrap();
+            run(
+                &mut h,
+                root_id,
+                "update_styles",
+                &json!({"updates": [
+                    {"nodeIds": [rect(&a)], "styles": {"width": "9px"}},
+                    {"nodeIds": [rect(&b)], "styles": {"width": "9px"}},
+                ]}),
+            )
+            .unwrap();
+        }
+        // No temporary files are left behind.
+        assert!(
+            files(&t.0)
+                .iter()
+                .all(|(p, _)| !p.to_string_lossy().ends_with(".tmp")),
+            "{:?}",
+            files(&t.0)
+        );
+    }
+
+    /// Review round 4, F1: if undoing a failed save fails too, every later write is refused
+    /// (fail closed), naming the files; reads still work.
+    #[test]
+    fn a_failed_rollback_refuses_every_later_write() {
+        let (t, mut h, root_id, a, b) = two_page_host();
+        let two_pages = json!({"updates": [
+            {"nodeIds": [rect(&a)], "styles": {"width": "30px"}},
+            {"nodeIds": [rect(&b)], "styles": {"width": "30px"}},
+        ]});
+        // Steps 0-2 stage A, B and the manifest; 3 renames A; 4 (B's rename) fails; 5 is
+        // the staging of A's restore, which fails too.
+        crate::commit::fault::fail_at(&[4, 5]);
+        let r = run(&mut h, root_id, "update_styles", &two_pages);
+        crate::commit::fault::fail_at(&[]);
+        let e = r.unwrap_err();
+        assert!(e.contains("restoring") && e.contains(".json"), "{e}");
+        assert!(h.broken.lock().unwrap().is_some());
+        let before = files(&t.0);
+        let r = run(
+            &mut h,
+            root_id,
+            "update_styles",
+            &json!({"updates": [{"nodeIds": [rect(&b)], "styles": {"width": "40px"}}]}),
+        );
+        assert!(r.unwrap_err().contains("writes are disabled"));
+        assert_eq!(files(&t.0), before, "nothing written");
+        assert!(run(&mut h, root_id, "get_basic_info", &json!({})).is_ok());
+    }
+
+    fn host_thread() -> (
+        Tmp,
+        Sender<Job>,
+        Arc<tokio::sync::Mutex<()>>,
+        PathBuf,
+        String,
+    ) {
+        let (t, h, root_id, a, _) = two_page_host();
+        let dir = h.project.dir.clone();
+        drop(h);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let calls = spawn_host(dir.clone(), root_id, lock.clone(), Default::default()).unwrap();
+        (t, calls, lock, dir, a)
+    }
+
+    fn with_session(args: Value, s: u64) -> Value {
+        let mut a = args.as_object().cloned().unwrap();
+        a.insert(SESSION_ARG.into(), json!(s));
+        Value::Object(a)
+    }
+
+    /// Review round 4, F4: a read that timed out before it started is never run, so it
+    /// acknowledges nothing and a following blind write is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_abandoned_before_it_started_is_never_run() {
+        let (_t, calls, lock, _dir, a) = host_thread();
+        let s = new_session_for_test();
+        let read = with_session(json!({"nodeId": "root", "pageId": a}), s);
+        // The project is busy (another writer holds the lock) past the wait.
+        let busy = lock.lock().await;
+        let r = send_and_wait(
+            &calls,
+            "get_tree_summary".into(),
+            read,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(r.unwrap_err().contains("could not start in time"));
+        drop(busy);
+        let write = with_session(
+            json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "50px"}}]}),
+            s,
+        );
+        let r = send_and_wait(
+            &calls,
+            "update_styles".into(),
+            write,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(r.unwrap_err().contains("hasn't been read"));
+    }
+
+    /// Review round 4, F4: once a call has started, its real result is returned, however
+    /// long it takes (no timeout after the start).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_started_call_returns_its_real_result() {
+        let (_t, calls, _lock, dir, a) = host_thread();
+        SLOW.lock()
+            .unwrap()
+            .push((dir, "get_tree_summary".into(), Duration::from_millis(400)));
+        let s = new_session_for_test();
+        let read = with_session(json!({"nodeId": "root", "pageId": a}), s);
+        let r = send_and_wait(
+            &calls,
+            "get_tree_summary".into(),
+            read,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+        // It was delivered, so it counts as a read.
+        let write = with_session(
+            json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "50px"}}]}),
+            s,
+        );
+        let r = send_and_wait(
+            &calls,
+            "update_styles".into(),
+            write,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// Review round 4, F4: a result that can't be delivered (the caller is gone) is not
+    /// acknowledged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undelivered_read_acknowledges_nothing() {
+        let (_t, calls, _lock, _dir, a) = host_thread();
+        let s = new_session_for_test();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        calls
+            .send(Job {
+                name: "get_tree_summary".into(),
+                args: with_session(json!({"nodeId": "root", "pageId": a}), s),
+                reply,
+                state: Arc::new(AtomicU8::new(QUEUED)),
+            })
+            .unwrap();
+        let write = with_session(
+            json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "50px"}}]}),
+            s,
+        );
+        let r = send_and_wait(
+            &calls,
+            "update_styles".into(),
+            write,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(r.unwrap_err().contains("hasn't been read"));
+    }
+
+    fn new_session_for_test() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 40);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
 
     fn bound() -> Bound {
         Bound {

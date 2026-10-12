@@ -1072,6 +1072,66 @@ async fn a_failed_call_changes_nothing() {
     c.cancel().await.unwrap();
 }
 
+/// Another 1×1 PNG (not `PNG_B64`, which a test keeps unregistered as an "outside" image).
+const OTHER_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+/// Review round 4, F1 (the reviewer's I/O failure): a save that fails part-way leaves every
+/// file as it was. Page A changes and page B needs a new image, but `assets/` can't be
+/// written: neither page nor the manifest may change.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_failing_part_way_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read(&c).await;
+    read_page(&c, &a).await;
+    read_page(&c, &b).await;
+    let assets = p.dir.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::set_permissions(&assets, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let before = (
+        file(&p, &a),
+        file(&p, &b),
+        std::fs::read(p.dir.join("project.json")).unwrap(),
+    );
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [
+            {"nodeIds": [first_node(&p, &a)], "styles": {"width": "33px"}},
+            {"nodeIds": [first_node(&p, &b)], "styles": {"backgroundImage": format!("url(data:image/png;base64,{OTHER_PNG_B64})")}},
+        ]}),
+    )
+    .await;
+    std::fs::set_permissions(&assets, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!ok, "{out}");
+    assert_eq!(
+        (
+            file(&p, &a),
+            file(&p, &b),
+            std::fs::read(p.dir.join("project.json")).unwrap()
+        ),
+        before,
+        "nothing written: {out}"
+    );
+    // Once the folder is writable again, the same change goes through in full.
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [
+            {"nodeIds": [first_node(&p, &a)], "styles": {"width": "33px"}},
+            {"nodeIds": [first_node(&p, &b)], "styles": {"backgroundImage": format!("url(data:image/png;base64,{OTHER_PNG_B64})")}},
+        ]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_ne!(file(&p, &a), before.0);
+    assert_ne!(file(&p, &b), before.1);
+    c.cancel().await.unwrap();
+}
+
 /// Review round 4: the page list's revision can't collide whatever the names contain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_list_revisions_are_unambiguous() {
