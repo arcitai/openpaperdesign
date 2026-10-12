@@ -8,7 +8,7 @@
 //         and undo (toolbar), screenshot, reload. Ends with the moved node and the new
 //         rectangle on the page. Every step is asserted.
 // agent:  an agent edits over MCP while the page is open. Its new shape must appear without a
-//         reload; then the page drags a node while the agent moves its shape, and both
+//         reload; then the page drags a node (saved), the agent moves its shape, and both
 //         changes must be in the page and survive a reload. Needs the same URL (its token).
 // verify: load, report the backend and top-level nodes, screenshot. With expect.json (the
 //         result-edit.json of an earlier edit run, e.g. before a server restart) the moved
@@ -305,7 +305,8 @@ try {
     check(await ev('window.__opdNoReload === 1'), 'the page reloaded instead of updating in place');
     result.steps.push({ step: 'agent create_shape shown live', node: agentNode });
 
-    // 2. At the same time: the page drags one of its nodes, the agent moves its shape.
+    // 2. One after the other: the page drags one of its nodes (saved), then the agent moves
+    //    its shape. (Overlapping edits are refused by design and covered by unit tests.)
     const inView = (n) => n.id !== agentNode && n.children === 0 && n.screen[0] > 0 && n.screen[1] > 0
       && n.screen[0] + n.screen[2] < canvas[2] - 100 && n.screen[1] + n.screen[3] < canvas[3] - 100
       && n.screen[2] > 24 && n.screen[3] > 24;
@@ -315,18 +316,16 @@ try {
     const zoom = target.screen[2] / target.world[2];
     const [cx, cy] = at(target.screen[0] + target.screen[2] / 2, target.screen[1] + target.screen[3] / 2);
     const n0 = await saves();
-    const [, moved] = await Promise.all([
-      drag(cx, cy, cx + 60, cy + 40),
-      mcp.call('update_styles', { updates: [{ nodeIds: [keyOf(agentNode)], styles: { left: `${right + 200}px` } }] }),
-    ]);
+    await drag(cx, cy, cx + 60, cy + 40);
+    await settled(n0, 'the page save of the drag');
+    const moved = await mcp.call('update_styles', { updates: [{ nodeIds: [keyOf(agentNode)], styles: { left: `${right + 200}px` } }] });
     check(moved.ok, 'agent update_styles failed', moved.text);
-    await settled(n0, 'the page save during the agent edit');
     await waitFor(`(() => { const n = JSON.parse(window.__opdEditor.root_nodes()).find((n) => n.id === ${agentNode}); return n && Math.abs(n.world[0] - ${right + 200}) < 0.5; })()`, 'the agent move in the page', 10000);
     const after = await nodes();
     const t2 = byId(after, target.id);
     check(Math.abs(t2.world[0] - target.world[0] - 60 / zoom) <= 8 / zoom, 'the page drag was lost', { before: target.world, after: t2.world });
     check(!(await ev('window.__opd.conflict')), 'unexpected conflict');
-    result.steps.push({ step: 'concurrent page drag + agent move', target: target.id, agentNode, saves: await saves() });
+    result.steps.push({ step: 'page drag, then agent move', target: target.id, agentNode, saves: await saves() });
 
     // 3. Both survive a reload.
     await cdp('Page.reload', { ignoreCache: true });

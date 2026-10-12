@@ -4,8 +4,13 @@ Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), 
 of B1 (`browser-edit-b1.md`). While `openpaperdesign-serve --project <dir>` runs and the page
 is open in a browser, an AI agent connected over MCP edits the **same** project, and the
 browser shows the agent's change without a manual reload. Edits in the browser are kept, and
-overlapping edits are shown as a conflict, never overwritten either way. Out of scope: Codex
+overlapping edits are refused as a conflict, never overwritten either way.
+
+Out of scope: Codex
 plugin packaging, skills, discovery, the MCP App panel (B2b), several projects, remote use.
+
+Updated 2026-10-12: the automatic three-way merge was dropped in favour of strict revisions
+(see "Decision: strict revisions, no merge").
 
 ## Run it
 
@@ -76,40 +81,53 @@ check your client's docs if one is refused. The token changes on every start.
 - `get_screenshot` stays. It renders only the bound project and needs a GPU (headless wgpu);
   without one it reports that.
 
-### Revisions and merging (`src/merge.rs`, `lib.rs`)
+### Revisions: strict (`lib.rs`)
 
-- **History:** the server keeps recent page revisions' bytes in memory (64 entries, 256 MiB at
-  most), recorded on every page GET and PUT and every agent save.
-- **Revision endpoint:** `GET /api/pages/{id}/revision` returns the current revision cheaply.
-- **Stale browser PUTs:** a PUT whose `If-Match` is stale but still retained is merged three
-  ways at node level: base = the browser's revision, theirs = disk now, mine = the browser's
-  page.
-  - Non-overlapping adds, deletes and changes merge, and are saved. The answer is the merged
-    page with its new revision and `X-Opd-Merged: 1`.
-  - Both sides allocating the same new node id for different layers renumbers the browser's
-    layer, with all references to it (parent, children, connector bindings, instance links).
-  - Z-order: one side's reordering wins; the other side's insertions go before their next
-    sibling (or on top).
-  - Conflicts: the same layer changed differently, delete versus edit, a layer whose parent was
-    deleted, both sides reordering the same container differently, or a cycle. The answer is
-    `409` with `conflicts: [node ids | "root"]`, and nothing is written.
-  - An unknown or evicted base gets a plain `409`, as in B1.
-- `Document::validate` doesn't detect cycles, so the merge also checks that every node is
-  reachable from the root.
+- **Revision endpoint:** `GET /api/pages/{id}/revision` returns the page's current revision
+  (the hash of its file on disk) cheaply.
+- **Every browser save** needs `If-Match` equal to that current revision, as in B1. A stale or
+  unknown revision gets `409` with the current revision, and nothing is written. Nothing is
+  merged, and no revision history is kept.
+- **Agent writes** go through the single host thread under the **same write lock** as browser
+  saves. The host reloads from disk before each call when anything changed, and saves
+  atomically, which gives a new revision.
+  - So an agent write can't overwrite a browser save: the host has reloaded it first.
+  - And a browser save can't overwrite an agent write: its `If-Match` names the older revision
+    and is refused.
 
-### Browser (`static/session.js`, `src/state.rs`)
+### Browser (`static/session.js`, `static/page.js`, `src/state.rs`)
 
 - **Polling:** about once a second the page asks for the revision. Polling waits for Ready and
-  pauses during a fallback, a save or a conflict, under the same gating as B1 round 4.
+  pauses during a fallback, a save or a conflict, under the same gating as B1.
 - **Nothing unsaved:** the new revision is loaded in place (`WebState::reload`), keeping the
   camera, tool and the selection where it still exists. "Nothing unsaved" means no unsaved
   change, no save in flight, no gesture and no text edit.
-- **Unsaved work:** the page is never reloaded over it. The next save carries the old base, and
-  the server merges it.
-  - If nothing changed locally while that save was in flight, the merged page is loaded.
-  - Otherwise the old base is kept, so the following save merges again.
-- **Conflict:** the overlay banner lists the affected layers, with one button,
-  "Reload (discard my unsaved change)". Nothing is discarded without that click.
+- **Unsaved work:** the page is never reloaded over it. Its next save is based on the older
+  revision, so the server answers 409. The banner appears, and the unsaved state stays on
+  screen.
+- **Discard:** only the person's explicit click on "Reload (discard my unsaved change)"
+  replaces the page. It loads the server's version **in place** (`Session.discard` via
+  `page.js` `discardStep`), with no navigation. That fixes the operator's Codex finding on
+  ba93173: `location.reload()` together with the always-on leave-page guard gave
+  `net::ERR_ABORTED` and left the banner up. Ordinary navigation with unsaved edits stays
+  guarded.
+- **Stale answers:** a save, poll or discard answer only applies to the editor that asked,
+  with the state it had. Anything else is dropped.
+
+### Decision: strict revisions, no merge (2026-10-12)
+
+The lead decided this under the owner's thin-wrapper, minimum-maintenance mandate. Issue #1
+needs:
+- an editable browser canvas;
+- real MCP edits;
+- preserved edits and safety against stale revisions;
+- explicit boundaries.
+
+It doesn't need a collaboration engine; that is issue #2. The independent review was finding
+defects in the node-level merge (children lost, duplicated or deleted), which confirmed the
+maintenance risk. So the three-way merge, its id renumbering and the retained-revision history
+(64 entries, 256 MiB) were removed. Their code and tests stay retrievable at the local tag
+`experiment/b2a-three-way-merge` (commit `2da2f52`, the pre-decision B2a head).
 
 ### Boundary (unchanged from B1)
 
@@ -127,12 +145,14 @@ them, but it can still overwrite this server's writes.
     connect.
   - `agent_edits_land_on_disk_and_change_the_revision`: create_shape/update_styles/
     delete_nodes reach the page file. The revision endpoint changes. Refused tools aren't listed.
-  - `a_stale_browser_save_merges_with_the_agents_change`: the agent adds a shape while the
-    browser, on the older revision, moves another layer. Both end up on disk, the answer is the
-    merged page, and the agent sees it on its next call.
-  - `overlapping_edits_conflict_and_nothing_is_written`: the same layer changed by both, and
-    delete versus edit, each give 409 with the layer id and leave the bytes on disk unchanged.
-    An unknown base gives a plain 409.
+  - `sequential_human_and_agent_edits_are_both_kept`: a browser save then an agent write, and
+    an agent write then a browser save on the new revision. Both changes end up on disk each
+    time, and the agent sees the browser's save on its next call.
+  - `a_stale_browser_save_after_an_agent_write_is_refused_and_writes_nothing`: after an agent
+    write to a different layer, to the same layer, or deleting the layer, the browser's save on
+    the older revision gets 409 with the current revision, and the disk keeps the agent's
+    version. An unknown revision is refused too. After a discard (GET the current version) the
+    browser can save again.
   - `refused_tools_projects_and_local_paths`: export, export_combined_pdf, create_file, a
     sibling project by id or path, and a foreign `fileId` are refused. So are `<img src>` with
     absolute, `file://` and `../` paths, CSS `url()`, SVG `<image href>` and
@@ -141,31 +161,39 @@ them, but it can still overwrite this server's writes.
     written outside, refused calls write nothing, and only the bound project is listed. A
     `data:` image still works. With the policy disabled, this test fails (`create_file`
     succeeds).
-- **`merge::tests` (7 passed):** both sides changing different layers; the same layer (conflict
-  and identical); adds on both sides with clashing ids renumbered, including a child; deletes
-  and delete versus edit; a deleted parent with additions inside; z-order merge and conflict;
-  reparenting, conflicting parents and cycles.
 - **`agent::tests` (3 passed):** refused tools and other projects; local image paths in
   `<img>`, CSS and styles, including entity-encoded, uppercase-tag and `DATA:` forms; inline SVG
   `href`, `url()`, `@import`, DTD and malformed XML.
 - **`state::tests` (2 new, 10 total passed):** `reload_only_when_clean_and_it_keeps_the_view`,
   `never_reload_over_unsaved_or_in_flight_edits`.
-- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (14 passed, 5 new for B2a; mocked editor/server, no
-  browser):**
+- **`node --test crates/openpaperdesign-web/tests/session.test.mjs` (18 passed; mocked
+  editor/server/page, no browser).** The B2a tests:
   - `a change made elsewhere is loaded in place when nothing is unsaved`
-  - `never reloads over unsaved edits; the next save is merged by the server`
-  - `edits made while a merged save was in flight keep the old base for the next merge`
-  - `a conflict is reported with its layers and stops saving and reloading`
+  - `never reloads over unsaved edits; the stale save is a conflict and the edit stays`
+  - `explicit discard loads the version on disk in place and resumes saving` (through
+    `discardStep`: banner hidden, status shown, saving resumes on the new revision)
+  - `a discard answer is dropped when the editor changed meanwhile, and a failed one changes
+    nothing`
   - `no polling before Ready or while switching`
-- **B1 serve tests:** all still pass (17). One case was adapted: `security_headers_are_on_every_response`'s
-  "stale write" now changes the same layer differently, because a stale save of a non-overlapping
-  change now merges (200) by design.
+- **B1 serve tests:** all pass (17).
 - **Live smoke test:** the server binary on a demo project, driven by `scripts/mcp-client.mjs`
   (a dependency-free JSON-RPC client) over a real socket. `get_basic_info` answered,
   `create_shape` wrote node 24 to the page file (format v3), `export` was refused with the
   policy message, and a wrong token got HTTP 401.
 
-The full check-list results are in the commit message of the docs commit and in the handoff.
+Results of the strict-model change (2026-10-12, proportionate checks per the owner). This
+change touches only the serve crate and the page JavaScript; no root-package file, web Rust,
+manifest or lockfile changed.
+- **Run now:**
+  - `cargo fmt --all --check`;
+  - clippy for serve and web (0 warnings);
+  - serve tests: 3 unit, 5 agent, 17 serve;
+  - the CI Node command: 18 passed, Node 26.8.1;
+  - `node --check` on all page JavaScript and scripts;
+  - wasm32 check, native build, `git diff --check`;
+  - the bundle rebuild. The wasm is unchanged; `app.js`, `page.js` and `session.js` changed.
+- **Inherited from the 2da2f52 run (not re-run):** serial 162, headless 9, root clippy and
+  `cargo tree -p paper-rs`.
 
 ## Not proven
 
@@ -173,8 +201,8 @@ The full check-list results are in the commit message of the docs commit and in 
   update, the in-place reload and the conflict banner are untested in a browser. This includes
   Codex's in-app browser and any real MCP client app (Codex, Claude Code). Chromium can't start
   in this sandbox. `scripts/browser-check.mjs … agent` is written for the operator: an agent
-  shape must appear without a reload, then a concurrent page drag and agent move must both
-  survive a reload.
+  shape must appear without a reload, then a saved page drag followed by an agent move must
+  both survive a reload. The discard fix still needs the operator's Codex re-check.
 - **Client config syntax:** the printed Claude Code/Codex settings haven't been tried with those
   clients.
 - **`get_screenshot` over this server:** not exercised.
