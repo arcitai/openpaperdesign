@@ -76,17 +76,24 @@ check your client's docs if one is refused. The token changes on every start.
       this project's pages' entries are copied and put back; other projects in the same
       process (another launcher binding, tests) keep theirs. Reading it needs one added
       upstream function, `exec::with_no_stretch` (final review).
-    - **Ownership across bindings** (operator's Mac finding on `cffeec6`): that record is
-      keyed by page id, so a project bound later in the same process could inherit an earlier
-      project's entries. Two rules prevent this.
-      - A host that opens a project successfully first drops any entries for that project's
-        page ids, so every binding starts as if the process had just started. This covers
-        `openpaperdesign-serve` at start-up too. A failed open drops nothing.
-      - `Server::release_layout_state` drops the entries of every page a server held. The
-        launcher calls it when it switches projects.
-
-      Two servers alive in one process with the same page ids would still share entries;
-      the launcher binds one project at a time.
+    - **Ownership across bindings** (operator's Mac finding on `cffeec6`; lifecycle
+      correction after final review round 3 on `b846b8a`, 2026-10-12): the record is keyed
+      by page id, including ids shared by two projects opened in succession.
+      - Replacement preparation validates and loads the project without changing the
+        active host's layout record. A failed bind leaves its server, token and state intact;
+        binding the same project again is a no-op.
+      - `Server::retire` closes admission, then takes the same writer lock as MCP calls and
+        browser saves. A started call completes with its own layout state, including any
+        rollback and acknowledgement. Queued and late old calls are refused without
+        executing; browser saves re-check admission under the lock too.
+      - Only after that drain does retirement release the lifetime union of the old host's
+        page ids (including removed pages). Activation then clears entries for the new
+        project's ids and admits its calls. Unrelated page ids are preserved. Retained old
+        routes and server handles remain retired; repeated retirement cannot clear a later
+        owner's entries.
+      - Initial standalone `openpaperdesign-serve` activation uses the same fresh-state
+        reset. This supports the launcher's one-bound-project lifecycle, not arbitrary
+        simultaneous hosts sharing page ids. It does not protect external/native writers.
   - **On disk, one commit** (`crate::commit`) per call, used by browser saves too (page plus
     manifest):
     1. The current bytes of every target are read first.
@@ -521,3 +528,27 @@ scripts, and one doc comment in web Rust):
 - **Undo:** agent undo/redo across a browser save is limited, because the host's history
   restarts when the page changes on disk.
 - **External writers:** a concurrently running native app is still unprotected (see Boundary).
+
+### Final review round 3 lifecycle correction (2026-10-12)
+
+On exact `b846b8a`, deterministic launcher/HTTP probes showed an old refused call restoring
+its layout entries after a switch (Y child 0px instead of 300px), and an accepted old call
+saving with entries cleared too early (X child 450px instead of 0px). The correction above
+waits for started work before transferring ownership and fences queued or late work.
+The launcher regression tests exercise both outcomes through authenticated HTTP and the
+concurrent stdio protocol, including queued MCP calls and browser saves. Their scheduling
+points are test-only; the portable listener and inert web bundle are test fixtures, not
+browser rendering or installed-plugin proof. The existing completed-save test now seeds
+an old manifest timestamp so its byte-change assertion does not depend on millisecond
+clock timing; its successful response and committed-byte revision checks remain.
+
+Linux checks for this correction passed: 23 library + 24 agent + eight executable launcher
++ 17 API tests; the six lifecycle regressions also passed with real loopback. Serve
+clippy all-targets, fmt and diff checks passed. The portable results and the socket checks
+(after scoped sandbox approval) are separate evidence; neither is Mac or installed-plugin
+proof. No upstream source, dependency, browser or plugin input changed.
+
+The operator's 2026-10-12 Mac proof on `b846b8a` covers 65 serve tests, doctor and sequential
+actual-stdio X-to-Y rebinding (Y child 300px). It did not cover overlapping calls. The new
+candidate awaits independent review and fresh Mac lifecycle proof. Installed-plugin
+and actual in-app-browser editing/save/conflict/reopen verification remain pending.

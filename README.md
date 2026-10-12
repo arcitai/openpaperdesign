@@ -1,3 +1,15 @@
+# openpaperdesign
+
+An independent fork of [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs),
+not affiliated with or endorsed by Paper (paper.design). The first slice is a local Codex
+plugin with a loopback editable canvas, deliberately bound to one design project inside the
+workspace. See [standalone plugin setup](docs/openpaperdesign/plugin-b2b.md#install-on-a-mac-operator-steps)
+for setup and verification limits. Installed-plugin/browser verification is pending.
+There is no protection against concurrent native or external writers, and no multiplayer
+or cloud service. The upstream README follows unchanged.
+
+---
+
 # paper-rs
 
 A native Rust infinite canvas for planning, working and sketching. It is modeled on the

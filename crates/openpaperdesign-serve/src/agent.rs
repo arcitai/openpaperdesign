@@ -290,7 +290,7 @@ pub struct BoundHost {
     /// Set when a failed save couldn't be undone: every later write is refused (shared with
     /// the browser API, see `crate::Broken`).
     broken: crate::Broken,
-    /// Every page id this host has held (see `crate::Server::release_layout_state`).
+    /// Every page id this host has held (released by `crate::Server::retire`).
     held: crate::HeldPages,
 }
 
@@ -406,14 +406,15 @@ fn load_assets(dir: &Path) -> Result<(), String> {
 
 impl BoundHost {
     pub fn open(dir: &Path) -> Result<BoundHost, String> {
-        BoundHost::open_with(dir, Default::default(), Default::default())
+        let h = BoundHost::prepare(dir, Default::default(), Default::default())?;
+        let ids = h.held.lock().unwrap();
+        exec::with_no_stretch(|s| s.retain(|(p, _)| !ids.contains(p)));
+        drop(ids);
+        Ok(h)
     }
 
-    /// Open and check the project. Only once that succeeded, the project starts with fresh
-    /// layout state: upstream's process-wide stretch record loses any entries for its page
-    /// ids (left by an earlier binding of a project with the same page ids), as if the
-    /// process had just started. A failed open changes nothing.
-    pub fn open_with(
+    /// Load and validate without touching the active binding's layout registry.
+    fn prepare(
         dir: &Path,
         broken: crate::Broken,
         held: crate::HeldPages,
@@ -436,9 +437,6 @@ impl BoundHost {
             held,
         };
         h.load()?;
-        let ids: std::collections::HashSet<String> =
-            h.ed.pages.iter().map(|p| p.id.clone()).collect();
-        exec::with_no_stretch(|s| s.retain(|(p, _)| !ids.contains(p)));
         Ok(h)
     }
 
@@ -948,6 +946,8 @@ fn execute_inner(
     // What a failed call restores: the editor as it was (documents and undo histories of
     // every page, selection, view, page list). Reads don't change it, so they need none.
     let snap = (!READ_TOOLS.contains(&name)).then(|| EditorSnapshot::take(&host.ed));
+    #[cfg(test)]
+    crate::test_support::hit(&dir, "snapshot");
     let undo = |host: &mut BoundHost, snap: Option<EditorSnapshot>| -> Result<(), String> {
         match snap {
             Some(s) => s.restore(&mut host.ed),
@@ -1054,6 +1054,23 @@ pub struct Job {
     state: Arc<AtomicU8>,
 }
 
+/// All senders, including retained HTTP sessions, share the binding's admission fence.
+#[derive(Clone)]
+pub struct Calls {
+    tx: Sender<Option<Job>>,
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    #[cfg(test)]
+    dir: PathBuf,
+}
+
+impl Calls {
+    pub(crate) fn stop(&self) {
+        // Wake an idle worker too. Jobs already in the queue are refused under the fence;
+        // a sender racing with this message either gets the refusal or a closed channel.
+        let _ = self.tx.send(None);
+    }
+}
+
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
 const ABANDONED: u8 = 2;
@@ -1061,11 +1078,12 @@ const ABANDONED: u8 = 2;
 /// Queue a call and wait for its result. `start_within` bounds only the wait for the call
 /// to start; once it runs, its real result is returned.
 pub(crate) async fn send_and_wait(
-    calls: &Sender<Job>,
+    calls: &Calls,
     name: String,
     args: Value,
     start_within: Duration,
 ) -> ToolResult {
+    calls.lifecycle.check_active()?;
     let (reply, mut rx) = tokio::sync::oneshot::channel();
     let state = Arc::new(AtomicU8::new(QUEUED));
     let job = Job {
@@ -1074,9 +1092,11 @@ pub(crate) async fn send_and_wait(
         reply,
         state: state.clone(),
     };
-    if calls.send(job).is_err() {
+    if calls.tx.send(Some(job)).is_err() {
         return Err("the project host has stopped".into());
     }
+    #[cfg(test)]
+    crate::test_support::hit(&calls.dir, "queued");
     match tokio::time::timeout(start_within, &mut rx).await {
         Ok(r) => r.unwrap_or_else(|_| Err("the project host dropped the call".into())),
         Err(_) => {
@@ -1097,23 +1117,27 @@ pub(crate) async fn send_and_wait(
     }
 }
 
-/// Start the host thread. Calls are run one at a time under `lock`.
-pub fn spawn_host(
+/// Prepare the host thread without resetting layout state. Once activated, calls run one
+/// at a time under the binding's writer fence; a retired binding never executes another job.
+pub(crate) fn spawn_host(
     dir: PathBuf,
     root_id: (u64, u64),
-    lock: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
     broken: crate::Broken,
     held: crate::HeldPages,
-) -> Result<Sender<Job>, String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Job>();
+) -> Result<Calls, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Job>>();
+    let calls = Calls {
+        tx,
+        lifecycle: lifecycle.clone(),
+        #[cfg(test)]
+        dir: dir.clone(),
+    };
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("opd-mcp-host".into())
         .spawn(move || {
-            let host = {
-                let _g = lock.blocking_lock();
-                BoundHost::open_with(&dir, broken, held)
-            };
+            let host = BoundHost::prepare(&dir, broken, held);
             let mut host = match host {
                 Ok(h) => {
                     let _ = ready_tx.send(Ok(()));
@@ -1124,8 +1148,12 @@ pub fn spawn_host(
                     return;
                 }
             };
-            while let Ok(job) = rx.recv() {
-                let _g = lock.blocking_lock();
+            while let Ok(Some(job)) = rx.recv() {
+                let _g = lifecycle.write.blocking_lock();
+                if let Err(e) = lifecycle.check_active() {
+                    let _ = job.reply.send(Err(e));
+                    continue;
+                }
                 // Waiting for the lock still counts as queued: a call abandoned meanwhile
                 // is skipped entirely.
                 if job
@@ -1148,7 +1176,7 @@ pub fn spawn_host(
     ready_rx
         .recv()
         .map_err(|_| "the MCP host thread stopped".to_string())??;
-    Ok(tx)
+    Ok(calls)
 }
 
 // ------------------------------------------------------------------------------ MCP
@@ -1163,7 +1191,7 @@ pub fn offered_tools() -> Vec<Tool> {
 
 /// Run one tool call on the project's host thread (policy, save and revision included).
 /// The timeout bounds only the wait for the call to start (see `Job`).
-pub async fn dispatch(calls: &Sender<Job>, session: u64, name: String, args: Value) -> ToolResult {
+pub async fn dispatch(calls: &Calls, session: u64, name: String, args: Value) -> ToolResult {
     let mut args = match args {
         Value::Object(a) => a,
         _ => Map::new(),
@@ -1174,13 +1202,13 @@ pub async fn dispatch(calls: &Sender<Job>, session: u64, name: String, args: Val
 
 #[derive(Clone)]
 pub struct AgentServer {
-    calls: Arc<Mutex<Sender<Job>>>,
+    calls: Arc<Mutex<Calls>>,
     /// One per MCP session (the service makes a handler per session).
     session: u64,
 }
 
 impl AgentServer {
-    pub fn new(calls: Sender<Job>) -> AgentServer {
+    pub fn new(calls: Calls) -> AgentServer {
         AgentServer {
             calls: Arc::new(Mutex::new(calls)),
             session: new_session(),
@@ -1577,25 +1605,22 @@ mod tests {
         drop(t);
     }
 
-    fn host_thread() -> (
-        Tmp,
-        Sender<Job>,
-        Arc<tokio::sync::Mutex<()>>,
-        PathBuf,
-        String,
-    ) {
+    fn host_thread() -> (Tmp, Calls, Arc<tokio::sync::Mutex<()>>, PathBuf, String) {
         let (t, h, root_id, a, _) = two_page_host();
         let dir = h.project.dir.clone();
         drop(h);
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::default());
+        let held = crate::HeldPages::default();
+        let lock = lifecycle.write.clone();
         let calls = spawn_host(
             dir.clone(),
             root_id,
-            lock.clone(),
+            lifecycle.clone(),
             Default::default(),
-            Default::default(),
+            held.clone(),
         )
         .unwrap();
+        lifecycle.activate(&held);
         (t, calls, lock, dir, a)
     }
 
@@ -1679,12 +1704,13 @@ mod tests {
         let (reply, rx) = tokio::sync::oneshot::channel();
         drop(rx);
         calls
-            .send(Job {
+            .tx
+            .send(Some(Job {
                 name: "get_tree_summary".into(),
                 args: with_session(json!({"nodeId": "root", "pageId": a}), s),
                 reply,
                 state: Arc::new(AtomicU8::new(QUEUED)),
-            })
+            }))
             .unwrap();
         let write = with_session(
             json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "50px"}}]}),

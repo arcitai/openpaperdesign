@@ -11,7 +11,8 @@ surface), plugin publishing, other hosts.
 
 ## What is in it
 
-- **`openpaperdesign-mcp`** (`crates/openpaperdesign-serve/src/bin/openpaperdesign-mcp.rs`)
+- **`openpaperdesign-mcp`** (entrypoint `crates/openpaperdesign-serve/src/bin/openpaperdesign-mcp.rs`,
+  shared implementation `src/launcher.rs` in that crate)
   is the plugin's MCP server, over stdio.
   - **Workspace:** the working directory the host starts it in (or `--workspace`).
   - **Tools:** upstream's design tools, behind B2a's bound-project host and policy, plus:
@@ -30,6 +31,12 @@ surface), plugin publishing, other hosts.
       is touched (containment, `project.json`, page ids, page links). A failed bind leaves
       the current binding, its server, and its editor URL and token working.
     - **Rebinding the same project** changes nothing.
+    - **In-flight work on a successful switch:** preparation does not reset layout state.
+      The old binding closes admission and waits for its started writer/rollback under the
+      shared MCP/browser write lock. Queued and late old work is refused without executing.
+      Only then are the old page ids released and the new binding activated. Old HTTP
+      sessions, routes and cloned server handles remain retired. Cancelling the bind's
+      response waiter does not interrupt an already-started handoff.
     - **Unsaved browser edits:** once `open_editor` has handed out the URL, switching stops
       the server that browser tab saves to. Edits made through the tools are saved by each
       call, but the tab may hold an unsaved edit, which could no longer be saved. So the
@@ -264,6 +271,31 @@ B2b review round 2 (on `66a825f`), 2026-10-12:
 plugin tests plus the Node CI command; Python design tests; fmt, serve clippy and
 `git diff --check`.
 
+### Lifecycle correction after final review round 3 (2026-10-12)
+
+Exact `b846b8a` has operator Mac evidence for a built-in editor bundle, doctor, 65 serve
+checks and the sequential actual-stdio same-id switch (Y child 300px). The bundle was
+inherited from unchanged `cffeec6` web inputs, not freshly rebuilt. Round 3 still rejected
+`b846b8a`: overlapping old HTTP calls could restore X's layout state into Y or save X with
+incorrect geometry after an early reset. This replacement introduces the retirement
+boundary described above. Its regression tests use the actual launcher and MCP handler,
+authenticated HTTP/axum connection tasks, worker and disk commits with deterministic
+test-only scheduling. Portable tests substitute an in-memory listener and an inert web
+bundle; `OPD_LIFECYCLE_TCP=1` selects real loopback for the same unit regressions. The
+separate `tests/launcher.rs` continues to drive the actual executable over stdio.
+
+Linux implementation checks for this correction: 23 library tests, 24 agent tests, eight
+actual-executable stdio launcher tests and 17 API tests passed. All six deterministic
+lifecycle regressions also passed with real Linux loopback. Serve clippy (`--all-targets`),
+format and diff checks passed. Initial socket attempts were blocked by the sandbox;
+scoped loopback access was then approved and those tests ran. No root/GPU/wasm/plugin
+baseline was repeated; their inputs are unchanged. The README addition only prepends a
+fork/setup entry; the upstream text below it is preserved byte-for-byte.
+
+The replacement candidate needs fresh independent review and exact-candidate Mac lifecycle
+proof. The operator has prepared the installed-plugin/in-app-browser probe but has not run
+it; installation and browser editing/save/conflict/reopen remain unverified.
+
 ## Not proven
 
 - **Codex itself:** the plugin tests are source-only checks. They cover the forbidden
@@ -276,7 +308,7 @@ plugin tests plus the Node CI command; Python design tests; fmt, serve clippy an
   was actually used.
 - **Opening the editor:** opening the `open_editor` URL in the in-app browser from a skill
   hasn't been tried.
-- **Embedding:** proven here on Linux only; the Mac build and install are the operator's to
-  run.
+- **Embedding:** the historical `b846b8a` Mac binary/doctor evidence is recorded above.
+  Fresh replacement-binary proof and installation remain the operator's to run.
 - **Browser behaviour:** everything listed as unproven in the B1 and B2a records still
   applies (for example agent + browser editing in a real browser).

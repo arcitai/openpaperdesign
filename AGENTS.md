@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.13 · Updated: 2026-10-12
+Revision: 0.14 · Updated: 2026-10-12
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -25,8 +25,9 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
   - `src/mcp/exec.rs`: `pub fn with_no_stretch` gives access to the process-wide record of
     containers that don't stretch their children (B2a final review). Accessor only, no
     behaviour change. The host copies and restores its own pages' entries with the editor. A
-    newly opened project drops stale entries for its page ids, and a server that stops for
-    good releases its own (`Server::release_layout_state`).
+    newly activated project drops stale entries for its page ids. `Server::retire` first
+    closes admission and drains the current writer/rollback, then releases every page id
+    the host held. Queued and retained old handles cannot execute or save after retirement.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -114,7 +115,10 @@ discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `ski
 `mcp.json` is explicit `type: "stdio"` with no `cwd`. The launcher records the workspace's
 canonical path and identity at start and refuses a moved or replaced workspace. It creates
 `design/<name>/` itself without following links. A failed `bind_project` must leave the
-current binding working. Never claim browser edits are saved on a switch or exit: once
+current binding working. Replacement preparation must not change the active host's layout
+registry. On a successful switch, retire the old server before activating the replacement;
+HTTP sessions, stdio clones and browser saves share that fence. Same-project binding is a
+no-op. Never claim browser edits are saved on a switch or exit: once
 `open_editor` was called, switching needs `force: true`. The summary bind returns runs in a
 one-off session and is not the agent's read: instructions must have the agent read the
 target page (`get_tree_summary` root with its `pageId`) before its first change. The ported

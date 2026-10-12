@@ -32,6 +32,11 @@
 
 pub mod agent;
 mod commit;
+#[doc(hidden)]
+pub mod launcher;
+mod lifecycle;
+#[cfg(test)]
+mod test_support;
 
 use axum::Router;
 use axum::body::Body;
@@ -49,7 +54,6 @@ use rmcp::transport::streamable_http_server::{
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
 pub(crate) const ASSETS: &str = ASSETS_DIR;
 /// The MCP endpoint (same listener, same token).
@@ -110,13 +114,26 @@ pub struct Server {
     origins: [String; 2],
     /// Serializes revision check + write for every writer through this server: browser saves
     /// and agent calls (the MCP host thread takes the same lock).
-    write_lock: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: Arc<lifecycle::Lifecycle>,
     /// Tool calls for the MCP host thread.
-    calls: Sender<agent::Job>,
+    calls: agent::Calls,
     /// Set when a failed write couldn't be undone; every later write is refused.
     broken: Broken,
-    /// Every page id the host has held, for `release_layout_state`.
+    /// Every page id the host has held, released only after retirement drains its writers.
     held: HeldPages,
+}
+
+/// Fully loaded but not yet active. Preparation has no effect on the layout registry.
+/// The launcher retires its old server before consuming this value.
+pub(crate) struct PreparedServer(Arc<Server>);
+
+impl PreparedServer {
+    /// Start with fresh layout state for this project's ids. For a replacement, the previous
+    /// server must have completed `retire` first. Arbitrary concurrent hosts are unsupported.
+    pub(crate) fn activate(self) -> Arc<Server> {
+        self.0.lifecycle.activate(&self.0.held);
+        self.0
+    }
 }
 
 /// Page ids a host has held (shared between the server and its host thread).
@@ -375,6 +392,7 @@ impl Server {
             cfg.port,
             cfg.token,
         )
+        .map(PreparedServer::activate)
     }
 
     /// Like [`Server::open`], with the web bundle compiled into the binary (`files` = file
@@ -391,6 +409,22 @@ impl Server {
             "only supported on Unix (Linux, macOS)".into(),
         ));
         #[cfg(unix)]
+        Self::prepare_embedded(project, files, port, token).map(PreparedServer::activate)
+    }
+
+    /// Validate and load a replacement without changing the active binding's layout state.
+    /// The returned server admits no calls until `activate` consumes it.
+    pub(crate) fn prepare_embedded(
+        project: PathBuf,
+        files: EmbeddedBundle,
+        port: u16,
+        token: String,
+    ) -> Result<PreparedServer, OpenError> {
+        #[cfg(not(unix))]
+        return Err(OpenError::Unsafe(
+            "only supported on Unix (Linux, macOS)".into(),
+        ));
+        #[cfg(unix)]
         Self::open_unix(project, BundleSource::Embedded(files), port, token)
     }
 
@@ -400,7 +434,7 @@ impl Server {
         bundle: BundleSource,
         port: u16,
         token: String,
-    ) -> Result<Arc<Server>, OpenError> {
+    ) -> Result<PreparedServer, OpenError> {
         let dir = project
             .canonicalize()
             .map_err(|e| OpenError::NotAProject(project.clone(), e.to_string()))?;
@@ -424,19 +458,19 @@ impl Server {
                 })
                 .collect(),
         };
-        let write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle = Arc::new(lifecycle::Lifecycle::default());
         let broken = Broken::default();
         let held = HeldPages::default();
         let calls = agent::spawn_host(
             dir.clone(),
             root_id,
-            write_lock.clone(),
+            lifecycle.clone(),
             broken.clone(),
             held.clone(),
         )
         .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = port;
-        Ok(Arc::new(Server {
+        Ok(PreparedServer(Arc::new(Server {
             dir,
             root_id,
             bundle,
@@ -446,24 +480,23 @@ impl Server {
                 format!("http://127.0.0.1:{p}"),
                 format!("http://localhost:{p}"),
             ],
-            write_lock,
+            lifecycle,
             calls,
             broken,
             held,
-        }))
+        })))
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Before this server stops for good (e.g. a launcher switching to another project): drop
-    /// the entries for every page it has held from upstream's process-wide stretch record, so
-    /// they can't affect a project bound later in the same process. Entries of other pages
-    /// are untouched.
-    pub fn release_layout_state(&self) {
-        let held = self.held.lock().unwrap().clone();
-        paper_rs::mcp::exec::with_no_stretch(|s| s.retain(|(p, _)| !held.contains(p)));
+    /// Permanently close admission, wait for the current writer (including rollback), and
+    /// release this host's page ids. Queued and late HTTP/stdio calls cannot execute, and
+    /// browser saves check the same fence. Retained handles stay retired; this is idempotent.
+    pub async fn retire(&self) {
+        self.lifecycle.retire(&self.held).await;
+        self.calls.stop();
     }
 
     /// Run a tool call against this project's host, exactly as `/mcp` does (same policy,
@@ -587,6 +620,9 @@ async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Respon
         if !ok {
             return error(StatusCode::UNAUTHORIZED, "missing or wrong token");
         }
+    }
+    if let Err(e) = s.lifecycle.check_active() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, &e);
     }
     next.run(req).await
 }
@@ -784,8 +820,13 @@ async fn put_page(
             "If-Match with the page revision is required",
         );
     };
-    let _write = s.write_lock.lock().await;
+    #[cfg(test)]
+    test_support::hit(&s.dir, "browser_queued");
+    let _write = s.lifecycle.write.lock().await;
     let result = (|| {
+        s.lifecycle
+            .check_active()
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
         let mut p = s.project()?;
         let name = page_ref(&p, &id)?;
         // Strict: the save must be based on the revision on disk now (whoever wrote it: the
@@ -941,8 +982,8 @@ mod tests {
 
     /// Operator Mac finding on cffeec6: a server that stops for good releases the stretch
     /// entries of every page it held, and only those.
-    #[test]
-    fn releasing_a_server_drops_only_its_pages_layout_state() {
+    #[tokio::test]
+    async fn releasing_a_server_drops_only_its_pages_layout_state() {
         use std::hash::{BuildHasher, RandomState};
         let root = std::env::temp_dir().join(format!(
             "opd-unit-release-{:016x}",
@@ -966,7 +1007,7 @@ mod tests {
             set.insert((id.clone(), n));
             set.insert((other.clone(), n));
         });
-        s.release_layout_state();
+        s.retire().await;
         let (mine, theirs) = paper_rs::mcp::exec::with_no_stretch(|set| {
             (
                 set.contains(&(id.clone(), n)),
@@ -976,6 +1017,93 @@ mod tests {
         assert!(!mine && theirs);
         paper_rs::mcp::exec::with_no_stretch(|set| set.remove(&(other.clone(), n)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Retirement releases the lifetime union, including pages no longer in the manifest.
+    /// The manifest edit is a sequential reload fixture, not a concurrent external writer.
+    #[tokio::test]
+    async fn retirement_includes_created_then_removed_pages_and_preserves_other_keys() {
+        use paper_rs::mcp::Out;
+        use paper_rs::model::NodeId;
+        use serde_json::{Value, json};
+        fn value(r: paper_rs::mcp::ToolResult) -> Value {
+            r.unwrap()
+                .iter()
+                .find_map(|o| match o {
+                    Out::Text(t) => serde_json::from_str(t).ok(),
+                    _ => None,
+                })
+                .unwrap()
+        }
+        use std::hash::{BuildHasher, RandomState};
+        let root = std::env::temp_dir().join(format!(
+            "opd-held-{:016x}",
+            RandomState::new().hash_one(std::time::SystemTime::now())
+        ));
+        let (p, _) = paper_rs::project::Store::open(&root)
+            .unwrap()
+            .create("Held")
+            .unwrap();
+        let first = p.manifest.pages[0].id.clone();
+        let other = format!("other-{first}");
+        let node = NodeId(991);
+        paper_rs::mcp::exec::with_no_stretch(|s| {
+            s.insert((first.clone(), node));
+            s.insert((other.clone(), node));
+        });
+        let server = Server::open(Config {
+            project: p.dir.clone(),
+            web_dir: root.join("no-web"),
+            port: 1,
+            token: TOKEN.into(),
+        })
+        .unwrap();
+        assert!(paper_rs::mcp::exec::with_no_stretch(|s| !s
+            .contains(&(first.clone(), node))
+            && s.contains(&(other.clone(), node))));
+        let session = agent::new_session();
+        server
+            .call_tool(session, "get_basic_info", json!({}))
+            .await
+            .unwrap();
+        let added = value(
+            server
+                .call_tool(session, "create_page", json!({"name":"Temporary"}))
+                .await,
+        )["pageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        server
+            .call_tool(
+                session,
+                "get_tree_summary",
+                json!({"nodeId":"root","pageId":added}),
+            )
+            .await
+            .unwrap();
+        server.call_tool(session,"create_artboard",json!({"pageId":added,"styles":{"display":"flex","flexDirection":"column","alignItems":"flex-start","width":"450px","height":"200px"}})).await.unwrap();
+        assert!(paper_rs::mcp::exec::with_no_stretch(|s| s
+            .iter()
+            .any(|(p, _)| p == &added)));
+        let manifest = p.dir.join(MANIFEST);
+        let mut m: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        m["pages"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|v| v["id"] != added);
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        let now = value(server.call_tool(session, "get_basic_info", json!({})).await);
+        assert_eq!(now["pages"].as_array().unwrap().len(), 1);
+        paper_rs::mcp::exec::with_no_stretch(|s| {
+            s.insert((first.clone(), node));
+        });
+        server.retire().await;
+        paper_rs::mcp::exec::with_no_stretch(|s| {
+            assert!(!s.iter().any(|(p, _)| p == &first || p == &added));
+            assert!(s.remove(&(other, node)));
+        });
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Final review, P2 2: once both files are committed the save is reported as saved, with
@@ -988,10 +1116,13 @@ mod tests {
             "opd-unit-put2-{:016x}",
             RandomState::new().hash_one(std::time::SystemTime::now())
         ));
-        let (p, _) = paper_rs::project::Store::open(&root)
+        let (mut p, _) = paper_rs::project::Store::open(&root)
             .unwrap()
             .create("Put")
             .unwrap();
+        // Make the before timestamp distinct without depending on clock resolution.
+        p.manifest.modified = 0;
+        p.write_manifest().unwrap();
         let id = p.manifest.pages[0].id.clone();
         let s = Server::open(Config {
             project: p.dir.clone(),
