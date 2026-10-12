@@ -136,9 +136,21 @@ async fn call(
     (r.is_error != Some(true), text(&r))
 }
 
-/// What an agent does before it changes a page: read it in its own session.
+/// What an agent does before it changes a page: read it in its own session (`get_basic_info`
+/// returns the page the user is viewing and the page list).
 async fn read(c: &rmcp::service::RunningService<rmcp::RoleClient, ()>) {
     let (ok, out) = call(c, "get_basic_info", json!({})).await;
+    assert!(ok, "{out}");
+}
+
+/// Read one page (its whole tree) in the session.
+async fn read_page(c: &rmcp::service::RunningService<rmcp::RoleClient, ()>, page: &str) {
+    let (ok, out) = call(
+        c,
+        "get_tree_summary",
+        json!({"nodeId": "root", "pageId": page}),
+    )
+    .await;
     assert!(ok, "{out}");
 }
 
@@ -668,8 +680,8 @@ async fn reloads_keep_saved_page_names() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{out}");
-    // An unrelated agent edit on the second page, after reading.
-    read(&c).await;
+    // An unrelated agent edit on the second page, after reading that page.
+    read_page(&c, &second).await;
     let (ok, out) = call(
         &c,
         "create_shape",
@@ -743,6 +755,221 @@ async fn stale_page_renames_are_refused() {
     assert_eq!(page_names(&p), ["B one", "Two"]);
     a.cancel().await.unwrap();
     b.cancel().await.unwrap();
+}
+
+/// A browser-style save of `page` on its current revision (changes its bytes only).
+async fn browser_save(r: &Running, page: &str) {
+    let (tag, body) = browser_get(r, page).await;
+    let mut data = page_from_json(&body).unwrap();
+    data.doc.next_id += 1;
+    let (st, _, _, out) = http(
+        r,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        Some(&tag),
+        page_to_json(&data),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{out}");
+}
+
+/// A served project with two pages, A (the one the user views, with a rectangle) and B
+/// (with a rectangle the setup session drew).
+async fn two_pages(t: &Tmp) -> (Project, String, String, Running) {
+    let (p, a) = project(&t.0, "Agent");
+    let r = serve(&p.dir).await;
+    let setup = client(r.port).await;
+    read(&setup).await;
+    let (ok, out) = call(&setup, "create_page", json!({"name": "B"})).await;
+    assert!(ok, "{out}");
+    let b = manifest(&p)["pages"][1]["id"].as_str().unwrap().to_string();
+    let (ok, out) = call(&setup, "create_shape", shape_on(&b)).await;
+    assert!(ok, "{out}");
+    setup.cancel().await.unwrap();
+    (p, a, b, r)
+}
+
+/// The id of the first top-level node of `page`, as a node key.
+fn first_node(p: &Project, page: &str) -> String {
+    key(page, doc(p, page).root[0].0)
+}
+
+/// Review round 3: a change to several pages needs every one of them read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_write_needs_every_page_it_writes_read() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read_page(&c, &a).await;
+    let batch = json!({"updates": [
+        {"nodeIds": [first_node(&p, &a)], "styles": {"width": "11px"}},
+        {"nodeIds": [first_node(&p, &b)], "styles": {"width": "12px"}},
+    ]});
+    let before = (
+        file(&p, &a),
+        file(&p, &b),
+        std::fs::read(p.dir.join("project.json")).unwrap(),
+    );
+    let (ok, out) = call(&c, "update_styles", batch.clone()).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(
+        (
+            file(&p, &a),
+            file(&p, &b),
+            std::fs::read(p.dir.join("project.json")).unwrap()
+        ),
+        before,
+        "neither page nor the manifest was written"
+    );
+    read_page(&c, &b).await;
+    let (ok, out) = call(&c, "update_styles", batch).await;
+    assert!(ok, "{out}");
+    c.cancel().await.unwrap();
+}
+
+fn shape_on(page: &str) -> Value {
+    json!({"type": "rectangle", "x": 0, "y": 0, "width": 5, "height": 5, "pageId": page})
+}
+
+/// Review round 3: reading one page acknowledges only that page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_page_a_does_not_acknowledge_page_b() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    // B read, then saved by the browser; the agent then reads only A and writes B: refused.
+    read_page(&c, &b).await;
+    browser_save(&r, &b).await;
+    read_page(&c, &a).await;
+    let disk = file(&p, &b);
+    let (ok, out) = call(&c, "create_shape", shape_on(&b)).await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(file(&p, &b), disk);
+    // A page never read in this session isn't writable after reading another one either.
+    let c2 = client(r.port).await;
+    read_page(&c2, &a).await;
+    let (ok, out) = call(&c2, "create_shape", shape_on(&b)).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    // A successful read of A allows writing A.
+    let (ok, out) = call(&c2, "create_shape", shape_on(&a)).await;
+    assert!(ok, "{out}");
+    assert_eq!(file(&p, &b), disk);
+    c.cancel().await.unwrap();
+    c2.cancel().await.unwrap();
+}
+
+/// Review round 3: a failed call acknowledges nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_read_acknowledges_nothing() {
+    let t = tmp();
+    let (p, a, _, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read_page(&c, &a).await;
+    browser_save(&r, &a).await;
+    // Reads that fail: a node that doesn't exist, a page that doesn't exist.
+    for (tool, args) in [
+        ("get_node_info", json!({"nodeId": key(&a, 999_999)})),
+        (
+            "get_tree_summary",
+            json!({"nodeId": "root", "pageId": "no-such-page"}),
+        ),
+    ] {
+        let (ok, out) = call(&c, tool, args).await;
+        assert!(!ok, "{tool}: {out}");
+    }
+    let disk = file(&p, &a);
+    let (ok, out) = call(&c, "create_shape", shape_on(&a)).await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    assert_eq!(file(&p, &a), disk);
+    // A fresh session whose only call failed hasn't read anything.
+    let c2 = client(r.port).await;
+    let (ok, _) = call(&c2, "get_node_info", json!({"nodeId": key(&a, 999_999)})).await;
+    assert!(!ok);
+    let (ok, out) = call(&c2, "create_shape", shape_on(&a)).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(file(&p, &a), disk);
+    c.cancel().await.unwrap();
+    c2.cancel().await.unwrap();
+}
+
+/// Review round 3: a session's own write keeps that page writable, and only that page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_writes_acknowledge_only_the_pages_written() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read_page(&c, &a).await;
+    for _ in 0..2 {
+        // The second write needs no re-read: the session wrote that revision itself.
+        let (ok, out) = call(&c, "create_shape", shape_on(&a)).await;
+        assert!(ok, "{out}");
+    }
+    let disk = file(&p, &b);
+    let (ok, out) = call(&c, "create_shape", shape_on(&b)).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(file(&p, &b), disk);
+    // Someone else's save of A still makes the session's next write to A stale.
+    browser_save(&r, &a).await;
+    let (ok, out) = call(&c, "create_shape", shape_on(&a)).await;
+    assert!(!ok && out.contains("conflict"), "{out}");
+    c.cancel().await.unwrap();
+}
+
+/// Review round 3: calls that can't be attributed to a page acknowledge nothing, and a
+/// page read doesn't acknowledge the page list (names, order), which renames change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unattributable_reads_acknowledge_nothing() {
+    let t = tmp();
+    let (p, a, _, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    // Successful calls that don't return a page's state.
+    for (tool, args) in [
+        ("find_nodes", json!({"textValue": "x"})),
+        ("list_resources", json!({})),
+        ("get_guide", json!({"topic": "html"})),
+        ("get_font_family_info", json!({"familyNames": ["Inter"]})),
+        ("rename_pages", json!({"updates": []})),
+        ("finish_working_on_nodes", json!({})),
+        ("select_nodes", json!({"nodeIds": [first_node(&p, &a)]})),
+    ] {
+        let (ok, out) = call(&c, tool, args).await;
+        assert!(ok, "{tool}: {out}");
+    }
+    // And failed ones: an unknown tool, a mutation with missing arguments, a bad guide.
+    for (tool, args) in [
+        ("no_such_tool", json!({})),
+        ("update_styles", json!({})),
+        ("get_guide", json!({"topic": "no-such-topic"})),
+    ] {
+        let (ok, out) = call(&c, tool, args).await;
+        assert!(!ok, "{tool}: {out}");
+    }
+    let disk = file(&p, &a);
+    let (ok, out) = call(&c, "create_shape", shape_on(&a)).await;
+    assert!(!ok && out.contains("hasn't been read"), "{out}");
+    assert_eq!(file(&p, &a), disk);
+    // A page read allows content changes, but not a rename (the page list is separate).
+    read_page(&c, &a).await;
+    let m = std::fs::read(p.dir.join("project.json")).unwrap();
+    let (ok, out) = call(
+        &c,
+        "rename_pages",
+        json!({"updates": [{"pageId": a, "name": "Renamed"}]}),
+    )
+    .await;
+    assert!(!ok && out.contains("page list"), "{out}");
+    assert_eq!(std::fs::read(p.dir.join("project.json")).unwrap(), m);
+    // get_basic_info returns the page list, so then the rename goes through.
+    read(&c).await;
+    let (ok, out) = call(
+        &c,
+        "rename_pages",
+        json!({"updates": [{"pageId": a, "name": "Renamed"}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    assert_eq!(page_names(&p), ["Renamed", "B"]);
+    c.cancel().await.unwrap();
 }
 
 fn set_manifest_pages(p: &Project, pages: Value) {
@@ -980,6 +1207,7 @@ async fn refused_tools_projects_and_local_paths() {
         "{out}"
     );
     // data: images still work.
+    read(&c).await;
     let (ok, out) = call(
         &c,
         "create_artboard",

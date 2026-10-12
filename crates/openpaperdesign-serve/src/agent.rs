@@ -15,11 +15,14 @@
 //! 5. otherwise saves every changed page atomically through upstream `Project::save_page`,
 //!    which changes that page's revision, so the browser picks the change up.
 //!
-//! "Read" in step 4 means any call by the session that wrote nothing (a summary, node info, a
-//! screenshot, ...): it records the current revisions of every page as seen by that session.
-//! A session that hasn't read (a new one, or one whose record was dropped because more than
-//! `MAX_SESSIONS` sessions were seen) can't change existing pages until it reads; it can
-//! still create new ones.
+//! What a session has read is kept per page: a page counts as read at a revision only when a
+//! call that succeeded returned that page's content or state (`read_keys`), or when the
+//! session's own successful call wrote that revision. The page list (names, order) is one
+//! more item, read only through `get_basic_info`. Failed calls, and calls that can't be
+//! attributed to a page, acknowledge nothing. A change must find every page it writes (and
+//! the page list, if it changes it) read at its current revision. A session that hasn't read
+//! (a new one, or one whose record was dropped because more than `MAX_SESSIONS` sessions
+//! were seen) can't change existing pages until it reads; it can still create new ones.
 //!
 //! Policy: `export` and `export_combined_pdf` are refused (they write files where the agent
 //! says), and so is `create_file`. `list_resources`, `open_file` and any `fileId` argument only
@@ -279,14 +282,23 @@ pub struct BoundHost {
 
 const MANIFEST_KEY: &str = "\0manifest";
 
-/// Key of a page's manifest metadata (name and position) in the revision maps.
-fn meta_key(id: &str) -> String {
-    format!("\0meta:{id}")
+/// Key of the page list (ids, names and order: the manifest's page metadata) in the revision
+/// maps, observed and checked as one item.
+const PAGES_KEY: &str = "\0pages";
+
+fn pages_rev<'a>(pages: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let mut b = Vec::new();
+    for (id, name) in pages {
+        b.extend_from_slice(id.as_bytes());
+        b.push(0);
+        b.extend_from_slice(name.as_bytes());
+        b.push(b'\n');
+    }
+    etag(&b)
 }
 
-fn meta_rev(pos: usize, name: &str) -> String {
-    format!("{pos}:{name}")
-}
+/// A listed page that has no file yet: still a page whose content can be stale.
+const NO_FILE: &str = "\0none";
 
 /// Argument key the MCP handler sets to its session number (overwriting any client value);
 /// stripped before the call is checked or run.
@@ -308,7 +320,7 @@ fn read_pages(project: &Project) -> Result<(Vec<PageData>, HashMap<String, Strin
     let mut pages = Vec::new();
     // Distinct pages must be distinct files (backs up the case-folded id check).
     let mut files = std::collections::HashSet::new();
-    for (pos, r) in project.manifest.pages.iter().enumerate() {
+    for r in &project.manifest.pages {
         if !valid_page_id(&r.id) {
             return Err(format!("unsafe page id {:?}", r.id));
         }
@@ -324,6 +336,7 @@ fn read_pages(project: &Project) -> Result<(Vec<PageData>, HashMap<String, Strin
             page_from_json(&text).map_err(|e| format!("{}: {e}", r.id))?
         } else {
             // A listed page without a file starts empty, as in upstream `load_pages`.
+            revs.insert(r.id.clone(), NO_FILE.to_string());
             PageData {
                 id: String::new(),
                 name: r.name.clone(),
@@ -339,9 +352,18 @@ fn read_pages(project: &Project) -> Result<(Vec<PageData>, HashMap<String, Strin
         page.id = r.id.clone();
         page.name = r.name.clone();
         page.doc.name = r.name.clone();
-        revs.insert(meta_key(&r.id), meta_rev(pos, &r.name));
         pages.push(page);
     }
+    revs.insert(
+        PAGES_KEY.to_string(),
+        pages_rev(
+            project
+                .manifest
+                .pages
+                .iter()
+                .map(|p| (p.id.as_str(), p.name.as_str())),
+        ),
+    );
     Ok((pages, revs))
 }
 
@@ -536,9 +558,10 @@ fn list_resources(host: &BoundHost) -> ToolResult {
     )])
 }
 
-/// Why this call may not change what it changed, if so: it touches (changes the content of,
-/// renames, moves or removes) an existing page that `session` hasn't read, or whose content or
-/// metadata changed since that session last read it.
+/// Why this call may not change what it changed, if so. Each existing page whose content it
+/// changed or which it removed must have been observed by `session` at its current revision,
+/// and so must the page list if the call changed it (a rename, a new or removed page, a new
+/// order).
 fn stale_change(
     host: &mut BoundHost,
     session: u64,
@@ -549,50 +572,126 @@ fn stale_change(
     let seen = host.seen.get(&session).unwrap_or(&empty);
     let ed = &host.ed;
     let now: std::collections::HashSet<&str> = ed.pages.iter().map(|p| p.id.as_str()).collect();
-    let content = ed.dirty_pages().into_iter().map(|i| ed.pages[i].id.clone());
-    let meta = ed
-        .pages
-        .iter()
-        .enumerate()
-        .filter(|(i, p)| {
+    let mut keys: Vec<String> = ed
+        .dirty_pages()
+        .into_iter()
+        .map(|i| ed.pages[i].id.clone())
+        .chain(
             before
-                .get(&meta_key(&p.id))
-                .is_some_and(|m| *m != meta_rev(*i, &p.name))
-        })
-        .map(|(_, p)| p.id.clone());
-    let removed = before
-        .keys()
-        .filter(|k| !k.starts_with('\0') && !now.contains(k.as_str()))
-        .cloned();
-    for id in content.chain(meta).chain(removed) {
+                .keys()
+                .filter(|k| !k.starts_with('\0') && !now.contains(k.as_str()))
+                .cloned(),
+        )
+        .collect();
+    let list = pages_rev(ed.pages.iter().map(|p| (p.id.as_str(), p.name.as_str())));
+    if before.get(PAGES_KEY) != Some(&list) {
+        keys.push(PAGES_KEY.to_string());
+    }
+    for k in keys {
         // Pages new in this call have nothing before it.
-        for k in [id.clone(), meta_key(&id)] {
-            let Some(rev) = before.get(&k) else { continue };
-            let name = host
-                .project
+        let Some(rev) = before.get(&k) else { continue };
+        let what = if k == PAGES_KEY {
+            "the page list (names, order)".to_string()
+        } else {
+            host.project
                 .manifest
                 .pages
                 .iter()
-                .find(|p| p.id == id)
-                .map_or(id.clone(), |p| format!("{} ({id})", p.name));
-            match seen.get(&k) {
-                Some(s) if s == rev => {}
-                Some(_) => {
-                    return Some(format!(
-                        "conflict: page {name} was changed by someone else (e.g. in the browser) \
-                         since you last read it"
-                    ));
-                }
-                None => {
-                    return Some(format!(
-                        "conflict: page {name} hasn't been read in this MCP session yet (or the \
-                         session's reads were forgotten)"
-                    ));
-                }
+                .find(|p| p.id == k)
+                .map_or(format!("page {k}"), |p| format!("page {} ({k})", p.name))
+        };
+        match seen.get(&k) {
+            Some(s) if s == rev => {}
+            Some(_) => {
+                return Some(format!(
+                    "conflict: {what} was changed by someone else (e.g. in the browser) since \
+                     you last read it"
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "conflict: {what} hasn't been read in this MCP session yet (or the \
+                     session's reads were forgotten)"
+                ));
             }
         }
     }
     None
+}
+
+/// What a successful read call returned, as revision keys: the pages whose content or state
+/// it returned (resolved like upstream: `pageId`, else the page the user is viewing; node
+/// keys `<page prefix>:<n>` name their own page), and the page list for `get_basic_info`.
+/// Calls that can't be attributed to specific pages (an unscoped search, guides, fonts,
+/// selection changes, ...) return nothing here, so they acknowledge nothing.
+fn read_keys(ed: &Editor, name: &str, args: &Value) -> Vec<String> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim);
+    let find = |key: &str| -> Option<usize> {
+        ed.pages
+            .iter()
+            .position(|p| p.id == key)
+            .or_else(|| {
+                ed.pages
+                    .iter()
+                    .position(|p| p.id.starts_with(key) && key.len() >= 4)
+            })
+            .or_else(|| {
+                ed.pages
+                    .iter()
+                    .position(|p| p.name.eq_ignore_ascii_case(key))
+            })
+    };
+    let default = match s("pageId") {
+        Some(p) if !p.is_empty() => find(p),
+        _ => Some(ed.active_page),
+    };
+    let node = |key: &str| -> Option<usize> {
+        let key = key.trim().trim_start_matches('#');
+        match key.split_once(':') {
+            Some((p, _)) => find(p),
+            None => default,
+        }
+    };
+    let root_or_node = |k: Option<&str>| match k.filter(|k| !k.is_empty() && *k != "root") {
+        Some(k) => node(k),
+        None => default,
+    };
+    let pages: Vec<Option<usize>> = match name {
+        "get_basic_info" => vec![default],
+        "get_selection" => vec![Some(ed.active_page)],
+        "get_node_info" | "get_jsx" | "get_fill_image" => vec![s("nodeId").and_then(node)],
+        "get_children" | "get_tree_summary" | "get_screenshot" => vec![root_or_node(s("nodeId"))],
+        "get_computed_styles" => match args.get("nodeIds").and_then(Value::as_array) {
+            Some(ids) => ids
+                .iter()
+                .map(|v| match v {
+                    Value::String(k) => node(k),
+                    Value::Number(_) => default,
+                    _ => None,
+                })
+                .collect(),
+            None => vec![None],
+        },
+        "find_nodes" => match s("nodeId").filter(|k| !k.is_empty()) {
+            Some(k) => vec![node(k)],
+            None if s("pageId").is_some() => vec![default],
+            // Searching every page returns matches, not any one page's state.
+            None => vec![None],
+        },
+        _ => vec![None],
+    };
+    if pages.iter().any(Option::is_none) {
+        return Vec::new();
+    }
+    let mut keys: Vec<String> = pages
+        .into_iter()
+        .flatten()
+        .filter_map(|i| ed.pages.get(i).map(|p| p.id.clone()))
+        .collect();
+    if name == "get_basic_info" {
+        keys.push(PAGES_KEY.to_string());
+    }
+    keys
 }
 
 /// One tool call on the host thread, with the write lock held by the caller.
@@ -608,6 +707,8 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         .and_then(|v| v.as_u64());
     let before = host.known.clone();
     let args = check_call(name, &args, &host.bound())?;
+    // Worked out before the call, on the pages as they are; used only if it succeeds.
+    let reads = read_keys(&host.ed, name, &args);
     let r = match name {
         "list_resources" => list_resources(host),
         "open_file" => {
@@ -624,14 +725,18 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         // Drop the change: it wasn't decided on the page as it is now.
         host.load()?;
         return Err(format!(
-            "{why}, so this change was not applied and nothing was written. Read the page \
-             (get_tree_summary with nodeId \"root\", get_node_info or get_basic_info) and redo \
-             the change on what is there now."
+            "{why}, so this change was not applied and nothing was written. Read every page \
+             you change (get_tree_summary with nodeId \"root\" and its pageId, or get_node_info \
+             on its nodes; get_basic_info for the page list) and redo the change on what is \
+             there now."
         ));
     }
     let saved = host.save_changes();
+    // Only a call that succeeded acknowledges anything: a failed or refused call, or a
+    // failed save, leaves what the session has observed as it was.
     if let Some(s) = session
         && saved.is_ok()
+        && r.is_ok()
     {
         if !host.seen.contains_key(&s) && host.seen.len() >= MAX_SESSIONS {
             // Forgetting fails closed: that session must read again before changing a page.
@@ -639,12 +744,16 @@ pub fn run(host: &mut BoundHost, root_id: (u64, u64), name: &str, args: &Value) 
         }
         let seen = host.seen.entry(s).or_default();
         if before == host.known {
-            // Nothing written: everything as it is now has been seen.
-            *seen = host.known.clone();
+            // Nothing written: acknowledge exactly the pages (and page list) it returned.
+            for k in &reads {
+                if let Some(v) = host.known.get(k) {
+                    seen.insert(k.clone(), v.clone());
+                }
+            }
         } else {
-            // What this call wrote is seen as written; the rest keeps what was last read.
+            // What this call wrote is observed as written; nothing else is acknowledged.
             for (k, v) in &host.known {
-                if before.get(k) != Some(v) {
+                if k != MANIFEST_KEY && before.get(k) != Some(v) {
                     seen.insert(k.clone(), v.clone());
                 }
             }
