@@ -1,6 +1,7 @@
 # B1: editing a paper-rs project in a browser — 2026-10-12
 
-Updated 2026-10-12 after review round 1 (see "Fix round 1" below).
+Updated 2026-10-12 after review rounds 1 and 2 and the operator's Codex browser runs (see "Fix
+round 1" and "Fix round 2" below).
 
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B1. A
 loopback server opens one existing paper-rs project folder. A browser page runs the upstream
@@ -76,12 +77,21 @@ apart from `manifest.modified`.
   outermost layer. Only the four bundle files are served.
 - **No links out of the project (fail closed):** `project.json`, `pages/`, each page file
   and each bundle file must be a real file or directory, not a symbolic link. Files must
-  also have a single hard link. This is checked before upstream `Project::open` (whose
-  stale-temp cleanup deletes `.*.tmp` files in `pages/`) and again on every read and write.
-  Otherwise the server refuses to start or answers 403. Saves are atomic renames over the
-  page file, so they replace a file inside `pages/` and never write through a link. Residual
-  risk: a link swapped in between a check and the following read is not detected. Someone
-  who can do that can already edit the project folder directly.
+  also have a single hard link. The project root must stay the directory opened at startup:
+  on every access it must still be a real directory (not a link), canonicalize to the same
+  path (which also catches a swapped ancestor folder), and have the same (device, inode).
+  This is checked before upstream `Project::open` (whose stale-temp cleanup deletes `.*.tmp`
+  files in `pages/`) and again on every read and write. Otherwise the server refuses to
+  start or answers 403. Saves are atomic renames over the page file, so they replace a file
+  inside `pages/` and never write through a link.
+  **Residual race (TOCTOU):** a directory or link swapped in between a check and the file
+  operation that follows can still redirect that read **or write** outside the project.
+  The checks close persistent replacements, not that window. Someone able to swap folders
+  there can already edit the project folder directly.
+- **Platforms:** the root identity and hard-link checks use Unix metadata, so the server
+  starts only on Unix (Linux, macOS) and refuses to start elsewhere. Linux is tested here,
+  and macOS-arm64 by the operator (below). Other platforms are unsupported for these
+  guarantees.
 - **Pages:** pages are addressed only by ids listed in the manifest, which must also be plain
   `[A-Za-z0-9_-]`, max 64 characters. The server builds every path. The body's page id must
   match the URL. The body must parse and validate as an upstream page. The manifest's page
@@ -187,10 +197,114 @@ assertions are new in fix round 1; the first four positional arguments are uncha
 
 Results after the fixes are under "Results" below.
 
+## Fix round 2 (2026-10-12, after the operator's Codex browser run)
+
+### Operator-observed on 13b2430 (not re-run by the implementation worker)
+
+The operator ran the 13b2430 server on the Z13 host, opened it in the Codex in-app browser on
+a Mac (Apple M4), and reached it through an explicit SSH loopback tunnel to `127.0.0.1:29981`.
+This was the bridged Linux server, not a Mac-local binary or an installed plugin.
+
+- **WebGL2 (`?backend=webgl`) works.** The adapter was `Gl / ANGLE Metal, Apple M4`. With real
+  UI input the operator dragged node 23, drew rectangle 24, deleted it with Delete, restored
+  it with native ⌘Z, used toolbar Redo/Undo, and reloaded. The disk readback went from 23 to
+  24 nodes. Only node 23 moved (x 420 → 475, y 470 → 526.78), and rectangle 24 sits at x 105,
+  y 658, w 175, h 80.
+- **Default WebGPU drew a black canvas but said "Ready · BrowserWebGpu / (Other)".** The
+  console showed `Error while parsing WGSL :55:17: textureSample must only be called from
+  uniform control flow`, then an invalid shader module, invalid render pipelines and invalid
+  command buffers. Upstream's fragment shader sampled the image texture inside
+  `else if (k >= 3u)`, after a possible `discard`, and `k` comes from a fragment input. The
+  browser's WGSL front end enforces the uniformity rule; native wgpu/naga accepted it.
+- **Layout jump.** At about 697 px panel width the long "Ready · renderer" status wrapped the
+  header to 103 px. "Saving…"/"Saved" shrank it back to 39 px, so the canvas jumped while
+  editing.
+
+### Fixes (working tree on top of e770d46)
+
+| Problem | Change | Check |
+|---|---|---|
+| WGSL uniformity | **The one upstream edit:** `src/render/gpu.rs` `fs` samples `img_tex` once at the top, before any branch or `discard`, and the image branch uses that value. Group 2 is bound for every draw (`gpu.rs:716`, `blank_img` when there is no image), so the unconditional sample adds no binding requirement. Same texture, coordinates and sampler; the image filtering uses the same implicit derivatives, now taken in uniform control flow | `tests/shader.rs`: `implicit_derivative_samples_come_before_any_branch` is a focused structural source check, not a WGSL uniformity analysis. On the old shader it fails ("textureSample at byte 497 of fs is inside or after a branch (first at 124)"); on the new one it passes. naga 30 accepts the old shader even with every validation flag and `diagnostic(error, derivative_uniformity)`, so naga can't be the regression test. `canvas_shader_is_valid_wgsl` checks the new shader with naga |
+| "Ready" over invalid GPU objects | `start()` wraps shader/pipeline creation, surface setup and the first frame in a wgpu validation error scope and fails with the message. A device-level handler records later errors, which stop drawing and switch the page to a red error state. On a WebGPU failure the page swaps in a fresh `<canvas>` (one that handed out a WebGPU context can't give WebGL) and retries with WebGL2. The footer then says `WebGPU failed: <reason> — using WebGL (...)`, and the failure is logged with `console.error` | browser-check fails on any console error, on a fallback, and when no backend is reported. It records the requested and actual backend. Run it once as is and once with `?backend=webgl` |
+| Layout jump | Header and footer have fixed heights, and long text is cut with an ellipsis (full text in the tooltip). Renderer and adapter text moved to the footer; the status line only shows Ready/Saving…/Saved/conflict/errors. The canvas fills a separate stage, and the conflict banner overlays it instead of pushing it down | browser-check asserts the canvas rect is identical at load and after every save |
+
+### Results of run 8 (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `git diff --check` | clean |
+| `cargo clippy` new crates (host, all targets) | 0 warnings |
+| `cargo clippy` core and web (wasm32) | only upstream `src/io/atomic.rs:30` (`drop_non_drop`) |
+| `cargo test -p openpaperdesign-serve -p openpaperdesign-web` | 13, 103 and 2 (`tests/shader.rs`) passed |
+| `cargo check` core and web for wasm32 | pass |
+| Native `cargo build --all-targets` | pass |
+| `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed (llvmpipe) |
+| `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline) |
+| Regenerated native screenshots, before vs after the shader change (same sandbox, llvmpipe) | 9 of 11 byte-identical. `milestone1_home.png` and `milestone1_trash.png` also differ between two runs of the **old** shader: the home screen shows times |
+| Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
+| `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
+| Bundle | `openpaperdesign_web_bg.wasm` 11,647,042 B (4,230,013 B gzip -9), `openpaperdesign_web.js` 124,728 B, `app.js` 7,716 B, `index.html` 3,002 B |
+
+**Environment note:** the sandbox's shared tmpfs (`/tmp/claude-1001`, 81% full) returned
+`Disk quota exceeded` during this round. Upstream's file-writing tests (`io::atomic`,
+`io::file`, `library`, `project`, `session`, headless `m6_save_load_and_export`) failed on
+those I/O errors, which had nothing to do with the GPU code (two home-screen screenshots were
+also compared with the old shader, see above). The native results were taken with
+`TMPDIR=<worktree>/target/tmp` (gitignored, main disk) as a workaround for the shared tmpfs
+quota. No test or source was changed for this.
+
+### Operator-observed on the uncommitted run-8 tree (macOS-arm64 server, Codex in-app browser)
+
+The operator froze the uncommitted run-8 source on top of e770d46 (source archive SHA-256
+`d3857ecfd6c30915114dea62fc1c958f9390e420cbe521aaec31c3abfa50b754`). It was built as a
+macOS-arm64 server and used in the actual Codex in-app browser with native UI input:
+
+- **Default WebGPU renders**, with no warnings, errors or fallback. The selection outline
+  updates without any document change. ⌘A selects canvas objects and no browser text.
+- **Edits:** drag of node 23, rectangle 26 created, Delete (25 nodes), ⌘Z (26), toolbar Redo
+  (25), Undo (26). A reload keeps the changes. The header/canvas top stays at 40 px.
+- **Explicit WebGL (ANGLE) also renders.** A marquee selects 24/25, and ellipse 27 saves.
+- **Restart:** the old token gets 401, the new one 200, with the same bytes. A new Codex tab
+  renders all 27 nodes on WebGPU.
+- **Content:** of the 25 nodes that existed before, only the moved node 23 differs. The final
+  page SHA-256 is `345946161710edae7c45a7853bdd250eaa55afdb16502f97b2c8047278b8eec7`.
+- **Evidence:** `visual-readback.json`, `restart-readback.json` and two images, kept
+  privately outside the repository.
+
+This proves the run-8 changes only. It doesn't prove acceptance of e770d46, an installed
+plugin or MCP. Changes made after run 8 (round-2 review items A–C below) haven't been run in
+a browser.
+
+### Round-2 review of e770d46 (REJECT; round-1 findings confirmed fixed)
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| Major: replacing the project root (renamed away, symlink to an outside project) bypassed containment: GET 200, PUT 200, outside rect x changed to 777 | Root identity recorded at startup and re-verified on every access, and right before a save: a real directory, same canonical path, same (device, inode). Fails closed with 403. The residual race is documented above | `replaced_project_root_is_refused`: symlinked root (twice), a different real directory, and a swapped ancestor, all refused for GET page, GET project and PUT, with outside files byte-identical. On e770d46's server code it fails: `symlinked root: GET page`, 200 instead of 403 |
+| Minor: laser expiry skipped the clearing frame (points removed before `animating()` was checked, so the last mark stayed on screen) | `tick()` marks a redraw when expiry removed points; it stays pending until a frame is actually drawn | `laser_expiry_draws_the_clearing_frame`, `laser_expiry_after_a_long_gap_still_draws`. Both fail without the fix ("frame at 1012 ms while the trail fades", "the stale trail must be cleared") |
+| Minor: hard-link check returned 1 on non-Unix while the docs promised refusal | The server refuses to start on non-Unix. Docs scope the guarantees to Linux/macOS | none: non-Unix not compiled here (no such target installed) |
+
+### Final round-2 results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, `TMPDIR=<worktree>/target/tmp`)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `git diff --check` | clean |
+| `cargo clippy` new crates (host, all targets) | 0 warnings |
+| `cargo clippy` core and web (wasm32) | only upstream `src/io/atomic.rs:30` (`drop_non_drop`), once per crate |
+| `cargo test -p openpaperdesign-serve` / `-p openpaperdesign-web` (lib) / `tests/shader.rs` | 14 / 105 / 2 passed |
+| `cargo check` core and web for wasm32 | pass |
+| Native `cargo build --all-targets` | pass |
+| `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed, 0 failed, 0 ignored on llvmpipe; no skips, no quota errors |
+| `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline); no quota errors |
+| Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
+| `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
+| Bundle (`scripts/build-web.sh --offline` → `target/openpaperdesign-web/`) | `openpaperdesign_web_bg.wasm` 11,647,034 B (4,229,799 B gzip -9), `openpaperdesign_web.js` 124,728 B, `app.js` 7,716 B, `index.html` 3,002 B |
+
 ## Not proven / open
 
-- The whole browser runtime (above): WebGPU or WebGL2 in a real browser, the renderer's WGSL
-  pipelines, 4× MSAA and blend modes on those backends, and pointer/keyboard behavior.
+- Browser runs are operator-observed only, in the Codex in-app browser on a Mac (Apple M4):
+  WebGL2 on 13b2430, and WebGPU plus WebGL on the run-8 tree. The round-2 changes after that
+  (root identity, laser redraw, non-Unix refusal) haven't been run in a browser.
+- Other browsers, MSAA and blend-mode output in a browser compared with native.
 - Image fills: the browser registers no project assets, so image fills don't draw. Saving
   keeps their references.
 - Text editing UI, inspector, layers, multiple pages (only the active page loads), export,

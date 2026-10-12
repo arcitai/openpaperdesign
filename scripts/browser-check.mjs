@@ -10,8 +10,12 @@
 // verify: load, report the backend and top-level nodes, screenshot. With expect.json (the
 //         result-edit.json of an earlier edit run, e.g. before a server restart) the moved
 //         node, the rectangle and the revision must match it.
-// Any failed assertion, console error, page exception or missing GPU adapter fails the run
-// (exit 1). Results go to <out-dir>/result-<mode>.json. The chromium sandbox stays on.
+// Any failed assertion, console error (including GPU validation messages), page exception,
+// missing GPU adapter or WebGPU-to-WebGL fallback fails the run (exit 1). The canvas must keep
+// its size and position through every save. Results, including the backend that ran, go to
+// <out-dir>/result-<mode>.json. The chromium sandbox stays on.
+// Default backend: WebGPU when the browser offers it. For WebGL2 put `?backend=webgl` before
+// the `#token=` fragment of the URL.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -106,9 +110,13 @@ const nodes = async () => JSON.parse(await ev('window.__opdEditor.root_nodes()')
 const byId = (list, id) => list.find((n) => n.id === id);
 const ids = (list) => list.map((n) => n.id).sort((a, b) => a - b);
 const saves = () => ev('window.__opd.saves');
+const canvasRect = () => ev('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; })()');
+let canvasAtLoad = null;
 async function settled(before, what) {
   await waitFor(`window.__opd.saves > ${before} && !window.__opd.saving && !window.__opdEditor.dirty()`, what);
   check(!(await ev('window.__opd.conflict')), `unexpected conflict after ${what}`);
+  const now = await canvasRect();
+  check(JSON.stringify(now) === JSON.stringify(canvasAtLoad), `canvas moved or resized by ${what}`, { load: canvasAtLoad, now });
 }
 async function shot(name) {
   const { data } = await cdp('Page.captureScreenshot', { format: 'png' });
@@ -121,6 +129,7 @@ async function load() {
   const st = JSON.parse(await ev('JSON.stringify(window.__opd)'));
   check(!st.error, 'page reported an error', st.error);
   check(st.backend, 'no GPU backend reported');
+  check(!st.fallback, 'WebGPU failed and the page fell back to WebGL', st.fallback);
   return st;
 }
 
@@ -158,10 +167,13 @@ try {
   await cdp('Page.navigate', { url });
   const st = await load();
   result.backend = st.backend;
+  result.requestedBackend = new URL(url).searchParams.get('backend') || 'default (WebGPU if offered)';
   result.revisionLoaded = st.revision;
   result.webgpuApi = await ev("typeof navigator.gpu !== 'undefined'");
   await sleep(300);
-  const canvas = await ev('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; })()');
+  const canvas = await canvasRect();
+  canvasAtLoad = canvas;
+  result.canvas = canvas;
   const at = (sx, sy) => [canvas[0] + sx, canvas[1] + sy];
   result.nodesLoaded = await nodes();
   check(result.nodesLoaded.length > 0, 'page has no top-level nodes');
