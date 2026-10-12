@@ -298,6 +298,9 @@ try {
     const before = await nodes();
     const right = Math.max(...before.map((n) => n.world[0] + n.world[2])) + 80;
     const top = Math.min(...before.map((n) => n.world[1]));
+    // An agent reads a page in its session before it may change it.
+    const read = await mcp.call('get_basic_info', {});
+    check(read.ok, 'agent get_basic_info failed', read.text);
     const made = await mcp.call('create_shape', { type: 'ellipse', x: right, y: top, width: 80, height: 60 });
     check(made.ok, 'agent create_shape failed', made.text);
     const agentNode = idOf(made.text);
@@ -305,8 +308,8 @@ try {
     check(await ev('window.__opdNoReload === 1'), 'the page reloaded instead of updating in place');
     result.steps.push({ step: 'agent create_shape shown live', node: agentNode });
 
-    // 2. One after the other: the page drags one of its nodes (saved), then the agent moves
-    //    its shape. (Overlapping edits are refused by design and covered by unit tests.)
+    // 2. One after the other: the page drags one of its nodes (saved), then the agent reads
+    //    and moves its shape. (Overlapping edits are refused by design and covered by unit tests.)
     const inView = (n) => n.id !== agentNode && n.children === 0 && n.screen[0] > 0 && n.screen[1] > 0
       && n.screen[0] + n.screen[2] < canvas[2] - 100 && n.screen[1] + n.screen[3] < canvas[3] - 100
       && n.screen[2] > 24 && n.screen[3] > 24;
@@ -318,6 +321,10 @@ try {
     const n0 = await saves();
     await drag(cx, cy, cx + 60, cy + 40);
     await settled(n0, 'the page save of the drag');
+    // As a real agent must: read the page after the person's save before changing it (a
+    // change to a page changed since the session last read it is refused as a conflict).
+    const reread = await mcp.call('get_basic_info', {});
+    check(reread.ok, 'agent get_basic_info failed', reread.text);
     const moved = await mcp.call('update_styles', { updates: [{ nodeIds: [keyOf(agentNode)], styles: { left: `${right + 200}px` } }] });
     check(moved.ok, 'agent update_styles failed', moved.text);
     await waitFor(`(() => { const n = JSON.parse(window.__opdEditor.root_nodes()).find((n) => n.id === ${agentNode}); return n && Math.abs(n.world[0] - ${right + 200}) < 0.5; })()`, 'the agent move in the page', 10000);

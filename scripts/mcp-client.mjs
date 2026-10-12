@@ -3,6 +3,9 @@
 //
 //   node scripts/mcp-client.mjs '<printed browser URL with #token=...>' <tool> '<json args>'
 //
+// Each run is a new MCP session, which must read before it may change a page, so the
+// command line first calls get_basic_info, then the tool.
+//
 // It only talks to the URL it is given (openpaperdesign-serve's /mcp) with the token from
 // that URL's fragment.
 
@@ -77,6 +80,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(2);
   }
   const c = await new McpClient(url).connect();
+  const read = await c.call('get_basic_info', {});
+  if (!read.ok) {
+    console.log(read.text);
+    process.exit(1);
+  }
   const r = await c.call(tool, JSON.parse(args));
   console.log(r.text);
   process.exit(r.ok ? 0 : 1);
