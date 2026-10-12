@@ -56,6 +56,9 @@ fn ramp(t: f32, row: u32) -> vec4<f32> {
 
 @fragment
 fn fs(i: VsOut) -> @location(0) vec4<f32> {
+    // Sampled before any branch: implicit-derivative sampling must be in uniform control
+    // flow (WGSL rule, enforced by browser WebGPU). Group 2 is bound for every draw.
+    let t = textureSample(img_tex, img_samp, i.uv);
     let k = i.kind & 255u;
     let row = i.kind >> 8u;
     var c = i.color;
@@ -69,7 +72,6 @@ fn fs(i: VsOut) -> @location(0) vec4<f32> {
         if (k == 3u && (i.uv.x < 0.0 || i.uv.y < 0.0 || i.uv.x > 1.0 || i.uv.y > 1.0)) {
             discard;
         }
-        let t = textureSample(img_tex, img_samp, i.uv);
         c = vec4<f32>(t.rgb, t.a * i.color.a);
     }
     // Premultiplied output; every pipeline blends premultiplied.
