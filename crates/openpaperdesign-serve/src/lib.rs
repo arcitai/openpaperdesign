@@ -7,9 +7,15 @@
 //!   every path itself, so no client input reaches the file system as a path.
 //! - Symbolic links are refused, fail closed: `project.json`, `pages/`, every page file and
 //!   every bundle file must be a real file or directory (and files must have a single hard
-//!   link). This is checked before upstream `Project::open` runs (its stale-temp cleanup must
+//!   link). The project root itself must stay the directory that was opened: on every access
+//!   it must still be a real directory with the same canonical path and the same (device,
+//!   inode). This is checked before upstream `Project::open` runs (its stale-temp cleanup must
 //!   never follow a link out of the project) and again on every read and write. Atomic saves
-//!   rename over the page file, so a write never lands outside `pages/`.
+//!   rename over the page file, so a write never lands outside `pages/`. Residual race: a
+//!   directory or link swapped in between a check and the following file operation can still
+//!   redirect that read or write.
+//! - Unix only (Linux, macOS): the root identity and hard-link checks use Unix metadata, so the
+//!   server refuses to start elsewhere.
 //! - Writes are revision-checked: a page's revision (ETag) is a hash of its file **as it is
 //!   on disk**, `PUT` needs a matching `If-Match`, and a stale one gets `409 Conflict` with
 //!   the file left untouched. Saves go through upstream `project::Project::save_page`
@@ -73,7 +79,10 @@ pub struct Config {
 }
 
 pub struct Server {
+    /// Canonical project root at startup.
     dir: PathBuf,
+    /// (device, inode) of the root at startup.
+    root_id: (u64, u64),
     web_dir: PathBuf,
     token: String,
     hosts: [String; 2],
@@ -138,9 +147,38 @@ fn links(m: &std::fs::Metadata) -> u64 {
     m.nlink()
 }
 
+#[cfg(unix)]
+fn dev_ino(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+// Non-Unix: `Server::open` refuses to start, so these never run; they fail closed anyway.
 #[cfg(not(unix))]
 fn links(_m: &std::fs::Metadata) -> u64 {
-    1
+    u64::MAX
+}
+
+#[cfg(not(unix))]
+fn check_root(_dir: &Path, _id: (u64, u64)) -> Result<(), String> {
+    Err("only supported on Unix".into())
+}
+
+/// The root must still be the directory opened at startup: a real directory (not a link),
+/// with the same canonical path (catches swapped ancestors too) and the same (device, inode).
+#[cfg(unix)]
+fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
+    let m = std::fs::symlink_metadata(dir).map_err(|e| format!("project folder: {e}"))?;
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return Err("the project folder was replaced (not a real directory any more)".into());
+    }
+    let now = dir
+        .canonicalize()
+        .map_err(|e| format!("project folder: {e}"))?;
+    if now != dir || dev_ino(&m) != id {
+        return Err("the project folder was replaced since the server started".into());
+    }
+    Ok(())
 }
 
 /// The project's own entries must be real: `project.json` (required) and `pages/` (optional).
@@ -160,10 +198,25 @@ impl Server {
     /// Open an existing project folder. Nothing is created: a folder without a valid
     /// `project.json` is refused.
     pub fn open(cfg: Config) -> Result<Arc<Server>, OpenError> {
+        #[cfg(not(unix))]
+        return Err(OpenError::Unsafe(
+            "only supported on Unix (Linux, macOS): the project-root identity and hard-link \
+             checks need Unix metadata"
+                .into(),
+        ));
+        #[cfg(unix)]
+        Self::open_unix(cfg)
+    }
+
+    #[cfg(unix)]
+    fn open_unix(cfg: Config) -> Result<Arc<Server>, OpenError> {
         let dir = cfg
             .project
             .canonicalize()
             .map_err(|e| OpenError::NotAProject(cfg.project.clone(), e.to_string()))?;
+        let root_id = std::fs::symlink_metadata(&dir)
+            .map(|m| dev_ino(&m))
+            .map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
         // Before upstream `Project::open`: its stale-temp cleanup deletes files in `pages/`, so
         // that must not be a link to somewhere else.
         check_project_dir(&dir).map_err(OpenError::Unsafe)?;
@@ -172,6 +225,7 @@ impl Server {
         let p = cfg.port;
         Ok(Arc::new(Server {
             dir,
+            root_id,
             web_dir: cfg.web_dir,
             token: cfg.token,
             hosts: [format!("127.0.0.1:{p}"), format!("localhost:{p}")],
@@ -187,10 +241,16 @@ impl Server {
         &self.dir
     }
 
+    /// Root identity plus the project's own entries; run before every read and write.
+    fn check(&self) -> Result<(), ApiError> {
+        check_root(&self.dir, self.root_id).map_err(forbidden)?;
+        check_project_dir(&self.dir).map_err(forbidden)
+    }
+
     fn project(&self) -> Result<Project, ApiError> {
         // Re-read per request: the manifest may change while we run (e.g. pages renamed
         // natively). Not `Project::open`, which also deletes other writers' temp files.
-        check_project_dir(&self.dir).map_err(forbidden)?;
+        self.check()?;
         let manifest = std::fs::read_to_string(self.dir.join(MANIFEST))
             .map_err(|e| e.to_string())
             .and_then(|s| Manifest::from_json(&s).map_err(|e| e.to_string()))
@@ -471,7 +531,7 @@ async fn put_page(
         page.name = name.clone();
         page.doc.name = name;
         // Checked again just before writing (`read_page` above checked the page file).
-        check_project_dir(&p.dir).map_err(forbidden)?;
+        s.check()?;
         p.save_page(&page)
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         // Like the native session: a page write bumps the project's modified time.

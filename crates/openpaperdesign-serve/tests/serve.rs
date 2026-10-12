@@ -659,3 +659,92 @@ async fn security_headers_are_on_every_response() {
         assert!(csp.contains("frame-ancestors 'none'"), "{what}: {csp}");
     }
 }
+
+// ------------------------------------------------------------------ project root replaced
+
+/// A byte-identical copy of the project (same page ids and revisions) somewhere else.
+#[cfg(unix)]
+fn copy_project(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to.join(PAGES_DIR)).unwrap();
+    std::fs::copy(from.join("project.json"), to.join("project.json")).unwrap();
+    for e in std::fs::read_dir(from.join(PAGES_DIR)).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), to.join(PAGES_DIR).join(e.file_name())).unwrap();
+    }
+}
+
+/// After the server started and before any request, the project folder is renamed away and
+/// replaced: by a symlink to an outside copy, by a different real directory, or by swapping
+/// an ancestor folder. Every read and write must be refused, and the outside copy untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn replaced_project_root_is_refused() {
+    use std::os::unix::fs::symlink;
+    let t = tmp();
+    let parent = t.0.join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    let (p, id) = project(&parent);
+    let body = String::from_utf8(file(&p, &id)).unwrap();
+    // The copy has the same bytes, so the revision a client holds would match it.
+    let tag = etag(body.as_bytes());
+
+    let refused = async |s: &Arc<Server>, outside: &Path, what: &str| {
+        let before = snapshot(&outside.join(PAGES_DIR));
+        let manifest = std::fs::read(outside.join("project.json")).unwrap();
+        assert_eq!(
+            get_page(s, &id).await.0,
+            StatusCode::FORBIDDEN,
+            "{what}: GET page"
+        );
+        let (st, _, _) = send(s, req("GET", "/api/project").body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: GET project");
+        let (st, _, _) = put_page(s, &id, Some(&tag), moved(&body, 777.0, 0.0)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{what}: PUT");
+        assert_eq!(
+            snapshot(&outside.join(PAGES_DIR)),
+            before,
+            "{what}: outside pages"
+        );
+        assert_eq!(
+            std::fs::read(outside.join("project.json")).unwrap(),
+            manifest,
+            "{what}: outside manifest"
+        );
+    };
+
+    // 1. Root renamed away and replaced by a symlink to an outside project.
+    let outside = t.0.join("outside-project");
+    copy_project(&p.dir, &outside);
+    let s = server(&p.dir);
+    let away = t.0.join("moved-away");
+    std::fs::rename(&p.dir, &away).unwrap();
+    symlink(&outside, &p.dir).unwrap();
+    refused(&s, &outside, "symlinked root").await;
+    // Persistent: still refused on later requests.
+    refused(&s, &outside, "symlinked root, again").await;
+
+    // 2. Root replaced by a different real directory with the same content.
+    std::fs::remove_file(&p.dir).unwrap();
+    copy_project(&away, &p.dir);
+    refused(&s, &p.dir, "replaced root directory").await;
+    std::fs::remove_dir_all(&p.dir).unwrap();
+    std::fs::rename(&away, &p.dir).unwrap();
+
+    // 3. An ancestor swapped for a symlink to a folder holding a copy at the same name.
+    let s = server(&p.dir);
+    let other_parent = t.0.join("other-parent");
+    copy_project(&p.dir, &other_parent.join(p.dir.file_name().unwrap()));
+    std::fs::rename(&parent, t.0.join("parent-away")).unwrap();
+    symlink(&other_parent, &parent).unwrap();
+    refused(
+        &s,
+        &other_parent.join(p.dir.file_name().unwrap()),
+        "swapped ancestor",
+    )
+    .await;
+
+    // Back in place, the original root serves again.
+    std::fs::remove_file(&parent).unwrap();
+    std::fs::rename(t.0.join("parent-away"), &parent).unwrap();
+    assert_eq!(get_page(&s, &id).await.0, StatusCode::OK);
+}
