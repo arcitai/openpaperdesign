@@ -10,9 +10,10 @@
 //   (content and revision), on a fresh canvas with its own resize observer.
 // - A save's answer is only applied to the editor that took the snapshot.
 // - Changes made elsewhere (an agent over MCP, another tab) are polled for. They replace the
-//   page in place only when this tab has nothing unsaved (`can_reload`); otherwise this tab's
-//   next save carries its base revision and the server merges, or answers with a conflict that
-//   is shown, never resolved silently.
+//   page in place only when this tab has nothing unsaved (`can_reload`). Otherwise nothing is
+//   reloaded: this tab's next save is based on an older revision, the server refuses it (409,
+//   nothing written), and the unsaved state stays on screen until the person explicitly
+//   discards it (`discard`), which loads the server's version in place.
 
 export class Session {
   /**
@@ -21,7 +22,7 @@ export class Session {
    *   fetchPage() -> Promise<page>                    the page as the server has it now
    *   replaceCanvas(old) -> canvas                    a fresh canvas in place of `old`
    *   observeResize(canvas, onResize) -> { disconnect() }
-   *   put(snapshot, revision) -> Promise<{ ok, status, revision, merged?, body?, conflicts? }>
+   *   put(snapshot, revision) -> Promise<{ ok, status, revision }>
    *   revision() -> Promise<string>                   the page's current revision (polling)
    *   log(message)                                    console.error
    * }
@@ -30,7 +31,7 @@ export class Session {
     this.deps = deps;
     this.state = Object.assign(state, {
       ready: false, error: null, fallback: null, backend: null, revision: null,
-      saves: 0, saving: false, conflict: false, switching: false, conflicts: null,
+      saves: 0, saving: false, conflict: false, switching: false,
       reloads: 0, behind: false,
     });
     this.ed = null;
@@ -140,7 +141,8 @@ export class Session {
 
   /**
    * Look for a newer revision on the server. Returns 'reloaded' when the page was replaced in
-   * place, 'behind' when it changed but this tab has unsaved work (merged on save), else
+   * place, 'behind' when it changed but this tab has unsaved work (its next save will be a
+   * conflict), else
    * undefined.
    */
   async poll() {
@@ -169,6 +171,26 @@ export class Session {
     return 'reloaded';
   }
 
+  /**
+   * The person chose "Reload (discard my unsaved change)": load the page as the server has it
+   * now, in place (no navigation, so no leave-page guard), and resume saving and polling.
+   * Returns 'discarded', or undefined when there is nothing to do or the answer is stale.
+   */
+  async discard() {
+    const s = this.state;
+    const ed = this.ed;
+    if (!ed || s.switching || s.error || s.saving) return undefined;
+    const page = await this.deps.fetchPage();
+    // Apply only to the editor that asked, and only if nothing else changed meanwhile.
+    if (this.ed !== ed || s.switching || s.error || s.saving) return undefined;
+    ed.reload(page.text);
+    s.revision = page.revision;
+    s.conflict = false;
+    s.behind = false;
+    s.reloads += 1;
+    return 'discarded';
+  }
+
   /** Save the editor's pending change, if any. Returns what happened, for the status line. */
   async save() {
     const s = this.state;
@@ -185,23 +207,12 @@ export class Session {
       if (res.ok) {
         s.saves += 1;
         ed.save_succeeded();
-        if (!res.merged) {
-          s.revision = res.revision;
-          return 'saved';
-        }
-        // The server merged this change with others. Take the merged page if nothing changed
-        // here since the snapshot; otherwise keep the old base, so the next save merges again.
-        if (ed.can_reload()) {
-          ed.reload(res.body);
-          s.revision = res.revision;
-          s.behind = false;
-        }
-        return 'merged';
+        s.revision = res.revision;
+        return 'saved';
       }
       ed.save_failed();
       if (res.status === 409) {
         s.conflict = true;
-        s.conflicts = res.conflicts || null;
         return 'conflict';
       }
       return 'failed';

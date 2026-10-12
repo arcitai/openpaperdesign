@@ -3,7 +3,7 @@
 // editor lifecycle (gating, fallback, saving) is in session.js.
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
-import { frameStep, saveStep } from './page.js';
+import { discardStep, frameStep, saveStep } from './page.js';
 
 const SAVE_POLL_MS = 300;
 // How often to look for changes made elsewhere (an agent over MCP, another tab).
@@ -99,14 +99,7 @@ async function main() {
         method: 'PUT', body: snapshot,
         headers: { 'If-Match': revision, 'Content-Type': 'application/json' },
       });
-      const merged = res.ok && res.headers.get('X-Opd-Merged') === '1';
-      const out = { ok: res.ok, status: res.status, revision: res.headers.get('ETag'), merged };
-      if (merged) out.body = await res.text();
-      if (res.status === 409) {
-        const v = await res.json().catch(() => ({}));
-        out.conflicts = v.conflicts || null;
-      }
-      return out;
+      return { ok: res.ok, status: res.status, revision: res.headers.get('ETag') };
     },
     revision: async () => {
       const res = await api(`${pageUrl}/revision`);
@@ -197,17 +190,23 @@ async function main() {
     status: (text) => status(text),
     tick: syncToolbar,
     // The conflict banner: affected layers and an explicit discard.
-    conflict: (ids) => {
+    // The conflict banner. The unsaved state stays on screen until the person discards it;
+    // the button reloads the server's version in place (no navigation, so the leave-page
+    // guard for unsaved edits stays in force for ordinary navigation).
+    conflict: () => {
       const c = $('conflict');
       c.replaceChildren();
-      const layers = ids && ids.length ? ` Affected layers: ${ids.join(', ')}.` : '';
-      c.append(`This page was changed elsewhere (for example by an agent) in a way that overlaps `
-        + `your unsaved change. Nothing was overwritten, and your change is not saved.${layers} `);
+      c.append('This page was changed elsewhere (for example by an agent) since your unsaved '
+        + 'change. Nothing was overwritten, and your change is not saved. ');
       const b = document.createElement('button');
       b.textContent = 'Reload (discard my unsaved change)';
-      b.addEventListener('click', () => location.reload());
+      b.addEventListener('click', () => discardStep(session, ui));
       c.append(b);
       c.classList.add('show');
+    },
+    hideConflict: () => {
+      $('conflict').classList.remove('show');
+      $('conflict').replaceChildren();
     },
   };
   // ---- saving: one request at a time, always with the revision we last saw.
@@ -218,7 +217,7 @@ async function main() {
       const r = await session.poll();
       if (state.error) return; // a terminal error stays on screen
       if (r === 'reloaded') status('Updated with changes made elsewhere');
-      else if (r === 'behind') status('Changed elsewhere; your edit will be merged when saved');
+      else if (r === 'behind') status('Changed elsewhere; saving your edit will report a conflict');
     } catch {
       // The server is unreachable; the save loop reports that.
     }

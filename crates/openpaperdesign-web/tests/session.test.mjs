@@ -245,7 +245,7 @@ test('the page glue shows Ready once and keeps the loop running', async () => {
 
 // ---- a terminal error while a save is in flight (static/page.js saveStep + frameStep)
 
-import { saveStep } from '../static/page.js';
+import { discardStep, saveStep } from '../static/page.js';
 
 for (const [outcome, settle, check] of [
   ['success', (d) => d.resolve({ ok: true, status: 200, revision: '"r2"' }),
@@ -310,48 +310,75 @@ test('a change made elsewhere is loaded in place when nothing is unsaved', async
   assert.equal(s.state.revision, '"r2"');
 });
 
-test('never reloads over unsaved edits; the next save is merged by the server', async () => {
-  const merged = { ok: true, status: 200, revision: '"r3"', merged: true, body: 'merged-page' };
+test('never reloads over unsaved edits; the stale save is a conflict and the edit stays', async () => {
   let sentWith = null;
   const { s, ed, server } = await readySession({
-    put: async (snap, rev) => { sentWith = rev; return merged; },
+    put: async (snap, rev) => { sentWith = rev; return { ok: false, status: 409, revision: '"r2"' }; },
   });
   ed.pending = '{"mine":1}'; // an unsaved local edit
-  server.revision = '"r2"';
+  server.revision = '"r2"';  // an agent wrote meanwhile
   server.text = 'agent-change';
   assert.equal(await s.poll(), 'behind');
   assert.ok(!ed.calls.some((c) => c.startsWith('reload')), 'unsaved work not replaced');
-  assert.equal(s.state.behind, true);
-  // The save goes out with this tab's base revision, and the merged result is loaded.
-  assert.equal(await s.save(), 'merged');
-  assert.equal(sentWith, '"r1"');
-  assert.ok(ed.calls.includes('reload:merged-page'));
-  assert.equal(s.state.revision, '"r3"');
+  assert.equal(await s.save(), 'conflict');
+  assert.equal(sentWith, '"r1"', 'saved against the revision it was based on');
+  assert.ok(ed.calls.includes('save_failed'), 'the edit stays unsaved, on screen');
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
+  assert.equal(s.state.revision, '"r1"');
+  // Stopped until the person decides: no silent reload, no further save.
+  assert.equal(await s.poll(), undefined);
+  assert.equal(await s.save(), undefined);
 });
 
-test('edits made while a merged save was in flight keep the old base for the next merge', async () => {
-  const answer = deferred();
-  const { s, ed } = await readySession({ put: async () => answer.promise });
-  ed.pending = '{"first":1}';
-  const saving = s.save();
-  ed.canReload = false; // another edit started meanwhile
-  answer.resolve({ ok: true, status: 200, revision: '"r3"', merged: true, body: 'merged-page' });
-  assert.equal(await saving, 'merged');
-  assert.ok(!ed.calls.some((c) => c.startsWith('reload')), 'newer local edit not overwritten');
-  assert.equal(s.state.revision, '"r1"', 'base kept, so the next save merges again');
-});
+/** A mocked page for discardStep: records what is shown. */
+function discardUi() {
+  return { shown: [], hidden: 0, status(t) { this.shown.push(t); }, hideConflict() { this.hidden += 1; } };
+}
 
-test('a conflict is reported with its layers and stops saving and reloading', async () => {
+test('explicit discard loads the version on disk in place and resumes saving', async () => {
   const { s, ed, server } = await readySession({
-    put: async () => ({ ok: false, status: 409, conflicts: ['7', 'root'] }),
+    put: async () => ({ ok: false, status: 409 }),
   });
   ed.pending = '{"mine":1}';
+  server.revision = '"r2"';
+  server.text = 'agent-change';
   assert.equal(await s.save(), 'conflict');
-  assert.deepEqual(s.state.conflicts, ['7', 'root']);
-  assert.ok(ed.calls.includes('save_failed'));
-  server.revision = '"r9"';
-  assert.equal(await s.poll(), undefined, 'no silent reload after a conflict');
-  assert.equal(await s.save(), undefined, 'no more saves until the user decides');
+  const ui = discardUi();
+  assert.equal(await discardStep(s, ui), 'discarded');
+  assert.ok(ed.calls.includes('reload:agent-change'), "the agent's version is shown");
+  assert.equal(s.state.revision, '"r2"');
+  assert.equal(s.state.conflict, false);
+  assert.equal(ui.hidden, 1, 'banner hidden');
+  assert.deepEqual(ui.shown, ['Reloaded the version on disk']);
+  // Saving resumes from the new revision.
+  let sentWith = null;
+  s.deps.put = async (snap, rev) => { sentWith = rev; return { ok: true, status: 200, revision: '"r3"' }; };
+  ed.pending = '{"next":1}';
+  assert.equal(await s.save(), 'saved');
+  assert.equal(sentWith, '"r2"');
+});
+
+test('a discard answer is dropped when the editor changed meanwhile, and a failed one changes nothing', async () => {
+  const { s, ed } = await readySession({ put: async () => ({ ok: false, status: 409 }) });
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.save(), 'conflict');
+  const page = deferred();
+  s.deps.fetchPage = async () => page.promise;
+  const ui = discardUi();
+  const discarding = discardStep(s, ui);
+  s.ed = editor('replacement'); // whatever replaced it
+  page.resolve({ text: 'late', revision: '"r9"' });
+  assert.equal(await discarding, undefined);
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
+  assert.equal(s.state.revision, '"r1"');
+  assert.equal(ui.hidden, 0);
+  // A fetch failure keeps the banner, the conflict and the unsaved state.
+  s.ed = ed;
+  s.deps.fetchPage = async () => { throw new Error('offline'); };
+  assert.equal(await discardStep(s, ui), undefined);
+  assert.equal(s.state.conflict, true);
+  assert.equal(ui.hidden, 0);
+  assert.deepEqual(ui.shown, ['Could not load the version on disk; try again']);
 });
 
 test('no polling before Ready or while switching', async () => {

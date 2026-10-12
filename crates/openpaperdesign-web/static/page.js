@@ -31,12 +31,30 @@ export async function saveStep(session, ui) {
     ui.status('Saving…');
   }
   const r = await session.save();
-  if (r === 'conflict') ui.conflict(st.conflicts || null);
+  if (r === 'conflict') ui.conflict();
   if (st.error) return r;
   if (r === 'saved') ui.status('Saved');
-  else if (r === 'merged') ui.status('Saved (merged with changes made elsewhere)');
   else if (r === 'conflict') ui.status('Not saved: conflict');
   else if (r === 'failed') ui.status('Save failed; retrying');
   else if (r === 'unreachable') ui.status('Save failed (server unreachable); retrying');
+  return r;
+}
+
+/**
+ * The conflict banner's "Reload (discard my unsaved change)": load the server's version in
+ * place. `ui` also needs `hideConflict()`. Nothing is discarded any other way.
+ */
+export async function discardStep(session, ui) {
+  let r;
+  try {
+    r = await session.discard();
+  } catch {
+    if (!session.state.error) ui.status('Could not load the version on disk; try again');
+    return undefined;
+  }
+  if (r === 'discarded') {
+    ui.hideConflict();
+    if (!session.state.error) ui.status('Reloaded the version on disk');
+  }
   return r;
 }
