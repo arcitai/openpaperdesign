@@ -232,6 +232,19 @@ pub(crate) fn check_root(dir: &Path, id: (u64, u64)) -> Result<(), String> {
     Ok(())
 }
 
+/// Web bundle files compiled into a binary: (file name, bytes).
+pub type EmbeddedBundle = &'static [(&'static str, &'static [u8])];
+
+/// The bundle file names a complete build has (see `scripts/build-web.sh`).
+pub fn bundle_file_names() -> Vec<&'static str> {
+    BUNDLE.iter().map(|(_, f, _)| *f).collect()
+}
+
+enum BundleSource {
+    Dir(PathBuf),
+    Embedded(EmbeddedBundle),
+}
+
 /// (URL path, content type, bytes) of each bundle file found at startup.
 type Bundle = Vec<(&'static str, &'static str, Vec<u8>)>;
 
@@ -356,15 +369,41 @@ impl Server {
                 .into(),
         ));
         #[cfg(unix)]
-        Self::open_unix(cfg)
+        Self::open_unix(
+            cfg.project,
+            BundleSource::Dir(cfg.web_dir),
+            cfg.port,
+            cfg.token,
+        )
+    }
+
+    /// Like [`Server::open`], with the web bundle compiled into the binary (`files` = file
+    /// name and bytes; only the allowlisted names are served). Nothing is read from disk for
+    /// static files, at startup or later.
+    pub fn open_embedded(
+        project: PathBuf,
+        files: EmbeddedBundle,
+        port: u16,
+        token: String,
+    ) -> Result<Arc<Server>, OpenError> {
+        #[cfg(not(unix))]
+        return Err(OpenError::Unsafe(
+            "only supported on Unix (Linux, macOS)".into(),
+        ));
+        #[cfg(unix)]
+        Self::open_unix(project, BundleSource::Embedded(files), port, token)
     }
 
     #[cfg(unix)]
-    fn open_unix(cfg: Config) -> Result<Arc<Server>, OpenError> {
-        let dir = cfg
-            .project
+    fn open_unix(
+        project: PathBuf,
+        bundle: BundleSource,
+        port: u16,
+        token: String,
+    ) -> Result<Arc<Server>, OpenError> {
+        let dir = project
             .canonicalize()
-            .map_err(|e| OpenError::NotAProject(cfg.project.clone(), e.to_string()))?;
+            .map_err(|e| OpenError::NotAProject(project.clone(), e.to_string()))?;
         let root_id = std::fs::symlink_metadata(&dir)
             .map(|m| dev_ino(&m))
             .map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
@@ -373,7 +412,18 @@ impl Server {
         check_project_dir(&dir).map_err(OpenError::Unsafe)?;
         // Same check (and stale temp-file cleanup) as when the native app opens a project.
         Project::open(&dir).map_err(|e| OpenError::NotAProject(dir.clone(), e.to_string()))?;
-        let bundle = load_bundle(&cfg.web_dir, &dir).map_err(OpenError::Unsafe)?;
+        let bundle = match bundle {
+            BundleSource::Dir(web_dir) => load_bundle(&web_dir, &dir).map_err(OpenError::Unsafe)?,
+            BundleSource::Embedded(files) => BUNDLE
+                .iter()
+                .filter_map(|&(url, file, mime)| {
+                    files
+                        .iter()
+                        .find(|(name, _)| *name == file)
+                        .map(|(_, bytes)| (url, mime, bytes.to_vec()))
+                })
+                .collect(),
+        };
         let write_lock = Arc::new(tokio::sync::Mutex::new(()));
         let broken = Broken::default();
         let held = HeldPages::default();
@@ -385,12 +435,12 @@ impl Server {
             held.clone(),
         )
         .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
-        let p = cfg.port;
+        let p = port;
         Ok(Arc::new(Server {
             dir,
             root_id,
             bundle,
-            token: cfg.token,
+            token,
             hosts: [format!("127.0.0.1:{p}"), format!("localhost:{p}")],
             origins: [
                 format!("http://127.0.0.1:{p}"),
@@ -414,6 +464,18 @@ impl Server {
     pub fn release_layout_state(&self) {
         let held = self.held.lock().unwrap().clone();
         paper_rs::mcp::exec::with_no_stretch(|s| s.retain(|(p, _)| !held.contains(p)));
+    }
+
+    /// Run a tool call against this project's host, exactly as `/mcp` does (same policy,
+    /// lock, save, revision and stale-write check). `session` is the caller's MCP session,
+    /// from [`agent::new_session`].
+    pub async fn call_tool(
+        &self,
+        session: u64,
+        name: &str,
+        args: serde_json::Value,
+    ) -> paper_rs::mcp::ToolResult {
+        agent::dispatch(&self.calls, session, name.to_string(), args).await
     }
 
     /// How many bundle files were found at startup (0 = not built).

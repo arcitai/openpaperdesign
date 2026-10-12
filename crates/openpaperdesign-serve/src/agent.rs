@@ -310,9 +310,15 @@ fn pages_rev<'a>(pages: impl Iterator<Item = (&'a str, &'a str)>) -> String {
 /// A listed page that has no file yet: still a page whose content can be stale.
 const NO_FILE: &str = "\0none";
 
-/// Argument key the MCP handler sets to its session number (overwriting any client value);
+/// Argument key `dispatch` sets to the caller's session number (overwriting any client value);
 /// stripped before the call is checked or run.
 pub const SESSION_ARG: &str = "_openpaperdesignSession";
+/// A new MCP session number (see [`SESSION_ARG`]).
+pub fn new_session() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Sessions whose reads are remembered. Beyond this the oldest is forgotten, and must read
 /// again before it changes a page (never a silent pass).
 const MAX_SESSIONS: usize = 256;
@@ -1155,6 +1161,17 @@ pub fn offered_tools() -> Vec<Tool> {
         .collect()
 }
 
+/// Run one tool call on the project's host thread (policy, save and revision included).
+/// The timeout bounds only the wait for the call to start (see `Job`).
+pub async fn dispatch(calls: &Sender<Job>, session: u64, name: String, args: Value) -> ToolResult {
+    let mut args = match args {
+        Value::Object(a) => a,
+        _ => Map::new(),
+    };
+    args.insert(SESSION_ARG.into(), json!(session));
+    send_and_wait(calls, name, Value::Object(args), CALL_TIMEOUT).await
+}
+
 #[derive(Clone)]
 pub struct AgentServer {
     calls: Arc<Mutex<Sender<Job>>>,
@@ -1164,10 +1181,9 @@ pub struct AgentServer {
 
 impl AgentServer {
     pub fn new(calls: Sender<Job>) -> AgentServer {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         AgentServer {
             calls: Arc::new(Mutex::new(calls)),
-            session: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session: new_session(),
         }
     }
 }
@@ -1201,16 +1217,9 @@ impl ServerHandler for AgentServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let mut args = request.arguments.unwrap_or_default();
-        args.insert(SESSION_ARG.into(), json!(self.session));
         let calls = self.calls.lock().unwrap().clone();
-        let r = send_and_wait(
-            &calls,
-            request.name.to_string(),
-            Value::Object(args),
-            CALL_TIMEOUT,
-        )
-        .await;
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let r = dispatch(&calls, self.session, request.name.to_string(), args).await;
         Ok(to_result(r).into())
     }
 }

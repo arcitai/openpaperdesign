@@ -11,6 +11,11 @@ publish = false
 name = "openpaperdesign-serve"
 path = "src/main.rs"
 
+# The openpaperdesign plugin's MCP server (stdio); see plugin/openpaperdesign/.
+[[bin]]
+name = "openpaperdesign-mcp"
+path = "src/bin/openpaperdesign-mcp.rs"
+
 [lib]
 path = "src/lib.rs"
 
@@ -29,4 +34,6 @@ tower = "0.5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Same as the root package's dev-dependency: drives the stdio launcher as a child process.
+rmcp = { version = "3.5.1", default-features = false, features = ["transport-child-process"] }
 http-body-util = "0.1"
