@@ -1132,6 +1132,56 @@ async fn a_save_failing_part_way_writes_nothing() {
     c.cancel().await.unwrap();
 }
 
+/// Review round 5, F2: a failed call leaves the editor as it was, selection and undo history
+/// included (a failed read used to reload the project and lose both).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_call_keeps_selection_and_undo_history() {
+    let t = tmp();
+    let (p, a, b, r) = two_pages(&t).await;
+    let c = client(r.port).await;
+    read(&c).await;
+    read_page(&c, &a).await;
+    read_page(&c, &b).await;
+    let rect = first_node(&p, &a);
+    let x = || {
+        doc(&p, &a)
+            .nodes
+            .values()
+            .find(|n| n.parent.is_none())
+            .unwrap()
+            .rect
+            .x
+    };
+    let x0 = x();
+    let (ok, out) = call(
+        &c,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [rect], "styles": {"left": "111px"}}]}),
+    )
+    .await;
+    assert!(ok, "{out}");
+    let (ok, out) = call(&c, "select_nodes", json!({"nodeIds": [rect]})).await;
+    assert!(ok, "{out}");
+    // A failed read, then a failed change (a move across pages, refused upstream).
+    for (tool, args) in [
+        ("get_node_info", json!({"nodeId": key(&a, 999_999)})),
+        (
+            "move_nodes",
+            json!({"moves": [{"nodeId": rect, "parentId": first_node(&p, &b)}]}),
+        ),
+    ] {
+        let (ok, out) = call(&c, tool, args).await;
+        assert!(!ok, "{tool}: {out}");
+        let (ok, out) = call(&c, "get_selection", json!({})).await;
+        assert!(ok && out.contains(&rect), "{tool}: selection kept: {out}");
+    }
+    // The undo history survived: undo reverts the earlier successful change.
+    let (ok, out) = call(&c, "undo", json!({"pageId": a})).await;
+    assert!(ok && out.contains("true"), "{out}");
+    assert_eq!(x(), x0, "undone on disk");
+    c.cancel().await.unwrap();
+}
+
 /// Review round 4: the page list's revision can't collide whatever the names contain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn page_list_revisions_are_unambiguous() {

@@ -455,7 +455,7 @@ impl BoundHost {
 
     /// Save every changed page (and the manifest when needed) like the native session does.
     /// Each written page gets a new revision (its on-disk hash).
-    pub fn save_changes(&mut self) -> Result<(), String> {
+    pub(crate) fn save_changes(&mut self) -> Result<(), crate::commit::CommitError> {
         let ed = &mut self.ed;
         ed.commit_pending();
         let dirty = ed.dirty_pages();
@@ -468,10 +468,10 @@ impl BoundHost {
         // Write only to safe names (listed pages come from the checked manifest, new ones get
         // upstream's random hex ids) and never through a link.
         if let Some(bad) = ed.pages.iter().find(|p| !valid_page_id(&p.id)) {
-            return Err(format!(
+            return Err(crate::commit::CommitError::Failed(format!(
                 "refusing to save a page with unsafe id {:?}",
                 bad.id
-            ));
+            )));
         }
         let mut folded = std::collections::HashSet::new();
         if let Some(dup) = ed
@@ -479,10 +479,10 @@ impl BoundHost {
             .iter()
             .find(|p| !folded.insert(p.id.to_ascii_lowercase()))
         {
-            return Err(format!(
+            return Err(crate::commit::CommitError::Failed(format!(
                 "refusing to save: page id {:?} differs from another only in case",
                 dup.id
-            ));
+            )));
         }
         let mut prefixes = std::collections::HashSet::new();
         if let Some(dup) = ed
@@ -490,10 +490,10 @@ impl BoundHost {
             .iter()
             .find(|p| !prefixes.insert(page_prefix(&p.id)))
         {
-            return Err(format!(
+            return Err(crate::commit::CommitError::Failed(format!(
                 "refusing to save: page id {:?} shares its first six characters with another",
                 dup.id
-            ));
+            )));
         }
         crate::refuse_if_broken(&self.broken)?;
         // One commit for the whole call (see `crate::commit`): new images, then every changed
@@ -545,17 +545,18 @@ impl BoundHost {
                 .map_err(|e| format!("pages: {e}"))?;
         }
         if let Err(e) = crate::commit::commit(&writes) {
-            if let crate::commit::CommitError::Broken(m) = &e {
-                crate::set_broken(&self.broken, m);
+            if let crate::commit::CommitError::Broken { files, .. } = &e {
+                crate::set_broken(&self.broken, &files.join(", "));
             }
-            return Err(e.message().to_string());
+            return Err(e);
         }
         for &i in &dirty {
             ed.mark_page_saved(i);
         }
         self.project.manifest = manifest;
         ed.meta_dirty = false;
-        self.known = disk_revisions(&self.project)?;
+        // Written. If the revisions can't be read back now, the next call's sync reloads.
+        self.known = disk_revisions(&self.project).unwrap_or_default();
         Ok(())
     }
 }
@@ -768,6 +769,67 @@ fn returned(name: &str, out: &[paper_rs::mcp::Out], key: &str) -> bool {
 }
 
 /// One tool call on the host thread, with the write lock held by the caller.
+/// Tools that only read: they change nothing in the editor, so a failure needs no restore.
+const READ_TOOLS: &[&str] = &[
+    "list_resources",
+    "get_basic_info",
+    "get_selection",
+    "get_node_info",
+    "get_children",
+    "get_tree_summary",
+    "get_screenshot",
+    "get_jsx",
+    "get_computed_styles",
+    "get_fill_image",
+    "find_nodes",
+    "get_font_family_info",
+    "get_guide",
+];
+
+/// The editor state a call can change, copied before a call that may change it, and put back
+/// when it fails: every page's document and undo history (the active page's in the editor,
+/// the others parked in their slots), the page list, selection, view and active page.
+struct EditorSnapshot {
+    doc: paper_rs::model::Document,
+    history: paper_rs::history::History,
+    camera: paper_rs::geom::Camera,
+    selection: Vec<paper_rs::model::NodeId>,
+    active_page: usize,
+    pages: Vec<paper_rs::editor::pages::PageSlot>,
+    meta_dirty: bool,
+    doc_stamp: u64,
+    revision: u64,
+}
+
+impl EditorSnapshot {
+    fn take(ed: &Editor) -> EditorSnapshot {
+        EditorSnapshot {
+            doc: ed.doc.clone(),
+            history: ed.history.clone(),
+            camera: ed.camera,
+            selection: ed.selection.clone(),
+            active_page: ed.active_page,
+            pages: ed.pages.clone(),
+            meta_dirty: ed.meta_dirty,
+            doc_stamp: ed.doc_stamp,
+            revision: ed.revision,
+        }
+    }
+
+    fn restore(self, ed: &mut Editor) {
+        ed.doc = self.doc;
+        ed.history = self.history;
+        ed.camera = self.camera;
+        ed.selection = self.selection;
+        ed.active_page = self.active_page;
+        ed.pages = self.pages;
+        ed.meta_dirty = self.meta_dirty;
+        ed.doc_stamp = self.doc_stamp;
+        // Views are told to redraw.
+        ed.revision = self.revision.max(ed.revision) + 1;
+    }
+}
+
 /// What a call acknowledged for its session: applied only once its result was delivered
 /// (see `spawn_host`).
 pub struct Ack {
@@ -830,6 +892,18 @@ fn execute_inner(
     let args = check_call(name, &args, &host.bound())?;
     // Worked out before the call, on the pages as they are; used only if it succeeds.
     let reads = read_keys(&host.ed, name, &args);
+    // What a failed call restores: the editor as it was (documents and undo histories of
+    // every page, selection, view, page list). Reads don't change it, so they need none.
+    let snap = (!READ_TOOLS.contains(&name)).then(|| EditorSnapshot::take(&host.ed));
+    let undo = |host: &mut BoundHost, snap: Option<EditorSnapshot>| -> Result<(), String> {
+        match snap {
+            Some(s) => s.restore(&mut host.ed),
+            // A read that changed something after all: back to what is on disk.
+            None if host.ed.project_dirty() => host.load()?,
+            None => {}
+        }
+        Ok(())
+    };
     // Nothing reaches the disk during the call (`Host::save` is a no-op, export and file
     // creation are refused): changes are saved below, only after a successful result.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
@@ -842,19 +916,27 @@ fn execute_inner(
         }
         _ => exec::call(host, name, &args),
     }))
-    .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")));
+    .map_err(|_| ());
+    let r = match r {
+        Ok(r) => r,
+        Err(()) => {
+            // A panic may have left the editor mid-operation: reload what is on disk (which it
+            // matched before the call). The undo history restarts.
+            host.load()?;
+            return Ok((Err(format!("{name} failed unexpectedly")), None));
+        }
+    };
     if r.is_err() {
-        // A call that fails changes nothing: drop whatever it changed in memory (the editor
-        // was in step with the disk before the call, so reloading restores it), save
-        // nothing and acknowledge nothing.
-        host.load()?;
+        // A call that fails changes nothing: put the editor back as it was, save nothing and
+        // acknowledge nothing.
+        undo(host, snap)?;
         return Ok((r, None));
     }
     if let Some(s) = session
         && let Some(why) = stale_change(host, s, &before)
     {
         // Drop the change: it wasn't decided on the page as it is now.
-        host.load()?;
+        undo(host, snap)?;
         return Ok((
             Err(format!(
                 "{why}, so this change was not applied and nothing was written. Read every page \
@@ -868,7 +950,7 @@ fn execute_inner(
     let saved = host.save_changes();
     if saved.is_err() {
         // Not saved: drop the call's changes, as for a failed call.
-        host.load()?;
+        undo(host, snap)?;
     }
     // Only a call that succeeded acknowledges anything: a failed or refused call, or a
     // failed save, leaves what the session has observed as it was.
@@ -899,9 +981,7 @@ fn execute_inner(
     Ok((
         match saved {
             Ok(()) => r,
-            Err(e) => Err(format!(
-                "the change could not be saved, and nothing was written: {e}"
-            )),
+            Err(e) => Err(format!("the change was {}", e.describe())),
         },
         ack,
     ))
@@ -1170,11 +1250,12 @@ mod tests {
             {"nodeIds": [rect(&b)], "styles": {"width": "30px"}},
         ]});
         let rename = json!({"updates": [{"pageId": a, "name": "Renamed"}]});
-        // Steps: one staging per file, then one rename per file.
+        // Steps: one staging per file, one rename per file, then one sync per directory
+        // (pages/ and the project folder; the manifest alone: the project folder).
         for (tool, args, steps) in [
-            ("update_styles", &one_page, 4),
-            ("update_styles", &two_pages, 6),
-            ("rename_pages", &rename, 2),
+            ("update_styles", &one_page, 6),
+            ("update_styles", &two_pages, 8),
+            ("rename_pages", &rename, 3),
         ] {
             for at in 0..steps {
                 let before = files(&t.0);
@@ -1241,8 +1322,16 @@ mod tests {
         crate::commit::fault::fail_at(&[4, 5]);
         let r = run(&mut h, root_id, "update_styles", &two_pages);
         crate::commit::fault::fail_at(&[]);
+        // Review round 5, F3: not "nothing was written", but which files may be inconsistent
+        // and that writes are disabled.
         let e = r.unwrap_err();
-        assert!(e.contains("restoring") && e.contains(".json"), "{e}");
+        assert!(
+            e.contains("may now be inconsistent")
+                && e.contains(&format!("{a}.json"))
+                && e.contains("disabled")
+                && !e.contains("nothing was written"),
+            "{e}"
+        );
         assert!(h.broken.lock().unwrap().is_some());
         let before = files(&t.0);
         let r = run(
@@ -1254,6 +1343,42 @@ mod tests {
         assert!(r.unwrap_err().contains("writes are disabled"));
         assert_eq!(files(&t.0), before, "nothing written");
         assert!(run(&mut h, root_id, "get_basic_info", &json!({})).is_ok());
+    }
+
+    /// Review round 5, F1: a failing directory sync is an error, not a success: after the
+    /// renames, the sync of pages/ fails, the files are put back; and when the directory
+    /// sync of that rollback fails too, the server fails closed.
+    #[test]
+    fn directory_sync_failures_roll_back_or_fail_closed() {
+        let (t, mut h, root_id, a, _) = two_page_host();
+        let change = json!({"updates": [{"nodeIds": [rect(&a)], "styles": {"width": "30px"}}]});
+        // 0-1 stage page and manifest, 2-3 rename them, 4 syncs pages/: fails.
+        let before = files(&t.0);
+        crate::commit::fault::fail_at(&[4]);
+        let r = run(&mut h, root_id, "update_styles", &change);
+        crate::commit::fault::fail_at(&[]);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("nothing was written") && e.contains("directory sync"),
+            "{e}"
+        );
+        assert_eq!(files(&t.0), before, "the renamed files were put back");
+        assert!(h.broken.lock().unwrap().is_none());
+        // Again, and the rollback's directory sync (after restoring both files: 5-8) fails.
+        crate::commit::fault::fail_at(&[4, 9]);
+        let r = run(&mut h, root_id, "update_styles", &change);
+        crate::commit::fault::fail_at(&[]);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("may now be inconsistent") && e.contains("disabled"),
+            "{e}"
+        );
+        assert!(h.broken.lock().unwrap().is_some());
+        assert!(
+            run(&mut h, root_id, "update_styles", &change)
+                .unwrap_err()
+                .contains("writes are disabled")
+        );
     }
 
     fn host_thread() -> (

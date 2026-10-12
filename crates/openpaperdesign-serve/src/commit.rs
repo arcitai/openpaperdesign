@@ -4,15 +4,20 @@
 //! 1. The current bytes of every target are read (the pre-images; a missing file is "none").
 //! 2. Every new content is written to a temporary file next to its target and synced.
 //! 3. The temporary files are renamed over their targets, in the order given.
+//! 4. Each directory containing a target is synced, so the renames are durable.
 //!
-//! If anything fails, the temporary files are removed and each target already replaced is put
-//! back: its pre-image is written the same way (temporary file, sync, rename), or the file is
-//! removed if it didn't exist. If putting a file back fails too, the project can no longer be
-//! known to be consistent: the error is `Broken`, naming the files, and the caller must refuse
-//! every further write (see `Broken` in lib.rs).
+//! If anything fails (a write, a file or directory sync, a rename), the temporary files are
+//! removed and each target already replaced is put back: its pre-image is written the same way
+//! (temporary file, sync, rename), or the file is removed if it didn't exist, and the
+//! directories are synced again. If any of that fails too, the project can no longer be known
+//! to be consistent: the error is `Broken`, listing the files, and the caller must refuse every
+//! further write (see `Broken` in lib.rs).
 //!
-//! Temporary files are named like upstream's (`.<name>.<pid>-<random>.tmp`), so a crash
-//! leaves files that upstream `Project::open` already cleans up.
+//! This covers errors the process sees. It is not crash-atomic: there is no journal, the
+//! pre-images live only in memory, so a crash between two renames leaves some targets new and
+//! some old (each file itself complete). Temporary files are named like upstream's
+//! (`.<name>.<pid>-<random>.tmp`), so the ones a crash leaves are cleaned by upstream
+//! `Project::open`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -26,14 +31,29 @@ pub(crate) struct Write {
 pub(crate) enum CommitError {
     /// Nothing changed: every target is as it was before the call.
     Failed(String),
-    /// A failed write could not be undone; the files named may be inconsistent.
-    Broken(String),
+    /// A failed write could not be undone: `files` may now be inconsistent (some new, some
+    /// old, or not durably restored).
+    Broken { error: String, files: Vec<String> },
+}
+
+/// Errors before anything is written.
+impl From<String> for CommitError {
+    fn from(e: String) -> CommitError {
+        CommitError::Failed(e)
+    }
 }
 
 impl CommitError {
-    pub fn message(&self) -> &str {
+    /// For the person or agent: what happened, and whether anything may have changed.
+    pub fn describe(&self) -> String {
         match self {
-            CommitError::Failed(m) | CommitError::Broken(m) => m,
+            CommitError::Failed(e) => format!("not saved; nothing was written ({e})"),
+            CommitError::Broken { error, files } => format!(
+                "not saved, and undoing the partial save failed ({error}): these files may now \
+                 be inconsistent: {}. Writes to this project are disabled until those files \
+                 are checked or restored and the server is restarted",
+                files.join(", ")
+            ),
         }
     }
 }
@@ -74,12 +94,40 @@ fn replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-fn sync_parent(path: &Path) {
-    if let Some(d) = path.parent()
-        && let Ok(f) = std::fs::File::open(d)
-    {
-        let _ = f.sync_all();
+/// Sync every distinct directory holding one of `paths`.
+fn sync_dirs<'a>(paths: impl Iterator<Item = &'a Path>) -> std::io::Result<()> {
+    let mut done: Vec<&Path> = Vec::new();
+    for p in paths {
+        let d = p.parent().unwrap_or(Path::new("."));
+        if done.contains(&d) {
+            continue;
+        }
+        done.push(d);
+        fault::check()?;
+        std::fs::File::open(d)?.sync_all()?;
     }
+    Ok(())
+}
+
+/// Put the first `n` targets back (latest first) and sync their directories. Returns the
+/// files that couldn't be put back durably.
+fn roll_back(writes: &[Write], pre: &[Option<Vec<u8>>], n: usize) -> Vec<String> {
+    let mut failed = Vec::new();
+    for j in (0..n).rev() {
+        if let Err(e) = restore(&writes[j].path, &pre[j]) {
+            failed.push(format!("{} ({e})", label(&writes[j].path)));
+        }
+    }
+    if let Err(e) = sync_dirs(writes[..n].iter().map(|w| w.path.as_path())) {
+        // Every restored file's directory entry may not be durable.
+        for w in &writes[..n] {
+            let l = label(&w.path);
+            if !failed.iter().any(|f| f.starts_with(&l)) {
+                failed.push(format!("{l} (directory sync: {e})"));
+            }
+        }
+    }
+    failed
 }
 
 /// Put `path` back to `pre` (its bytes before, or absent).
@@ -126,35 +174,34 @@ pub(crate) fn commit(writes: &[Write]) -> Result<(), CommitError> {
             }
         }
     }
+    let outcome = |what: String, n: usize| {
+        let failed = roll_back(writes, &pre, n);
+        if failed.is_empty() {
+            CommitError::Failed(what)
+        } else {
+            CommitError::Broken {
+                error: what,
+                files: failed,
+            }
+        }
+    };
     for (i, w) in writes.iter().enumerate() {
         if let Err(e) = replace(&temps[i], &w.path) {
             for t in &temps[i..] {
                 let _ = std::fs::remove_file(t);
             }
-            let mut unrestored = Vec::new();
-            for j in (0..i).rev() {
-                if let Err(re) = restore(&writes[j].path, &pre[j]) {
-                    unrestored.push(format!("{} ({re})", label(&writes[j].path)));
-                }
-            }
-            let what = format!("{}: {e}", label(&w.path));
-            if unrestored.is_empty() {
-                return Err(CommitError::Failed(what));
-            }
-            return Err(CommitError::Broken(format!(
-                "{what}; restoring the files already written failed too: {}",
-                unrestored.join(", ")
-            )));
+            return Err(outcome(format!("{}: {e}", label(&w.path)), i));
         }
     }
-    for w in writes {
-        sync_parent(&w.path);
+    // The renames are only durable once their directories are synced.
+    if let Err(e) = sync_dirs(writes.iter().map(|w| w.path.as_path())) {
+        return Err(outcome(format!("directory sync: {e}"), writes.len()));
     }
     Ok(())
 }
 
 /// Test-only failure injection: fail the Nth fallible step (staging a file, a rename, a
-/// restore) on this thread. Compiled out of non-test builds.
+/// directory sync, a restore) on this thread. Compiled out of non-test builds.
 pub(crate) mod fault {
     #[cfg(test)]
     thread_local! {

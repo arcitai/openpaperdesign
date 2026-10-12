@@ -129,9 +129,9 @@ pub(crate) fn set_broken(b: &Broken, why: &str) {
 
 pub(crate) fn refuse_if_broken(b: &Broken) -> Result<(), String> {
     match b.lock().unwrap().as_ref() {
-        Some(why) => Err(format!(
-            "writes are disabled: a failed save could not be undone ({why}). Check those \
-             files, then restart the server"
+        Some(files) => Err(format!(
+            "writes are disabled: a failed save could not be undone, so these files may be \
+             inconsistent: {files}. Check or restore them, then restart the server"
         )),
         None => Ok(()),
     }
@@ -745,13 +745,10 @@ async fn put_page(
             },
         ];
         commit::commit(&writes).map_err(|e| {
-            if let commit::CommitError::Broken(m) = &e {
-                set_broken(&s.broken, m);
+            if let commit::CommitError::Broken { files, .. } = &e {
+                set_broken(&s.broken, &files.join(", "));
             }
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("not saved, nothing was written: {}", e.message()),
-            )
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.describe())
         })?;
         let rev = revision(&read_page(&p, &id)?);
         Ok((
@@ -774,7 +771,8 @@ mod tests {
 
     const TOKEN: &str = "unit-test-token-0123456789abcdef";
 
-    async fn put(s: &Arc<Server>, id: &str, tag: &str, body: String) -> StatusCode {
+    async fn put(s: &Arc<Server>, id: &str, tag: &str, body: String) -> (StatusCode, String) {
+        use http_body_util::BodyExt;
         let req = Request::builder()
             .method("PUT")
             .uri(format!("/api/pages/{id}"))
@@ -783,7 +781,10 @@ mod tests {
             .header(header::IF_MATCH, tag)
             .body(Body::from(body))
             .unwrap();
-        router(s.clone()).oneshot(req).await.unwrap().status()
+        let res = router(s.clone()).oneshot(req).await.unwrap();
+        let st = res.status();
+        let b = res.into_body().collect().await.unwrap().to_bytes();
+        (st, String::from_utf8_lossy(&b).into_owned())
     }
 
     /// Review round 4, F1, browser side: the page and the manifest are one commit, so a
@@ -817,28 +818,37 @@ mod tests {
         let mut page = p.load_page(&id).unwrap();
         page.doc.next_id += 1;
         let body = page_to_json(&page);
-        // Steps: stage page (0), stage manifest (1), rename page (2), rename manifest (3).
-        for at in 0..4 {
+        // Steps: stage page (0), stage manifest (1), rename page (2), rename manifest (3),
+        // sync pages/ (4), sync the project folder (5).
+        for at in 0..6 {
             let before = files();
             let tag = etag(&before.0);
             commit::fault::fail_at(&[at]);
-            let st = put(&s, &id, &tag, body.clone()).await;
+            let (st, msg) = put(&s, &id, &tag, body.clone()).await;
             commit::fault::fail_at(&[]);
             assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "step {at}");
+            assert!(msg.contains("nothing was written"), "step {at}: {msg}");
             assert_eq!(files(), before, "step {at}: nothing written");
         }
-        // Rename of the manifest fails, and restoring the page fails too: fail closed.
+        // Rename of the manifest fails, and restoring the page fails too: fail closed, and
+        // the answer says the page may be inconsistent (review round 5, F3).
         let tag = etag(&files().0);
         commit::fault::fail_at(&[3, 4]);
-        assert_eq!(
-            put(&s, &id, &tag, body.clone()).await,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        let (st, msg) = put(&s, &id, &tag, body.clone()).await;
         commit::fault::fail_at(&[]);
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            msg.contains("may now be inconsistent")
+                && msg.contains(&format!("{id}.json"))
+                && msg.contains("disabled")
+                && !msg.contains("nothing was written"),
+            "{msg}"
+        );
         assert!(s.broken.lock().unwrap().is_some());
         let before = files();
-        let st = put(&s, &id, &etag(&before.0), body).await;
+        let (st, msg) = put(&s, &id, &etag(&before.0), body).await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains(&format!("{id}.json")), "{msg}");
         assert_eq!(files(), before);
         let _ = std::fs::remove_dir_all(&root);
     }
