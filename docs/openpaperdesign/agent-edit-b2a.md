@@ -76,6 +76,17 @@ check your client's docs if one is refused. The token changes on every start.
       this project's pages' entries are copied and put back; other projects in the same
       process (another launcher binding, tests) keep theirs. Reading it needs one added
       upstream function, `exec::with_no_stretch` (final review).
+    - **Ownership across bindings** (operator's Mac finding on `cffeec6`): that record is
+      keyed by page id, so a project bound later in the same process could inherit an earlier
+      project's entries. Two rules prevent this.
+      - A host that opens a project successfully first drops any entries for that project's
+        page ids, so every binding starts as if the process had just started. This covers
+        `openpaperdesign-serve` at start-up too. A failed open drops nothing.
+      - `Server::release_layout_state` drops the entries of every page a server held. The
+        launcher calls it when it switches projects.
+
+      Two servers alive in one process with the same page ids would still share entries;
+      the launcher binds one project at a time.
   - **On disk, one commit** (`crate::commit`) per call, used by browser saves too (page plus
     manifest):
     1. The current bytes of every target are read first.

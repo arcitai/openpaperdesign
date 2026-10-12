@@ -24,7 +24,9 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     host restore the exact editor state after a failed MCP call.
   - `src/mcp/exec.rs`: `pub fn with_no_stretch` gives access to the process-wide record of
     containers that don't stretch their children (B2a final review). Accessor only, no
-    behaviour change. The host copies and restores its own pages' entries with the editor.
+    behaviour change. The host copies and restores its own pages' entries with the editor. A
+    newly opened project drops stale entries for its page ids, and a server that stops for
+    good releases its own (`Server::release_layout_state`).
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
