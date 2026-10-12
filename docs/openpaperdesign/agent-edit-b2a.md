@@ -89,14 +89,18 @@ check your client's docs if one is refused. The token changes on every start.
     and `casepage` are the same page file. The operator observed this on `a96b32c`: the server
     started with both ids aliasing one file (`.toolchain/operator-evidence/mac-case-alias.json`).
     The rule doesn't depend on the file system, so it is tested on Linux too.
+  - No two page ids may share their first six characters (ignoring case). Upstream node ids
+    are `<first six characters of the page id>:<n>`, so such pages would be ambiguous to
+    every tool. The reviewer reproduced a lost update through `abcdef-A`/`abcdef-B` on
+    `b730f4c`. The project is refused at start and bind, and before any read or write.
   - The host reads pages itself rather than with upstream `load_pages`. `pages/` and each page
     file are checked (no symlink, a single hard link) **before** any byte is read, and two
     pages that turn out to be the same file (same device and inode) are refused.
   - A page takes its id and name from its manifest entry, whatever its file says, as upstream
     `Project::load_page` does. So the id inside a file can't choose where it is saved, and a
     reload doesn't revert a saved rename (renames only write the manifest).
-  - Before saving, every page id is checked again (format, case-folded uniqueness), and each
-    destination is checked not to be a link.
+  - Before saving, every page id is checked again (format, case-folded uniqueness, distinct
+    six-character prefixes), and each destination is checked not to be a link.
 - **Project assets:** loaded by the adapter, not by upstream `assets::load_dir`, which follows
   symlinks. Only plain single-link files in a real `assets/` folder are registered. `assets/`
   joins the B1 entry checks (not a symlink), and agent-saved images are written there only
@@ -126,15 +130,23 @@ check your client's docs if one is refused. The token changes on every start.
     - `get_tree_summary`, `get_children`, `get_screenshot`: the page of `nodeId` (or of
       `"root"`).
     - `get_node_info`, `get_jsx`, `get_fill_image`: the page of the node.
-    - `get_computed_styles`: the page of each node.
-    - `get_selection`: the page the user is viewing.
-    - `find_nodes`: the page it is scoped to by `nodeId` or `pageId`.
+    - `get_computed_styles`: the page of each node whose styles are actually in the answer
+      (its node ids are keys of the returned map); a page left out isn't credited.
   - **Acknowledges nothing:** any call that failed (an error, a policy refusal, a conflict, an
-    unknown tool), and any call that can't be attributed to one page: `find_nodes` across all
-    pages, `list_resources`, `get_guide`, `get_font_family_info`, `select_nodes`,
+    unknown tool). Also any call that can't be attributed to one page, or that returns
+    matches or a selection rather than a page's content: `find_nodes`, `get_selection`,
+    `list_resources`, `get_guide`, `get_font_family_info`, `select_nodes`,
     `finish_working_on_nodes`, no-op changes.
   - **Page list:** the manifest's page metadata (ids, names, order) is a separate item. Only
-    `get_basic_info`, which returns it, reads it.
+    `get_basic_info`, which returns it, reads it. Its revision is the hash of a canonical
+    JSON array of `[id, name]` pairs, so names containing newlines or NULs can't make two
+    lists look the same.
+  - **A call that returns an error changes nothing,** in memory or on disk. Nothing reaches
+    the disk during a call (`Host::save` is a no-op; export and file creation are refused).
+    After an error (or a caught panic, or a failed save) the host reloads the project from
+    disk, which it matched before the call. It saves nothing and acknowledges nothing, so
+    what the session read before stays valid. As after any reload, the agent's undo history
+    restarts.
   - **What is refused:** a call that changes an existing page's content, or removes it, unless
     **every** page it writes is read at its current revision. The same applies to the page
     list if the call changes it (a rename, a new page, a removed page). Otherwise it gets a
@@ -210,6 +222,14 @@ them, but it can still overwrite this server's writes.
 
 Findings 6 and 7 were in the merge, which was removed (see the decision above).
 
+### Review round 4 (on `b730f4c`)
+
+| Finding | Fix | Tests (each fails on `b730f4c`'s code) |
+| --- | --- | --- |
+| P1. Failed `rename_pages`, `move_nodes` and `set_text_content` saved their partial changes, and a failed `write_html` replace deleted its target from disk | A failed call reloads from disk and saves nothing | `a_failed_call_changes_nothing` (the reviewer's four cases: disk bytes of both pages and the manifest, and later reads, unchanged) |
+| P2. Newlines/NULs in page names made two page lists encode the same, permitting blind and stale renames | Page-list revision is the hash of a canonical JSON array | `page_list_revisions_are_unambiguous` (the reviewer's names) |
+| Lost update via colliding six-character page-id prefixes (`get_computed_styles` answered for one page and both were credited) | Such projects are refused at start/bind and before saving. `get_computed_styles` credits only pages present in its answer; `find_nodes` and `get_selection` credit nothing. | `page_ids_sharing_their_first_six_characters_are_refused` (`abcdef-A`/`abcdef-B`, and a case-folded variant) |
+
 ### Review round 3 (on `9c3ba69`)
 
 | Finding | Fix | Tests (each fails on `9c3ba69`'s code) |
@@ -241,7 +261,7 @@ The reviewer also flagged two stale comments that still said "merged"
 
 ## Tests and results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, Node 26.8.1, `TMPDIR=<worktree>/target/tmp`)
 
-- **`tests/agent.rs` (18 passed; see the review round tables for the newer tests):** real loopback listener, upstream-compatible rmcp
+- **`tests/agent.rs` (21 passed; see the review round tables for the newer tests):** real loopback listener, upstream-compatible rmcp
   streamable-HTTP client.
   - `mcp_needs_the_token_and_a_loopback_host_and_origin`: 401 without or with a wrong token,
     403 for a foreign Host or Origin, 200 with the token, and a client without the token can't
@@ -324,6 +344,13 @@ page JavaScript only):
   Node: the reviewer sequence applies the older page, and the overlap test times out.
 - **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
   from the 2da2f52 run.
+
+Results of the review round 4 fixes (2026-10-12; serve crate only):
+- **Run now:** `cargo fmt --all --check`; serve clippy (0 warnings); serve build; serve tests
+  4 unit, 21 agent, 17 serve; `git diff --check`.
+- **On `b730f4c`'s code** (with the new tests copied in): the three new tests fail.
+- **Inherited (not re-run):** serial 162, headless 9, root clippy, `cargo tree -p paper-rs`
+  from the 2da2f52 run; the Node command (no JavaScript changed).
 
 Results of the review round 3 fixes (2026-10-12; serve crate and `session.js`):
 - **Run now:** `cargo fmt --all --check`; serve clippy (0 warnings); serve tests 4 unit,
