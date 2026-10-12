@@ -1,7 +1,7 @@
 # B1: editing a paper-rs project in a browser — 2026-10-12
 
-Updated 2026-10-12 after review rounds 1 and 2 and the operator's Codex browser runs (see "Fix
-round 1" and "Fix round 2" below).
+Updated 2026-10-12 after review rounds 1–3 and the operator's Codex browser runs (see "Fix
+round 1", "Fix round 2" and "Fix round 3" below).
 
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B1. A
 loopback server opens one existing paper-rs project folder. A browser page runs the upstream
@@ -74,7 +74,11 @@ apart from `manifest.modified`.
   `Sec-Fetch-Site` values other than `same-origin`/`none`. Every response carries `no-store`,
   `nosniff`, `no-referrer` and a same-origin CSP with `frame-ancestors 'none'`. That includes
   refusals, unknown paths and body-limit errors, because the headers are added by the
-  outermost layer. Only the four bundle files are served.
+  outermost layer. Only the four bundle files are served. They are checked (plain,
+  single-link files in a folder that is not inside the project) and read into memory once
+  at startup, and every request is served from memory, so replacing the bundle folder or a
+  file in it later can't change what is sent. A `--web-dir` inside or equal to the project
+  folder is refused at startup.
 - **No links out of the project (fail closed):** `project.json`, `pages/`, each page file
   and each bundle file must be a real file or directory, not a symbolic link. Files must
   also have a single hard link. The project root must stay the directory opened at startup:
@@ -299,16 +303,67 @@ a browser.
 | `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
 | Bundle (`scripts/build-web.sh --offline` → `target/openpaperdesign-web/`) | `openpaperdesign_web_bg.wasm` 11,647,034 B (4,229,799 B gzip -9), `openpaperdesign_web.js` 124,728 B, `app.js` 7,716 B, `index.html` 3,002 B |
 
+## Fix round 3 (2026-10-12, after independent review of 260ac38)
+
+### Operator-observed on exact 260ac38 (not re-run by the implementation worker)
+
+The server was built for the Mac from 260ac38, and all 14 serve tests passed there. In the
+actual Codex in-app browser:
+
+- **WebGPU:** BrowserWebGpu paints. A laser trail expires without new input. The toolbar
+  stays 40 px.
+- **Edits:** R plus a drag created rectangle 28, which persisted, and all 27 earlier nodes
+  were unchanged.
+- **WebGL:** an explicit WebGL fresh reload shows all 28 nodes.
+- **Logs:** no errors or warnings.
+
+This is operator-observed on 260ac38 only; the round-3 changes below were not part of it.
+
+### Round-3 review of 260ac38 (REJECT; round-2 items confirmed fixed)
+
+| Finding | Resolution | Tests |
+|---|---|---|
+| Major: static bundle serving checked only the final file. Replacing the project root while `--web-dir` was inside it, or replacing a separate bundle folder with a symlink to an outside folder, served outside bytes | Bundle checked and read into memory once at startup and served only from memory. A `--web-dir` inside or equal to the project folder is refused at startup (checked on the real path, or for a missing folder on its resolved path, including `..`). The first case can't arise any more: a bundle inside the project is refused | `bundle_is_served_from_memory_after_its_folder_is_replaced` (folder replaced by a symlink to an outside folder with sentinel files: the original bytes are served, a file absent at startup stays 404, and an in-place rewrite changes nothing), `web_dir_inside_the_project_is_refused` (inside, equal, missing-inside, via `..`), `symlinked_bundle_file_is_refused_at_startup`. All three fail on 260ac38's server code; the first shows exactly `(200, "OUTSIDE SENTINEL")` |
+| Minor: Ready without renderability. Surface failures returned silently, recorded errors weren't checked before returning, no device-loss handling | New host-testable `health.rs`. Surface outcomes: Success draws; Suboptimal draws, then reconfigures; Timeout/Occluded skip and retry; Outdated reconfigures and retries; Lost/Validation are terminal with a visible message. Uncaptured errors and `set_device_lost_callback` record a terminal error and stop drawing. `start()` fails if a problem is recorded during startup. The page says Ready only when `ready()` is true (validated, a frame presented, no recorded problem). If WebGPU fails before Ready, the page falls back to WebGL2 once and says so; after Ready, a failure is shown as a red error | `health::tests::{surface_outcomes, ready_needs_a_presented_frame, any_recorded_error_ends_readiness_and_drawing, terminal_surface_outcomes_fail_readiness}`. `health.rs` is new, so there is nothing on 260ac38 to run them against; there, `app.js` set Ready right after `start()` returned. **Only the state machine is tested; the wgpu callback wiring, the surface-acquire mapping and the page's fallback are untested until a browser re-check, and a real device loss hasn't been exercised at all** |
+| Minor: stale docs about the Mac ⌘ mapping and Codex behavior | Corrected (see "Not proven / open") | — |
+
+**Reviewer observation (llvmpipe PNG variance).** The reviewer saw 3 of 14 headless PNGs
+differ in 55–61 px by at most 1 channel level between the base and candidate shader. In this
+sandbox (llvmpipe, GL) the 14 PNGs that `tests/headless.rs` writes were compared, by bytes
+and by decoded pixels, across two runs with the base shader and two with the new one.
+base/base, new/new and base/new were all 14/14 byte-identical. So the reviewer's difference
+wasn't reproduced here, and its cause (llvmpipe nondeterminism or something else) is not
+established by this check.
+
+### Round-3 results (2026-10-12, implementation worker sandbox, offline, Rust 1.95.0, `TMPDIR=<worktree>/target/tmp` as the shared-tmpfs quota workaround)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `git diff --check` | clean |
+| `cargo clippy` new crates (host, all targets) | 0 warnings |
+| `cargo clippy` core and web (wasm32) | only upstream `src/io/atomic.rs:30`, once per crate |
+| `cargo test -p openpaperdesign-serve` / web lib / `tests/shader.rs` | 16 / 109 / 2 passed |
+| `cargo check` core and web for wasm32 | pass |
+| Native `cargo build --all-targets` | pass |
+| `PAPER_RS_REQUIRE_GPU=1 cargo test --test headless` | 9 passed, 0 failed, 0 ignored; no skips, no quota errors |
+| `cargo test -- --test-threads=1` | 162 passed, 0 failed, 0 ignored (= baseline); no quota errors |
+| Root `cargo clippy --all-targets` | 1 upstream warning (= baseline) |
+| `cargo tree -p paper-rs -e features` | byte-identical to the pre-round-1 capture |
+| Bundle (`target/openpaperdesign-web/`) | `openpaperdesign_web_bg.wasm` 11,662,088 B (4,234,028 B gzip -9), `openpaperdesign_web.js` 126,514 B, `app.js` 8,648 B, `index.html` 3,002 B |
+
 ## Not proven / open
 
-- Browser runs are operator-observed only, in the Codex in-app browser on a Mac (Apple M4):
-  WebGL2 on 13b2430, and WebGPU plus WebGL on the run-8 tree. The round-2 changes after that
-  (root identity, laser redraw, non-Unix refusal) haven't been run in a browser.
+- Browser runs are operator-observed only, all in the Codex in-app browser on a Mac (Apple
+  M4): the WebGPU failure and WebGL2 on 13b2430, WebGPU and WebGL on the run-8 tree, and
+  WebGPU and WebGL on 260ac38 (see "Fix round 3"). **The final revision needs its own browser
+  re-check:** the round-3 changes (bundle from memory, renderer readiness, device loss) have
+  not been run in a browser.
 - Other browsers, MSAA and blend-mode output in a browser compared with native.
 - Image fills: the browser registers no project assets, so image fills don't draw. Saving
   keeps their references.
 - Text editing UI, inspector, layers, multiple pages (only the active page loads), export,
   thumbnails, async GPU readback, IME and touch/pen pressure.
-- Mac browser ⌘ mapping is implemented and unit-tested but not tried on a Mac.
+- The Mac browser ⌘ mapping is unit-tested and was operator-observed in Codex on the run-8
+  tree (⌘A, ⌘Z). Other Mac browsers are untested.
 - ~4.2 MB gzip download: the fonts alone are 2.5 MB uncompressed. Size work is open.
 - Codex built-in browser, MCP App panel, plugin packaging and B2 agent writes.
