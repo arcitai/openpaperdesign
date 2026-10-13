@@ -74,8 +74,6 @@
       <label>New canvas name <input id="name" maxlength="60" placeholder="Landing page" autocomplete="off"></label>
       <button id="new">New canvas</button>
     </div>
-    <p id="msg-state" class="hint" style="margin-top:10px"></p>
-    <pre id="prompt" hidden></pre>
   </div>
 
   <div id="result" hidden>
@@ -83,10 +81,15 @@
     <div class="card">
       <p id="result-state"></p>
       <dl id="result-fields"></dl>
-      <p style="margin-top:10px"><button id="canvas" class="primary" hidden>Open canvas</button></p>
+      <div id="result-list"></div>
+      <p style="margin-top:10px"><button id="canvas" class="primary" hidden>Open canvas</button>
+        <button id="ask-open" hidden>Ask the agent to open it</button></p>
       <p id="canvas-state" class="hint"></p>
     </div>
   </div>
+
+  <p id="msg-state" class="hint" style="margin-top:10px"></p>
+  <pre id="prompt" hidden></pre>
 
   <footer>
     Design files live in your project: one <code>DESIGN.md</code> at its root (an existing
@@ -113,6 +116,7 @@
 
   let canMessage = false;
   let editorUrl = null; // memory only, for the Open canvas button
+  let editorFor = null; // the same result's workspace and project, for the agent fallback
 
   // ---- actions: user messages to the active chat ----
 
@@ -121,9 +125,8 @@
   const cleanName = (s) => String(s).replace(/[\u0000-\u001f\u007f"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
   const prompts = {
     open: () => 'Open an existing OpenPaperDesign canvas in this workspace. ' + PRELUDE +
-      'Otherwise find the existing paper-rs projects (folders with a project.json, usually under ' +
-      'design/), ask me which one if there are several, bind it with bind_project, read its first ' +
-      'page with get_tree_summary, then call open_editor. Don\'t create, move or redesign anything.',
+      'Otherwise call openpaperdesign_canvases and show me the canvases it lists; if there is one, ' +
+      'open it, and if there are several, ask me which. ' + OPEN_STEPS,
     new: () => {
       const name = cleanName($('name').value);
       return 'Create a new OpenPaperDesign canvas' + (name ? ' named "' + name + '"' : '') + '. ' +
@@ -141,10 +144,26 @@
       '" (Codex project id ' + cleanText(p.id, 256) + ' on this computer), folder ' +
       cleanText(root, 4096) + '. ' + PRELUDE + 'Continue only if the workspace it reports is exactly ' +
       'that folder; if it isn\'t, tell me to open that folder\'s project in Codex and stop, without ' +
-      'trying to switch folders or reading anything there. If it is, look for existing paper-rs ' +
-      'projects under design/: bind and open the one I mean (ask if there are several), or ask me ' +
-      'whether to create a new canvas. Don\'t create, move or redesign anything without asking.',
+      'trying to switch folders or reading anything there. If it is, call openpaperdesign_canvases: ' +
+      'open the canvas I mean (ask if there are several), or ask me whether to create a new one. ' +
+      OPEN_STEPS,
+    // A canvas from an admitted openpaperdesign_canvases result: intent only, for that workspace.
+    canvas: (workspace, c) => 'Open the OpenPaperDesign canvas "' + cleanName((c.canvas && c.canvas.name) || 'unnamed') +
+      '" at ' + cleanText(c.project, 512) + ' in the workspace ' + cleanText(workspace, 4096) + '. ' + PRELUDE +
+      'Continue only if the workspace it reports is exactly that one; otherwise tell me and stop. ' +
+      'Bind ' + cleanText(c.project, 512) + ' with bind_project. ' + OPEN_STEPS,
+    // The editor link from an admitted open_editor result: the agent opens a fresh one.
+    browser: (v) => 'Open the OpenPaperDesign canvas for ' + cleanText(v.project, 512) + ' in the in-app ' +
+      'browser. ' + PRELUDE + 'Continue only if the workspace it reports is exactly ' + cleanText(v.workspace, 4096) +
+      ' and its bound project is ' + cleanText(v.project_path, 4096) + '; otherwise tell me and stop. Call ' +
+      'open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded.',
   };
+  // How a chosen canvas is opened: never forced, the target page read, then a fresh editor link.
+  const OPEN_STEPS = 'Never pass force to bind_project; if a switch needs it, tell me why and stop. ' +
+    'Before showing it, call get_basic_info and read the page you will show with get_tree_summary ' +
+    '(nodeId root and that page\'s pageId; the bind summary doesn\'t count). Then call open_editor, open ' +
+    'the URL it returns in the in-app browser, and tell me whether the canvas loaded. Don\'t create, move ' +
+    'or redesign anything without asking.';
   const cleanText = (s, max) => String(s).replace(/[\u0000-\u001f\u007f`]/g, ' ').slice(0, max);
 
   async function act(kind, ...args) {
@@ -248,12 +267,7 @@
     let v = null;
     try { v = JSON.parse(text); } catch { v = null; }
     if (v && v.surface === 'home') return; // the home tool itself: stay on the home view
-    $('home').hidden = true;
-    $('result').hidden = false;
-    $('result-fields').textContent = '';
-    $('canvas').hidden = true;
-    $('canvas-state').textContent = '';
-    editorUrl = null;
+    reset();
     if (result.isError) {
       $('result-state').className = 'bad';
       $('result-state').textContent = 'Refused: ' + (text.split('\n')[0] || 'the tool call failed').slice(0, 300);
@@ -279,13 +293,67 @@
       editorUrl = v.url;
       $('result-state').className = '';
       $('result-state').textContent = 'The canvas for the bound project is ready to open.';
+      // Identity from this same admitted result, never from an earlier one.
+      if (typeof v.workspace === 'string') field('Workspace', v.workspace);
+      if (typeof v.project === 'string') field('Project', v.project);
+      if (v.canvas && typeof v.canvas.name === 'string') {
+        field('Canvas', v.canvas.name + ' (' + pages(v.canvas.pages) + ')');
+      }
       field('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]);
       $('canvas').hidden = false;
+      if (typeof v.workspace === 'string' && typeof v.project === 'string' && typeof v.project_path === 'string') {
+        editorFor = { workspace: v.workspace, project: v.project, project_path: v.project_path };
+        $('ask-open').hidden = false;
+      }
+      return;
+    }
+    if (v && Array.isArray(v.canvases) && typeof v.workspace === 'string') { // openpaperdesign_canvases
+      showCanvases(v);
       return;
     }
     $('result-state').className = '';
     $('result-state').textContent = 'Done.';
   }
+
+  const pages = (n) => (n === 1 ? '1 page' : (Number.isInteger(n) ? n : '?') + ' pages');
+
+  function reset() {
+    $('home').hidden = true;
+    $('result').hidden = false;
+    $('result-fields').textContent = '';
+    $('result-list').textContent = '';
+    $('canvas').hidden = true;
+    $('ask-open').hidden = true;
+    $('canvas-state').textContent = '';
+    editorUrl = null;
+    editorFor = null;
+  }
+
+  // Canvases of this chat's admitted workspace. Choosing one is a request to the agent.
+  function showCanvases(v) {
+    const list = v.canvases.filter((c) => c && typeof c.project === 'string');
+    $('result-state').className = '';
+    $('result-state').textContent = list.length
+      ? (v.complete === false ? 'The first ' + list.length + ' canvases in this workspace:' : 'Canvases in this workspace:')
+      : 'No canvases under design/ in this workspace yet.';
+    field('Workspace', v.workspace);
+    for (const c of list) {
+      const item = node('div', undefined, 'project');
+      item.append(node('b', (c.canvas && c.canvas.name) || c.project));
+      item.append(node('span', c.project + ' · ' + pages(c.canvas && c.canvas.pages) + (c.bound ? ' · open now' : ''), 'hint'));
+      const open = node('button', 'Open this canvas');
+      open.onclick = () => act('canvas', v.workspace, c);
+      const row = node('div', undefined, 'root');
+      row.append(open);
+      item.append(row);
+      $('result-list').append(item);
+    }
+    const skipped = Array.isArray(v.skipped) ? v.skipped.length : 0;
+    if (skipped) $('result-list').append(node('p', skipped === 1 ? 'Skipped 1 folder that isn\'t a usable canvas.'
+      : 'Skipped ' + skipped + ' folders that aren\'t usable canvases.', 'hint'));
+  }
+
+  $('ask-open').onclick = () => { if (editorFor) act('browser', editorFor); };
 
   $('canvas').onclick = async () => {
     if (!editorUrl) return;
@@ -306,6 +374,11 @@
       return;
     }
     if (m.method === 'ui/notifications/tool-result' && m.params) showResult(m.params);
+    else if (m.method === 'ui/notifications/tool-cancelled') {
+      reset();
+      $('result-state').className = 'bad';
+      $('result-state').textContent = 'The tool call was cancelled; there is nothing to open.';
+    }
     else if (m.id !== undefined && m.method) window.parent.postMessage({ jsonrpc: '2.0', id: m.id, result: {} }, '*');
   });
 
@@ -317,7 +390,7 @@
     });
     if (r.timeout || r.error || !r.result) {
       $('conn').className = 'bad';
-      $('conn').textContent = 'Couldn\'t connect to Codex' + errorCode(r.error) + '. Reopen OpenPaperDesign from the sidebar.';
+      $('conn').textContent = 'Couldn\'t connect to Codex' + errorCode(r.error) + '. Close and reopen OpenPaperDesign.';
       for (const id of ['open', 'new', 'current']) $(id).disabled = true;
       return;
     }

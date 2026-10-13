@@ -14,14 +14,28 @@ surface), plugin publishing, other hosts. The later sidebar home is described in
 ## Sidebar home (issue #6): source candidate, 2026-10-13
 
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
-adds `openpaperdesign_home`, the Codex sidebar (global) entry, its static MCP App view
-`ui://openpaperdesign/home.html` (`text/html;profile=mcp-app`), and a read-only native project
-inventory, `openpaperdesign_projects`. The server now lists 35 tools and one resource.
+adds `openpaperdesign_home`, a Codex sidebar (global) entry that is also a chat tab (thread
+entry), and its static MCP App view `ui://openpaperdesign/home.html`
+(`text/html;profile=mcp-app`). It also adds a read-only native project inventory,
+`openpaperdesign_projects`, and a read-only list of this workspace's canvases,
+`openpaperdesign_canvases`. The server now lists 36 tools and one resource.
 
 - **Answered before workspace admission.** The home tool, the view resource and the inventory
   read or change none of the session's context, binding, project, listener or files. The home
   refuses any argument; the inventory accepts only `projectId`. The exemption names exactly
   these three. Every other tool keeps per-call admission and retirement unchanged.
+- **Canvases in this workspace** (`openpaperdesign_canvases`, `{}` only).
+  - It is admitted like `openpaperdesign_status`: missing, changed or read-only context fails
+    closed and retires the session.
+  - It lists the projects directly under the validated workspace's `design/`, at most 200,
+    with `complete` reporting a cut-off. Each passes the binding checks: a real folder on the
+    same file system, and a real `project.json` with safe page ids.
+  - Links are reported, never followed, and a linked `design/` is refused.
+  - It creates nothing (not even `design/`), binds nothing, starts no server and counts as
+    reading no page.
+- **`open_editor`** now names its own validated workspace, the bound project's relative and
+  absolute path, and its canvas (manifest id, name, page count). The URL and token are
+  unchanged.
 - **Native inventory.** This is Codex CLI 0.162.1's experimental app-server, started as
   `codex app-server` from PATH for one exchange:
   - It speaks JSONL over stdio and sends `initialize` with `experimentalApi`, then
@@ -41,9 +55,15 @@ inventory, `openpaperdesign_projects`. The server now lists 35 tools and one res
     text to paste. The message asks the agent to continue only if
     `openpaperdesign_status` reports exactly that folder as the workspace, and never to switch
     folders. A message or a listed root grants nothing.
-  - It shows the bound workspace and project only from admitted `openpaperdesign_status` and
-    `open_editor` results that the host delivers (those two tools carry the view as a
-    model-only result presentation).
+  - It shows the bound workspace and project only from admitted `openpaperdesign_status`,
+    `openpaperdesign_canvases` and `open_editor` results that the host delivers. Those three
+    tools carry the view as a model-only result presentation. Each result replaces the last,
+    and a cancelled call leaves nothing to open.
+  - A listed canvas's "Open this canvas" asks the agent to check that workspace, bind
+    without `force`, read the page it shows (not the bind summary), call `open_editor`, open
+    the URL in the in-app browser and say whether it loaded.
+  - An `open_editor` result also offers "Ask the agent to open it", which requests a fresh
+    link.
   - It opens only the exact loopback editor URL through `ui/open-link`. Codex's
     acknowledgement is not proof that the canvas loaded.
   - The only server tool it calls is the inventory, and it stores nothing.
@@ -53,8 +73,13 @@ Issue #6 stays open until these are proven on a real host:
    only been tested here against task-owned fake app-servers; an operator ran a read-only
    `project/list` probe on 2026-10-13.
 2. Workspace authority for model calls in the global entry's own thread. The Mac global
-   receipts carried only thread ids, and no supported route makes a chosen root the chat's
-   workspace.
+   receipts carried only thread ids. The routes inspected so far don't hand a chosen root to
+   an existing desktop chat:
+   - MCP App `ui/message` has only `target`/`send`.
+   - `thread/settings/update` acts only on a thread loaded in that same app-server.
+
+   A thread-entry tab in a project chat uses that chat's own context. That is source metadata
+   only until it is observed on a real host.
 3. Delivery of model results to the view.
 4. Where `ui/open-link` opens the loopback page.
 5. An actual canvas load.

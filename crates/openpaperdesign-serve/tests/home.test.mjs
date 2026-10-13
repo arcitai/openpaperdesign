@@ -32,9 +32,10 @@ const texts = (e) => all(e).map((n) => n.textContent).filter(Boolean);
 
 function mount() {
   const ids = ['conn', 'home', 'inventory', 'projects', 'refresh', 'open', 'current', 'name', 'new', 'msg-state',
-    'prompt', 'result', 'result-state', 'result-fields', 'canvas', 'canvas-state'];
+    'prompt', 'result', 'result-state', 'result-fields', 'result-list', 'canvas', 'ask-open', 'canvas-state'];
   const els = Object.fromEntries(ids.map((id) => [id, el()]));
   els.result.hidden = true; els.prompt.hidden = true; els.canvas.hidden = true; els.refresh.hidden = true;
+  els['ask-open'].hidden = true;
   const sent = [];
   let listener = null;
   // Copy into this realm so deep equality is not confused by the VM context's prototypes.
@@ -280,6 +281,83 @@ test('messages from other windows are ignored', async () => {
   assert.deepEqual(methods(v), ['ui/initialize']);
   v.from(result({ url: URL_OK }), { postMessage() {} });
   assert.equal(v.els.canvas.hidden, true);
+});
+
+// An admitted openpaperdesign_canvases result (fictional workspace).
+const CANVASES = {
+  workspace: '/w/acme', design_present: true, complete: true,
+  canvases: [
+    { project: 'design/Alpha', path: '/w/acme/design/Alpha', bound: false, canvas: { id: 'c-alpha', name: 'Alpha', pages: 2, modified: 1 } },
+    { project: 'design/Beta', path: '/w/acme/design/Beta', bound: true, canvas: { id: 'c-beta', name: 'Beta', pages: 1, modified: 2 } },
+  ],
+  skipped: [{ project: 'design/Escape', problem: 'a symbolic link (not followed)' }],
+};
+const OPENED = { url: URL_OK, workspace: '/w/acme', project: 'design/Beta', project_path: '/w/acme/design/Beta', canvas: { id: 'c-beta', name: 'Beta', pages: 1 } };
+
+test('a canvases result lists this workspace\'s canvases; choosing one asks for a guarded open', async () => {
+  const v = await initialized();
+  v.from(result(CANVASES));
+  assert.equal(v.els.home.hidden, true);
+  assert.equal(v.els['result-state'].textContent, 'Canvases in this workspace:');
+  assert.deepEqual(fields(v), ['Workspace', '/w/acme']);
+  const list = v.els['result-list'].children;
+  assert.deepEqual(texts(list[0]), ['Alpha', 'design/Alpha · 2 pages', 'Open this canvas']);
+  assert.deepEqual(texts(list[1]), ['Beta', 'design/Beta · 1 page · open now', 'Open this canvas']);
+  assert.equal(list[2].textContent, "Skipped 1 folder that isn't a usable canvas.");
+  assert.equal(v.last('ui/message'), undefined, 'listing sends nothing');
+  all(list[0]).find((n) => n.tag === 'button').onclick();
+  await flush();
+  const text = v.last('ui/message').params.content[0].text;
+  assert.match(text, /^Open the OpenPaperDesign canvas "Alpha" at design\/Alpha in the workspace \/w\/acme\. First call openpaperdesign_status\./);
+  assert.match(text, /Continue only if the workspace it reports is exactly that one; otherwise tell me and stop\. Bind design\/Alpha with bind_project\./);
+  assert.match(text, /Never pass force to bind_project/);
+  assert.match(text, /read the page you will show with get_tree_summary \(nodeId root and that page's pageId; the bind summary doesn't count\)/);
+  assert.match(text, /Then call open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded\./);
+  assert.match(v.els['msg-state'].textContent, /Sending to this chat/);
+  onlyAllowed(v);
+});
+
+test('an empty or partial canvases result says so', async () => {
+  const v = await initialized();
+  v.from(result({ ...CANVASES, canvases: [], skipped: [] }));
+  assert.equal(v.els['result-state'].textContent, 'No canvases under design/ in this workspace yet.');
+  assert.equal(v.els['result-list'].children.length, 0);
+  v.from(result({ ...CANVASES, complete: false }));
+  assert.equal(v.els['result-state'].textContent, 'The first 2 canvases in this workspace:');
+});
+
+test('an open_editor result names its own workspace, project and canvas, with an agent fallback', async () => {
+  const v = await initialized();
+  v.from(result(OPENED));
+  assert.deepEqual(fields(v), ['Workspace', '/w/acme', 'Project', 'design/Beta', 'Canvas', 'Beta (1 page)', 'Address', 'local, port 41234']);
+  assert.equal(v.els.canvas.hidden, false);
+  assert.equal(v.els['ask-open'].hidden, false);
+  assert.ok(!JSON.stringify(texts(v.els.result)).includes(TOKEN), 'the token is not displayed');
+  v.els['ask-open'].onclick();
+  await flush();
+  const text = v.last('ui/message').params.content[0].text;
+  assert.match(text, /^Open the OpenPaperDesign canvas for design\/Beta in the in-app browser\. First call openpaperdesign_status\./);
+  assert.match(text, /exactly \/w\/acme and its bound project is \/w\/acme\/design\/Beta; otherwise tell me and stop\. Call open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded\./);
+  assert.ok(!text.includes(TOKEN), 'the agent gets a fresh link, not this one');
+  onlyAllowed(v);
+});
+
+test('each result replaces the last; a cancelled call leaves nothing to open', async () => {
+  const v = await initialized();
+  v.from(result(OPENED));
+  v.from(result({ workspace_state: 'pinned', workspace_usable: true, workspace: '/w/acme', bound_project: null }));
+  assert.equal(v.els.canvas.hidden, true);
+  assert.equal(v.els['ask-open'].hidden, true);
+  assert.deepEqual(fields(v), ['Workspace', '/w/acme', 'Project', 'none bound yet']);
+  v.from(result(OPENED));
+  v.from({ method: 'ui/notifications/tool-cancelled', params: { reason: 'user' } });
+  assert.equal(v.els.canvas.hidden, true);
+  assert.equal(v.els['ask-open'].hidden, true);
+  assert.deepEqual(fields(v), []);
+  assert.equal(v.els['result-state'].textContent, 'The tool call was cancelled; there is nothing to open.');
+  v.els.canvas.onclick();
+  await flush();
+  assert.equal(v.last('ui/open-link'), undefined);
 });
 
 test('the view source calls only the inventory tool and stores nothing', () => {

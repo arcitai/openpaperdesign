@@ -211,8 +211,20 @@ fn own_tools() -> Vec<Tool> {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
             "_meta": {
                 "ui": {"resourceUri": HOME_URI},
-                "openai/ui": {"entrypoints": [{"type": "global"}]}
+                // Global: the sidebar. Thread: a tab inside a chat, whose model calls carry
+                // that chat's own workspace context. Neither entry grants a workspace.
+                "openai/ui": {"entrypoints": [{"type": "global"}, {"type": "thread"}]}
             }
+        }),
+        json!({
+            "name": "openpaperdesign_canvases",
+            "description": "List the existing design canvases (paper-rs projects) directly under \
+                this workspace's design/ folder: project path, canvas name and id, page count, \
+                and which one is bound. Read-only: it creates nothing (not even design/), binds \
+                nothing, follows no links and counts as reading no page. Needs the same \
+                workspace context as every other tool.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "_meta": result_view()
         }),
         json!({
             "name": PROJECTS_TOOL,
@@ -316,6 +328,113 @@ impl Workspace {
             return Err(replaced());
         }
         Ok(())
+    }
+
+    /// The existing paper-rs projects directly under `<workspace>/design/`, read-only. Runs only
+    /// after workspace admission. Each candidate must be a real directory on the workspace's
+    /// file system (links are reported, never followed) with a real `project.json` that passes
+    /// the same checks as binding. Nothing is created: no `design/`, project, server, layout
+    /// entry or page-read acknowledgement. The scan is bounded and says when it stopped early.
+    fn canvases(&self, bound: Option<&Path>) -> ToolResult {
+        const MAX_SCAN: usize = 1000;
+        const MAX_CANVASES: usize = 200;
+        self.check_workspace()?;
+        if let Some(p) = workspace_problem(&self.path) {
+            return Err(format!("refusing to list canvases: {p}"));
+        }
+        let design = self.path.join("design");
+        self.project_path(&design)?;
+        let mut out = serde_json::Map::new();
+        out.insert("workspace".into(), json!(self.path));
+        let present = crate::plain(&design, crate::Kind::Dir)
+            .map_err(|e| format!("design/ can't be listed: {e}"))?;
+        out.insert("design_present".into(), json!(present));
+        let (mut canvases, mut skipped, mut complete) = (vec![], vec![], true);
+        if present {
+            let design_dev = identity(&real_dir(&design)?).0;
+            let entries = std::fs::read_dir(&design).map_err(|e| format!("design/: {e}"))?;
+            for (n, entry) in entries.enumerate() {
+                if n >= MAX_SCAN || canvases.len() >= MAX_CANVASES {
+                    complete = false;
+                    break;
+                }
+                let entry = entry.map_err(|e| format!("design/: {e}"))?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    skipped.push(
+                        json!({"project": null, "problem": "a folder name that isn't valid UTF-8"}),
+                    );
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let rel = format!("design/{name}");
+                let dir = design.join(name);
+                let mut skip =
+                    |problem: String| skipped.push(json!({"project": rel, "problem": problem}));
+                if let Err(e) = self.project_path(&dir) {
+                    skip(e);
+                    continue;
+                }
+                let m = match std::fs::symlink_metadata(&dir) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        skip(e.to_string());
+                        continue;
+                    }
+                };
+                if m.file_type().is_symlink() {
+                    skip("a symbolic link (not followed)".into());
+                    continue;
+                }
+                if !m.is_dir() {
+                    continue;
+                }
+                if identity(&m).0 != design_dev {
+                    skip("on another file system (not followed)".into());
+                    continue;
+                }
+                match crate::plain(&dir.join(paper_rs::project::MANIFEST), crate::Kind::File) {
+                    Ok(false) => continue, // not a paper-rs project
+                    Err(e) => {
+                        skip(e);
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                let checked = crate::check_project_dir(&dir)
+                    .and_then(|()| crate::read_manifest_checked(&dir));
+                match checked {
+                    Ok(manifest) => canvases.push(json!({
+                        "project": rel,
+                        "path": dir,
+                        "bound": bound == Some(dir.as_path()),
+                        "canvas": {
+                            "id": manifest.id,
+                            "name": manifest.name,
+                            "pages": manifest.pages.len(),
+                            "modified": manifest.modified,
+                        },
+                    })),
+                    Err(e) => skip(e),
+                }
+            }
+        }
+        canvases.sort_by(|a, b| a["project"].as_str().cmp(&b["project"].as_str()));
+        skipped.sort_by(|a, b| a["project"].as_str().cmp(&b["project"].as_str()));
+        out.insert("complete".into(), json!(complete));
+        out.insert("canvases".into(), json!(canvases));
+        out.insert("skipped".into(), json!(skipped));
+        out.insert(
+            "note".into(),
+            json!(
+                "Read-only discovery: nothing was created or bound, and no page counts as read. \
+                   To open one, bind_project its project path, read the page you will change \
+                   (get_tree_summary root with its pageId), then call open_editor."
+            ),
+        );
+        text(Value::Object(out))
     }
 
     /// Create `design/<folder>/pages/` without following links: each component is made with
@@ -608,11 +727,29 @@ impl Launcher {
                     );
                 }
                 b.editor_opened = true;
+                // Self-contained identity from this admitted call: the validated workspace and
+                // the bound project, whose manifest is read with the binding checks. Reading
+                // it acknowledges no page.
+                let dir = b.server.dir().to_path_buf();
+                let canvas = crate::read_manifest_checked(&dir)
+                    .ok()
+                    .map(|m| json!({"id": m.id, "name": m.name, "pages": m.pages.len()}));
                 text(json!({
                     "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
+                    "workspace": ws.path,
+                    "project": ws.relative(&dir),
+                    "project_path": dir,
+                    "canvas": canvas,
                     "open_in": "the host's in-app browser (loopback only)",
                     "note": "The token in the URL is for this session only; don't write it into files.",
                 }))
+            }
+            "openpaperdesign_canvases" => {
+                if args.as_object().is_some_and(|a| !a.is_empty()) {
+                    return Err("openpaperdesign_canvases takes no arguments; it lists this workspace's design/ folder.".into());
+                }
+                let bound = state.bound.as_ref().map(|b| b.server.dir().to_path_buf());
+                ws.canvases(bound.as_deref())
             }
             _ => {
                 let server = {

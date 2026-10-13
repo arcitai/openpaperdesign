@@ -15,7 +15,9 @@ run time; there is no cloud service and no telemetry.
 
 Check first: run `openpaperdesign-mcp --version` and `openpaperdesign-mcp doctor`. `doctor`
 prints JSON and exits 0 when the command, the built-in browser editor and the platform are
-fine. Report its output as is.
+fine. Report its output as is. The sidebar home's Codex project list also needs the `codex`
+command on that same `PATH`. Without it the home says the list is unavailable, and
+everything else still works.
 
 The package starts `openpaperdesign-mcp --codex-context`. Codex starts it in the plugin
 folder; that folder cannot authorize edits. Workspace and permissions come from Codex

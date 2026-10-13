@@ -19,10 +19,11 @@ see each other's changes live.
    host-generated context on real model tool calls, not its plugin-folder cwd or tool
    arguments. If unusable, report `workspace_problem` and stop; do not invent metadata,
    change permissions, or bypass the refusal with another route.
-2. **Bind deliberately.** Nothing is open until you bind. Use `bind_project` with an existing
-   project folder inside the workspace (a folder with `project.json`, usually under
-   `design/`), or `create_project` for a new one under `design/<name>/`. If several projects
-   could be meant, ask which. Binding again switches projects; a failed bind keeps the
+2. **Bind deliberately.** Nothing is open until you bind. `openpaperdesign_canvases` lists the
+   existing canvases (projects directly under `design/`) in this workspace, read-only. Use
+   `bind_project` with one of them, or another existing project folder inside the workspace
+   (a folder with `project.json`), or `create_project` for a new one under `design/<name>/`.
+   If several projects could be meant, ask which. Binding again switches projects; a failed bind keeps the
    current one. Once you've called `open_editor`, switching stops the server the browser tab
    saves to, so the person's unsaved edits there would be lost. The switch is then refused
    until you call it again with `force: true`. Ask the person first (let their edits save, or
@@ -38,8 +39,10 @@ see each other's changes live.
    tools (`write_html`, `create_shape`, `update_styles`, `move_nodes`, `delete_nodes`,
    `rename_pages`, …). Each change is saved to the project at once.
 4. **Open the canvas.** Call `open_editor` and open the returned
-   `http://127.0.0.1:<port>/#token=…` URL in the in-app browser. The token is for this
-   session only: don't write it into files or commits.
+   `http://127.0.0.1:<port>/#token=…` URL in the in-app browser. Its result also names the
+   workspace, the bound project and its canvas; check they're the ones meant. Say whether
+   the canvas actually loaded. The token is for this session only: don't write it into files
+   or commits.
 5. **Work together.** Your saved changes show up in the canvas when the person has nothing
    unsaved there. If the person has an unsaved edit while you write the same page, their save
    is refused and the page shows a conflict; nothing is overwritten either way. Let the person
@@ -66,10 +69,13 @@ Limits (state them when relevant):
 - Image fills aren't drawn in the browser canvas yet; multi-page editing in the browser is
   limited to the active page.
 
-The OpenPaperDesign home in the Codex sidebar (`openpaperdesign_home`) is a static view. Its
-buttons send you requests like the steps above as ordinary user messages; they grant no
-workspace and name no authority. Follow the same steps and refusals. Opening an existing
-project changes nothing in it.
+The OpenPaperDesign home (`openpaperdesign_home`, in the Codex sidebar and as a chat tab) is a
+static view. Its buttons send you requests like the steps above as ordinary user messages;
+they grant no workspace and name no authority. Follow the same steps and refusals. When a
+request names a workspace or project, continue only if `openpaperdesign_status` shows
+exactly that. Opening an existing project changes nothing in it: no `DESIGN.md`, token,
+asset or folder is created, copied or moved. A new canvas follows the
+[design](../design/SKILL.md) method.
 
 `openpaperdesign_projects` lists the Codex projects saved on this computer, with every root
 folder: discovery only. When the person picks a folder there, use it only if

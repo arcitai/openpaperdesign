@@ -666,18 +666,26 @@ async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
         .into_iter()
         .map(|t| serde_json::to_value(t).unwrap())
         .collect();
-    assert_eq!(tools.len(), 35, "4 own + home + projects + 29 offered");
+    assert_eq!(
+        tools.len(),
+        36,
+        "4 own + home + projects + canvases + 29 offered"
+    );
     let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
     let home = tool("openpaperdesign_home");
     assert_eq!(
         home["_meta"],
-        json!({"ui":{"resourceUri":HOME},"openai/ui":{"entrypoints":[{"type":"global"}]}})
+        json!({"ui":{"resourceUri":HOME},"openai/ui":{"entrypoints":[{"type":"global"},{"type":"thread"}]}})
     );
     assert_eq!(
         home["inputSchema"],
         json!({"type":"object","properties":{},"additionalProperties":false})
     );
-    for n in ["openpaperdesign_status", "open_editor"] {
+    for n in [
+        "openpaperdesign_status",
+        "open_editor",
+        "openpaperdesign_canvases",
+    ] {
         assert_eq!(
             tool(n)["_meta"],
             json!({"ui":{"resourceUri":HOME,"visibility":["model"]}}),
@@ -908,5 +916,234 @@ async fn synthetic_native_inventory_is_read_only_discovery_beside_the_pinned_bin
     assert_eq!(v["available"], false);
     assert_eq!(v["reason"], "codex_not_found");
     assert_eq!(status(&c, meta).await["workspace_usable"], true);
+    c.cancel().await.unwrap();
+}
+
+/// Every entry under `dir`, without following links: (path, bytes | "dir" | "link:<target>").
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut all = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            let v = if m.file_type().is_symlink() {
+                format!("link:{}", std::fs::read_link(&p).unwrap().display()).into_bytes()
+            } else if m.is_dir() {
+                stack.push(p.clone());
+                b"dir".to_vec()
+            } else {
+                std::fs::read(&p).unwrap()
+            };
+            all.push((p, v));
+        }
+    }
+    all.sort();
+    all
+}
+
+async fn canvases(c: &Client, args: Value, m: RequestMetaObject) -> (bool, String) {
+    call(c, "openpaperdesign_canvases", args, m).await
+}
+
+/// Current-workspace canvas discovery is an admitted tool like status: same context rules and
+/// retirement, read-only, no links followed, nothing created, and no page counts as read.
+/// `open_editor` names the same workspace and bound project in its own result.
+#[tokio::test]
+async fn synthetic_canvas_discovery_is_admitted_read_only_and_names_the_bound_canvas() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    // A normal Git worktree's opaque `.git` file and existing root guidance stay as they are.
+    std::fs::write(f.ws.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+    std::fs::write(f.ws.join("design.md"), "# Direction\n").unwrap();
+    let c = f.host().await;
+    let meta = context::writable(&f.ws);
+
+    let (ok, s) = canvases(&c, json!({"path": "/"}), meta.clone()).await;
+    assert!(!ok && s.contains("takes no arguments"), "{s}");
+    // No design/ yet: an empty answer, and design/ is not created.
+    let (ok, s) = canvases(&c, json!({}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let v: Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["workspace"], f.ws.to_str().unwrap());
+    assert_eq!(v["design_present"], false);
+    assert_eq!(v["complete"], true);
+    assert_eq!(v["canvases"], json!([]));
+    assert!(!f.ws.join("design").exists());
+
+    for name in ["Alpha", "Beta"] {
+        let (ok, s) = call(&c, "create_project", json!({"name": name}), meta.clone()).await;
+        assert!(ok, "{s}");
+    }
+    let design = f.ws.join("design");
+    std::fs::create_dir(design.join("Broken")).unwrap();
+    std::fs::write(design.join("Broken/project.json"), "not json").unwrap();
+    std::fs::create_dir(design.join("notes")).unwrap();
+    std::fs::write(design.join("README.md"), "plain file").unwrap();
+    std::fs::create_dir(design.join(".cache")).unwrap();
+    std::fs::copy(
+        design.join("Alpha/project.json"),
+        design.join(".cache/project.json"),
+    )
+    .unwrap();
+    let outside = f.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::copy(
+        design.join("Alpha/project.json"),
+        outside.join("project.json"),
+    )
+    .unwrap();
+    symlink(&outside, design.join("Escape")).unwrap();
+    std::fs::create_dir(design.join("LinkedManifest")).unwrap();
+    symlink(
+        outside.join("project.json"),
+        design.join("LinkedManifest/project.json"),
+    )
+    .unwrap();
+
+    let before = snapshot(&f.root);
+    let (ok, s) = canvases(&c, json!({}), meta.clone()).await;
+    assert!(ok, "{s}");
+    assert_eq!(snapshot(&f.root), before, "discovery changed nothing");
+    let v: Value = serde_json::from_str(&s).unwrap();
+    let manifest = |n: &str| -> Value {
+        serde_json::from_slice(&std::fs::read(design.join(n).join("project.json")).unwrap())
+            .unwrap()
+    };
+    let entry = |n: &str, bound: bool| {
+        let m = manifest(n);
+        json!({
+            "project": format!("design/{n}"),
+            "path": design.join(n).to_str().unwrap(),
+            "bound": bound,
+            "canvas": {"id": m["id"], "name": n, "pages": 1, "modified": m["modified"]},
+        })
+    };
+    assert_eq!(v["design_present"], true);
+    assert_eq!(v["complete"], true);
+    assert_eq!(
+        v["canvases"],
+        json!([entry("Alpha", false), entry("Beta", true)])
+    );
+    let skipped: Vec<(&str, &str)> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["project"].as_str().unwrap(),
+                s["problem"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(skipped.len(), 3, "{skipped:?}");
+    assert_eq!(skipped[0].0, "design/Broken");
+    assert_eq!(
+        skipped[1],
+        ("design/Escape", "a symbolic link (not followed)")
+    );
+    assert_eq!(skipped[2].0, "design/LinkedManifest");
+    assert!(skipped[2].1.contains("symbolic link"), "{skipped:?}");
+    assert!(!s.contains("notes") && !s.contains("README") && !s.contains(".cache"));
+
+    // Discovery is not a page read: a change to the bound project's page is still refused.
+    let (ok, s) = call(
+        &c,
+        "create_artboard",
+        json!({"name":"Unread","styles":{"width":"10px","height":"10px"}}),
+        meta.clone(),
+    )
+    .await;
+    assert!(!ok && s.to_lowercase().contains("conflict"), "{s}");
+    assert_eq!(snapshot(&f.root), before);
+
+    // open_editor names the same validated workspace and bound project.
+    let st = status(&c, meta.clone()).await;
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    if st["browser_editor"] == "built in" {
+        assert!(ok, "{s}");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["workspace"], f.ws.to_str().unwrap());
+        assert_eq!(v["project"], "design/Beta");
+        assert_eq!(v["project_path"], design.join("Beta").to_str().unwrap());
+        assert_eq!(v["canvas"]["name"], "Beta");
+        assert_eq!(v["canvas"]["id"], manifest("Beta")["id"]);
+        assert_eq!(v["canvas"]["pages"], 1);
+        let token = v["url"].as_str().unwrap().split("#token=").nth(1).unwrap();
+        assert_eq!(token.len(), 64);
+    } else {
+        assert!(!ok, "{s}");
+    }
+
+    // Missing context fails closed and retires the session, as for status.
+    let (ok, s) = canvases(&c, json!({}), Default::default()).await;
+    assert!(!ok && s.contains("No call was run"), "{s}");
+    assert_eq!(status(&c, meta.clone()).await["workspace_state"], "retired");
+    assert!(!canvases(&c, json!({}), meta.clone()).await.0);
+    c.cancel().await.unwrap();
+
+    for case in ["changed", "readonly", "malformed"] {
+        let c = f.host().await;
+        assert_eq!(status(&c, meta.clone()).await["workspace_state"], "pinned");
+        let bad = match case {
+            "changed" => context::writable(&f.root),
+            "readonly" => context::readonly(&f.ws),
+            _ => {
+                let mut m = meta.clone();
+                m.get_mut(context::KEY).unwrap()["sandboxCwd"] = json!(12);
+                m
+            }
+        };
+        let (ok, s) = canvases(&c, json!({}), bad).await;
+        assert!(!ok, "{case}: {s}");
+        assert_eq!(
+            status(&c, meta.clone()).await["workspace_state"],
+            "retired",
+            "{case}"
+        );
+        c.cancel().await.unwrap();
+    }
+    assert_eq!(
+        std::fs::read(f.ws.join("design.md")).unwrap(),
+        b"# Direction\n"
+    );
+    f.no_cache_writes();
+}
+
+/// The scan is bounded and says so; a linked design/ folder is refused, not followed.
+#[tokio::test]
+async fn synthetic_canvas_discovery_is_bounded_and_refuses_a_linked_design_folder() {
+    let f = Fixture::new();
+    let c = f.host().await;
+    let meta = context::writable(&f.ws);
+    let (ok, s) = call(&c, "create_project", json!({"name": "Seed"}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let design = f.ws.join("design");
+    for i in 0..204 {
+        let d = design.join(format!("Copy{i:03}"));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::copy(design.join("Seed/project.json"), d.join("project.json")).unwrap();
+    }
+    let (ok, s) = call(&c, "openpaperdesign_canvases", json!({}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let v: Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["complete"], false);
+    assert_eq!(v["canvases"].as_array().unwrap().len(), 200);
+    c.cancel().await.unwrap();
+
+    let g = Fixture::new();
+    let elsewhere = g.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, g.ws.join("design")).unwrap();
+    let c = g.host().await;
+    let (ok, s) = call(
+        &c,
+        "openpaperdesign_canvases",
+        json!({}),
+        context::writable(&g.ws),
+    )
+    .await;
+    assert!(!ok && s.contains("design/ can't be listed"), "{s}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     c.cancel().await.unwrap();
 }
