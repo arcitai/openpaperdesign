@@ -15,7 +15,11 @@
         "shortDescription": "Agent + human design canvas",
         "longDescription": "Binds one paper-rs design project in the workspace, lets the agent edit it over MCP, and opens the editable canvas in the in-app browser on a loopback URL. Local only: no cloud, no telemetry. Not affiliated with Paper (paper.design).",
         "developerName": "onlinesourdough",
-        "category": "Design"
+        "category": "Design",
+        "logo": "./assets/logo.svg",
+        "logoDark": "./assets/logo-dark.svg",
+        "composerIcon": "./assets/icon.svg",
+        "composerIconDark": "./assets/icon-dark.svg"
       },
       "onboardingSkill": "./skills/setup"
     }

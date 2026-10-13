@@ -1402,3 +1402,89 @@ async fn synthetic_open_editor_refuses_a_replaced_or_linked_bound_project() {
     f.no_cache_writes();
     c.cancel().await.unwrap();
 }
+
+/// The plugin's mark reaches the host on the wire exactly as packaged: the home entry's tool
+/// `icons` and the `serverInfo.icons` fallback are SVG data URIs that decode to the bytes of
+/// `plugin/openpaperdesign/assets/icon.svg` (light) and `icon-dark.svg` (dark). Only the home
+/// carries icons, and it stays the only entrypoint.
+#[tokio::test]
+async fn synthetic_icons_are_the_packaged_assets() {
+    fn unbase64(s: &str) -> Vec<u8> {
+        let val = |c: u8| match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("not base64: {c}"),
+        };
+        let bytes = s.trim_end_matches('=').as_bytes();
+        let mut out = vec![];
+        for chunk in bytes.chunks(4) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &c)| n | u32::from(val(c)) << (18 - 6 * i));
+            for i in 0..chunk.len() - 1 {
+                out.push((n >> (16 - 8 * i)) as u8);
+            }
+        }
+        out
+    }
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/openpaperdesign/assets");
+    let f = Fixture::new();
+    let c = f.host().await;
+    let tools: Vec<Value> = c
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    let home = tools
+        .iter()
+        .find(|t| t["name"] == "openpaperdesign_home")
+        .unwrap();
+    let icons = home["icons"].as_array().unwrap();
+    assert_eq!(icons.len(), 2);
+    for (icon, (file, theme)) in icons
+        .iter()
+        .zip([("icon.svg", "light"), ("icon-dark.svg", "dark")])
+    {
+        assert_eq!(icon["mimeType"], "image/svg+xml");
+        assert_eq!(icon["sizes"], json!(["any"]));
+        assert_eq!(icon["theme"], theme);
+        let src = icon["src"].as_str().unwrap();
+        let data = src
+            .strip_prefix("data:image/svg+xml;base64,")
+            .expect("an inline data URI, never a URL");
+        let decoded = unbase64(data);
+        assert_eq!(decoded, std::fs::read(assets.join(file)).unwrap(), "{file}");
+        let svg = String::from_utf8(decoded).unwrap();
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\""));
+        for banned in [
+            "<script",
+            "foreignObject",
+            "href",
+            "url(",
+            "<image",
+            "<style",
+        ] {
+            assert!(!svg.contains(banned), "{file}: {banned}");
+        }
+    }
+    let with_icons = tools.iter().filter(|t| t.get("icons").is_some()).count();
+    assert_eq!(with_icons, 1, "only the home entry has icons");
+    let entries = tools
+        .iter()
+        .filter(|t| t["_meta"].get("openai/ui").is_some())
+        .count();
+    assert_eq!(entries, 1, "no new entrypoint");
+    let server = serde_json::to_value(&c.peer_info().unwrap().server_info).unwrap();
+    assert_eq!(
+        server["icons"], home["icons"],
+        "the server icon fallback is the same mark"
+    );
+    assert_eq!(server["name"], "openpaperdesign");
+    c.cancel().await.unwrap();
+}

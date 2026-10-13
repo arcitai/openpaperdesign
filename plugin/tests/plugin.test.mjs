@@ -70,6 +70,37 @@ test('every ./ path in the manifests exists inside its root', () => {
   assert.ok(n >= 2, 'the onboarding skill and the marketplace path were checked');
 });
 
+test('interface icons are contained, square, static SVGs of at least 48 px', () => {
+  // plugin-creator 0.1.26 packaging reference (read by the operator): logo and composerIcon
+  // (dark variants optional) are contained relative paths to square PNG/JPEG/WebP/SVG files
+  // of at least 48x48 and at most 5 MiB. Whether Codex shows them is only proven installed.
+  const ui = json(join(plugin, 'plugin.json')).extensions['com.openai'].interface;
+  const fields = ['logo', 'logoDark', 'composerIcon', 'composerIconDark'];
+  const files = new Set();
+  for (const f of fields) {
+    const abs = inside(plugin, ui[f]);
+    assert.match(ui[f], /^\.\/assets\/[a-z-]+\.svg$/, f);
+    assert.ok(statSync(abs).size <= 5 * 1024 * 1024, `${f}: at most 5 MiB`);
+    const svg = readFileSync(abs, 'utf8');
+    assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" /, `${f}: one root svg`);
+    const attr = (k) => Number((svg.match(new RegExp(` ${k}="([0-9.]+)"`)) || [])[1]);
+    assert.ok(attr('width') >= 48 && attr('width') === attr('height'), `${f}: square, >= 48`);
+    assert.match(svg, / viewBox="0 0 24 24"/, `${f}: square viewBox`);
+    // Static and self-contained: nothing that runs, styles, loads or embeds.
+    for (const banned of ['<script', 'foreignObject', 'href', 'url(', '<style', 'style=', '<text',
+      '<image', '@import', 'on', '<!']) {
+      if (banned === 'on') assert.doesNotMatch(svg, /\son[a-z]+=/i, `${f}: no event handler`);
+      else assert.ok(!svg.includes(banned), `${f}: no ${banned}`);
+    }
+    assert.deepEqual(svg.match(/https?:\/\/[^"]*/g), ['http://www.w3.org/2000/svg'], `${f}: no external reference`);
+    files.add(ui[f]);
+  }
+  assert.equal(files.size, 4, 'distinct light/dark logo and composer icon');
+  // Sandboxed sessions can leave empty dot placeholders (see AGENTS.md); they aren't assets.
+  const assets = readdirSync(join(plugin, 'assets')).filter((n) => !n.startsWith('.')).sort();
+  assert.deepEqual(assets, ['icon-dark.svg', 'icon.svg', 'logo-dark.svg', 'logo.svg']);
+});
+
 test('one manifest: no .codex-plugin overlay to contradict plugin.json', () => {
   assert.ok(!existsSync(join(plugin, '.codex-plugin')));
 });

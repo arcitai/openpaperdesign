@@ -209,6 +209,7 @@ fn own_tools() -> Vec<Tool> {
                 canvas use openpaperdesign_status, then bind_project or create_project, then \
                 open_editor.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "icons": icons(),
             "_meta": {
                 "ui": {"resourceUri": HOME_URI},
                 // Global: the sidebar. Thread: a tab inside a chat, whose model calls carry
@@ -242,6 +243,44 @@ fn own_tools() -> Vec<Tool> {
     .into_iter()
     .map(|t| serde_json::from_value(t).expect("valid tool"))
     .collect()
+}
+
+/// The plugin's mark, from its packaged assets (`plugin/openpaperdesign/assets`), as static
+/// SVG data URIs: dark ink for light backgrounds, light ink for dark ones. Used for the home
+/// entry (tool `icons`) and as the server icon fallback (`serverInfo.icons`); no URL, file
+/// access or listener is involved.
+const ICON_LIGHT: &[u8] = include_bytes!("../../../plugin/openpaperdesign/assets/icon.svg");
+const ICON_DARK: &[u8] = include_bytes!("../../../plugin/openpaperdesign/assets/icon-dark.svg");
+
+fn icons() -> Value {
+    let icon = |svg: &[u8], theme: &str| {
+        json!({
+            "src": format!("data:image/svg+xml;base64,{}", base64(svg)),
+            "mimeType": "image/svg+xml",
+            "sizes": ["any"],
+            "theme": theme,
+        })
+    };
+    json!([icon(ICON_LIGHT, "light"), icon(ICON_DARK, "dark")])
+}
+
+/// Standard base64 with padding (RFC 4648), for the icon data URIs.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// The home view also presents the model's own status and editor results. Model-only: the
@@ -794,7 +833,10 @@ impl ServerHandler for Launcher {
         // Safe to advertise in standalone mode too; only --codex-context consumes it.
         capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
         ServerConfig::new(capabilities)
-            .with_server_info(Implementation::new("openpaperdesign", VERSION))
+            .with_server_info(
+                Implementation::new("openpaperdesign", VERSION)
+                    .with_icons(serde_json::from_value(icons()).expect("valid icons")),
+            )
             .with_instructions(format!(
                 "openpaperdesign: an editable design canvas (paper-rs) for this workspace. \
                  Check openpaperdesign_status first. In packaged Codex mode every call except \

@@ -292,8 +292,19 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
   - **Later installed evidence:** on `0921280`, Codex discovered four skills and 33 tools
     without an overlay. That historical discovery check did not qualify editing/browser behavior.
 - **Field limits:** the staged reference (`codex-plugin-packages-0.1.26.md`, checked by the
-  B2b review) caps only `shortDescription` (30 characters). `defaultPrompt` and the icon
-  fields have rules of their own but aren't set. No other caps apply to the fields set here.
+  B2b review) caps only `shortDescription` (30 characters). `defaultPrompt` isn't set. The
+  icon fields (issue #8) follow plugin-creator 0.1.26's packaging rule: contained relative
+  paths to square PNG/JPEG/WebP/SVG files of at least 48×48 and at most 5 MiB.
+- **Icon (issue #8, source only):**
+  - The static SVGs live in `assets/`: `logo.svg`/`logo-dark.svg` for the listing, and
+    `icon.svg`/`icon-dark.svg` for the composer. Each has a 24-unit `viewBox` and a 48×48
+    intrinsic size.
+  - The mark is an open sheet with a folded corner and a selection handle.
+  - The launcher embeds `icon.svg`/`icon-dark.svg` at build time. It sends them as SVG data
+    URIs (light and dark themes) in the home entry's tool `icons` and as the `serverInfo.icons`
+    fallback.
+  - Whether Codex shows them in the listing, the composer or the sidebar is unproven until
+    it is installed.
 
 ### Ported design methods (AIOS #54)
 
