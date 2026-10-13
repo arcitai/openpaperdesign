@@ -139,14 +139,26 @@ target page (`get_tree_summary` root with its `pageId`) before its first change.
 audit rejects duplicate evidence (JSON keys, repeated records). Keep the ported `design` and `review-design` skills' provenance notes and
 LICENSE files, and the plugin's `NOTICE.md`, intact.
 
-Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): `openpaperdesign_home` and
-the `ui://openpaperdesign/home.html` resource are answered before workspace admission. They
-read or change no context, binding, project, listener or file, and the tool refuses
-arguments. This named exemption covers only those two; never route another tool around
-admission. The view never calls server tools and stores nothing (no URL, token or path). Its
+Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): three things are answered
+before workspace admission:
+- `openpaperdesign_home`, which refuses arguments.
+- The `ui://openpaperdesign/home.html` resource.
+- The read-only native inventory `openpaperdesign_projects` (only `projectId`).
+
+They read or change none of the session's context, binding, project, listener or files. This
+named exemption covers only those three; never route another tool around admission.
+
+The inventory starts `codex app-server` from PATH for one bounded exchange. It sends only
+`initialize` (`experimentalApi`), `initialized`, and `project/list` or `project/read`, with
+schema checks, a deadline and kill-on-drop. Never add thread, turn, settings, auth or project
+writes to it. It keeps Codex's namespace and ids, and every root. A listed project or root is
+discovery, never authority: never join it with other ids by name, and never pick a root for
+the person.
+
+The view calls only that inventory tool and stores nothing (no URL, token or path). Its
 actions are user messages (`ui/message`), which grant nothing. It shows only admitted
 `openpaperdesign_status`/`open_editor` results that the host delivers, and opens only the
-exact loopback editor URL. A native Codex project list or root is discovery, never authority.
+exact loopback editor URL.
 
 ## Model profile
 

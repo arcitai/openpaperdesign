@@ -45,6 +45,8 @@ include!(concat!(env!("OUT_DIR"), "/bundle.rs"));
 #[cfg(test)]
 use tests::BUNDLE_FILES;
 
+#[path = "launcher_inventory.rs"]
+mod inventory;
 #[path = "launcher_scope.rs"]
 mod scope;
 use scope::{CAPABILITY, Workspace};
@@ -58,11 +60,17 @@ const SWITCH_NEEDS_FORCE: &str = "The browser editor for the bound project was o
     tool edits are already saved by each call. Ask the person to let their edits save (the \
     page shows \"Saved\") or to accept losing them, then call again with force: true.";
 
-/// The home: one global-entry tool and its static MCP App view. Both are answered before
-/// workspace admission because they touch nothing: no context, binding, project, listener or
-/// file. They never read or change the session's workspace state, so opening the home cannot
-/// pin, inspect or retire a binding. Every other tool keeps per-call admission unchanged.
+/// The home: one global-entry tool and its static MCP App view, plus the read-only native
+/// project inventory it shows. All three are answered before workspace admission because they
+/// touch none of this session's state: no context, binding, project, listener or workspace
+/// file. They never read or change it, so they cannot pin, inspect or retire a binding. The
+/// inventory reads Codex's own project list through its CLI; a listed root is discovery, never
+/// authority. Every other tool keeps per-call admission unchanged.
 const HOME_TOOL: &str = "openpaperdesign_home";
+const PROJECTS_TOOL: &str = "openpaperdesign_projects";
+const INVENTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// One inventory child process at a time per session.
+static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const HOME_URI: &str = "ui://openpaperdesign/home.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
@@ -206,6 +214,18 @@ fn own_tools() -> Vec<Tool> {
                 "openai/ui": {"entrypoints": [{"type": "global"}]}
             }
         }),
+        json!({
+            "name": PROJECTS_TOOL,
+            "description": "List the Codex projects saved on this computer (read-only, from the \
+                Codex CLI's app-server: project/list, or project/read with projectId), each \
+                with its id and every root folder. Discovery only: a listed root is not this \
+                chat's workspace and grants nothing; openpaperdesign_status shows the \
+                workspace you can use. Reports available: false with a reason when the list \
+                can't be read.",
+            "inputSchema": {"type": "object", "properties": {
+                "projectId": {"type": "string", "maxLength": 256, "description": "Read just this project (an id from the list)."}
+            }, "additionalProperties": false}
+        }),
     ]
     .into_iter()
     .map(|t| serde_json::from_value(t).expect("valid tool"))
@@ -230,6 +250,44 @@ fn home(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
         "version": VERSION,
         "note": "Static home view. Nothing was read or changed. Use openpaperdesign_status to check this chat's workspace.",
     }))
+}
+
+/// `openpaperdesign_projects`: the native inventory, answered without workspace admission and
+/// without touching state. Only `projectId` is accepted.
+async fn projects(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
+    let empty = serde_json::Map::new();
+    let args = args.unwrap_or(&empty);
+    if let Some(k) = args.keys().find(|k| *k != "projectId") {
+        return Err(format!(
+            "{PROJECTS_TOOL} accepts only projectId, not `{k}`."
+        ));
+    }
+    let id = match args.get("projectId") {
+        None => None,
+        Some(Value::String(s))
+            if !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control) =>
+        {
+            Some(s.as_str())
+        }
+        Some(_) => return Err("projectId must be a non-empty project id string.".into()),
+    };
+    use std::sync::atomic::Ordering;
+    if INVENTORY_BUSY.swap(true, Ordering::AcqRel) {
+        return Err("The Codex project list is already being read; try again.".into());
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            INVENTORY_BUSY.store(false, Ordering::Release);
+        }
+    }
+    let _release = Release;
+    let query = id.map_or(inventory::Query::List, inventory::Query::Read);
+    // The normal command route: `codex` on this process's PATH. No fixed install path.
+    match inventory::read(std::ffi::OsStr::new("codex"), query, INVENTORY_DEADLINE).await {
+        Ok(v) => text(v),
+        Err(why) => text(why.to_json()),
+    }
 }
 
 impl Workspace {
@@ -583,8 +641,10 @@ impl ServerHandler for Launcher {
             .with_instructions(format!(
                 "openpaperdesign: an editable design canvas (paper-rs) for this workspace. \
                  Check openpaperdesign_status first. In packaged Codex mode every call except \
-                 the static openpaperdesign_home view needs host-generated workspace and \
-                 supported permission context; tool arguments cannot supply it. If workspace_usable is false, report workspace_problem \
+                 the static openpaperdesign_home view and the read-only openpaperdesign_projects \
+                 list needs host-generated workspace and supported permission context; tool \
+                 arguments cannot supply it, and a listed Codex project folder is not the \
+                 workspace. If workspace_usable is false, report workspace_problem \
                  and stop editing. First \
                  bind a project deliberately (bind_project for an existing one inside the \
                  workspace, or create_project under design/). Before changing a page, read \
@@ -649,6 +709,9 @@ impl ServerHandler for Launcher {
     ) -> Result<CallToolResponse, ErrorData> {
         if request.name == HOME_TOOL {
             return Ok(to_result(home(request.arguments.as_ref())).into());
+        }
+        if request.name == PROJECTS_TOOL {
+            return Ok(to_result(projects(request.arguments.as_ref()).await).into());
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
         Ok(to_result(self.run(&request.name, args, &context.meta).await).into())

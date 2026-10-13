@@ -14,33 +14,47 @@ surface), plugin publishing, other hosts. The later sidebar home is described in
 ## Sidebar home (issue #6): source candidate, 2026-10-13
 
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
-adds `openpaperdesign_home`, the Codex sidebar (global) entry, and its static MCP App view
-`ui://openpaperdesign/home.html` (`text/html;profile=mcp-app`). The server now lists 34 tools
-and one resource.
+adds `openpaperdesign_home`, the Codex sidebar (global) entry, its static MCP App view
+`ui://openpaperdesign/home.html` (`text/html;profile=mcp-app`), and a read-only native project
+inventory, `openpaperdesign_projects`. The server now lists 35 tools and one resource.
 
-- **Home tool and view resource.** Both are answered before workspace admission. They read and
-  change no context, binding, project, listener or file, and the tool refuses any argument.
-  The exemption names exactly these two. Every other tool keeps per-call admission and
-  retirement unchanged.
-- **The view never calls the server's tools and stores nothing.**
-  - Its actions (open an existing canvas, new canvas, current project) send a user message
-    to the active chat with `ui/message`, only when the host advertises `message.text`.
-    Otherwise they show the text to paste. A message grants nothing; the model runs the usual
-    guarded steps.
-  - It shows project details only from admitted `openpaperdesign_status` and `open_editor`
-    results that the host delivers. Those two tools carry the view as a model-only result
-    presentation.
-  - It opens only the exact loopback editor URL, through `ui/open-link`. Codex's
+- **Answered before workspace admission.** The home tool, the view resource and the inventory
+  read or change none of the session's context, binding, project, listener or files. The home
+  refuses any argument; the inventory accepts only `projectId`. The exemption names exactly
+  these three. Every other tool keeps per-call admission and retirement unchanged.
+- **Native inventory.** This is Codex CLI 0.162.1's experimental app-server, started as
+  `codex app-server` from PATH for one exchange:
+  - It speaks JSONL over stdio and sends `initialize` with `experimentalApi`, then
+    `initialized`, then `project/list` (pages of 100, at most 10) or `project/read`.
+  - Every reply is checked against the 0.162.1 schemas. Anything else, a missing CLI, an
+    error, a 15 s timeout or an oversized line gives `available: false` with a reason and no
+    paths.
+  - The child is closed afterwards and killed if it lingers or the call is cancelled.
+  - There are no threads, turns, settings, auth or project writes.
+  - Projects keep Codex's `codex-app-server` namespace, their ids and every root. Ids are not
+    joined with desktop or cloud ids by name.
+- **The view.**
+  - It shows the projects with each folder and a "Use this folder" button. It never picks a
+    root.
+  - Choosing a folder, like the other actions, sends a user message to the active chat with
+    `ui/message`, and only when the host advertises `message.text`; otherwise it shows the
+    text to paste. The message asks the agent to continue only if
+    `openpaperdesign_status` reports exactly that folder as the workspace, and never to switch
+    folders. A message or a listed root grants nothing.
+  - It shows the bound workspace and project only from admitted `openpaperdesign_status` and
+    `open_editor` results that the host delivers (those two tools carry the view as a
+    model-only result presentation).
+  - It opens only the exact loopback editor URL through `ui/open-link`. Codex's
     acknowledgement is not proof that the canvas loaded.
-- **Native Codex project inventory is shown as not available in this build.** Codex 0.162.1's
-  experimental app-server has `project/list` and `project/read`: an operator ran a read-only
-  probe on 2026-10-13. Integration still needs the exact app-server handshake and proof that
-  the packaged plugin can reach the CLI. A listed root is discovery, never write authority.
+  - The only server tool it calls is the inventory, and it stores nothing.
 
 Issue #6 stays open until these are proven on a real host:
-1. Native inventory and root selection.
+1. That the packaged plugin reaches `codex app-server` and lists the real projects. This has
+   only been tested here against task-owned fake app-servers; an operator ran a read-only
+   `project/list` probe on 2026-10-13.
 2. Workspace authority for model calls in the global entry's own thread. The Mac global
-   receipts carried only thread ids.
+   receipts carried only thread ids, and no supported route makes a chosen root the chat's
+   workspace.
 3. Delivery of model results to the view.
 4. Where `ui/open-link` opens the loopback page.
 5. An actual canvas load.

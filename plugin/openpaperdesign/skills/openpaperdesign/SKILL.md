@@ -71,5 +71,11 @@ buttons send you requests like the steps above as ordinary user messages; they g
 workspace and name no authority. Follow the same steps and refusals. Opening an existing
 project changes nothing in it.
 
+`openpaperdesign_projects` lists the Codex projects saved on this computer, with every root
+folder: discovery only. When the person picks a folder there, use it only if
+`openpaperdesign_status` reports exactly that folder as this chat's workspace. Otherwise, ask
+them to open that project in Codex. Never switch folders, read the listed folder, or treat a
+listed root as permission.
+
 For visual direction and review, use the [design](../design/SKILL.md) and
 [review design](../review-design/SKILL.md) skills; this editor is their editable companion.

@@ -8,22 +8,33 @@ import vm from 'node:vm';
 
 const html = readFileSync(new URL('../src/home.html', import.meta.url), 'utf8');
 const script = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
-const flush = () => new Promise((r) => setImmediate(r));
+const flush = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
 const TOKEN = 'ab'.repeat(32);
 const URL_OK = `http://127.0.0.1:41234/#token=${TOKEN}`;
-const ALLOWED = new Set(['ui/initialize', 'ui/notifications/initialized', 'ui/message', 'ui/open-link']);
+const ALLOWED = new Set(['ui/initialize', 'ui/notifications/initialized', 'ui/message', 'ui/open-link', 'tools/call']);
+const INVENTORY = 'openpaperdesign_projects';
 
-function el() {
-  const e = { textContent: '', hidden: false, disabled: false, className: '', value: '', onclick: null, children: [] };
+// Fictional fixtures. Two local projects share a name; Acme has two folders.
+const ACME = { source: 'codex-app-server', host: 'this computer', id: 'prj_fixture_acme', name: 'Acme site', position: 0, recencyAt: null, roots: [{ path: '/w/acme' }, { path: '/w/acme-docs' }] };
+const BETA = { source: 'codex-app-server', host: 'this computer', id: 'prj_fixture_beta', name: 'Acme site', position: 1, recencyAt: null, roots: [{ path: '/w/beta' }] };
+const LISTED = { available: true, source: 'codex-app-server', host: 'this computer', complete: true, projects: [ACME, BETA] };
+
+function el(tag = 'div') {
+  const e = { tag, textContent: '', hidden: false, disabled: false, className: '', value: '', onclick: null, children: [] };
   e.append = (...c) => { e.children.push(...c); };
+  // Setting textContent clears children, as in the DOM.
+  let text = '';
+  Object.defineProperty(e, 'textContent', { get: () => text, set: (v) => { text = String(v); e.children = []; } });
   return e;
 }
+const all = (e) => [e, ...e.children.flatMap(all)];
+const texts = (e) => all(e).map((n) => n.textContent).filter(Boolean);
 
 function mount() {
-  const ids = ['conn', 'home', 'inventory', 'open', 'current', 'name', 'new', 'msg-state', 'prompt',
-    'result', 'result-state', 'result-fields', 'canvas', 'canvas-state'];
+  const ids = ['conn', 'home', 'inventory', 'projects', 'refresh', 'open', 'current', 'name', 'new', 'msg-state',
+    'prompt', 'result', 'result-state', 'result-fields', 'canvas', 'canvas-state'];
   const els = Object.fromEntries(ids.map((id) => [id, el()]));
-  els.result.hidden = true; els.prompt.hidden = true; els.canvas.hidden = true;
+  els.result.hidden = true; els.prompt.hidden = true; els.canvas.hidden = true; els.refresh.hidden = true;
   const sent = [];
   let listener = null;
   // Copy into this realm so deep equality is not confused by the VM context's prototypes.
@@ -33,7 +44,7 @@ function mount() {
   for (const k of ['localStorage', 'sessionStorage', 'indexedDB', 'fetch', 'XMLHttpRequest']) {
     Object.defineProperty(window, k, { get: forbidden });
   }
-  const document = { getElementById: (id) => els[id], createElement: () => el() };
+  const document = { getElementById: (id) => els[id], createElement: (tag) => el(tag) };
   Object.defineProperty(document, 'cookie', { get: forbidden, set: forbidden });
   vm.runInNewContext(script, { window, document, setTimeout: () => 0, JSON, String, RegExp, Array, Map, Promise });
   const from = (m, source = parent) => listener({ source, data: { jsonrpc: '2.0', ...m } });
@@ -41,24 +52,45 @@ function mount() {
   return { els, sent, from, last, parent };
 }
 
-async function initialized(caps = { message: { text: {} } }) {
+const toolText = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] });
+
+/// Initialize, then answer the inventory call (if any) with `inventory`.
+async function initialized({ caps = { message: { text: {} } }, context = {}, inventory = LISTED } = {}) {
   const v = mount();
-  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: caps, hostContext: {} } });
+  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: caps, hostContext: context } });
   await flush();
+  const call = v.last('tools/call');
+  if (call && inventory !== null) {
+    v.from(inventory.error ? { id: call.id, error: inventory.error } : { id: call.id, result: inventory.isError ? inventory : toolText(inventory) });
+    await flush();
+  }
   return v;
 }
 
 const methods = (v) => v.sent.filter((m) => m.method).map((m) => m.method);
-const onlyUiMethods = (v) => assert.ok(methods(v).every((m) => ALLOWED.has(m)), methods(v).join());
+const onlyAllowed = (v) => {
+  assert.ok(methods(v).every((m) => ALLOWED.has(m)), methods(v).join());
+  for (const m of v.sent.filter((m) => m.method === 'tools/call')) {
+    assert.deepEqual(m.params, { name: INVENTORY, arguments: {} }, 'the inventory is the only server tool the view calls');
+  }
+};
 
-test('initialize claims only display modes, then announces initialized', async () => {
+test('initialize claims only display modes, then announces initialized and reads the inventory', async () => {
   const v = mount();
   assert.equal(v.sent[0].method, 'ui/initialize');
   assert.deepEqual(v.sent[0].params.appCapabilities, { availableDisplayModes: ['inline', 'fullscreen'] });
   v.from({ id: v.sent[0].id, result: { hostCapabilities: { message: { text: {} } } } });
   await flush();
-  assert.deepEqual(methods(v), ['ui/initialize', 'ui/notifications/initialized']);
+  assert.deepEqual(methods(v), ['ui/initialize', 'ui/notifications/initialized', 'tools/call']);
+  onlyAllowed(v);
   assert.match(v.els.conn.textContent, /asks the agent in this chat/);
+});
+
+test('rendered for a model status or editor result, the view does not read the inventory', async () => {
+  const v = await initialized({ context: { toolInfo: { tool: { name: 'openpaperdesign_status' } } } });
+  assert.deepEqual(methods(v), ['ui/initialize', 'ui/notifications/initialized']);
+  const home = await initialized({ context: { toolInfo: { tool: { name: 'openpaperdesign_home' } } } });
+  assert.ok(methods(home).includes('tools/call'));
 });
 
 test('a failed initialize disables the actions and sends nothing else', async () => {
@@ -69,6 +101,69 @@ test('a failed initialize disables the actions and sends nothing else', async ()
   assert.ok(v.els.open.disabled && v.els.new.disabled && v.els.current.disabled);
   assert.match(v.els.conn.textContent, /Couldn't connect to Codex \(code -32603\)/);
   assert.ok(!v.els.conn.textContent.includes('/Users/') && !v.els.conn.textContent.includes(TOKEN));
+});
+
+test('native projects are listed with their id and every folder; nothing is chosen for you', async () => {
+  const v = await initialized();
+  assert.equal(v.els.inventory.textContent, 'Your Codex projects on this computer:');
+  const items = v.els.projects.children;
+  assert.equal(items.length, 2, 'same-named projects stay separate');
+  assert.deepEqual(texts(items[0]), ['Acme site', 'Codex project on this computer · id prj_fixture_acme',
+    'This project has 2 folders. Choose the one to design in:', '/w/acme', 'Use this folder', '/w/acme-docs', 'Use this folder']);
+  assert.deepEqual(texts(items[1]), ['Acme site', 'Codex project on this computer · id prj_fixture_beta', '/w/beta', 'Use this folder']);
+  assert.equal(v.last('ui/message'), undefined, 'listing sends nothing');
+  assert.equal(v.els.refresh.hidden, false);
+});
+
+test('choosing a folder sends that exact folder and project id as intent, not a switch', async () => {
+  const v = await initialized();
+  const second = all(v.els.projects.children[0]).filter((n) => n.tag === 'button')[1];
+  second.onclick();
+  await flush();
+  const text = v.last('ui/message').params.content[0].text;
+  assert.match(text, /^Use OpenPaperDesign in my Codex project "Acme site" \(Codex project id prj_fixture_acme on this computer\), folder \/w\/acme-docs\. First call openpaperdesign_status\./);
+  assert.match(text, /Continue only if the workspace it reports is exactly that folder; if it isn't, tell me to open that folder's project in Codex and stop, without trying to switch folders/);
+  assert.doesNotMatch(text, /\/w\/acme[^-]/, 'only the chosen folder');
+  onlyAllowed(v);
+});
+
+test('a hostile project name or path cannot break out of the message', async () => {
+  const evil = { ...ACME, name: 'A"B`C\u0007\n', roots: [{ path: '/w/x`y\u0000z' }] };
+  const v = await initialized({ inventory: { ...LISTED, projects: [evil] } });
+  all(v.els.projects).find((n) => n.tag === 'button').onclick();
+  await flush();
+  const text = v.last('ui/message').params.content[0].text;
+  assert.match(text, /project "A B C"/);
+  assert.match(text, /folder \/w\/x y z\./);
+});
+
+test('unavailable inventories explain why and show no list', async () => {
+  for (const [inventory, want] of [
+    [{ available: false, reason: 'codex_not_found' }, /couldn't find the Codex command-line tool/],
+    [{ available: false, reason: 'unsupported' }, /doesn't share its project list/],
+    [{ available: false, reason: 'protocol' }, /isn't available here/],
+    [{ isError: true, content: [{ type: 'text', text: 'busy' }] }, /^Couldn't read your Codex projects\.$/],
+    [{ error: { code: -32601, message: 'no such tool at /private' } }, /^Couldn't read your Codex projects \(code -32601\)\.$/],
+  ]) {
+    const v = await initialized({ inventory });
+    assert.match(v.els.inventory.textContent, want);
+    assert.equal(v.els.projects.children.length, 0);
+    assert.ok(!v.els.inventory.textContent.includes('/private'));
+    assert.equal(v.els.refresh.hidden, false);
+  }
+  const none = await initialized({ inventory: { ...LISTED, projects: [] } });
+  assert.match(none.els.inventory.textContent, /no saved projects on this computer yet/);
+  const partial = await initialized({ inventory: { ...LISTED, complete: false } });
+  assert.equal(partial.els.inventory.textContent, 'Your Codex projects on this computer (the first 2):');
+});
+
+test('refresh reads the inventory again', async () => {
+  const v = await initialized();
+  v.els.refresh.onclick();
+  await flush();
+  assert.equal(v.sent.filter((m) => m.method === 'tools/call').length, 2);
+  assert.equal(v.els.inventory.textContent, 'Reading your Codex projects…');
+  onlyAllowed(v);
 });
 
 test('with message support each action sends one user message to the active chat', async () => {
@@ -87,7 +182,7 @@ test('with message support each action sends one user message to the active chat
     await flush();
     assert.match(v.els['msg-state'].textContent, /^Sent to this chat/);
   }
-  onlyUiMethods(v);
+  onlyAllowed(v);
 });
 
 test('the new canvas message carries a cleaned name and the design method', async () => {
@@ -114,14 +209,16 @@ test('a refused message is reported, not shown as sent', async () => {
 });
 
 test('without message support actions show text to paste and send nothing', async () => {
-  const v = await initialized({});
+  const v = await initialized({ caps: {} });
   assert.match(v.els.conn.textContent, /doesn't let apps send messages/);
   v.els.open.onclick();
   await flush();
+  all(v.els.projects).find((n) => n.tag === 'button').onclick();
+  await flush();
   assert.equal(v.last('ui/message'), undefined);
   assert.equal(v.els.prompt.hidden, false);
-  assert.match(v.els.prompt.textContent, /openpaperdesign_status/);
-  onlyUiMethods(v);
+  assert.match(v.els.prompt.textContent, /^Use OpenPaperDesign in my Codex project/);
+  onlyAllowed(v);
 });
 
 const result = (obj, isError = false) => ({ method: 'ui/notifications/tool-result', params: { content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj) }], isError } });
@@ -165,7 +262,7 @@ test('only the exact loopback editor URL can be opened, and the ack is not a loa
   v.from(result({ url: URL_OK, open_in: 'in-app browser' }));
   assert.equal(v.els.canvas.hidden, false);
   assert.deepEqual(fields(v), ['Address', 'local, port 41234']);
-  assert.ok(!JSON.stringify(v.els).includes(TOKEN), 'the token is not displayed');
+  assert.ok(!JSON.stringify(texts(v.els.result)).includes(TOKEN), 'the token is not displayed');
   v.els.canvas.onclick();
   await flush();
   const open = v.last('ui/open-link');
@@ -173,7 +270,7 @@ test('only the exact loopback editor URL can be opened, and the ack is not a loa
   v.from({ id: open.id, result: {} });
   await flush();
   assert.match(v.els['canvas-state'].textContent, /doesn't confirm it loaded/);
-  onlyUiMethods(v);
+  onlyAllowed(v);
 });
 
 test('messages from other windows are ignored', async () => {
@@ -185,15 +282,11 @@ test('messages from other windows are ignored', async () => {
   assert.equal(v.els.canvas.hidden, true);
 });
 
-test('the Codex project section is an honest unavailable state, not a chooser', () => {
-  const card = html.slice(html.indexOf('<h2>Codex projects</h2>'), html.indexOf('<h2>Start</h2>'));
-  assert.match(card, /Codex keeps a list of your projects, but this version of OpenPaperDesign can't show it yet/);
-  assert.doesNotMatch(card, /<(button|input|select|ul|ol)\b/, 'no dead chooser or fallback list');
-  assert.match(card, /never takes a folder path from here/);
-});
-
-test('the view source never calls server tools or stores anything', () => {
-  for (const banned of ['tools/call', 'resources/read', 'localStorage', 'sessionStorage', 'indexedDB', 'document.cookie', 'fetch(', 'XMLHttpRequest', 'innerHTML']) {
+test('the view source calls only the inventory tool and stores nothing', () => {
+  assert.equal(script.split("'tools/call'").length, 2, 'one tools/call site');
+  assert.match(script, /rpc\('tools\/call', \{ name: 'openpaperdesign_projects', arguments: \{\} \}\)/);
+  for (const banned of ['resources/read', 'localStorage', 'sessionStorage', 'indexedDB', 'document.cookie', 'fetch(', 'XMLHttpRequest', 'innerHTML',
+    'openpaperdesign_status\'', 'bind_project\'', 'create_project\'', 'open_editor\'']) {
     assert.ok(!script.includes(banned), banned);
   }
 });

@@ -51,6 +51,17 @@ impl Fixture {
     async fn host(&self) -> Client {
         self.launch(&["--codex-context"]).await
     }
+    /// The packaged launcher with only `bin` on its PATH (where a fake `codex` may live).
+    async fn host_with_path(&self, bin: &Path) -> Client {
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openpaperdesign-mcp"));
+        cmd.current_dir(&self.plugin)
+            .env("HOME", &self.home)
+            .env("PATH", bin)
+            .arg("--codex-context");
+        ().serve(rmcp::transport::TokioChildProcess::new(cmd).unwrap())
+            .await
+            .unwrap()
+    }
     fn no_cache_writes(&self) {
         assert!(!self.plugin.join("design").exists());
     }
@@ -655,7 +666,7 @@ async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
         .into_iter()
         .map(|t| serde_json::to_value(t).unwrap())
         .collect();
-    assert_eq!(tools.len(), 34, "4 own + home + 29 offered");
+    assert_eq!(tools.len(), 35, "4 own + home + projects + 29 offered");
     let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
     let home = tool("openpaperdesign_home");
     assert_eq!(
@@ -765,5 +776,137 @@ async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
     pure_home(&c, &metas, f.ws.to_str().unwrap(), url.as_deref()).await;
     assert_eq!(status(&c, meta).await["workspace_state"], "retired");
     f.no_cache_writes();
+    c.cancel().await.unwrap();
+}
+
+/// The native project inventory is read through `codex app-server` found on PATH, before
+/// workspace admission and without touching the session: a pinned, bound session with its
+/// editor open is unchanged, and listed roots never become the workspace.
+#[tokio::test]
+async fn synthetic_native_inventory_is_read_only_discovery_beside_the_pinned_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bin = f.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = f.root.join("app-server.log");
+    let acme = r#"{"id":"prj_fixture_acme","name":"Acme site","createdAt":1,"updatedAt":2,"position":0,"recencyAt":null,"metadata":{},"roots":[{"path":"/w/acme"},{"path":"/w/acme-docs"}]}"#;
+    // Shell builtins only: PATH holds nothing but this directory.
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = app-server ] || exit 64\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{log}'\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"codexHome\":\"/fixture-home/.codex\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\",\"userAgent\":\"codex_cli_rs/0.162.1\"}}}}' ;;\n    *'\"method\":\"project/list\"'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[{acme}],\"nextCursor\":null}}}}' ;;\n    *'\"method\":\"project/read\"'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"project\":{acme}}}}}' ;;\n  esac\ndone\n",
+        log = log.display()
+    );
+    std::fs::write(bin.join("codex"), script).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let c = f.host_with_path(&bin).await;
+    let tools: Vec<Value> = c
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    let inv = tools
+        .iter()
+        .find(|t| t["name"] == "openpaperdesign_projects")
+        .unwrap();
+    assert_eq!(
+        inv["inputSchema"],
+        json!({"type":"object","properties":{"projectId":{"type":"string","maxLength":256,"description":"Read just this project (an id from the list)."}},"additionalProperties":false})
+    );
+    assert!(
+        inv.get("_meta").is_none(),
+        "no entrypoint or view of its own"
+    );
+
+    let meta = context::writable(&f.ws);
+    let (ok, s) = call(&c, "create_project", json!({"name":"Canvas"}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let before = status(&c, meta.clone()).await;
+    let (_, opened) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    let token = opened.split("#token=").nth(1).map(|t| t[..64].to_string());
+
+    let want = json!({
+        "available": true, "source": "codex-app-server", "host": "this computer", "complete": true,
+        "projects": [{"source":"codex-app-server","host":"this computer","id":"prj_fixture_acme","name":"Acme site","position":0,"recencyAt":null,"roots":[{"path":"/w/acme"},{"path":"/w/acme-docs"}]}]
+    });
+    let mut fake = context::writable(&f.home);
+    fake.insert("thread_id".into(), json!("thread-from-another-chat"));
+    for m in [RequestMetaObject::default(), fake, context::readonly(&f.ws)] {
+        let (ok, s) = call(&c, "openpaperdesign_projects", json!({}), m.clone()).await;
+        assert!(ok, "{s}");
+        assert_eq!(serde_json::from_str::<Value>(&s).unwrap(), want);
+        assert!(!s.contains(f.ws.to_str().unwrap()) && !s.contains("fixture-home"));
+        if let Some(token) = &token {
+            assert!(!s.contains(token.as_str()));
+        }
+        let (ok, s) = call(
+            &c,
+            "openpaperdesign_projects",
+            json!({"projectId":"prj_fixture_acme"}),
+            m.clone(),
+        )
+        .await;
+        assert!(ok, "{s}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&s).unwrap()["projects"],
+            want["projects"]
+        );
+        for (args, why) in [
+            (
+                json!({"path": f.ws.to_str().unwrap()}),
+                "accepts only projectId",
+            ),
+            (json!({"projectId": 7}), "projectId must be"),
+            (json!({"projectId": ""}), "projectId must be"),
+        ] {
+            let (ok, s) = call(&c, "openpaperdesign_projects", args, m.clone()).await;
+            assert!(!ok && s.contains(why), "{s}");
+        }
+    }
+    // Only initialize, initialized and read-only project calls reached the app-server.
+    let methods: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["method"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(!methods.is_empty());
+    assert!(
+        methods.iter().all(
+            |m| ["initialize", "initialized", "project/list", "project/read"].contains(&m.as_str())
+        ),
+        "{methods:?}"
+    );
+
+    // The session is exactly as it was: same workspace, project and editor server.
+    let after = status(&c, meta.clone()).await;
+    assert_eq!(after["workspace_state"], "pinned");
+    assert_eq!(after["workspace"], before["workspace"]);
+    assert_eq!(after["bound_project"], before["bound_project"]);
+    if token.is_some() {
+        let (ok, again) = call(&c, "open_editor", json!({}), meta.clone()).await;
+        assert!(ok && again == opened, "{again}");
+    }
+    // A listed root never becomes the workspace: binding outside it is still refused.
+    let (ok, s) = call(&c, "bind_project", json!({"path":"/w/acme"}), meta.clone()).await;
+    assert!(!ok, "{s}");
+    f.no_cache_writes();
+    c.cancel().await.unwrap();
+
+    // No codex on PATH: an explicit unavailable answer, and the session is untouched.
+    let empty = f.root.join("empty-bin");
+    std::fs::create_dir(&empty).unwrap();
+    let c = f.host_with_path(&empty).await;
+    let (ok, s) = call(&c, "openpaperdesign_projects", json!({}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let v: Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["available"], false);
+    assert_eq!(v["reason"], "codex_not_found");
+    assert_eq!(status(&c, meta).await["workspace_usable"], true);
     c.cancel().await.unwrap();
 }

@@ -6,10 +6,12 @@
 <title>OpenPaperDesign</title>
 <!--
   The openpaperdesign MCP App view (issue #6). Served as a static resource by
-  `openpaperdesign-mcp`. It never calls the server's tools: it reads no workspace, project,
-  binding or token. Actions go to the active chat as user messages (`ui/message`), where the
-  model runs the guarded tools. Project details are shown only from results of those tools
-  that the host delivers to this view. Nothing is stored in the browser.
+  `openpaperdesign-mcp`. The only server tool it calls is the read-only native inventory
+  (`openpaperdesign_projects`), which lists Codex's saved projects and their folders as
+  discovery, never as authority. It reads no workspace, binding or token. Actions go to the
+  active chat as user messages (`ui/message`), where the model runs the guarded tools. The
+  bound workspace and project are shown only from results of those tools that the host
+  delivers to this view. Nothing is stored in the browser.
 -->
 <style>
   :root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6b6b70; --line: #d9d9de; --bg: #fff; --card: #f6f6f8; --accent: #2f5bea; --bad: #b42318; }
@@ -34,6 +36,12 @@
   dt { color: var(--muted); }
   dd { margin: 0; overflow-wrap: anywhere; }
   .bad { color: var(--bad); }
+  .project { border-top: 1px solid var(--line); padding: 10px 0; }
+  .project:first-child { border-top: 0; padding-top: 0; }
+  .project b { display: block; }
+  .root { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 6px; }
+  .root code { overflow-wrap: anywhere; }
+  .root button { flex: none; padding: 6px 10px; }
   [hidden] { display: none !important; }
   footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
 </style>
@@ -49,7 +57,10 @@
   <div id="home">
     <h2>Codex projects</h2>
     <div class="card">
-      <p id="inventory">Codex keeps a list of your projects, but this version of OpenPaperDesign can't show it yet. Open the project in Codex, then use <b>Start</b> below in its chat.</p>
+      <p id="inventory" class="hint">Your Codex projects appear here once Codex is connected.</p>
+      <div id="projects"></div>
+      <p><button id="refresh" hidden>Refresh</button></p>
+      <p class="hint">Choosing a folder asks the agent in this chat to use it. Codex decides which folder the agent may work in; choosing here grants nothing.</p>
       <h3>Add a folder</h3>
       <p class="hint">Add the folder to Codex as a project first. OpenPaperDesign only works in the workspace Codex gives the agent in that chat; it never takes a folder path from here.</p>
     </div>
@@ -124,10 +135,20 @@
     },
     current: () => 'Show my current OpenPaperDesign project: call openpaperdesign_status and tell ' +
       'me the workspace, the bound project and whether it is usable. Don\'t change anything.',
+    // A folder chosen from Codex's project list: intent only. The agent must find that this
+    // chat's workspace is exactly that folder; it never switches folders to match.
+    folder: (p, root) => 'Use OpenPaperDesign in my Codex project "' + cleanName(p.name || 'unnamed') +
+      '" (Codex project id ' + cleanText(p.id, 256) + ' on this computer), folder ' +
+      cleanText(root, 4096) + '. ' + PRELUDE + 'Continue only if the workspace it reports is exactly ' +
+      'that folder; if it isn\'t, tell me to open that folder\'s project in Codex and stop, without ' +
+      'trying to switch folders or reading anything there. If it is, look for existing paper-rs ' +
+      'projects under design/: bind and open the one I mean (ask if there are several), or ask me ' +
+      'whether to create a new canvas. Don\'t create, move or redesign anything without asking.',
   };
+  const cleanText = (s, max) => String(s).replace(/[\u0000-\u001f\u007f`]/g, ' ').slice(0, max);
 
-  async function act(kind) {
-    const text = prompts[kind]();
+  async function act(kind, ...args) {
+    const text = prompts[kind](...args);
     if (!canMessage) {
       $('msg-state').textContent = 'This Codex version doesn\'t let apps send messages. Copy this into the project\'s chat:';
       $('prompt').textContent = text;
@@ -144,6 +165,71 @@
   $('open').onclick = () => act('open');
   $('new').onclick = () => act('new');
   $('current').onclick = () => act('current');
+
+  // ---- Codex's saved projects (read-only discovery) ----
+
+  const UNAVAILABLE = {
+    codex_not_found: 'OpenPaperDesign couldn\'t find the Codex command-line tool (codex) on this computer, so it can\'t list your Codex projects here.',
+    unsupported: 'This Codex version doesn\'t share its project list with other programs.',
+    timeout: 'Codex didn\'t answer in time.',
+  };
+  const node = (tag, text, cls) => {
+    const e = document.createElement(tag);
+    if (text !== undefined) e.textContent = text;
+    if (cls) e.className = cls;
+    return e;
+  };
+
+  function renderProjects(v) {
+    const list = $('projects');
+    list.textContent = '';
+    const projects = Array.isArray(v.projects) ? v.projects : [];
+    if (!projects.length) {
+      $('inventory').textContent = 'Codex has no saved projects on this computer yet. Add the folder to Codex as a project, then refresh.';
+      return;
+    }
+    $('inventory').textContent = v.complete === false
+      ? 'Your Codex projects on this computer (the first ' + projects.length + '):'
+      : 'Your Codex projects on this computer:';
+    for (const p of projects) {
+      const item = node('div', undefined, 'project');
+      item.append(node('b', p.name || '(unnamed project)'));
+      item.append(node('span', 'Codex project on ' + (p.host || 'this computer') + ' · id ' + p.id, 'hint'));
+      const roots = Array.isArray(p.roots) ? p.roots : [];
+      if (!roots.length) item.append(node('p', 'This project has no folder.', 'hint'));
+      else if (roots.length > 1) item.append(node('p', 'This project has ' + roots.length + ' folders. Choose the one to design in:', 'hint'));
+      for (const r of roots) {
+        const row = node('div', undefined, 'root');
+        row.append(node('code', r.path));
+        const use = node('button', 'Use this folder');
+        use.onclick = () => act('folder', p, r.path);
+        row.append(use);
+        item.append(row);
+      }
+      list.append(item);
+    }
+  }
+
+  async function loadProjects() {
+    $('refresh').hidden = true;
+    $('inventory').textContent = 'Reading your Codex projects…';
+    $('projects').textContent = '';
+    const r = await rpc('tools/call', { name: 'openpaperdesign_projects', arguments: {} });
+    $('refresh').hidden = false;
+    let v = null;
+    if (!r.timeout && !r.error && r.result && !r.result.isError) {
+      try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
+    }
+    if (!v || typeof v !== 'object') {
+      $('inventory').textContent = 'Couldn\'t read your Codex projects' + errorCode(r.error) + '.';
+    } else if (v.available !== true) {
+      $('inventory').textContent = (UNAVAILABLE[v.reason] || 'Your Codex project list isn\'t available here.') +
+        ' Open the project in Codex, then use Start below in its chat.';
+    } else {
+      renderProjects(v);
+    }
+  }
+  $('refresh').onclick = () => loadProjects();
 
   // ---- results of the model's tool calls, delivered by the host ----
 
@@ -240,6 +326,10 @@
     window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
     $('conn').textContent = canMessage ? 'Each action asks the agent in this chat.'
       : 'This Codex version doesn\'t let apps send messages; each action shows text to paste into a project chat.';
+    // Shown for a model's status or editor result: no project list needed there.
+    const ctx = r.result.hostContext || {};
+    const tool = ctx.toolInfo && ctx.toolInfo.tool && ctx.toolInfo.tool.name;
+    if (!tool || tool === 'openpaperdesign_home') loadProjects();
   })();
 })();
 </script>
