@@ -209,7 +209,10 @@
     list.textContent = '';
     const projects = Array.isArray(v.projects) ? v.projects : [];
     if (!projects.length) {
-      $('inventory').textContent = 'Codex has no saved projects on this computer yet. Add the folder to Codex as a project, then refresh.';
+      // A cut-off read proves nothing about absence.
+      $('inventory').textContent = v.complete === false
+        ? 'This read of your Codex projects stopped early and returned none; more may exist. Refresh to try again.'
+        : 'Codex has no saved projects on this computer yet. Add the folder to Codex as a project, then refresh.';
       return;
     }
     $('inventory').textContent = v.complete === false
@@ -340,7 +343,9 @@
     $('result-state').className = '';
     $('result-state').textContent = list.length
       ? (v.complete === false ? 'The first ' + list.length + ' canvases in this workspace:' : 'Canvases in this workspace:')
-      : 'No canvases under design/ in this workspace yet.';
+      : (v.complete === false
+        ? 'This read stopped early before finding any canvases in design/; more may exist.'
+        : 'No canvases under design/ in this workspace yet.');
     field('Workspace', v.workspace);
     for (const c of list) {
       const item = node('div', undefined, 'project');

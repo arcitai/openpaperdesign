@@ -177,6 +177,18 @@ test('unavailable inventories explain why and show no list', async () => {
   assert.equal(partial.els.inventory.textContent, 'Your Codex projects on this computer (the first 2):');
 });
 
+test('an empty but partial inventory says more may exist, not that there are none', async () => {
+  const v = await initialized({ inventory: { ...LISTED, projects: [], complete: false } });
+  const text = v.els.inventory.textContent;
+  assert.match(text, /stopped early and returned none; more may exist/);
+  assert.doesNotMatch(text, /no saved projects/);
+  assert.equal(v.els.projects.children.length, 0);
+  assert.equal(v.els.refresh.hidden, false, 'refresh stays available');
+  // A complete empty answer is still a true empty.
+  const none = await initialized({ inventory: { ...LISTED, projects: [], complete: true } });
+  assert.match(none.els.inventory.textContent, /^Codex has no saved projects on this computer yet\./);
+});
+
 test('refresh reads the inventory again', async () => {
   const v = await initialized();
   v.els.refresh.onclick();
@@ -344,6 +356,16 @@ test('an empty or partial canvases result says so', async () => {
   assert.equal(v.els['result-list'].children.length, 0);
   v.from(result({ ...CANVASES, complete: false }));
   assert.equal(v.els['result-state'].textContent, 'The first 2 canvases in this workspace:');
+});
+
+test('an empty but partial canvases result says more may exist, not that there are none', async () => {
+  const v = await initialized();
+  v.from(result({ ...CANVASES, canvases: [], skipped: [], complete: false }));
+  const text = v.els['result-state'].textContent;
+  assert.match(text, /stopped early before finding any canvases in design\/; more may exist/);
+  assert.doesNotMatch(text, /No canvases under design\/ in this workspace yet/);
+  assert.deepEqual(fields(v), ['Workspace', '/w/acme']);
+  assert.equal(v.els['result-list'].children.length, 0);
 });
 
 test('an open_editor result names its own workspace, project and canvas, with an agent fallback', async () => {
