@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.16 · Updated: 2026-10-13
+Revision: 0.18 · Updated: 2026-10-13
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -59,6 +59,7 @@ cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target was
 cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
 node --test crates/openpaperdesign-web/tests/session.test.mjs   # page lifecycle; Node >= 22
 node --test plugin/tests/plugin.test.mjs                        # plugin manifests and skills
+node --test crates/openpaperdesign-serve/tests/home.test.mjs    # sidebar home view protocol
 (cd plugin/tests/design && python3 -m unittest)                 # ported design-method tests
 ./scripts/build-web.sh                         # browser bundle; needs wasm-bindgen CLI 0.2.129
 cargo clippy --locked --all-targets
@@ -138,7 +139,20 @@ target page (`get_tree_summary` root with its `pageId`) before its first change.
 audit rejects duplicate evidence (JSON keys, repeated records). Keep the ported `design` and `review-design` skills' provenance notes and
 LICENSE files, and the plugin's `NOTICE.md`, intact.
 
+Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): `openpaperdesign_home` and
+the `ui://openpaperdesign/home.html` resource are answered before workspace admission. They
+read or change no context, binding, project, listener or file, and the tool refuses
+arguments. This named exemption covers only those two; never route another tool around
+admission. The view never calls server tools and stores nothing (no URL, token or path). Its
+actions are user messages (`ui/message`), which grant nothing. It shows only admitted
+`openpaperdesign_status`/`open_editor` results that the host delivers, and opens only the
+exact loopback editor URL. A native Codex project list or root is discovery, never authority.
+
 ## Model profile
 
-- Implementation: `claudeAgent` `claude-opus-5-5`, effort `medium`, fastMode `false`.
-- Independent review: `codex` `gpt-6-astra`, reasoningEffort `xhigh`, serviceTier `default`.
+- Implementation: `claudeAgent` `claude-opus-5-5`, effort `high`, fastMode `false`.
+- AgentOps, research and independent review: `codex` `gpt-6.1-sol`, reasoningEffort `max`, serviceTier `default`.
+- Owner-selected defaults and native project/AgentOps readback verified 2026-10-13.
+  Native project configuration owns the
+  implementation default; thread selections own AgentOps and review. Preserve the actual
+  settings of an in-flight turn and apply changes at its next safe continuation.

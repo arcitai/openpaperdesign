@@ -595,3 +595,175 @@ async fn synthetic_worktree_pointer_is_opaque_and_edits_stay_inside_workspace() 
         f.no_cache_writes();
     }
 }
+
+/// Every pure home call, under each metadata variant: it succeeds, refuses extra arguments,
+/// serves only the exact view, and discloses neither the workspace nor the editor token.
+async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Option<&str>) {
+    const HOME: &str = "ui://openpaperdesign/home.html";
+    for meta in metas {
+        let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
+        assert!(ok, "{s}");
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["surface"], "home");
+        for (args, why) in [
+            (json!({"path":"design/Canvas"}), "takes no arguments"),
+            (
+                json!({"_meta":{"codex/sandbox-state-meta":{}}}),
+                "takes no arguments",
+            ),
+        ] {
+            let (ok, s) = call(c, "openpaperdesign_home", args, meta.clone()).await;
+            assert!(!ok && s.contains(why), "{s}");
+        }
+        let mut read = rmcp::model::ReadResourceRequestParams::new(HOME);
+        read.meta = Some(meta.clone());
+        let r = serde_json::to_value(c.read_resource(read).await.unwrap()).unwrap();
+        assert_eq!(r["contents"][0]["uri"], HOME);
+        assert_eq!(r["contents"][0]["mimeType"], "text/html;profile=mcp-app");
+        let html = r["contents"][0]["text"].as_str().unwrap();
+        assert!(html.contains("OpenPaperDesign") && html.contains("ui/initialize"));
+        for other in [
+            "ui://openpaperdesign/home.html?x",
+            "ui://openpaperdesign/other.html",
+            "file:///etc/passwd",
+        ] {
+            let mut read = rmcp::model::ReadResourceRequestParams::new(other);
+            read.meta = Some(meta.clone());
+            assert!(c.read_resource(read).await.is_err(), "{other}");
+        }
+        assert!(!s.contains(ws) && !html.contains(ws));
+        if let Some(url) = url {
+            let token = url.split("#token=").nth(1).unwrap();
+            assert!(!s.contains(token) && !html.contains(token));
+        }
+    }
+}
+
+/// The global home tool and its view are answered without workspace admission and leave the
+/// session's workspace state alone. Every other tool keeps per-call admission and retirement.
+#[tokio::test]
+async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
+    const HOME: &str = "ui://openpaperdesign/home.html";
+    let f = Fixture::new();
+    let c = f.host().await;
+
+    // Registration: one global entry with a strict empty schema and the static mcp-app view.
+    let tools: Vec<Value> = c
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    assert_eq!(tools.len(), 34, "4 own + home + 29 offered");
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
+    let home = tool("openpaperdesign_home");
+    assert_eq!(
+        home["_meta"],
+        json!({"ui":{"resourceUri":HOME},"openai/ui":{"entrypoints":[{"type":"global"}]}})
+    );
+    assert_eq!(
+        home["inputSchema"],
+        json!({"type":"object","properties":{},"additionalProperties":false})
+    );
+    for n in ["openpaperdesign_status", "open_editor"] {
+        assert_eq!(
+            tool(n)["_meta"],
+            json!({"ui":{"resourceUri":HOME,"visibility":["model"]}}),
+            "{n}"
+        );
+    }
+    let entries = tools
+        .iter()
+        .filter(|t| t["_meta"].get("openai/ui").is_some())
+        .count();
+    assert_eq!(entries, 1, "only the home is an entrypoint");
+    let resources: Vec<Value> = c
+        .list_all_resources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    assert_eq!(
+        resources,
+        vec![
+            json!({"uri":HOME,"name":"openpaperdesign-home","title":"OpenPaperDesign","mimeType":"text/html;profile=mcp-app"})
+        ]
+    );
+
+    // Pure calls, with any or no metadata. None of them may disclose the workspace or token.
+    let mut fake = context::writable(&f.home);
+    fake.insert("thread_id".into(), json!("thread-from-another-chat"));
+    let mut malformed = context::writable(&f.ws);
+    malformed.get_mut(context::KEY).unwrap()["sandboxCwd"] = json!(12);
+    let metas = [
+        RequestMetaObject::default(),
+        fake,
+        malformed,
+        context::readonly(&f.ws),
+    ];
+    // Before any context: the home pins nothing.
+    pure_home(&c, &metas, f.ws.to_str().unwrap(), None).await;
+    assert_eq!(
+        status(&c, RequestMetaObject::default()).await["workspace_state"],
+        "unresolved"
+    );
+
+    // Pinned, bound and editor opened: the home leaves all of it as it was.
+    let meta = context::writable(&f.ws);
+    let (ok, s) = call(&c, "create_project", json!({"name":"Canvas"}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let before = status(&c, meta.clone()).await;
+    let (ok, opened) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    let url = if before["browser_editor"] == "built in" {
+        assert!(ok, "{opened}");
+        let v: Value = serde_json::from_str(&opened).unwrap();
+        Some(v["url"].as_str().unwrap().to_string())
+    } else {
+        assert!(!ok && opened.contains("Build the web bundle"), "{opened}");
+        None
+    };
+    let files = |dir: &Path| {
+        let mut all = vec![];
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p.clone());
+                }
+                all.push((p.clone(), std::fs::read(&p).ok()));
+            }
+        }
+        all.sort();
+        all
+    };
+    let on_disk = files(&f.root);
+    pure_home(&c, &metas, f.ws.to_str().unwrap(), url.as_deref()).await;
+    assert_eq!(files(&f.root), on_disk, "the home changed no file");
+    let after = status(&c, meta.clone()).await;
+    assert_eq!(after["workspace_state"], "pinned");
+    assert_eq!(after["bound_project"], before["bound_project"]);
+    assert_eq!(after["editor_opened"], url.is_some());
+    if let Some(url) = &url {
+        let (ok, again) = call(&c, "open_editor", json!({}), meta.clone()).await;
+        assert!(ok, "{again}");
+        let v: Value = serde_json::from_str(&again).unwrap();
+        assert_eq!(v["url"].as_str().unwrap(), url, "same server, same session");
+    }
+
+    // An existing tool without context is still refused and still retires the session.
+    let (ok, s) = call(&c, "openpaperdesign_status", json!({}), Default::default()).await;
+    assert!(ok && s.contains("\"retired\""), "{s}");
+    let retired = status(&c, meta.clone()).await;
+    assert_eq!(retired["workspace_state"], "retired");
+    assert_eq!(retired["bound_project"], Value::Null);
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    assert!(!ok, "{s}");
+    // The pure home keeps working after retirement and revives nothing.
+    pure_home(&c, &metas, f.ws.to_str().unwrap(), url.as_deref()).await;
+    assert_eq!(status(&c, meta).await["workspace_state"], "retired");
+    f.no_cache_writes();
+    c.cancel().await.unwrap();
+}

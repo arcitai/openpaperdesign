@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPaperDesign</title>
+<!--
+  The openpaperdesign MCP App view (issue #6). Served as a static resource by
+  `openpaperdesign-mcp`. It never calls the server's tools: it reads no workspace, project,
+  binding or token. Actions go to the active chat as user messages (`ui/message`), where the
+  model runs the guarded tools. Project details are shown only from results of those tools
+  that the host delivers to this view. Nothing is stored in the browser.
+-->
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6b6b70; --line: #d9d9de; --bg: #fff; --card: #f6f6f8; --accent: #2f5bea; --bad: #b42318; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececf0; --muted: #a0a0a8; --line: #3a3a40; --bg: #18181b; --card: #222226; --accent: #7c9cff; --bad: #ff8a80; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 20px 32px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 24px 0 8px; }
+  h3 { font-size: 14px; margin: 14px 0 4px; }
+  p { margin: 0 0 8px; }
+  .sub, .hint { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .actions { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  button { font: inherit; padding: 9px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; text-align: left; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  input { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-size: 12px; user-select: all; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .bad { color: var(--bad); }
+  [hidden] { display: none !important; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>OpenPaperDesign</h1>
+    <p class="sub">An editable design canvas that you and the agent share, saved inside your project.</p>
+    <p id="conn" class="hint">Connecting to Codex…</p>
+  </header>
+
+  <div id="home">
+    <h2>Codex projects</h2>
+    <div class="card">
+      <p id="inventory">Codex keeps a list of your projects, but this version of OpenPaperDesign can't show it yet. Open the project in Codex, then use <b>Start</b> below in its chat.</p>
+      <h3>Add a folder</h3>
+      <p class="hint">Add the folder to Codex as a project first. OpenPaperDesign only works in the workspace Codex gives the agent in that chat; it never takes a folder path from here.</p>
+    </div>
+
+    <h2>Start</h2>
+    <div class="actions">
+      <button id="open" class="primary">Open an existing canvas</button>
+      <button id="current">Show the current project</button>
+    </div>
+    <div class="actions" style="margin-top:10px">
+      <label>New canvas name <input id="name" maxlength="60" placeholder="Landing page" autocomplete="off"></label>
+      <button id="new">New canvas</button>
+    </div>
+    <p id="msg-state" class="hint" style="margin-top:10px"></p>
+    <pre id="prompt" hidden></pre>
+  </div>
+
+  <div id="result" hidden>
+    <h2>In this chat</h2>
+    <div class="card">
+      <p id="result-state"></p>
+      <dl id="result-fields"></dl>
+      <p style="margin-top:10px"><button id="canvas" class="primary" hidden>Open canvas</button></p>
+      <p id="canvas-state" class="hint"></p>
+    </div>
+  </div>
+
+  <footer>
+    Design files live in your project: one <code>DESIGN.md</code> at its root (an existing
+    <code>design.md</code> is used as is, never duplicated) and canvases under
+    <code>design/&lt;name&gt;/</code>. Opening a canvas doesn't change your design.
+  </footer>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  // The loopback editor URL that `open_editor` returns. Nothing else is ever opened.
+  const EDITOR_URL = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/#token=[0-9a-f]{64}$/;
+
+  let nextId = 0;
+  const waiting = new Map();
+  const rpc = (method, params) => new Promise((resolve) => {
+    const id = ++nextId;
+    waiting.set(id, resolve);
+    window.parent.postMessage({ jsonrpc: '2.0', id, method, params }, '*');
+    setTimeout(() => { if (waiting.delete(id)) resolve({ timeout: true }); }, 60000);
+  });
+  const errorCode = (e) => (e && typeof e.code === 'number' ? ' (code ' + e.code + ')' : '');
+
+  let canMessage = false;
+  let editorUrl = null; // memory only, for the Open canvas button
+
+  // ---- actions: user messages to the active chat ----
+
+  const PRELUDE = 'First call openpaperdesign_status. If workspace_usable is false, tell me the ' +
+    'workspace_problem and stop; don\'t work around it. ';
+  const cleanName = (s) => String(s).replace(/[\u0000-\u001f\u007f"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const prompts = {
+    open: () => 'Open an existing OpenPaperDesign canvas in this workspace. ' + PRELUDE +
+      'Otherwise find the existing paper-rs projects (folders with a project.json, usually under ' +
+      'design/), ask me which one if there are several, bind it with bind_project, read its first ' +
+      'page with get_tree_summary, then call open_editor. Don\'t create, move or redesign anything.',
+    new: () => {
+      const name = cleanName($('name').value);
+      return 'Create a new OpenPaperDesign canvas' + (name ? ' named "' + name + '"' : '') + '. ' +
+        (name ? '' : 'Ask me for its name first. ') + PRELUDE +
+        'Follow the design method: reuse the project\'s existing design system, tokens and assets, ' +
+        'and its root DESIGN.md (use an existing design.md as is; never add a second file that ' +
+        'differs only in case). Then create it with create_project, read its first page with ' +
+        'get_tree_summary, and call open_editor.';
+    },
+    current: () => 'Show my current OpenPaperDesign project: call openpaperdesign_status and tell ' +
+      'me the workspace, the bound project and whether it is usable. Don\'t change anything.',
+  };
+
+  async function act(kind) {
+    const text = prompts[kind]();
+    if (!canMessage) {
+      $('msg-state').textContent = 'This Codex version doesn\'t let apps send messages. Copy this into the project\'s chat:';
+      $('prompt').textContent = text;
+      $('prompt').hidden = false;
+      return;
+    }
+    $('prompt').hidden = true;
+    $('msg-state').textContent = 'Sending to this chat…';
+    const r = await rpc('ui/message', { role: 'user', content: [{ type: 'text', text }] });
+    if (r.timeout) $('msg-state').textContent = 'Codex didn\'t answer the message request.';
+    else if (r.error || (r.result && r.result.isError)) $('msg-state').textContent = 'Codex didn\'t accept the message' + errorCode(r.error) + '.';
+    else $('msg-state').textContent = 'Sent to this chat. The agent checks the workspace first and will say if it can\'t use it.';
+  }
+  $('open').onclick = () => act('open');
+  $('new').onclick = () => act('new');
+  $('current').onclick = () => act('current');
+
+  // ---- results of the model's tool calls, delivered by the host ----
+
+  const field = (label, value) => {
+    const dt = document.createElement('dt'); dt.textContent = label;
+    const dd = document.createElement('dd'); dd.textContent = value;
+    $('result-fields').append(dt, dd);
+  };
+  const firstText = (result) => {
+    const c = result && Array.isArray(result.content) ? result.content.find((b) => b && b.type === 'text') : null;
+    return c && typeof c.text === 'string' ? c.text : '';
+  };
+
+  function showResult(result) {
+    const text = firstText(result);
+    let v = null;
+    try { v = JSON.parse(text); } catch { v = null; }
+    if (v && v.surface === 'home') return; // the home tool itself: stay on the home view
+    $('home').hidden = true;
+    $('result').hidden = false;
+    $('result-fields').textContent = '';
+    $('canvas').hidden = true;
+    $('canvas-state').textContent = '';
+    editorUrl = null;
+    if (result.isError) {
+      $('result-state').className = 'bad';
+      $('result-state').textContent = 'Refused: ' + (text.split('\n')[0] || 'the tool call failed').slice(0, 300);
+      return;
+    }
+    if (v && typeof v.workspace_state === 'string') { // openpaperdesign_status
+      const usable = v.workspace_usable === true;
+      $('result-state').className = usable ? '' : 'bad';
+      $('result-state').textContent = usable ? 'This chat can use its workspace.'
+        : 'This chat can\'t use a workspace: ' + String(v.workspace_problem || 'no Codex workspace context').slice(0, 300);
+      if (!usable) return; // a refused or retired context shows no workspace or project
+      if (typeof v.workspace === 'string') field('Workspace', v.workspace);
+      if (typeof v.workspace_permission_mode === 'string') field('Permissions', v.workspace_permission_mode);
+      field('Project', typeof v.bound_project === 'string' ? v.bound_project : 'none bound yet');
+      return;
+    }
+    if (v && typeof v.url === 'string') { // open_editor
+      if (!EDITOR_URL.test(v.url)) {
+        $('result-state').className = 'bad';
+        $('result-state').textContent = 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.';
+        return;
+      }
+      editorUrl = v.url;
+      $('result-state').className = '';
+      $('result-state').textContent = 'The canvas for the bound project is ready to open.';
+      field('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]);
+      $('canvas').hidden = false;
+      return;
+    }
+    $('result-state').className = '';
+    $('result-state').textContent = 'Done.';
+  }
+
+  $('canvas').onclick = async () => {
+    if (!editorUrl) return;
+    $('canvas-state').textContent = 'Asking Codex to open the canvas…';
+    const r = await rpc('ui/open-link', { url: editorUrl });
+    if (r.timeout) $('canvas-state').textContent = 'Codex didn\'t answer. Use the link in the chat instead.';
+    else if (r.error || (r.result && r.result.isError)) $('canvas-state').textContent = 'Codex didn\'t open the link' + errorCode(r.error) + '. Use the link in the chat instead.';
+    else $('canvas-state').textContent = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, use the link in the chat.';
+  };
+
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent) return;
+    const m = e.data;
+    if (!m || m.jsonrpc !== '2.0') return;
+    if (m.id !== undefined && !m.method) {
+      const done = waiting.get(m.id);
+      if (done) { waiting.delete(m.id); done(m); }
+      return;
+    }
+    if (m.method === 'ui/notifications/tool-result' && m.params) showResult(m.params);
+    else if (m.id !== undefined && m.method) window.parent.postMessage({ jsonrpc: '2.0', id: m.id, result: {} }, '*');
+  });
+
+  (async () => {
+    const r = await rpc('ui/initialize', {
+      protocolVersion: '2026-01-26',
+      appInfo: { name: 'openpaperdesign-home', version: '1' },
+      appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] },
+    });
+    if (r.timeout || r.error || !r.result) {
+      $('conn').className = 'bad';
+      $('conn').textContent = 'Couldn\'t connect to Codex' + errorCode(r.error) + '. Reopen OpenPaperDesign from the sidebar.';
+      for (const id of ['open', 'new', 'current']) $(id).disabled = true;
+      return;
+    }
+    const caps = r.result.hostCapabilities || {};
+    canMessage = !!(caps.message && caps.message.text);
+    window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
+    $('conn').textContent = canMessage ? 'Each action asks the agent in this chat.'
+      : 'This Codex version doesn\'t let apps send messages; each action shows text to paste into a project chat.';
+  })();
+})();
+</script>
+</body>
+</html>

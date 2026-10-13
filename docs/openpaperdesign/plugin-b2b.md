@@ -9,7 +9,41 @@ opens the editable canvas in Codex's in-app browser on a loopback URL. No AIOS d
 cloud, no telemetry. Not affiliated with Paper (paper.design).
 
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
-surface), plugin publishing, other hosts.
+surface), plugin publishing, other hosts. The later sidebar home is described in the next section.
+
+## Sidebar home (issue #6): source candidate, 2026-10-13
+
+Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
+adds `openpaperdesign_home`, the Codex sidebar (global) entry, and its static MCP App view
+`ui://openpaperdesign/home.html` (`text/html;profile=mcp-app`). The server now lists 34 tools
+and one resource.
+
+- **Home tool and view resource.** Both are answered before workspace admission. They read and
+  change no context, binding, project, listener or file, and the tool refuses any argument.
+  The exemption names exactly these two. Every other tool keeps per-call admission and
+  retirement unchanged.
+- **The view never calls the server's tools and stores nothing.**
+  - Its actions (open an existing canvas, new canvas, current project) send a user message
+    to the active chat with `ui/message`, only when the host advertises `message.text`.
+    Otherwise they show the text to paste. A message grants nothing; the model runs the usual
+    guarded steps.
+  - It shows project details only from admitted `openpaperdesign_status` and `open_editor`
+    results that the host delivers. Those two tools carry the view as a model-only result
+    presentation.
+  - It opens only the exact loopback editor URL, through `ui/open-link`. Codex's
+    acknowledgement is not proof that the canvas loaded.
+- **Native Codex project inventory is shown as not available in this build.** Codex 0.162.1's
+  experimental app-server has `project/list` and `project/read`: an operator ran a read-only
+  probe on 2026-10-13. Integration still needs the exact app-server handshake and proof that
+  the packaged plugin can reach the CLI. A listed root is discovery, never write authority.
+
+Issue #6 stays open until these are proven on a real host:
+1. Native inventory and root selection.
+2. Workspace authority for model calls in the global entry's own thread. The Mac global
+   receipts carried only thread ids.
+3. Delivery of model results to the view.
+4. Where `ui/open-link` opens the loopback page.
+5. An actual canvas load.
 
 ## Installed qualification (2026-10-13)
 

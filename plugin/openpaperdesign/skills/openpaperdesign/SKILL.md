@@ -66,5 +66,10 @@ Limits (state them when relevant):
 - Image fills aren't drawn in the browser canvas yet; multi-page editing in the browser is
   limited to the active page.
 
+The OpenPaperDesign home in the Codex sidebar (`openpaperdesign_home`) is a static view. Its
+buttons send you requests like the steps above as ordinary user messages; they grant no
+workspace and name no authority. Follow the same steps and refusals. Opening an existing
+project changes nothing in it.
+
 For visual direction and review, use the [design](../design/SKILL.md) and
 [review design](../review-design/SKILL.md) skills; this editor is their editable companion.

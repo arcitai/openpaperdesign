@@ -30,8 +30,9 @@ use crate::{Server, bundle_file_names, new_token, router};
 use paper_rs::mcp::server::to_result;
 use paper_rs::mcp::{Out, ToolResult, tools};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, RequestMetaObject, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    RequestMetaObject, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -56,6 +57,15 @@ const SWITCH_NEEDS_FORCE: &str = "The browser editor for the bound project was o
     isn't saved yet (the page shows an unsaved change or \"Saving…\") would be lost. Your own \
     tool edits are already saved by each call. Ask the person to let their edits save (the \
     page shows \"Saved\") or to accept losing them, then call again with force: true.";
+
+/// The home: one global-entry tool and its static MCP App view. Both are answered before
+/// workspace admission because they touch nothing: no context, binding, project, listener or
+/// file. They never read or change the session's workspace state, so opening the home cannot
+/// pin, inspect or retire a binding. Every other tool keeps per-call admission unchanged.
+const HOME_TOOL: &str = "openpaperdesign_home";
+const HOME_URI: &str = "ui://openpaperdesign/home.html";
+const HOME_MIME: &str = "text/html;profile=mcp-app";
+const HOME_HTML: &str = include_str!("home.html");
 
 const NOT_BOUND: &str = "No design project is bound yet. Call bind_project with the path of an \
     existing paper-rs project folder inside this workspace, or create_project to make a new one \
@@ -172,19 +182,54 @@ fn own_tools() -> Vec<Tool> {
                 browser; the person's edits there and your tool edits land in the same project \
                 and show up in each other live. The URL holds a per-session token: don't write \
                 it into files.",
-            "inputSchema": {"type": "object", "properties": {}}
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": result_view()
         }),
         json!({
             "name": "openpaperdesign_status",
             "description": "Report what is set up and what is bound: version, workspace, bound \
                 project, workspace provenance/permission admission or refusal reason, and \
                 whether the browser editor is available.",
-            "inputSchema": {"type": "object", "properties": {}}
+            "inputSchema": {"type": "object", "properties": {}},
+            "_meta": result_view()
+        }),
+        json!({
+            "name": HOME_TOOL,
+            "title": "OpenPaperDesign",
+            "description": "Open the OpenPaperDesign home: a static view (the Codex sidebar entry). \
+                It reads no workspace, project or binding and changes nothing. To work on a \
+                canvas use openpaperdesign_status, then bind_project or create_project, then \
+                open_editor.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "_meta": {
+                "ui": {"resourceUri": HOME_URI},
+                "openai/ui": {"entrypoints": [{"type": "global"}]}
+            }
         }),
     ]
     .into_iter()
     .map(|t| serde_json::from_value(t).expect("valid tool"))
     .collect()
+}
+
+/// The home view also presents the model's own status and editor results. Model-only: the
+/// view itself never calls these tools (it has no workspace context and would be refused).
+fn result_view() -> Value {
+    json!({"ui": {"resourceUri": HOME_URI, "visibility": ["model"]}})
+}
+
+/// `openpaperdesign_home`: answered without workspace admission and without touching state.
+fn home(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
+    if args.is_some_and(|a| !a.is_empty()) {
+        return Err(format!(
+            "{HOME_TOOL} takes no arguments; it only opens the home view."
+        ));
+    }
+    text(json!({
+        "surface": "home",
+        "version": VERSION,
+        "note": "Static home view. Nothing was read or changed. Use openpaperdesign_status to check this chat's workspace.",
+    }))
 }
 
 impl Workspace {
@@ -527,16 +572,19 @@ impl Launcher {
 
 impl ServerHandler for Launcher {
     fn get_info(&self) -> ServerConfig {
-        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         // Safe to advertise in standalone mode too; only --codex-context consumes it.
         capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("openpaperdesign", VERSION))
             .with_instructions(format!(
                 "openpaperdesign: an editable design canvas (paper-rs) for this workspace. \
-                 Check openpaperdesign_status first. In packaged Codex mode every call needs \
-                 host-generated workspace and supported permission context; tool arguments \
-                 cannot supply it. If workspace_usable is false, report workspace_problem \
+                 Check openpaperdesign_status first. In packaged Codex mode every call except \
+                 the static openpaperdesign_home view needs host-generated workspace and \
+                 supported permission context; tool arguments cannot supply it. If workspace_usable is false, report workspace_problem \
                  and stop editing. First \
                  bind a project deliberately (bind_project for an existing one inside the \
                  workspace, or create_project under design/). Before changing a page, read \
@@ -560,11 +608,48 @@ impl ServerHandler for Launcher {
         Ok(ListToolsResult::with_all_items(all))
     }
 
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let home = serde_json::from_value(json!({
+            "uri": HOME_URI,
+            "name": "openpaperdesign-home",
+            "title": "OpenPaperDesign",
+            "mimeType": HOME_MIME,
+        }))
+        .expect("valid resource");
+        Ok(ListResourcesResult::with_all_items(vec![home]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        // Static and exact: no other URI is resolved, and no state or file is read.
+        if request.uri != HOME_URI {
+            return Err(ErrorData::resource_not_found("unknown resource", None));
+        }
+        let contents = serde_json::from_value(json!({
+            "uri": HOME_URI,
+            "mimeType": HOME_MIME,
+            "text": HOME_HTML,
+            "_meta": {"openai/ui": {"availableDisplayModes": ["inline", "fullscreen"]}},
+        }))
+        .expect("valid resource contents");
+        Ok(ReadResourceResult::new(vec![contents]).into())
+    }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if request.name == HOME_TOOL {
+            return Ok(to_result(home(request.arguments.as_ref())).into());
+        }
         let args = Value::Object(request.arguments.unwrap_or_default());
         Ok(to_result(self.run(&request.name, args, &context.meta).await).into())
     }
