@@ -1296,3 +1296,109 @@ async fn synthetic_mcp_cancellation_stops_the_inventory_child_and_frees_the_inve
     }
     f.no_cache_writes();
 }
+
+/// `open_editor` names only the project that was bound: its root and entries are checked
+/// again first (same boundary as every API read). A root replaced by a link or by another
+/// directory, or a linked `project.json`, is refused, with no outside identity disclosed, no
+/// file changed and no "opened" flag left behind.
+#[tokio::test]
+async fn synthetic_open_editor_refuses_a_replaced_or_linked_bound_project() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let c = f.host().await;
+    let meta = context::writable(&f.ws);
+    if status(&c, meta.clone()).await["browser_editor"] != "built in" {
+        c.cancel().await.unwrap();
+        return; // open_editor needs the embedded bundle; nothing to check without it
+    }
+    let design = f.ws.join("design");
+    // A valid project outside the workspace, with a distinctive identity.
+    let (ok, s) = call(
+        &c,
+        "create_project",
+        json!({"name": "Inside"}),
+        meta.clone(),
+    )
+    .await;
+    assert!(ok, "{s}");
+    let outside = f.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let secret = std::fs::read_to_string(design.join("Inside/project.json"))
+        .unwrap()
+        .replace("\"Inside\"", "\"Outside Secret\"");
+    std::fs::write(outside.join("project.json"), &secret).unwrap();
+    let outside_id = serde_json::from_str::<Value>(&secret).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let outside_before = snapshot(&outside);
+    let refused = |s: &str| {
+        s.contains("can't be opened")
+            && s.contains("Nothing was opened")
+            && !s.contains("Outside Secret")
+            && !s.contains(outside.to_str().unwrap())
+            && !s.contains("#token=")
+    };
+
+    // 1. The bound root replaced by a link to the outside project.
+    std::fs::rename(design.join("Inside"), design.join("Inside.moved")).unwrap();
+    symlink(&outside, design.join("Inside")).unwrap();
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    assert!(!ok && refused(&s), "{s}");
+    let st = status(&c, meta.clone()).await;
+    assert_eq!(
+        st["editor_opened"], false,
+        "a failed open leaves no opened flag"
+    );
+
+    // 2. The bound root replaced by another real directory with a valid manifest.
+    std::fs::remove_file(design.join("Inside")).unwrap();
+    std::fs::create_dir(design.join("Inside")).unwrap();
+    std::fs::write(design.join("Inside/project.json"), &secret).unwrap();
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    assert!(!ok && refused(&s), "{s}");
+    assert_eq!(status(&c, meta.clone()).await["editor_opened"], false);
+    assert!(!s.contains(&outside_id));
+
+    // Switching away needs no force: nothing was opened.
+    let (ok, s) = call(&c, "create_project", json!({"name": "Other"}), meta.clone()).await;
+    assert!(ok, "{s}");
+
+    // 3. The bound project's manifest replaced by a link to the outside manifest.
+    let manifest = design.join("Other/project.json");
+    let original = std::fs::read(&manifest).unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    symlink(outside.join("project.json"), &manifest).unwrap();
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    assert!(!ok && refused(&s) && s.contains("symbolic link"), "{s}");
+    assert!(!s.contains(&outside_id));
+    assert_eq!(status(&c, meta.clone()).await["editor_opened"], false);
+    assert_eq!(
+        snapshot(&outside),
+        outside_before,
+        "the outside project was not changed"
+    );
+
+    // Restored: the normal open works and names the bound project.
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::write(&manifest, &original).unwrap();
+    let (ok, s) = call(&c, "open_editor", json!({}), meta.clone()).await;
+    assert!(ok, "{s}");
+    let v: Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["project"], "design/Other");
+    assert_eq!(v["canvas"]["name"], "Other");
+    assert_eq!(
+        v["url"]
+            .as_str()
+            .unwrap()
+            .split("#token=")
+            .nth(1)
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(status(&c, meta.clone()).await["editor_opened"], true);
+    assert_eq!(snapshot(&outside), outside_before);
+    f.no_cache_writes();
+    c.cancel().await.unwrap();
+}

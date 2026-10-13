@@ -516,6 +516,16 @@ impl Server {
         self.bundle.len()
     }
 
+    /// The bound project's manifest, behind the same boundary as every API read: the root is
+    /// still the directory that was bound (a real directory with the same canonical path and
+    /// device/inode, so a replaced or linked root is refused) and its own entries are real.
+    /// Reading it acknowledges no page.
+    pub(crate) fn bound_manifest(&self) -> Result<Manifest, String> {
+        check_root(&self.dir, self.root_id)?;
+        check_project_dir(&self.dir)?;
+        read_manifest_checked(&self.dir)
+    }
+
     /// Root identity plus the project's own entries; run before every read and write.
     fn check(&self) -> Result<(), ApiError> {
         check_root(&self.dir, self.root_id).map_err(forbidden)?;

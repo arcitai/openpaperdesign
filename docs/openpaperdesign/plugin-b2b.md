@@ -35,7 +35,10 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     reading no page.
 - **`open_editor`** now names its own validated workspace, the bound project's relative and
   absolute path, and its canvas (manifest id, name, page count). The URL and token are
-  unchanged.
+  unchanged. It reads the bound manifest only after the bound root's identity (real directory, same
+  canonical path and device/inode) and its entries pass again, as for every API read. A
+  replaced or linked root, or a linked `project.json`, is refused. Nothing is then marked as
+  opened, and no other project's identity is shown.
 - **Native inventory.** This is Codex CLI 0.162.1's experimental app-server, started as
   `codex app-server` from PATH for one exchange:
   - It speaks JSONL over stdio and sends `initialize` with `experimentalApi`, then

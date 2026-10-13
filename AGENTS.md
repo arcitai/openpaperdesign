@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.20 · Updated: 2026-10-14
+Revision: 0.21 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -148,7 +148,9 @@ before workspace admission:
 They read or change none of the session's context, binding, project, listener or files. This
 named exemption covers only those three; never route another tool around admission.
 `openpaperdesign_canvases` (read-only, bounded list of `design/` projects) and `open_editor`'s
-workspace/project/canvas identity are ordinary admitted calls, not exemptions. The home is
+workspace/project/canvas identity are ordinary admitted calls, not exemptions. `open_editor`
+reads the bound manifest only after the bound root's identity and entries pass again
+(`Server::bound_manifest`). Otherwise it refuses and marks nothing as opened. The home is
 both a global and a thread entry.
 
 The inventory starts `codex app-server` from PATH for one bounded exchange. It sends only

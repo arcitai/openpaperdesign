@@ -737,20 +737,29 @@ impl Launcher {
                             .into(),
                     );
                 }
-                b.editor_opened = true;
                 // Self-contained identity from this admitted call: the validated workspace and
-                // the bound project, whose manifest is read with the binding checks. Reading
-                // it acknowledges no page.
+                // the bound project. Its manifest is read only after the bound root's identity
+                // and entries are checked again (a replaced or linked root is refused), and
+                // reading it acknowledges no page. Nothing counts as opened unless this passes.
                 let dir = b.server.dir().to_path_buf();
-                let canvas = crate::read_manifest_checked(&dir)
-                    .ok()
-                    .map(|m| json!({"id": m.id, "name": m.name, "pages": m.pages.len()}));
+                let manifest = b.server.bound_manifest().map_err(|e| {
+                    format!(
+                        "The bound project {} can't be opened: {e}. Nothing was opened; bind \
+                         a project again.",
+                        ws.relative(&dir)
+                    )
+                })?;
+                b.editor_opened = true;
                 text(json!({
                     "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
                     "workspace": ws.path,
                     "project": ws.relative(&dir),
                     "project_path": dir,
-                    "canvas": canvas,
+                    "canvas": {
+                        "id": manifest.id,
+                        "name": manifest.name,
+                        "pages": manifest.pages.len(),
+                    },
                     "open_in": "the host's in-app browser (loopback only)",
                     "note": "The token in the URL is for this session only; don't write it into files.",
                 }))
