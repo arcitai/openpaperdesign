@@ -3,9 +3,11 @@
 // editor lifecycle (gating, fallback, saving) is in session.js.
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
-import { frameStep, saveStep } from './page.js';
+import { discardStep, frameStep, saveStep } from './page.js';
 
 const SAVE_POLL_MS = 300;
+// How often to look for changes made elsewhere (an agent over MCP, another tab).
+const REVISION_POLL_MS = 1000;
 
 // State for people and for automated checks (read-only from outside).
 const state = { pageId: null };
@@ -99,6 +101,11 @@ async function main() {
       });
       return { ok: res.ok, status: res.status, revision: res.headers.get('ETag') };
     },
+    revision: async () => {
+      const res = await api(`${pageUrl}/revision`);
+      if (!res.ok) throw new Error(`revision ${res.status}`);
+      return res.headers.get('ETag');
+    },
     log: (m) => console.error(m),
   }, state);
   window.__opdSession = session;
@@ -182,16 +189,39 @@ async function main() {
     },
     status: (text) => status(text),
     tick: syncToolbar,
+    // The conflict banner: affected layers and an explicit discard.
+    // The conflict banner. The unsaved state stays on screen until the person discards it;
+    // the button reloads the server's version in place (no navigation, so the leave-page
+    // guard for unsaved edits stays in force for ordinary navigation).
     conflict: () => {
       const c = $('conflict');
-      c.textContent = 'This page was changed on disk by something else since it was loaded. '
-        + 'Nothing was overwritten, and edits made here since then are not saved. '
-        + 'Reload to continue from the version on disk.';
+      c.replaceChildren();
+      c.append('This page was changed elsewhere (for example by an agent) since your unsaved '
+        + 'change. Nothing was overwritten, and your change is not saved. ');
+      const b = document.createElement('button');
+      b.textContent = 'Reload (discard my unsaved change)';
+      b.addEventListener('click', () => discardStep(session, ui));
+      c.append(b);
       c.classList.add('show');
+    },
+    hideConflict: () => {
+      $('conflict').classList.remove('show');
+      $('conflict').replaceChildren();
     },
   };
   // ---- saving: one request at a time, always with the revision we last saw.
   setInterval(() => saveStep(session, ui), SAVE_POLL_MS);
+  // ---- changes made elsewhere (e.g. an agent): reload in place when nothing is unsaved here.
+  setInterval(async () => {
+    try {
+      const r = await session.poll();
+      if (state.error) return; // a terminal error stays on screen
+      if (r === 'reloaded') status('Updated with changes made elsewhere');
+      else if (r === 'behind') status('Changed elsewhere; saving your edit will report a conflict');
+    } catch {
+      // The server is unreachable; the save loop reports that.
+    }
+  }, REVISION_POLL_MS);
   window.addEventListener('beforeunload', (e) => {
     if (session.ed && session.ed.dirty()) e.preventDefault();
   });

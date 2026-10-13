@@ -3,6 +3,8 @@
 Updated 2026-10-12 after review rounds 1–3 and the operator's Codex browser runs (see "Fix
 round 1", "Fix round 2" and "Fix round 3" below).
 
+2026-10-13 documentation update: linked the later installed qualification under remaining limits.
+
 Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B1. A
 loopback server opens one existing paper-rs project folder. A browser page runs the upstream
 editor and canvas renderer as wasm and saves through the server with revision checks.
@@ -456,11 +458,12 @@ lockfile changed.
 
 ## Not proven / open
 
-- Browser runs are operator-observed only, all in the Codex in-app browser on a Mac (Apple
+- Historical B1 browser runs are operator-observed, all in the Codex in-app browser on a Mac (Apple
   M4): the WebGPU failure and WebGL2 on 13b2430, WebGPU and WebGL on the run-8 tree, and
-  WebGPU and WebGL on 260ac38 (see "Fix round 3"). **The final revision needs its own browser
-  re-check:** the round-3 changes (bundle from memory, renderer readiness, device loss) have
-  not been run in a browser.
+  WebGPU and WebGL on 260ac38 (see "Fix round 3"). The later
+  [installed `0078487` qualification](plugin-b2b.md#installed-qualification-2026-10-13)
+  records WebGPU Ready and browser/agent save, stale refusal, reload and process-reopen
+  preservation. It does not establish live device-loss recovery or a physical crash test.
 - Other browsers, MSAA and blend-mode output in a browser compared with native.
 - Image fills: the browser registers no project assets, so image fills don't draw. Saving
   keeps their references.
@@ -469,7 +472,7 @@ lockfile changed.
 - The Mac browser ⌘ mapping is unit-tested and was operator-observed in Codex on the run-8
   tree (⌘A, ⌘Z). Other Mac browsers are untested.
 - ~4.2 MB gzip download: the fonts alone are 2.5 MB uncompressed. Size work is open.
-- The Codex in-app browser on the **final revision**: earlier revisions were
-  operator-observed there (above), but the round-4 changes (input gating, fallback
-  rework, `--web-dir` resolution) have not been run in any browser.
-- MCP App panel, plugin packaging and B2 agent writes.
+- Renderer fallback transitions, startup input gating and `--web-dir` variants have no
+  new browser qualification from the installed run; their earlier evidence remains above.
+- MCP App panel and other-host embedding. Local plugin packaging and B2 model writes are
+  covered only to the extent of the linked installed qualification.

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.3 · Updated: 2026-10-12
+Revision: 0.16 · Updated: 2026-10-13
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -16,6 +16,18 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
   `README.md`, `PROGRESS.md`) minimal. Put new code in separate adapter crates under
   `crates/`, which reuse upstream modules via `#[path]`. If an upstream file has to change,
   give the reason in the commit.
+- Upstream source changes so far (keep this list current):
+  - `src/render/gpu.rs`: the image texture is sampled in uniform control flow (B1, WebGPU
+    validation in browsers).
+  - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`
+    and `PageSlot` (B2a review round 5). Derive-only, no behaviour change. It lets the agent
+    host restore the exact editor state after a failed MCP call.
+  - `src/mcp/exec.rs`: `pub fn with_no_stretch` gives access to the process-wide record of
+    containers that don't stretch their children (B2a final review). Accessor only, no
+    behaviour change. The host copies and restores its own pages' entries with the editor. A
+    newly activated project drops stale entries for its page ids. `Server::retire` first
+    closes admission and drains the current writer/rollback, then releases every page id
+    the host held. Queued and retained old handles cannot execute or save after retirement.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -46,6 +58,8 @@ PAPER_RS_REQUIRE_GPU=1 cargo test --locked --test headless
 cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown
 cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
 node --test crates/openpaperdesign-web/tests/session.test.mjs   # page lifecycle; Node >= 22
+node --test plugin/tests/plugin.test.mjs                        # plugin manifests and skills
+(cd plugin/tests/design && python3 -m unittest)                 # ported design-method tests
 ./scripts/build-web.sh                         # browser bundle; needs wasm-bindgen CLI 0.2.129
 cargo clippy --locked --all-targets
 cargo fmt --all --check
@@ -64,6 +78,65 @@ that guard, so a pass is not proof that rendering happened.
 (`docs/openpaperdesign/browser-edit-b1.md`). Its revision checks protect only writers that go
 through it. Never describe it as protecting a concurrently running native app or other
 external writer.
+
+Agents edit the same project over MCP at `/mcp` on that server, with the per-launch token as
+`Authorization: Bearer <token>`. Only the bound project is reachable: export and project
+creation are refused, and images must be `data:` URIs
+(`docs/openpaperdesign/agent-edit-b2a.md`). Never write the token into repository files or commit it.
+Conflicts are strict, and nothing merges. A browser save on a stale revision is refused (409).
+An MCP session must read a page before it changes it (no first-call exception). Reads are
+per page: only a successful call that returned that page counts. Failed calls, and calls
+not attributable to one page, acknowledge nothing. The page list (names, order) is read only
+via `get_basic_info`. A change is refused as a `conflict` unless every page it writes (and
+the page list, if it changes it) is read at its current revision. The browser polls only
+while its editor is clean. Page ids come only from the manifest, must be safe file names,
+must differ in more than ASCII case (macOS file systems alias them), and must not share
+their first six characters, ignoring case (node ids are `<prefix>:<n>`). A call that returns
+an error changes nothing, in memory (the editor state, undo history and selection included)
+or on disk. Each save (agent call or browser) is one commit that is rolled back on any error,
+directory syncs included. If the rollback fails, the answer names the files that may be
+inconsistent, and the server refuses every further write. That state is in memory only and
+clears on restart, so check the named files first. Commits are not crash-atomic: a crash
+mid-commit can leave a mix of old and new files (each one complete). A call that couldn't start within the timeout is never run; a
+started call is always waited for; reads count only once their result was delivered. Inline SVG may not
+contain `<image>`/`<feImage>`.
+The dropped three-way-merge experiment is at the local tag `experiment/b2a-three-way-merge`;
+don't bring it back without an explicit decision (collaboration is issue #2).
+
+## Codex plugin
+
+`plugin/openpaperdesign/` is the local Codex plugin (`docs/openpaperdesign/plugin-b2b.md`). Its
+MCP server, `openpaperdesign-mcp`, must be on PATH. It binds only projects inside the
+workspace and embeds the web bundle at build time, so run `./scripts/build-web.sh` before
+`cargo install`. `plugin/openpaperdesign/plugin.json` is the only manifest. Codex
+discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `skills`,
+`mcpServers`, `apps` or `interface`. Codex presentation goes in `extensions.com.openai`
+(`interface.shortDescription` ≤ 30 characters). Don't add a `.codex-plugin/` overlay.
+`mcp.json` is explicit `type: "stdio"`, args `["--codex-context"]`, with no `cwd`. The packaged
+launcher pins canonical workspace/identity from Codex 0.162.1's experimental
+`codex/sandbox-state-meta` in `RequestContext.meta` on real model tool calls. Direct
+app-server calls omit it; arguments are never authority. Accept only the observed managed
+workspace-write shape or exact `{"type":"disabled"}` profile; never infer missing grants.
+Managed network must be `restricted` or `enabled`; neither changes adapter networking.
+Root `.git` may be an opaque regular file for a Git worktree: never read or follow its
+pointer. Protected project paths and symlinked metadata remain refused.
+Read-only/unsupported profiles cannot bind or open a writable browser. Plugin scope and
+protected-path checks apply even when the host sandbox is disabled. Missing, changed or
+no-longer-writable context after pinning permanently retires the binding through the same
+writer fence; caller cancellation cannot interrupt retirement. Checks are per call, not
+instantaneous detection of idle host permission changes, and provide no OS sandboxing.
+Standalone `--workspace`/cwd mode is separate; reject conflicting flags. The launcher
+refuses a moved or replaced workspace. It creates
+`design/<name>/` itself without following links. A failed `bind_project` must leave the
+current binding working. Replacement preparation must not change the active host's layout
+registry. On a successful switch, retire the old server before activating the replacement;
+HTTP sessions, stdio clones and browser saves share that fence. Same-project binding is a
+no-op. Never claim browser edits are saved on a switch or exit: once
+`open_editor` was called, switching needs `force: true`. The summary bind returns runs in a
+one-off session and is not the agent's read: instructions must have the agent read the
+target page (`get_tree_summary` root with its `pageId`) before its first change. The ported
+audit rejects duplicate evidence (JSON keys, repeated records). Keep the ported `design` and `review-design` skills' provenance notes and
+LICENSE files, and the plugin's `NOTICE.md`, intact.
 
 ## Model profile
 

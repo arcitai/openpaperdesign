@@ -367,6 +367,16 @@ impl WebEditor {
         self.state.save_succeeded();
     }
 
+    /// See [`WebState::can_reload`].
+    pub fn can_reload(&self) -> bool {
+        self.state.can_reload()
+    }
+
+    /// Load a newer revision of this page in place (see [`WebState::reload`]).
+    pub fn reload(&mut self, page_json: &str) -> Result<(), JsError> {
+        self.state.reload(page_json).map_err(js_err)
+    }
+
     pub fn save_failed(&mut self) {
         self.state.save_failed();
     }

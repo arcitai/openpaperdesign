@@ -2504,6 +2504,8 @@ dependencies = [
  "getrandom 0.3.4",
  "http-body-util",
  "paper-rs",
+ "rmcp",
+ "roxmltree 0.21.1",
  "serde_json",
  "tokio",
  "tower",

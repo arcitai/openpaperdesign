@@ -1149,6 +1149,12 @@ fn no_stretch() -> &'static Mutex<HashSet<(String, NodeId)>> {
     S.get_or_init(Default::default)
 }
 
+/// Run `f` on the remembered non-stretch containers (see `no_stretch`). For hosts that roll a
+/// failed call back: this state lives outside the editor, so they save and restore it too.
+pub fn with_no_stretch<R>(f: impl FnOnce(&mut HashSet<(String, NodeId)>) -> R) -> R {
+    f(&mut no_stretch().lock().unwrap())
+}
+
 fn stretches(page_id: &str, n: &Node) -> bool {
     n.layout
         .is_some_and(|l| l.align_cross == crate::model::Align::Start)

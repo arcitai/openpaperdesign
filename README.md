@@ -1,3 +1,18 @@
+# openpaperdesign
+
+An independent fork of [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs),
+not affiliated with or endorsed by Paper (paper.design). The first slice is a local Codex
+plugin with a loopback editable canvas, deliberately bound to one design project inside the
+workspace. See [standalone plugin setup](docs/openpaperdesign/plugin-b2b.md#install-on-a-mac-operator-steps)
+for local-build setup and limits. Installed model editing and browser save/conflict/reopen
+passed on macOS with Codex 0.162.1 at `0078487` (2026-10-13). Distribution is source-only /
+local build, with no packaged installer or public marketplace listing. See
+[repository Releases](https://github.com/onlinesourdough/openpaperdesign/releases) for delivery status.
+There is no protection against concurrent native or external writers, and no multiplayer
+or cloud service. The upstream README follows unchanged.
+
+---
+
 # paper-rs
 
 A native Rust infinite canvas for planning, working and sketching. It is modeled on the
@@ -338,6 +353,16 @@ src/bin/paper-rs-mcp.rs  stdio bridge to the running app
 analysis/          reverse-engineering findings and design (raw dumps are gitignored)
 docs/screenshots/  headless renders produced by `cargo test`
 ```
+
+## openpaperdesign: Codex plugin (this fork)
+
+This fork adds a local Codex plugin, `openpaperdesign` (`plugin/openpaperdesign/`, local
+marketplace `.agents/plugins/marketplace.json`). The agent binds a design project in your
+workspace, edits it over MCP, and opens the editable canvas in Codex's in-app browser on
+127.0.0.1. It runs locally only and is not affiliated with Paper. To set it up, run
+`./scripts/build-web.sh`, then
+`cargo install --locked --path crates/openpaperdesign-serve --bin openpaperdesign-mcp`. See
+`docs/openpaperdesign/plugin-b2b.md` for the steps and what is verified.
 
 ## License
 

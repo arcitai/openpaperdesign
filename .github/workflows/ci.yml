@@ -38,6 +38,12 @@ jobs:
         run: |
           node --version
           node --test crates/openpaperdesign-web/tests/session.test.mjs
+      # The plugin: manifests/skills (Node) and the ported design-method tests (Python 3,
+      # standard library only).
+      - name: Test the openpaperdesign plugin
+        run: |
+          node --test plugin/tests/plugin.test.mjs
+          cd plugin/tests/design && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v
 
   wasm-core:
     runs-on: ubuntu-24.04

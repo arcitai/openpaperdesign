@@ -11,6 +11,11 @@ publish = false
 name = "openpaperdesign-serve"
 path = "src/main.rs"
 
+# The openpaperdesign plugin's MCP server (stdio); see plugin/openpaperdesign/.
+[[bin]]
+name = "openpaperdesign-mcp"
+path = "src/bin/openpaperdesign-mcp.rs"
+
 [lib]
 path = "src/lib.rs"
 
@@ -21,7 +26,14 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "io-std"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 getrandom = "0.3"
+# Same requirements and features as the root package (MCP server over streamable HTTP).
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "base64", "transport-streamable-http-server", "transport-io", "client", "transport-streamable-http-client-reqwest"] }
+# The XML parser usvg uses: inline SVG is checked with the same parser before it reaches usvg.
+roxmltree = "0.21"
+tower = "0.5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Same as the root package's dev-dependency: drives the stdio launcher as a child process.
+rmcp = { version = "3.5.1", default-features = false, features = ["transport-child-process"] }
 http-body-util = "0.1"

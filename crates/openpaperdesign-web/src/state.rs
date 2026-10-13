@@ -274,6 +274,40 @@ impl WebState {
         Some(page_to_json(&self.ed.page_data(self.ed.active_page)))
     }
 
+    /// Whether a newer revision from the server may replace the page now: nothing unsaved,
+    /// no save in flight, no gesture or text edit under way. Otherwise nothing is reloaded:
+    /// the local change's save is refused as a conflict (nothing merges).
+    pub fn can_reload(&self) -> bool {
+        !self.dirty()
+            && self.inflight.is_none()
+            && !self.ed.is_busy()
+            && self.ed.text_edit.is_none()
+    }
+
+    /// Load a newer revision of the same page in place, keeping the view: camera, tool, and
+    /// the selection where those nodes still exist. Undo history starts over.
+    pub fn reload(&mut self, page_json: &str) -> Result<(), String> {
+        let mut page = page_from_json(page_json).map_err(|e| e.to_string())?;
+        let slot = &self.ed.pages[self.ed.active_page];
+        page.id = slot.id.clone();
+        page.name = slot.name.clone();
+        page.doc.name = slot.name.clone();
+        page.camera = Some(self.ed.camera);
+        let selection = self.ed.selection.clone();
+        let tool = self.ed.tool;
+        self.ed.open_pages(vec![page], None);
+        self.ed.tool = tool;
+        let kept: Vec<_> = selection
+            .into_iter()
+            .filter(|id| self.ed.doc.nodes.contains_key(id))
+            .collect();
+        self.ed.selection = kept;
+        self.saved_stamp = self.ed.doc_stamp;
+        self.inflight = None;
+        self.redraw = true;
+        Ok(())
+    }
+
     /// The server stored the last snapshot.
     pub fn save_succeeded(&mut self) {
         if let Some(s) = self.inflight.take() {
@@ -449,6 +483,62 @@ mod tests {
         s.modifiers(false, false, false, false);
         assert!(!s.key_down("F5", "F5", false));
         assert!(!s.key_down("Shift", "ShiftLeft", false));
+    }
+
+    /// The page with the rectangle moved to x and a second rectangle, as another writer saved it.
+    fn changed_elsewhere(s: &WebState, x: f64) -> String {
+        let mut page = s.ed.page_data(0);
+        let id = *page.doc.nodes.keys().next().unwrap();
+        page.doc.nodes.get_mut(&id).unwrap().rect.x = x;
+        let n = page.doc.alloc_id();
+        page.doc.nodes.insert(
+            n,
+            Node::new(
+                n,
+                NodeKind::Rect,
+                crate::geom::Rect::new(0.0, 0.0, 5.0, 5.0),
+            ),
+        );
+        page.doc.root.push(n);
+        page_to_json(&page)
+    }
+
+    #[test]
+    fn reload_only_when_clean_and_it_keeps_the_view() {
+        let mut s = state();
+        s.ed.camera.pan = v2(-40.0, 10.0);
+        s.pointer_down(150.0 + 40.0, 150.0 - 10.0, Button::Primary, 0.0);
+        s.pointer_up(150.0 + 40.0, 150.0 - 10.0, Button::Primary, 10.0);
+        assert_eq!(s.ed.selection.len(), 1);
+        let selected = s.ed.selection[0];
+        assert!(s.can_reload(), "clean: may reload");
+        let newer = changed_elsewhere(&s, 300.0);
+        s.reload(&newer).unwrap();
+        assert_eq!(s.ed.doc.nodes.len(), 2);
+        assert_eq!(s.ed.doc.nodes[&selected].rect.x, 300.0);
+        assert_eq!(s.ed.camera.pan, v2(-40.0, 10.0), "camera kept");
+        assert_eq!(s.ed.selection, vec![selected], "selection kept");
+        assert!(!s.dirty(), "the reloaded page is the saved state");
+        assert!(s.tick(100.0), "redraws");
+    }
+
+    #[test]
+    fn never_reload_over_unsaved_or_in_flight_edits() {
+        let mut s = state();
+        // Mid-gesture.
+        s.pointer_down(150.0, 150.0, Button::Primary, 0.0);
+        s.pointer_move(170.0, 160.0, 10.0);
+        assert!(!s.can_reload(), "dragging");
+        s.pointer_up(170.0, 160.0, Button::Primary, 20.0);
+        assert!(!s.can_reload(), "unsaved move");
+        let _snap = s.save_snapshot().unwrap();
+        assert!(!s.can_reload(), "save in flight");
+        s.save_succeeded();
+        assert!(s.can_reload(), "saved: clean again");
+        // A selection on its own is not an unsaved change.
+        s.pointer_down(170.0, 160.0, Button::Primary, 30.0);
+        s.pointer_up(170.0, 160.0, Button::Primary, 40.0);
+        assert!(s.can_reload());
     }
 
     #[test]

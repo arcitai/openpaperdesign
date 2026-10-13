@@ -18,6 +18,9 @@ function editor(name, { gpuError = null, ready = true, snapshot = '{"page":1}' }
     save_succeeded() { this.calls.push('saved'); },
     save_failed() { this.calls.push('save_failed'); },
     dirty() { return this.pending !== undefined; },
+    canReload: true,
+    can_reload() { return this.canReload && this.pending === undefined; },
+    reload(text) { this.calls.push(`reload:${text}`); },
     free() { this.freed = true; },
   };
 }
@@ -30,7 +33,7 @@ function deferred() {
 }
 
 /** A session with mock deps. `editors` are handed out by boot() in order. */
-function setup(editors, { pages = [{ text: 'v1', revision: '"r1"' }], put } = {}) {
+function setup(editors, { pages = [{ text: 'v1', revision: '"r1"' }], put, revision } = {}) {
   const log = [];
   const observers = [];
   const booted = [];
@@ -52,6 +55,7 @@ function setup(editors, { pages = [{ text: 'v1', revision: '"r1"' }], put } = {}
     },
     resize: (ed) => ed.resize(),
     put: put || (async () => ({ ok: true, status: 200, revision: '"r2"' })),
+    revision: revision || (async () => '"r1"'),
     log: (m) => log.push(m),
   };
   const s = new Session(deps);
@@ -241,7 +245,7 @@ test('the page glue shows Ready once and keeps the loop running', async () => {
 
 // ---- a terminal error while a save is in flight (static/page.js saveStep + frameStep)
 
-import { saveStep } from '../static/page.js';
+import { discardStep, saveStep } from '../static/page.js';
 
 for (const [outcome, settle, check] of [
   ['success', (d) => d.resolve({ ok: true, status: 200, revision: '"r2"' }),
@@ -278,3 +282,205 @@ for (const [outcome, settle, check] of [
     assert.equal(ui.shown.at(-1), fatal);
   });
 }
+
+/** A Ready session on page revision r1, with a server whose revision/page can be changed. */
+async function readySession({ put } = {}) {
+  const ed = editor('gpu');
+  ed.pending = undefined; // nothing unsaved
+  const server = { revision: '"r1"', text: 'v1' };
+  const { s } = setup([ed], {
+    put,
+    revision: async () => server.revision,
+    pages: [{ text: 'v1', revision: '"r1"' }],
+  });
+  s.deps.fetchPage = async () => ({ text: server.text, revision: server.revision });
+  await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+  s.frame(0);
+  assert.equal(s.editable(), true);
+  return { s, ed, server };
+}
+
+test('a change made elsewhere is loaded in place when nothing is unsaved', async () => {
+  const { s, ed, server } = await readySession();
+  assert.equal(await s.poll(), undefined, 'no change');
+  server.revision = '"r2"';
+  server.text = 'agent-change';
+  assert.equal(await s.poll(), 'reloaded');
+  assert.deepEqual(ed.calls.filter((c) => c.startsWith('reload')), ['reload:agent-change']);
+  assert.equal(s.state.revision, '"r2"');
+});
+
+test('never reloads over unsaved edits; the stale save is a conflict and the edit stays', async () => {
+  let sentWith = null;
+  const { s, ed, server } = await readySession({
+    put: async (snap, rev) => { sentWith = rev; return { ok: false, status: 409, revision: '"r2"' }; },
+  });
+  ed.pending = '{"mine":1}'; // an unsaved local edit
+  server.revision = '"r2"';  // an agent wrote meanwhile
+  server.text = 'agent-change';
+  assert.equal(await s.poll(), undefined, 'a dirty editor does not poll');
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')), 'unsaved work not replaced');
+  assert.equal(await s.save(), 'conflict');
+  assert.equal(sentWith, '"r1"', 'saved against the revision it was based on');
+  assert.ok(ed.calls.includes('save_failed'), 'the edit stays unsaved, on screen');
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
+  assert.equal(s.state.revision, '"r1"');
+  // Stopped until the person decides: no silent reload, no further save.
+  assert.equal(await s.poll(), undefined);
+  assert.equal(await s.save(), undefined);
+});
+
+/** A mocked page for discardStep: records what is shown. */
+function discardUi() {
+  return { shown: [], hidden: 0, status(t) { this.shown.push(t); }, hideConflict() { this.hidden += 1; } };
+}
+
+test('explicit discard loads the version on disk in place and resumes saving', async () => {
+  const { s, ed, server } = await readySession({
+    put: async () => ({ ok: false, status: 409 }),
+  });
+  ed.pending = '{"mine":1}';
+  server.revision = '"r2"';
+  server.text = 'agent-change';
+  assert.equal(await s.save(), 'conflict');
+  const ui = discardUi();
+  assert.equal(await discardStep(s, ui), 'discarded');
+  assert.ok(ed.calls.includes('reload:agent-change'), "the agent's version is shown");
+  assert.equal(s.state.revision, '"r2"');
+  assert.equal(s.state.conflict, false);
+  assert.equal(ui.hidden, 1, 'banner hidden');
+  assert.deepEqual(ui.shown, ['Reloaded the version on disk']);
+  // Saving resumes from the new revision.
+  let sentWith = null;
+  s.deps.put = async (snap, rev) => { sentWith = rev; return { ok: true, status: 200, revision: '"r3"' }; };
+  ed.pending = '{"next":1}';
+  assert.equal(await s.save(), 'saved');
+  assert.equal(sentWith, '"r2"');
+});
+
+test('a discard answer is dropped when the editor changed meanwhile, and a failed one changes nothing', async () => {
+  const { s, ed } = await readySession({ put: async () => ({ ok: false, status: 409 }) });
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.save(), 'conflict');
+  const page = deferred();
+  s.deps.fetchPage = async () => page.promise;
+  const ui = discardUi();
+  const discarding = discardStep(s, ui);
+  s.ed = editor('replacement'); // whatever replaced it
+  page.resolve({ text: 'late', revision: '"r9"' });
+  assert.equal(await discarding, undefined);
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
+  assert.equal(s.state.revision, '"r1"');
+  assert.equal(ui.hidden, 0);
+  // A fetch failure keeps the banner, the conflict and the unsaved state.
+  s.ed = ed;
+  s.deps.fetchPage = async () => { throw new Error('offline'); };
+  assert.equal(await discardStep(s, ui), undefined);
+  assert.equal(s.state.conflict, true);
+  assert.equal(ui.hidden, 0);
+  assert.deepEqual(ui.shown, ['Could not load the version on disk; try again']);
+});
+
+test('no polling before Ready or while switching', async () => {
+  const ed = editor('gpu', { ready: false });
+  let asked = 0;
+  const { s } = setup([ed], { revision: async () => { asked += 1; return '"r2"'; } });
+  await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+  assert.equal(await s.poll(), undefined);
+  assert.equal(asked, 0);
+});
+
+test('a late poll answer never replaces a newer saved state (reviewer sequence)', async () => {
+  const fetched = deferred();
+  const { s, ed, server } = await readySession({
+    put: async () => ({ ok: true, status: 200, revision: '"r3"' }),
+  });
+  server.revision = '"r2"';                 // someone else saved r2
+  s.deps.fetchPage = () => fetched.promise; // the poll's fetch is still pending...
+  const poll = s.poll();
+  await new Promise((r) => setTimeout(r, 0));
+  ed.pending = '{"human":1}';               // ...while a human edit is saved as r3
+  assert.equal(await s.save(), 'saved');
+  assert.equal(s.state.revision, '"r3"');
+  fetched.resolve({ text: 'older r2 page', revision: '"r2"' });
+  await poll;
+  assert.ok(!ed.calls.includes('reload:older r2 page'), 'the older page was not applied');
+  assert.equal(s.state.revision, '"r3"', 'no rollback');
+});
+
+test('polls never overlap, and a discard makes an older poll answer stale', async () => {
+  const fetched = deferred();
+  const { s, ed, server } = await readySession();
+  server.revision = '"r2"';
+  s.deps.fetchPage = () => fetched.promise;
+  const first = s.poll();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(await s.poll(), undefined, 'a second poll does not start while one is pending');
+  // A discard starts after the poll (e.g. the person clicked it): the poll's answer is stale.
+  s.state.conflict = true;
+  s.deps.fetchPage = async () => ({ text: 'discarded-to', revision: '"r4"' });
+  assert.equal(await s.discard(), 'discarded');
+  fetched.resolve({ text: 'stale poll page', revision: '"r2"' });
+  await first;
+  assert.ok(!ed.calls.includes('reload:stale poll page'));
+  assert.equal(s.state.revision, '"r4"');
+});
+
+test('editing is suspended while a discard loads, so it cannot erase a newer edit (reviewer sequence)', async () => {
+  const { s, ed } = await readySession({ put: async () => ({ ok: false, status: 409 }) });
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.save(), 'conflict');
+  const page = deferred();
+  s.deps.fetchPage = async () => page.promise;
+  const discarding = s.discard();
+  // The person types while the server's version is loading: the edit never reaches the
+  // editor (input is suspended), so the discard can't silently replace it.
+  assert.equal(s.editable(), false);
+  let applied = false;
+  assert.equal(s.edit(() => { applied = true; }), undefined);
+  assert.equal(applied, false);
+  assert.equal(await s.save(), undefined, 'no save either');
+  assert.equal(await s.discard(), undefined, 'one discard at a time');
+  page.resolve({ text: 'server page', revision: '"r2"' });
+  assert.equal(await discarding, 'discarded');
+  assert.ok(ed.calls.includes('reload:server page'));
+  // Editing resumes once it is done, also after a failed load.
+  assert.equal(s.editable(), true);
+  assert.equal(s.edit(() => 'ok'), 'ok');
+  s.state.conflict = true;
+  s.deps.fetchPage = async () => { throw new Error('offline'); };
+  await assert.rejects(s.discard());
+  assert.equal(s.editable(), true);
+  assert.equal(s.state.conflict, true, 'the conflict and unsaved work stay');
+});
+
+test('only a clean editor polls: no revision request while dirty, in a gesture or a text edit (review round 3)', async () => {
+  let requests = 0;
+  const { s, ed, server } = await readySession();
+  s.deps.revision = async () => { requests += 1; return server.revision; };
+  server.revision = '"r2"';
+  // Unsaved work.
+  ed.pending = '{"mine":1}';
+  assert.equal(await s.poll(), undefined);
+  // A gesture or text edit under way (the editor reports it can't reload).
+  ed.pending = undefined;
+  ed.canReload = false;
+  assert.equal(await s.poll(), undefined);
+  assert.equal(requests, 0, 'no revision request was made');
+  // Clean again: it polls and loads the change.
+  ed.canReload = true;
+  assert.equal(await s.poll(), 'reloaded');
+  assert.equal(requests, 1);
+});
+
+test('an edit made while a clean poll is under way is never replaced', async () => {
+  const { s, ed, server } = await readySession();
+  const rev = deferred();
+  s.deps.revision = async () => rev.promise;
+  const polling = s.poll();
+  ed.pending = '{"mine":1}';
+  server.revision = '"r2"';
+  rev.resolve('"r2"');
+  assert.equal(await polling, 'behind');
+  assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
+});

@@ -9,6 +9,12 @@
 // - A fallback waits for a save in flight, then reopens the page as the server has it now
 //   (content and revision), on a fresh canvas with its own resize observer.
 // - A save's answer is only applied to the editor that took the snapshot.
+// - Changes made elsewhere (an agent over MCP, another tab) are polled for. They replace the
+//   page in place only when this tab has nothing unsaved (`can_reload`). Otherwise nothing is
+//   reloaded: this tab's next save is based on an older revision, the server refuses it (409,
+//   nothing written), and the unsaved state stays on screen until the person explicitly
+//   discards it (`discard`), which loads the server's version in place. Editing is suspended
+//   while that load is under way, so no edit can be made that it would then replace.
 
 export class Session {
   /**
@@ -18,6 +24,7 @@ export class Session {
    *   replaceCanvas(old) -> canvas                    a fresh canvas in place of `old`
    *   observeResize(canvas, onResize) -> { disconnect() }
    *   put(snapshot, revision) -> Promise<{ ok, status, revision }>
+   *   revision() -> Promise<string>                   the page's current revision (polling)
    *   log(message)                                    console.error
    * }
    */
@@ -26,19 +33,24 @@ export class Session {
     this.state = Object.assign(state, {
       ready: false, error: null, fallback: null, backend: null, revision: null,
       saves: 0, saving: false, conflict: false, switching: false,
+      reloads: 0, behind: false, discarding: false,
     });
     this.ed = null;
     this.canvas = null;
     this.observer = null;
     this.forceWebgl = false;
     this.errorReported = false;
+    // Bumped whenever something that can change the editor's page starts (a save, a poll, a
+    // discard): an answer only applies if nothing started after its own request.
+    this.generation = 0;
+    this.polling = false;
     this.saveDone = Promise.resolve();
   }
 
   /** May the user edit right now? */
   editable() {
     const s = this.state;
-    return Boolean(this.ed) && s.ready && !s.switching && !s.error;
+    return Boolean(this.ed) && s.ready && !s.switching && !s.error && !s.discarding;
   }
 
   /** Run `fn(editor)` only when editing is allowed (input, toolbar). */
@@ -132,6 +144,86 @@ export class Session {
     this.deps.log(msg);
   }
 
+  /**
+   * Look for a newer revision on the server, only while the editor is clean. Returns
+   * 'reloaded' when the page was replaced in place, 'behind' when it changed but this tab got
+   * unsaved work while the request was under way (its next save will be a conflict), else
+   * undefined.
+   */
+  async poll() {
+    const s = this.state;
+    // Only a clean editor polls: with unsaved work, a gesture or a text edit nothing could be
+    // loaded anyway, so no request is made.
+    if (this.polling || !this.editable() || s.saving || s.conflict || !this.ed.can_reload()) {
+      return undefined;
+    }
+    this.polling = true;
+    try {
+      return await this.pollOnce();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  async pollOnce() {
+    const s = this.state;
+    const gen = ++this.generation;
+    const ed = this.ed;
+    // Apply an answer only to the editor that asked, if no save, discard or other load
+    // started since this request, and nothing is unsaved.
+    const current = () => this.ed === ed && gen === this.generation && this.editable()
+      && !s.saving && !s.conflict;
+    const rev = await this.deps.revision();
+    if (!current()) return undefined;
+    if (rev === s.revision) {
+      s.behind = false;
+      return undefined;
+    }
+    if (!ed.can_reload()) {
+      s.behind = true;
+      return 'behind';
+    }
+    const page = await this.deps.fetchPage();
+    if (!current() || !ed.can_reload()) {
+      s.behind = true;
+      return 'behind';
+    }
+    ed.reload(page.text);
+    s.revision = page.revision;
+    s.reloads += 1;
+    s.behind = false;
+    return 'reloaded';
+  }
+
+  /**
+   * The person chose "Reload (discard my unsaved change)": load the page as the server has it
+   * now, in place (no navigation, so no leave-page guard), and resume saving and polling.
+   * Returns 'discarded', or undefined when there is nothing to do or the answer is stale.
+   */
+  async discard() {
+    const s = this.state;
+    const ed = this.ed;
+    if (!ed || s.switching || s.error || s.saving || s.discarding) return undefined;
+    const gen = ++this.generation;
+    // No input, toolbar action or save reaches the editor until this is done.
+    s.discarding = true;
+    try {
+      const page = await this.deps.fetchPage();
+      // Apply only to the editor that asked, and only if nothing else started meanwhile.
+      if (this.ed !== ed || gen !== this.generation || s.switching || s.error || s.saving) {
+        return undefined;
+      }
+      ed.reload(page.text);
+      s.revision = page.revision;
+      s.conflict = false;
+      s.behind = false;
+      s.reloads += 1;
+      return 'discarded';
+    } finally {
+      s.discarding = false;
+    }
+  }
+
   /** Save the editor's pending change, if any. Returns what happened, for the status line. */
   async save() {
     const s = this.state;
@@ -140,15 +232,16 @@ export class Session {
     const snapshot = ed.save_snapshot();
     if (snapshot === undefined) return undefined;
     s.saving = true;
+    this.generation += 1;
     let done;
     this.saveDone = new Promise((r) => { done = r; });
     try {
       const res = await this.deps.put(snapshot, s.revision);
       if (this.ed !== ed) return 'stale';
       if (res.ok) {
-        s.revision = res.revision;
         s.saves += 1;
         ed.save_succeeded();
+        s.revision = res.revision;
         return 'saved';
       }
       ed.save_failed();
