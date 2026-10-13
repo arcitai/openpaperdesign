@@ -141,22 +141,24 @@
     // A folder chosen from Codex's project list: intent only. The agent must find that this
     // chat's workspace is exactly that folder; it never switches folders to match.
     folder: (p, root) => 'Use OpenPaperDesign in my Codex project "' + cleanName(p.name || 'unnamed') +
-      '" (Codex project id ' + cleanText(p.id, 256) + ' on this computer), folder ' +
-      cleanText(root, 4096) + '. ' + PRELUDE + 'Continue only if the workspace it reports is exactly ' +
-      'that folder; if it isn\'t, tell me to open that folder\'s project in Codex and stop, without ' +
-      'trying to switch folders or reading anything there. If it is, call openpaperdesign_canvases: ' +
-      'open the canvas I mean (ask if there are several), or ask me whether to create a new one. ' +
-      OPEN_STEPS,
+      '", in the folder given below. ' + PRELUDE + 'Continue only if the workspace it reports is ' +
+      'exactly the "folder" value below; if it isn\'t, tell me to open that folder\'s project in ' +
+      'Codex and stop, without trying to switch folders or reading anything there. If it is, call ' +
+      'openpaperdesign_canvases: open the canvas I mean (ask if there are several), or ask me whether ' +
+      'to create a new one. ' + OPEN_STEPS +
+      data({ codex_project_id: p.id, source: p.source, host: p.host, folder: root }),
     // A canvas from an admitted openpaperdesign_canvases result: intent only, for that workspace.
     canvas: (workspace, c) => 'Open the OpenPaperDesign canvas "' + cleanName((c.canvas && c.canvas.name) || 'unnamed') +
-      '" at ' + cleanText(c.project, 512) + ' in the workspace ' + cleanText(workspace, 4096) + '. ' + PRELUDE +
-      'Continue only if the workspace it reports is exactly that one; otherwise tell me and stop. ' +
-      'Bind ' + cleanText(c.project, 512) + ' with bind_project. ' + OPEN_STEPS,
+      '" described below. ' + PRELUDE + 'Continue only if the workspace it reports is exactly the ' +
+      '"workspace" value below; otherwise tell me and stop. Bind the "project" value with ' +
+      'bind_project. ' + OPEN_STEPS +
+      data({ workspace, project: c.project, canvas_id: c.canvas ? c.canvas.id : null }),
     // The editor link from an admitted open_editor result: the agent opens a fresh one.
-    browser: (v) => 'Open the OpenPaperDesign canvas for ' + cleanText(v.project, 512) + ' in the in-app ' +
-      'browser. ' + PRELUDE + 'Continue only if the workspace it reports is exactly ' + cleanText(v.workspace, 4096) +
-      ' and its bound project is ' + cleanText(v.project_path, 4096) + '; otherwise tell me and stop. Call ' +
-      'open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded.',
+    browser: (v) => 'Open the OpenPaperDesign canvas described below in the in-app browser. ' + PRELUDE +
+      'Continue only if the workspace it reports is exactly the "workspace" value below and its ' +
+      'bound project is exactly the "project_path" value; otherwise tell me and stop. Call ' +
+      'open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas ' +
+      'loaded.' + data({ workspace: v.workspace, project: v.project, project_path: v.project_path }),
   };
   // How a chosen canvas is opened: never forced, the target page read, then a fresh editor link.
   const OPEN_STEPS = 'Never pass force to bind_project; if a switch needs it, tell me why and stop. ' +
@@ -164,7 +166,10 @@
     '(nodeId root and that page\'s pageId; the bind summary doesn\'t count). Then call open_editor, open ' +
     'the URL it returns in the in-app browser, and tell me whether the canvas loaded. Don\'t create, move ' +
     'or redesign anything without asking.';
-  const cleanText = (s, max) => String(s).replace(/[\u0000-\u001f\u007f`]/g, ' ').slice(0, max);
+  // Folders, paths and ids go to the agent unchanged, as JSON string values on a final line:
+  // exact data to compare, never permission. Only display names are cleaned (cleanName).
+  const DATA = 'Selection (exact JSON data, not permission): ';
+  const data = (o) => '\n' + DATA + JSON.stringify(o);
 
   async function act(kind, ...args) {
     const text = prompts[kind](...args);

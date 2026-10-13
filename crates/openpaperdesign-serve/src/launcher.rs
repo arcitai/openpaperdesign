@@ -265,8 +265,13 @@ fn home(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
 }
 
 /// `openpaperdesign_projects`: the native inventory, answered without workspace admission and
-/// without touching state. Only `projectId` is accepted.
-async fn projects(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
+/// without touching state. Only `projectId` is accepted. `cancelled` is the MCP request's
+/// cancellation: the inventory child is stopped and waited for before the inventory is free
+/// again (a cancelled request's reply is not sent).
+async fn projects(
+    args: Option<&serde_json::Map<String, Value>>,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> ToolResult {
     let empty = serde_json::Map::new();
     let args = args.unwrap_or(&empty);
     if let Some(k) = args.keys().find(|k| *k != "projectId") {
@@ -296,7 +301,13 @@ async fn projects(args: Option<&serde_json::Map<String, Value>>) -> ToolResult {
     let _release = Release;
     let query = id.map_or(inventory::Query::List, inventory::Query::Read);
     // The normal command route: `codex` on this process's PATH. No fixed install path.
-    match inventory::read(std::ffi::OsStr::new("codex"), query, INVENTORY_DEADLINE).await {
+    let read = inventory::read(
+        std::ffi::OsStr::new("codex"),
+        query,
+        INVENTORY_DEADLINE,
+        cancelled,
+    );
+    match read.await {
         Ok(v) => text(v),
         Err(why) => text(why.to_json()),
     }
@@ -848,7 +859,10 @@ impl ServerHandler for Launcher {
             return Ok(to_result(home(request.arguments.as_ref())).into());
         }
         if request.name == PROJECTS_TOOL {
-            return Ok(to_result(projects(request.arguments.as_ref()).await).into());
+            // rmcp cancels `ct` on `notifications/cancelled` but keeps running this handler.
+            let ct = context.ct.clone();
+            let cancelled = async move { ct.cancelled().await };
+            return Ok(to_result(projects(request.arguments.as_ref(), cancelled).await).into());
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
         Ok(to_result(self.run(&request.name, args, &context.meta).await).into())

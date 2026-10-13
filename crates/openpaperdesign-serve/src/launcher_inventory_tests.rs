@@ -1,8 +1,20 @@
 //! The inventory client against task-owned fake `codex app-server` scripts (POSIX sh). They
 //! log every line they receive, so the tests check the exact protocol traffic. Synthetic
 //! fixtures only; the real Codex CLI is an operator check.
+//!
+//! Writing an executable while another thread forks lets the forked child inherit the write
+//! handle until it execs, and executing the file meanwhile fails (ETXTBSY on Linux). So in
+//! this test binary, writing a fixture and starting any process are mutually exclusive
+//! (`spawns`): writes take the write lock, every `read` and `ps` the read lock. Start
+//! failures are never retried, so an ordinary one (EACCES, ...) fails its test.
 use super::*;
 use std::path::{Path, PathBuf};
+use tokio::sync::RwLock;
+
+fn spawns() -> &'static RwLock<()> {
+    static SPAWNS: std::sync::OnceLock<RwLock<()>> = std::sync::OnceLock::new();
+    SPAWNS.get_or_init(|| RwLock::new(()))
+}
 
 const INIT: &str = r#"{"id":1,"result":{"codexHome":"/fixture-home/.codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex_cli_rs/0.162.1"}}"#;
 const ACME: &str = r#"{"id":"prj_fixture_acme","name":"Acme site","createdAt":1,"updatedAt":2,"position":0,"recencyAt":null,"metadata":{"note":"private"},"roots":[{"path":"/w/acme"},{"path":"/w/acme-docs"}]}"#;
@@ -24,7 +36,7 @@ impl Fake {
     }
 
     /// A fake app-server answering by method. `replies` are (case pattern, reply lines).
-    fn server(&self, init: &str, replies: &[(&str, &str)]) -> PathBuf {
+    async fn server(&self, init: &str, replies: &[(&str, &str)]) -> PathBuf {
         let mut cases = format!("    *'\"method\":\"initialize\"'*) printf '%s\\n' '{init}' ;;\n");
         cases.push_str("    *'\"method\":\"initialized\"'*) ;;\n");
         for (pattern, reply) in replies {
@@ -34,18 +46,23 @@ impl Fake {
         self.script(&format!(
             "while IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{log}'\n  case \"$line\" in\n{cases}  esac\ndone\n",
             log = self.dir.join("log").display()
-        ))
+        )).await
     }
 
-    fn script(&self, body: &str) -> PathBuf {
+    async fn script(&self, body: &str) -> PathBuf {
+        self.script_mode(body, 0o755).await
+    }
+
+    async fn script_mode(&self, body: &str, mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = self.dir.join("codex");
         let text = format!(
             "#!/bin/sh\n[ \"$1\" = app-server ] || exit 64\necho $$ > '{pid}'\n{body}",
             pid = self.dir.join("pid").display()
         );
+        let _no_spawns = spawns().write().await;
         std::fs::write(&path, text).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
     }
 
@@ -72,7 +89,8 @@ impl Drop for Fake {
 }
 
 /// The process is gone or a zombie waiting to be reaped (no longer running).
-fn running(pid: &str) -> bool {
+async fn running(pid: &str) -> bool {
+    let _spawn = spawns().read().await;
     let out = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", pid])
         .output()
@@ -82,21 +100,36 @@ fn running(pid: &str) -> bool {
     !stat.is_empty() && !stat.starts_with('Z')
 }
 
-/// `read`, retried while the freshly written fake can't be executed yet: a test thread that
-/// forks while another writes its script briefly holds the write handle (ETXTBSY on Linux).
+/// `read` once, never cancelled, with no fixture being written meanwhile. No retry.
 async fn run(program: &Path, query: Query<'_>, deadline: Duration) -> Result<Value, Unavailable> {
-    for _ in 0..50 {
-        let id = match &query {
-            Query::List => None,
-            Query::Read(id) => Some(*id),
-        };
-        let q = id.map_or(Query::List, Query::Read);
-        match read(program.as_os_str(), q, deadline).await {
-            Err(Unavailable::StartFailed) => tokio::time::sleep(Duration::from_millis(20)).await,
-            other => return other,
+    run_until(program, query, deadline, std::future::pending()).await
+}
+
+/// The read lock covers only this request's fork-to-exec window: it is held until the fake
+/// has started (it writes its pid first) or `read` has returned, never for the whole
+/// exchange, so other tests' `ps` checks and fixture writes don't queue behind a live request.
+async fn run_until(
+    program: &Path,
+    query: Query<'_>,
+    deadline: Duration,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> Result<Value, Unavailable> {
+    let pid = program.with_file_name("pid");
+    let mut spawn = Some(spawns().read().await);
+    // A pid from an earlier run must not end this run's window early.
+    let _ = std::fs::remove_file(&pid);
+    let read = read(program.as_os_str(), query, deadline, cancelled);
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            r = &mut read => return r,
+            _ = tokio::time::sleep(Duration::from_millis(5)), if spawn.is_some() => {
+                if pid.exists() {
+                    spawn = None;
+                }
+            }
         }
     }
-    Err(Unavailable::StartFailed)
 }
 
 async fn list(program: &Path) -> Result<Value, Unavailable> {
@@ -110,13 +143,15 @@ async fn lists_every_page_with_every_root_and_exact_traffic() {
     let f = Fake::new();
     let page1 = format!(r#"{{"id":2,"result":{{"data":[{ACME}],"nextCursor":"c2"}}}}"#);
     let page2 = format!(r#"{{"id":3,"result":{{"data":[{BETA}],"nextCursor":null}}}}"#);
-    let program = f.server(
-        INIT,
-        &[
-            ("*'\"cursor\":\"c2\"'*", page2.as_str()),
-            (LIST, page1.as_str()),
-        ],
-    );
+    let program = f
+        .server(
+            INIT,
+            &[
+                ("*'\"cursor\":\"c2\"'*", page2.as_str()),
+                (LIST, page1.as_str()),
+            ],
+        )
+        .await;
     let v = list(&program).await.unwrap();
     assert_eq!(
         v,
@@ -139,14 +174,19 @@ async fn lists_every_page_with_every_root_and_exact_traffic() {
         ],
         "initialize, initialized and read-only list calls only"
     );
-    assert!(!running(&f.pid().unwrap()), "the app-server was closed");
+    assert!(
+        !running(&f.pid().unwrap()).await,
+        "the app-server was closed"
+    );
 }
 
 #[tokio::test]
 async fn reads_one_project_by_id_and_checks_the_answer() {
     let f = Fake::new();
     let ok = format!(r#"{{"id":2,"result":{{"project":{ACME}}}}}"#);
-    let program = f.server(INIT, &[("*'\"method\":\"project/read\"'*", ok.as_str())]);
+    let program = f
+        .server(INIT, &[("*'\"method\":\"project/read\"'*", ok.as_str())])
+        .await;
     let v = run(
         &program,
         Query::Read("prj_fixture_acme"),
@@ -181,7 +221,7 @@ async fn host_errors_map_to_unsupported_or_api_error() {
         ),
     ] {
         let f = Fake::new();
-        let program = f.server(INIT, &[(LIST, reply)]);
+        let program = f.server(INIT, &[(LIST, reply)]).await;
         let got = list(&program).await;
         assert_eq!(got, Err(want), "{reply}");
         let json = got.unwrap_err().to_json().to_string();
@@ -245,13 +285,13 @@ async fn anything_outside_the_schema_makes_the_inventory_unavailable() {
     ];
     for (init, reply) in cases {
         let f = Fake::new();
-        let program = f.server(&init, &[(LIST, reply.as_str())]);
+        let program = f.server(&init, &[(LIST, reply.as_str())]).await;
         let got = list(&program).await;
         assert!(
             matches!(got, Err(Unavailable::Protocol(_))),
             "{reply}: {got:?}"
         );
-        assert!(!running(&f.pid().unwrap()));
+        assert!(!running(&f.pid().unwrap()).await);
     }
 }
 
@@ -259,7 +299,7 @@ async fn anything_outside_the_schema_makes_the_inventory_unavailable() {
 async fn notifications_are_skipped_and_an_empty_inventory_is_complete() {
     let f = Fake::new();
     let reply = "{\"method\":\"thread/started\",\"params\":{}}\n{\"id\":2,\"result\":{\"data\":[],\"nextCursor\":null}}";
-    let program = f.server(INIT, &[(LIST, reply)]);
+    let program = f.server(INIT, &[(LIST, reply)]).await;
     let v = list(&program).await.unwrap();
     assert_eq!(v["projects"], json!([]));
     assert_eq!(v["complete"], true);
@@ -279,7 +319,7 @@ async fn pages_are_bounded_and_reported_incomplete() {
     let program = f.script(&format!(
         "while IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{log}'\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{INIT}' ;;\n{cases}  esac\ndone\n",
         log = f.dir.join("log").display()
-    ));
+    )).await;
     let v = list(&program).await.unwrap();
     assert_eq!(v["complete"], false);
     let lists = f
@@ -293,18 +333,21 @@ async fn pages_are_bounded_and_reported_incomplete() {
 #[tokio::test]
 async fn a_silent_app_server_times_out_and_is_killed() {
     let f = Fake::new();
-    let program = f.script("read -r line\nexec sleep 30\n");
+    let program = f.script("read -r line\nexec sleep 30\n").await;
     let started = std::time::Instant::now();
     let r = run(&program, Query::List, Duration::from_millis(300)).await;
     assert_eq!(r, Err(Unavailable::Timeout));
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(!running(&f.pid().unwrap()), "killed after the deadline");
+    assert!(
+        !running(&f.pid().unwrap()).await,
+        "killed after the deadline"
+    );
 }
 
 #[tokio::test]
-async fn a_cancelled_request_kills_the_app_server() {
+async fn dropping_the_request_future_kills_the_app_server() {
     let f = Fake::new();
-    let program = f.script("read -r line\nexec sleep 30\n");
+    let program = f.script("read -r line\nexec sleep 30\n").await;
     let task =
         tokio::spawn(async move { run(&program, Query::List, Duration::from_secs(30)).await });
     let waited = std::time::Instant::now();
@@ -321,23 +364,25 @@ async fn a_cancelled_request_kills_the_app_server() {
     task.abort();
     let _ = task.await;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while running(&pid) && std::time::Instant::now() < deadline {
+    while running(&pid).await && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!running(&pid), "kill_on_drop stopped the app-server");
+    assert!(!running(&pid).await, "kill_on_drop stopped the app-server");
 }
 
 #[tokio::test]
 async fn oversized_lines_early_exit_and_missing_cli_are_unavailable() {
     let f = Fake::new();
-    let program = f.script("read -r line\nhead -c 1100000 /dev/zero | tr '\\000' a\necho\n");
+    let program = f
+        .script("read -r line\nhead -c 1100000 /dev/zero | tr '\\000' a\necho\n")
+        .await;
     assert_eq!(
         list(&program).await,
         Err(Unavailable::Protocol("line too long"))
     );
 
     let f = Fake::new();
-    let program = f.script("read -r line\nexit 0\n");
+    let program = f.script("read -r line\nexit 0\n").await;
     assert_eq!(list(&program).await, Err(Unavailable::Exited));
 
     let missing = f.dir.join("no-such-codex");
@@ -345,4 +390,79 @@ async fn oversized_lines_early_exit_and_missing_cli_are_unavailable() {
     let v = Unavailable::NotFound.to_json();
     assert_eq!(v["reason"], "codex_not_found");
     assert!(!v.to_string().contains(&f.dir.display().to_string()));
+}
+
+/// The MCP request's cancellation (R1-01): the child is killed and reaped before `read`
+/// returns, so the caller frees the inventory only after it is gone.
+#[tokio::test]
+async fn a_cancellation_signal_stops_and_reaps_the_app_server_before_returning() {
+    let f = Fake::new();
+    let program = f.script("read -r line\nexec sleep 30\n").await;
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        run_until(&program, Query::List, Duration::from_secs(30), async {
+            let _ = cancelled.await;
+        })
+        .await
+    });
+    let waited = std::time::Instant::now();
+    let pid = loop {
+        if let Some(pid) = f.pid().filter(|p| !p.is_empty()) {
+            break pid;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(10),
+            "the fake never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(running(&pid).await);
+    let cancelled_at = std::time::Instant::now();
+    cancel.send(()).unwrap();
+    assert_eq!(task.await.unwrap(), Err(Unavailable::Cancelled));
+    assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+    assert!(
+        !running(&pid).await,
+        "gone when read returned, without polling"
+    );
+    assert_eq!(Unavailable::Cancelled.to_json()["reason"], "cancelled");
+}
+
+/// A request already cancelled starts no app-server at all.
+#[tokio::test]
+async fn an_already_cancelled_request_starts_nothing() {
+    let f = Fake::new();
+    let program = f.script("read -r line\nexec sleep 30\n").await;
+    let r = run_until(
+        &program,
+        Query::List,
+        Duration::from_secs(5),
+        std::future::ready(()),
+    )
+    .await;
+    assert_eq!(r, Err(Unavailable::Cancelled));
+    assert_eq!(f.pid(), None, "never started");
+}
+
+/// An ordinary start failure (here EACCES: not executable) is reported once, never retried
+/// (R1-03). Making the file executable afterwards changes nothing about that answer.
+#[tokio::test]
+async fn an_ordinary_start_failure_is_reported_not_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fake::new();
+    let program = f.script_mode("read -r line\nexit 0\n", 0o644).await;
+    let path = program.clone();
+    let fix = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _no_spawns = spawns().write().await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    assert_eq!(list(&program).await, Err(Unavailable::StartFailed));
+    assert_eq!(f.pid(), None);
+    fix.await.unwrap();
+    assert_eq!(
+        Unavailable::StartFailed.to_json()["reason"],
+        "start_failed",
+        "no OS detail is passed on"
+    );
 }

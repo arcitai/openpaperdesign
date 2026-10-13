@@ -45,6 +45,8 @@ pub(super) enum Unavailable {
     Api(i64),
     /// The answer was not in the expected shape.
     Protocol(&'static str),
+    /// The MCP request was cancelled; the app-server was stopped.
+    Cancelled,
 }
 
 impl Unavailable {
@@ -63,6 +65,7 @@ impl Unavailable {
             ),
             Self::Api(code) => ("api_error", format!("Codex refused the request (code {code}).")),
             Self::Protocol(what) => ("protocol", format!("Codex's answer had an unexpected shape ({what}).")),
+            Self::Cancelled => ("cancelled", "The request was cancelled.".into()),
         };
         json!({"available": false, "source": SOURCE, "reason": reason, "detail": detail})
     }
@@ -73,13 +76,23 @@ pub(super) enum Query<'a> {
     Read(&'a str),
 }
 
-/// Read the inventory with `program app-server`. The whole exchange is bounded by `deadline`;
-/// the child is closed, then killed if it lingers, and is killed if this future is dropped.
+/// Read the inventory with `program app-server`. The whole exchange is bounded by `deadline`
+/// and ends early when `cancelled` completes (the MCP request's cancellation). An already
+/// cancelled request starts nothing. On cancellation the child is killed and waited for
+/// before this returns; otherwise it is closed, then killed if it lingers. It is also killed
+/// if this future is dropped.
 pub(super) async fn read(
     program: &OsStr,
     query: Query<'_>,
     deadline: Duration,
+    cancelled: impl std::future::Future<Output = ()>,
 ) -> Result<Value, Unavailable> {
+    let mut cancelled = std::pin::pin!(cancelled);
+    tokio::select! {
+        biased;
+        () = &mut cancelled => return Err(Unavailable::Cancelled),
+        () = std::future::ready(()) => {}
+    }
     let mut child = Command::new(program)
         .arg("app-server")
         .stdin(std::process::Stdio::piped())
@@ -96,15 +109,22 @@ pub(super) async fn read(
         out: BufReader::new(child.stdout.take().expect("piped stdout")),
         next: 0,
     };
-    let result = tokio::time::timeout(deadline, exchange(&mut conn, query))
-        .await
-        .unwrap_or(Err(Unavailable::Timeout));
-    // End of input asks the app-server to exit; one that lingers is killed.
+    let result = tokio::select! {
+        biased;
+        () = &mut cancelled => Err(Unavailable::Cancelled),
+        r = tokio::time::timeout(deadline, exchange(&mut conn, query)) => {
+            r.unwrap_or(Err(Unavailable::Timeout))
+        }
+    };
     drop(conn);
-    if tokio::time::timeout(Duration::from_millis(500), child.wait())
+    if result == Err(Unavailable::Cancelled) {
+        // Stop it now and wait for it, so the caller releases the inventory only after.
+        let _ = child.kill().await;
+    } else if tokio::time::timeout(Duration::from_millis(500), child.wait())
         .await
         .is_err()
     {
+        // End of input asks the app-server to exit; one that lingers is killed.
         let _ = child.kill().await;
     }
     result

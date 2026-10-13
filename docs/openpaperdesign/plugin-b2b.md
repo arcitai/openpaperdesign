@@ -43,7 +43,9 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
   - Every reply is checked against the 0.162.1 schemas. Anything else, a missing CLI, an
     error, a 15 s timeout or an oversized line gives `available: false` with a reason and no
     paths.
-  - The child is closed afterwards and killed if it lingers or the call is cancelled.
+  - The child is closed afterwards and killed if it lingers. An MCP cancellation of the
+    request kills it and waits for it to exit before the inventory takes the next request; the
+    cancelled request gets no reply.
   - There are no threads, turns, settings, auth or project writes.
   - Projects keep Codex's `codex-app-server` namespace, their ids and every root. Ids are not
     joined with desktop or cloud ids by name.
@@ -69,17 +71,22 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
   - The only server tool it calls is the inventory, and it stores nothing.
 
 Issue #6 stays open until these are proven on a real host:
-1. That the packaged plugin reaches `codex app-server` and lists the real projects. This has
-   only been tested here against task-owned fake app-servers; an operator ran a read-only
-   `project/list` probe on 2026-10-13.
-2. Workspace authority for model calls in the global entry's own thread. The Mac global
-   receipts carried only thread ids. The routes inspected so far don't hand a chosen root to
-   an existing desktop chat:
-   - MCP App `ui/message` has only `target`/`send`.
-   - `thread/settings/update` acts only on a thread loaded in that same app-server.
+1. That the installed packaged plugin reaches `codex app-server` and lists the real projects.
+   This source is tested against task-owned fake app-servers. On 2026-10-13 an operator ran
+   the exact `8a8554c` launcher against the real Codex CLI 0.162.1 over direct stdio on macOS:
+   `project/list` and `project/read` passed, with both roots of a local project. That was not
+   the packaged plugin inside Codex.
+2. Model calls carrying the chosen workspace. The Mac global-entry receipts carried only
+   thread ids, with no workspace context. None of the observations so far demonstrates
+   handing a chosen root to a desktop chat:
+   - `ui/message` carries only `target`/`send` intent.
+   - This plugin's separate read-only inventory connection has not been shown to reach the
+     desktop conversation.
 
-   A thread-entry tab in a project chat uses that chat's own context. That is source metadata
-   only until it is observed on a real host.
+   These observations don't exhaust what Codex may support. An actual model call with
+   matching workspace context and a supported profile stays an open gate. A thread-entry tab
+   in a project chat would use that chat's own context, but that is source metadata until it
+   is observed on a real host.
 3. Delivery of model results to the view.
 4. Where `ui/open-link` opens the loopback page.
 5. An actual canvas load.

@@ -1147,3 +1147,152 @@ async fn synthetic_canvas_discovery_is_bounded_and_refuses_a_linked_design_folde
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     c.cancel().await.unwrap();
 }
+
+/// R1-01 regression through the production launcher over raw stdio JSON-RPC: a real MCP
+/// `notifications/cancelled` for an inventory request stops its `codex app-server` child,
+/// frees the inventory for the next request, sends no reply for the cancelled request and
+/// changes no workspace state or file. Synthetic: a task-owned fake `codex` on PATH.
+#[tokio::test]
+async fn synthetic_mcp_cancellation_stops_the_inventory_child_and_frees_the_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let f = Fixture::new();
+    let bin = f.root.join("bin");
+    let state = f.root.join("fake-state");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let init = r#"{"id":1,"result":{"codexHome":"/fixture-home/.codex","platformFamily":"unix","platformOs":"linux","userAgent":"codex_cli_rs/0.162.1"}}"#;
+    // The first project/list never answers; the second answers an empty list.
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = app-server ] || exit 64\necho $$ >> '{s}/pids'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"method\":\"initialize\"'*) printf '%s\\n' '{init}' ;;\n    *'\"method\":\"project/list\"'*) if [ -e '{s}/started' ]; then printf '%s\\n' '{{\"id\":2,\"result\":{{\"data\":[],\"nextCursor\":null}}}}'; else : > '{s}/started'; exec sleep 30; fi ;;\n  esac\ndone\n",
+        s = state.display()
+    );
+    std::fs::write(bin.join("codex"), script).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut launcher = tokio::process::Command::new(env!("CARGO_BIN_EXE_openpaperdesign-mcp"))
+        .current_dir(&f.plugin)
+        .env("HOME", &f.home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .arg("--codex-context")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = launcher.stdin.take().unwrap();
+    let mut lines = BufReader::new(launcher.stdout.take().unwrap()).lines();
+    let mut seen_ids = vec![];
+    macro_rules! send {
+        ($v:expr) => {{
+            let mut l = serde_json::to_vec(&$v).unwrap();
+            l.push(b'\n');
+            stdin.write_all(&l).await.unwrap();
+            stdin.flush().await.unwrap();
+        }};
+    }
+    macro_rules! reply {
+        ($id:expr) => {{
+            loop {
+                let line =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                        .await
+                        .expect("a reply in time")
+                        .unwrap()
+                        .expect("the launcher is still running");
+                let m: Value = serde_json::from_str(&line).unwrap();
+                seen_ids.push(m["id"].clone());
+                if m["id"] == json!($id) {
+                    break m;
+                }
+            }
+        }};
+    }
+    let running = |pid: &str| {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
+    };
+    let call = |id: u64, name: &str| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":{}}});
+
+    send!(
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"opd-cancel-test","version":"1"}}})
+    );
+    reply!(1);
+    send!(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}));
+    send!(call(2, "openpaperdesign_status"));
+    let status_before = reply!(2)["result"].clone();
+    let workspace_before = snapshot(&f.ws);
+
+    send!(call(3, "openpaperdesign_projects"));
+    let waited = std::time::Instant::now();
+    while !state.join("started").exists() {
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(10),
+            "inventory never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let pids = std::fs::read_to_string(state.join("pids")).unwrap();
+    let pid = pids.lines().next().unwrap().trim().to_string();
+    assert!(running(&pid));
+
+    send!(
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3,"reason":"test cancellation"}})
+    );
+    let waited = std::time::Instant::now();
+    while running(&pid) {
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(5),
+            "the inventory child outlived the cancellation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The inventory is free again: the next request is admitted and answered.
+    send!(call(4, "openpaperdesign_projects"));
+    let next = reply!(4);
+    assert_eq!(next["result"]["isError"], false, "{next}");
+    let v: Value =
+        serde_json::from_str(next["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["available"], true, "{v}");
+    assert_eq!(v["projects"], json!([]));
+    assert_eq!(
+        std::fs::read_to_string(state.join("pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+
+    send!(call(5, "openpaperdesign_status"));
+    assert_eq!(
+        reply!(5)["result"],
+        status_before,
+        "workspace state unchanged"
+    );
+    assert_eq!(
+        snapshot(&f.ws),
+        workspace_before,
+        "no workspace file changed"
+    );
+    assert!(
+        !seen_ids.contains(&json!(3)),
+        "no reply for the cancelled request: {seen_ids:?}"
+    );
+
+    drop(stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(10), launcher.wait())
+        .await
+        .expect("the launcher exits when its input closes")
+        .unwrap();
+    assert!(exit.success(), "{exit}");
+    for pid in std::fs::read_to_string(state.join("pids")).unwrap().lines() {
+        assert!(!running(pid.trim()), "inventory child {pid} still running");
+    }
+    f.no_cache_writes();
+}

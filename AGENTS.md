@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.19 · Updated: 2026-10-13
+Revision: 0.20 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -153,7 +153,8 @@ both a global and a thread entry.
 
 The inventory starts `codex app-server` from PATH for one bounded exchange. It sends only
 `initialize` (`experimentalApi`), `initialized`, and `project/list` or `project/read`, with
-schema checks, a deadline and kill-on-drop. Never add thread, turn, settings, auth or project
+schema checks, a deadline and kill-on-drop. An MCP cancellation (`RequestContext.ct`) kills
+and waits for its child before the inventory is free again. Never add thread, turn, settings, auth or project
 writes to it. It keeps Codex's namespace and ids, and every root. A listed project or root is
 discovery, never authority: never join it with other ids by name, and never pick a root for
 the person.

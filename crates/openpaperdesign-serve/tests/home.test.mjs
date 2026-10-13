@@ -69,6 +69,13 @@ async function initialized({ caps = { message: { text: {} } }, context = {}, inv
 }
 
 const methods = (v) => v.sent.filter((m) => m.method).map((m) => m.method);
+// The exact data line every selection message ends with.
+const DATA = 'Selection (exact JSON data, not permission): ';
+const selection = (text) => {
+  const last = text.split('\n').pop();
+  assert.ok(last.startsWith(DATA), last);
+  return JSON.parse(last.slice(DATA.length));
+};
 const onlyAllowed = (v) => {
   assert.ok(methods(v).every((m) => ALLOWED.has(m)), methods(v).join());
   for (const m of v.sent.filter((m) => m.method === 'tools/call')) {
@@ -122,20 +129,32 @@ test('choosing a folder sends that exact folder and project id as intent, not a 
   second.onclick();
   await flush();
   const text = v.last('ui/message').params.content[0].text;
-  assert.match(text, /^Use OpenPaperDesign in my Codex project "Acme site" \(Codex project id prj_fixture_acme on this computer\), folder \/w\/acme-docs\. First call openpaperdesign_status\./);
-  assert.match(text, /Continue only if the workspace it reports is exactly that folder; if it isn't, tell me to open that folder's project in Codex and stop, without trying to switch folders/);
-  assert.doesNotMatch(text, /\/w\/acme[^-]/, 'only the chosen folder');
+  assert.match(text, /^Use OpenPaperDesign in my Codex project "Acme site", in the folder given below\. First call openpaperdesign_status\./);
+  assert.match(text, /Continue only if the workspace it reports is exactly the "folder" value below; if it isn't, tell me to open that folder's project in Codex and stop, without trying to switch folders/);
+  assert.deepEqual(selection(text), { codex_project_id: 'prj_fixture_acme', source: 'codex-app-server', host: 'this computer', folder: '/w/acme-docs' });
   onlyAllowed(v);
 });
 
-test('a hostile project name or path cannot break out of the message', async () => {
-  const evil = { ...ACME, name: 'A"B`C\u0007\n', roots: [{ path: '/w/x`y\u0000z' }] };
+test('a valid root and id with a backtick reach the agent exactly (R1-02)', async () => {
+  const odd = { ...ACME, id: 'prj`fixture', roots: [{ path: '/w/acme`docs' }] };
+  const v = await initialized({ inventory: { ...LISTED, projects: [odd] } });
+  assert.ok(texts(v.els.projects).includes('/w/acme`docs'), 'shown as is');
+  all(v.els.projects).find((n) => n.tag === 'button').onclick();
+  await flush();
+  const sel = selection(v.last('ui/message').params.content[0].text);
+  assert.equal(sel.folder, '/w/acme`docs');
+  assert.equal(sel.codex_project_id, 'prj`fixture');
+});
+
+test('a hostile name is cleaned for display; the exact path is only data', async () => {
+  const evil = { ...ACME, name: 'A"B`C\u0007\n', roots: [{ path: '/w/x"y\nz' }] };
   const v = await initialized({ inventory: { ...LISTED, projects: [evil] } });
   all(v.els.projects).find((n) => n.tag === 'button').onclick();
   await flush();
   const text = v.last('ui/message').params.content[0].text;
-  assert.match(text, /project "A B C"/);
-  assert.match(text, /folder \/w\/x y z\./);
+  assert.match(text, /project "A B C", in the folder given below/);
+  assert.equal(text.split('\n').length, 2, 'instructions plus one data line; no injected line');
+  assert.equal(selection(text).folder, '/w/x"y\nz', 'exact, escaped as JSON');
 });
 
 test('unavailable inventories explain why and show no list', async () => {
@@ -308,8 +327,9 @@ test('a canvases result lists this workspace\'s canvases; choosing one asks for 
   all(list[0]).find((n) => n.tag === 'button').onclick();
   await flush();
   const text = v.last('ui/message').params.content[0].text;
-  assert.match(text, /^Open the OpenPaperDesign canvas "Alpha" at design\/Alpha in the workspace \/w\/acme\. First call openpaperdesign_status\./);
-  assert.match(text, /Continue only if the workspace it reports is exactly that one; otherwise tell me and stop\. Bind design\/Alpha with bind_project\./);
+  assert.match(text, /^Open the OpenPaperDesign canvas "Alpha" described below\. First call openpaperdesign_status\./);
+  assert.match(text, /Continue only if the workspace it reports is exactly the "workspace" value below; otherwise tell me and stop\. Bind the "project" value with bind_project\./);
+  assert.deepEqual(selection(text), { workspace: '/w/acme', project: 'design/Alpha', canvas_id: 'c-alpha' });
   assert.match(text, /Never pass force to bind_project/);
   assert.match(text, /read the page you will show with get_tree_summary \(nodeId root and that page's pageId; the bind summary doesn't count\)/);
   assert.match(text, /Then call open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded\./);
@@ -336,8 +356,9 @@ test('an open_editor result names its own workspace, project and canvas, with an
   v.els['ask-open'].onclick();
   await flush();
   const text = v.last('ui/message').params.content[0].text;
-  assert.match(text, /^Open the OpenPaperDesign canvas for design\/Beta in the in-app browser\. First call openpaperdesign_status\./);
-  assert.match(text, /exactly \/w\/acme and its bound project is \/w\/acme\/design\/Beta; otherwise tell me and stop\. Call open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded\./);
+  assert.match(text, /^Open the OpenPaperDesign canvas described below in the in-app browser\. First call openpaperdesign_status\./);
+  assert.match(text, /exactly the "workspace" value below and its bound project is exactly the "project_path" value; otherwise tell me and stop\. Call open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas loaded\./);
+  assert.deepEqual(selection(text), { workspace: '/w/acme', project: 'design/Beta', project_path: '/w/acme/design/Beta' });
   assert.ok(!text.includes(TOKEN), 'the agent gets a fresh link, not this one');
   onlyAllowed(v);
 });
