@@ -317,3 +317,119 @@ async fn pick_and_unadmitted_view_calls_leave_a_bound_session_alone() {
     assert!(ok && v["workspace_state"] == "pinned", "{v}");
     std::fs::remove_dir_all(&ws).unwrap();
 }
+
+/// Every path under `dir`, with file bytes: compared before and after.
+fn tree(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut all = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                stack.push(p.clone());
+            }
+            all.push((p.clone(), m.is_file().then(|| std::fs::read(&p).unwrap())));
+        }
+    }
+    all.sort();
+    all
+}
+
+/// A direct action refused after admission pins nothing, even with valid context A: the
+/// session stays unresolved and a later legitimate context B still works.
+#[tokio::test]
+async fn direct_refusals_with_valid_context_pin_nothing() {
+    let a = scratch("pin-a");
+    let b = scratch("pin-b");
+    std::fs::create_dir(a.join("design")).unwrap();
+    let s = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+    let ma = context::writable(&a);
+    let before = state(&s).await;
+    assert_eq!(before["workspace"], Value::Null);
+    let files = tree(&a);
+    let b_root = b.to_str().unwrap();
+    for (name, args) in [
+        (UI_CANVASES, json!({"root": b_root})),
+        (UI_CREATE, json!({"root": b_root, "name": "X"})),
+        (UI_CREATE, json!({"name": "   "})),
+        (UI_OPEN, json!({"project": "Landing"})),
+        (UI_OPEN, json!({"project": "design/Missing"})),
+        (UI_EDITOR, json!({})),
+    ] {
+        let (ok, v) = call(&s, name, args.clone(), ma.clone()).await;
+        assert!(!ok, "{name} {args}: {v}");
+        assert_eq!(
+            state(&s).await,
+            before,
+            "{name} {args}: nothing pinned or bound"
+        );
+    }
+    assert_eq!(tree(&a), files, "no file changed in A");
+    assert!(!b.join("design").exists(), "nothing made in B");
+    let (ok, v) = call(
+        &s,
+        "openpaperdesign_status",
+        json!({}),
+        context::writable(&b),
+    )
+    .await;
+    assert!(ok, "{v}");
+    assert_eq!(v["workspace_state"], "pinned", "{v}");
+    assert_eq!(v["workspace"], b_root, "B is usable: A was never pinned");
+    assert_eq!(v["workspace_usable"], true, "{v}");
+    for d in [a, b] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// An accepted direct action pins with its result (a create or open together with its
+/// binding), and bad input later leaves the pinned, bound session as it was.
+#[tokio::test]
+async fn direct_success_pins_and_later_bad_input_changes_nothing() {
+    let a = scratch("pos-a");
+    let other = scratch("pos-other");
+    let ma = context::writable(&a);
+    // Create first, on a fresh session: pinned and bound in one step.
+    let s = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+    let (ok, v) = call(&s, UI_CREATE, json!({"name": "Landing"}), ma.clone()).await;
+    assert!(ok && v["action"] == "created", "{v}");
+    let pinned = state(&s).await;
+    assert_eq!(pinned["workspace"][0], json!(a));
+    assert_eq!(pinned["bound"][0], json!(a.join("design/Landing")));
+    assert_eq!(pinned["bound"][2], true, "editor link given");
+    let files = tree(&a);
+    for (name, args, meta) in [
+        (
+            UI_OPEN,
+            json!({"project": "design/Missing", "force": true}),
+            ma.clone(),
+        ),
+        (
+            UI_CREATE,
+            json!({"name": "Landing", "force": true}),
+            ma.clone(),
+        ),
+        (
+            UI_CANVASES,
+            json!({"root": other.to_str().unwrap()}),
+            ma.clone(),
+        ),
+        (UI_CANVASES, json!({}), context::writable(&other)),
+        (UI_EDITOR, json!({}), app_meta()),
+    ] {
+        let (ok, v) = call(&s, name, args.clone(), meta).await;
+        assert!(!ok, "{name} {args}: {v}");
+        assert_eq!(state(&s).await, pinned, "{name} {args}");
+    }
+    assert_eq!(tree(&a), files);
+    // A read-only success pins too.
+    let r = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+    let (ok, v) = call(&r, UI_CANVASES, json!({}), ma.clone()).await;
+    assert!(ok && v["canvases"][0]["project"] == "design/Landing", "{v}");
+    assert_eq!(state(&r).await["workspace"][0], json!(a));
+    assert_eq!(state(&r).await["bound"], Value::Null);
+    for d in [a, other] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}

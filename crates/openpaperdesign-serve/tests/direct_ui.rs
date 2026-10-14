@@ -154,8 +154,18 @@ fn editor_url(v: &Value) -> &str {
     assert!(port.parse::<u16>().is_ok() && token.len() == 64, "{url}");
     url
 }
+/// Whether this build has the browser editor. A test that needs it says so loudly when it
+/// doesn't, and fails instead when `OPD_REQUIRE_EDITOR` is set (the required local run).
 fn built_in(s: &Value) -> bool {
-    s["browser_editor"] == "built in"
+    let built = s["browser_editor"] == "built in";
+    if !built {
+        assert!(
+            std::env::var_os("OPD_REQUIRE_EDITOR").is_none(),
+            "OPD_REQUIRE_EDITOR is set but this build has no browser editor"
+        );
+        eprintln!("SKIPPED positive branch: this build has no browser editor");
+    }
+    built
 }
 
 const ACTIONS: [&str; 4] = [
@@ -429,6 +439,7 @@ async fn direct_new_open_reopen_use_the_one_binding_and_keep_design_files() {
         ),
         (direction, tokens, logo)
     );
+    eprintln!("EXECUTED positive branch: direct new/open/reopen/restart");
     c.cancel().await.unwrap();
 }
 
@@ -449,6 +460,7 @@ async fn direct_actions_keep_protected_paths_links_and_profiles() {
         )
         .await;
         assert!(ok && v["project"] == "design/Disabled", "{v}");
+        eprintln!("EXECUTED positive branch: disabled profile create");
     }
     assert_eq!(
         std::fs::read(f.ws.join(".git")).unwrap(),
@@ -567,6 +579,7 @@ async fn direct_actions_in_standalone_mode_use_the_configured_workspace() {
     )
     .await;
     assert!(ok && v["project"] == "design/Solo", "{v}");
+    eprintln!("EXECUTED positive branch: standalone create");
     let (ok, v) = call(
         &c,
         "openpaperdesign_ui_create",
@@ -575,5 +588,41 @@ async fn direct_actions_in_standalone_mode_use_the_configured_workspace() {
     )
     .await;
     assert!(!ok, "{v}");
+    c.cancel().await.unwrap();
+}
+
+/// A refusal after admission, with valid context A, leaves a fresh packaged session
+/// unresolved: a later legitimate model context B still works.
+#[tokio::test]
+async fn direct_refusal_with_valid_context_leaves_a_fresh_session_unpinned() {
+    let f = Fixture::new();
+    let c = f.host().await;
+    let w = context::writable(&f.ws);
+    let before = tree(&f.root);
+    for (name, args) in [
+        (
+            "openpaperdesign_ui_canvases",
+            json!({"root": f.other.to_str().unwrap()}),
+        ),
+        ("openpaperdesign_ui_create", json!({"name": " "})),
+        (
+            "openpaperdesign_ui_open",
+            json!({"project": "design/Missing"}),
+        ),
+        ("openpaperdesign_ui_editor", json!({})),
+    ] {
+        let (ok, v) = call(&c, name, args, w.clone()).await;
+        assert!(!ok, "{name}: {v}");
+        assert_eq!(
+            status(&c, app()).await["workspace_state"],
+            "unresolved",
+            "{name}"
+        );
+    }
+    assert_eq!(tree(&f.root), before);
+    let s = status(&c, context::writable(&f.other)).await;
+    assert_eq!(s["workspace_state"], "pinned");
+    assert_eq!(s["workspace"], f.other.to_str().unwrap());
+    assert_eq!(s["workspace_usable"], true);
     c.cancel().await.unwrap();
 }

@@ -14,7 +14,10 @@
 //!   the admitted workspace. They reuse the model path's operations and its one bound project.
 //!   A call without valid context is refused and changes nothing: unlike the model path it
 //!   never retires a pinned workspace or its binding, because an app view's call is not that
-//!   session's context. Arguments, the view's choice and the picker answer authorize nothing.
+//!   session's context. A refused call never pins either: an unpinned session is pinned only
+//!   by an accepted action (a listing under the same lock, or a create/open in the same bind
+//!   handoff that installs its binding). Arguments, the view's choice and the picker answer
+//!   authorize nothing.
 
 use super::*;
 use rmcp::model::{CancelledNotificationParam, CustomRequest, ProtocolVersion, ServerRequest};
@@ -131,12 +134,13 @@ fn same_root(ws: &Workspace, root: Option<&str>) -> Result<(), String> {
 
 impl Launcher {
     /// Admission for a direct view action. The call's own context must be valid and match
-    /// the pinned workspace (if any); a first valid context pins it, as a model call would.
-    /// On any failure nothing changes: no pin, no retirement, no binding change.
+    /// the pinned workspace (if any). Admission itself changes nothing: it returns the
+    /// workspace and whether the session is still unpinned, and the caller pins only once
+    /// its action is accepted. On any failure: no pin, no retirement, no binding change.
     fn admit_direct(
-        state: &mut LauncherState,
+        state: &LauncherState,
         meta: &RequestMetaObject,
-    ) -> Result<Workspace, String> {
+    ) -> Result<(Workspace, bool), String> {
         if let Some(reason) = &state.invalidated {
             return Err(format!(
                 "This session was retired ({reason}). Nothing was read or changed."
@@ -144,10 +148,11 @@ impl Launcher {
         }
         if !state.host_context {
             // Standalone: the deliberately configured workspace, as for every tool.
-            return state
+            let ws = state
                 .workspace
                 .clone()
-                .ok_or_else(|| NO_CONTEXT.to_string());
+                .ok_or_else(|| NO_CONTEXT.to_string())?;
+            return Ok((ws, false));
         }
         let ws = Workspace::from_meta(meta).map_err(|e| format!("{NO_CONTEXT} ({e})"))?;
         match &state.workspace {
@@ -156,11 +161,8 @@ impl Launcher {
                  read or changed."
                     .into(),
             ),
-            Some(_) => Ok(ws),
-            None => {
-                state.workspace = Some(ws.clone());
-                Ok(ws)
-            }
+            Some(_) => Ok((ws, false)),
+            None => Ok((ws, true)),
         }
     }
 
@@ -179,7 +181,7 @@ impl Launcher {
         let get = |k: &str| map.get(k).and_then(Value::as_str);
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
         let mut state = self.state.clone().lock_owned().await;
-        let ws = Self::admit_direct(&mut state, meta)?;
+        let (ws, pin) = Self::admit_direct(&state, meta)?;
         same_root(&ws, get("root"))?;
         // These actions end in the editor: without it, refuse before changing anything.
         if name != UI_CANVASES && !bundle_complete() {
@@ -192,7 +194,11 @@ impl Launcher {
         let (action, dir) = match name {
             UI_CANVASES => {
                 let bound = state.bound.as_ref().map(|b| b.server.dir().to_path_buf());
-                return ws.canvases(bound.as_deref());
+                let out = ws.canvases(bound.as_deref())?;
+                if pin {
+                    state.workspace = Some(ws); // accepted, still under the same lock
+                }
+                return Ok(out);
             }
             UI_EDITOR => {
                 if state.bound.is_none() {
@@ -201,6 +207,9 @@ impl Launcher {
                         .into());
                 }
                 let mut v = Self::editor(&mut state, &ws)?;
+                if pin {
+                    state.workspace = Some(ws); // accepted, still under the same lock
+                }
                 v["action"] = json!("reopened");
                 return text(v);
             }
@@ -208,7 +217,7 @@ impl Launcher {
                 let name = get("name")
                     .filter(|s| !s.trim().is_empty())
                     .ok_or("a canvas name is required; nothing was created")?;
-                let (dir, _) = Self::create(state, ws.clone(), name, force).await?;
+                let (dir, _) = Self::create(state, ws.clone(), name, force, pin).await?;
                 ("created", dir)
             }
             UI_OPEN => {
@@ -219,7 +228,7 @@ impl Launcher {
                     .filter(|r| !r.is_empty() && !r.contains(['/', '\\']) && *r != "." && *r != "..")
                     .ok_or("only a canvas folder directly under design/ can be opened here; nothing was opened")?;
                 let dir = Self::existing(&ws, &format!("design/{rest}"))?;
-                Self::bind(state, ws.clone(), dir.clone(), force).await?;
+                Self::bind(state, ws.clone(), dir.clone(), force, pin).await?;
                 ("opened", dir)
             }
             _ => return Err(format!("unknown tool {name}")),

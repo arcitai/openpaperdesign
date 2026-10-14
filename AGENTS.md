@@ -173,8 +173,9 @@ The view's basic actions call the server directly (owner correction, 2026-10-14)
 `_ui_create`, `_ui_open` and `_ui_editor` are admitted only from that call's own
 `codex/sandbox-state-meta` (the same `Workspace::from_meta` as model calls), and a named folder
 must equal the admitted workspace exactly. Without valid context they refuse and change nothing:
-unlike the model path they never pin a mismatched workspace, retire a session or touch its
-binding. They reuse the model path's create/bind/editor code and its one bound project; keep a
+unlike the model path they never retire a session or touch its binding. A refused direct action
+never pins either; an unpinned session is pinned only by an accepted one (a listing under its
+lock, or a create/open inside the bind handoff that installs the binding). They reuse the model path's create/bind/editor code and its one bound project; keep a
 single binding per process (no pool or second UI binding). Observed so far: app-view calls
 carry no workspace context, so these actions are refused on that host; that is the honest
 result, not a reason to borrow model context, use a picked folder or fall back to messages. The

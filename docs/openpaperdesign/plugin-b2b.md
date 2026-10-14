@@ -75,7 +75,10 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     open. A switch away from an opened editor is refused until the person confirms (force).
   - **Admission.** These app-only tools need the call's own Codex workspace context, exactly
     as a model call (`Workspace::from_meta`), and `root` must equal that admitted workspace.
-    Without it they refuse and change nothing: no pin, no retirement, no binding change. Tool
+    Without it they refuse and change nothing: no pin, no retirement, no binding change. Even
+    with valid context, a refused action (another folder, a bad name or canvas, nothing bound)
+    pins nothing; only an accepted action pins an unpinned session, a create or open in the same
+    bind handoff that installs its binding. Tool
     arguments, a listed root and a picked folder grant nothing. On the observed host (model
     view and global entry) app calls carry no workspace context, so these actions are refused
     there with a plain message; a user-opened conversation-panel tab is not yet observed.

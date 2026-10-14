@@ -613,11 +613,15 @@ impl Launcher {
         }
     }
 
+    /// Bind `dir`. With `pin`, an unpinned session is pinned to `ws` in the same handoff step
+    /// that installs the binding (a direct view action whose admission didn't pin), so the pin
+    /// and its binding appear together or not at all.
     async fn bind(
         mut state: OwnedMutexGuard<LauncherState>,
         ws: Workspace,
         dir: PathBuf,
         force: bool,
+        pin: bool,
     ) -> ToolResult {
         if let Some(b) = state.bound.as_ref()
             && b.server.dir() == dir
@@ -639,6 +643,7 @@ impl Launcher {
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let token = new_token().map_err(|e| e.to_string())?;
         let rel = ws.relative(&dir);
+        let pin = pin.then(|| ws.clone());
         let prepared = Server::prepare_embedded(dir, BUNDLE_FILES, port, token.clone())
             .map_err(|e| e.to_string())?;
         // No fallible preparation remains. Own the transition independently of the request:
@@ -655,6 +660,11 @@ impl Launcher {
             let task = tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
+            if let Some(ws) = pin
+                && state.workspace.is_none()
+            {
+                state.workspace = Some(ws);
+            }
             state.bound = Some(Bound {
                 server: server.clone(),
                 port,
@@ -704,6 +714,7 @@ impl Launcher {
         ws: Workspace,
         name: &str,
         force: bool,
+        pin: bool,
     ) -> Result<(PathBuf, Vec<Out>), String> {
         // Before creating anything.
         Self::may_switch(&state.bound, None, force)?;
@@ -728,7 +739,7 @@ impl Launcher {
         p.save_page(&page).map_err(|e| e.to_string())?;
         p.write_manifest().map_err(|e| e.to_string())?;
         let dir = p.dir.clone();
-        let out = Self::bind(state, ws, p.dir, force).await?;
+        let out = Self::bind(state, ws, p.dir, force, pin).await?;
         Ok((dir, out))
     }
 
@@ -830,9 +841,9 @@ impl Launcher {
         match name {
             "bind_project" => {
                 let dir = Self::existing(&ws, arg("path")?)?;
-                Self::bind(state, ws, dir, force).await
+                Self::bind(state, ws, dir, force, false).await
             }
-            "create_project" => Self::create(state, ws, arg("name")?, force)
+            "create_project" => Self::create(state, ws, arg("name")?, force, false)
                 .await
                 .map(|(_, out)| out),
             "open_editor" => text(Self::editor(&mut state, &ws)?),
