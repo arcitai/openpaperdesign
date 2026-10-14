@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.28 · Updated: 2026-10-14
+Revision: 0.29 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -186,8 +186,8 @@ keep a single binding per process (no pool or second UI binding). Project creati
 origins) acquires the binding's listener before writing anything; a later failure before the
 binding is installed removes, under the same lock, only what is still provably that
 creation's: files it finished writing with the same identity and bytes, and folders it created
-with the same identity at their canonical path, once empty. Anything replaced, changed, moved
-or unknown stays and is named (never existing `design/`, direction files, tokens or assets).
+with the same identity at their canonical path, once empty. Anything replaced, changed, moved,
+unknown or unobservable (only NotFound counts as gone) stays and is named (never existing `design/`, direction files, tokens or assets).
 The check-then-remove path race, crashes and other writers remain unprotected. Observed so far: app-view calls
 carry no workspace context, so these actions are refused on that host; that is the honest
 result, not a reason to borrow model context, use a picked folder or fall back to messages. The

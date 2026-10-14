@@ -90,8 +90,8 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     writing anything. A later failure before the binding is installed removes, under the same
     lock, only what is still provably that creation's: files it finished writing (same
     identity and bytes) and folders it created (same identity at their canonical path, once
-    empty). A file replaced or changed, a folder swapped or moved, or anything unknown stays
-    and is named; existing `design/` content, direction files, tokens and assets are never
+    empty). A file replaced or changed, a folder swapped or moved, or anything unknown or
+    unobservable (only a missing path counts as gone) stays and is named; existing `design/` content, direction files, tokens and assets are never
     removed, and any existing binding is kept. Not crash atomic; a final check-then-remove
     race and other writers remain unprotected. Tool
     arguments, a listed root and a picked folder grant nothing. On the observed host (model

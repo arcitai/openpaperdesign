@@ -739,3 +739,142 @@ async fn failed_create_keeps_what_is_no_longer_exactly_its_own() {
     );
     std::fs::remove_dir_all(&ws).unwrap();
 }
+
+/// Makes `dir` unsearchable for this test and restores its mode on drop, even when an
+/// assertion fails. `armed()` is false when the environment can't induce the denial (for
+/// example when run as root); the caller then reports the case NOT RUN instead of passing it.
+struct Unsearchable(PathBuf);
+impl Unsearchable {
+    fn new(dir: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Self(dir.to_path_buf())
+    }
+    fn armed(&self, inside: &Path) -> bool {
+        matches!(std::fs::symlink_metadata(inside), Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+}
+impl Drop for Unsearchable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// R4-F1: only an observed NotFound is absence. A destination that can't be observed
+/// (permission denied) is kept and named, never reported as cleanly removed; a genuinely
+/// missing one still counts as gone.
+#[test]
+fn made_observation_error_is_uncertainty_not_absence() {
+    let made_under = |root: &Path| {
+        let project = root.join("canvas");
+        let pages = project.join("pages");
+        let mut made = Made::default();
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        made.dir(project.clone());
+        std::fs::create_dir(&pages).unwrap();
+        made.dir(pages.clone());
+        std::fs::write(pages.join("page.json"), b"owned page").unwrap();
+        made.file(pages.join("page.json"));
+        std::fs::write(project.join("project.json"), b"owned manifest").unwrap();
+        made.file(project.join("project.json"));
+        (project, made)
+    };
+    let base = scratch("observe");
+    // Control: genuinely gone before cleanup is absence.
+    let (project, made) = made_under(&base.join("absent"));
+    std::fs::remove_dir_all(&project).unwrap();
+    assert_eq!(
+        made.fail("later failure".into()),
+        "later failure. Nothing was created."
+    );
+    // Observation denied: every tracked destination stays and is named.
+    let parent = base.join("denied");
+    let (project, made) = made_under(&parent);
+    let answer = {
+        let guard = Unsearchable::new(&parent);
+        if !guard.armed(&project) {
+            eprintln!("NOT RUN: this environment can't deny metadata access (root?)");
+            std::fs::remove_dir_all(&base).unwrap();
+            return;
+        }
+        made.fail("later failure".into())
+    };
+    assert!(!answer.contains("Nothing was created"), "{answer}");
+    for p in [
+        "canvas/project.json",
+        "canvas/pages/page.json",
+        "canvas/pages",
+        "canvas",
+    ] {
+        assert!(
+            answer.contains(parent.join(p).to_str().unwrap()),
+            "{p}: {answer}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(project.join("project.json")).unwrap(),
+        b"owned manifest"
+    );
+    assert_eq!(
+        std::fs::read(project.join("pages/page.json")).unwrap(),
+        b"owned page"
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// R4-F1 through a full create: the existing design/ becomes unsearchable after the files are
+/// written, then the create fails. The new canvas's paths are named (not "Nothing was
+/// created"), its files and the existing direction/tokens keep their bytes, and the open
+/// canvas's binding is unchanged; one final reopen shows it still usable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_create_names_destinations_it_cannot_observe() {
+    let ws = seeded("unobservable", true);
+    let s = Arc::new(connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await);
+    let w = context::writable(&ws);
+    let (ok, v) = call(&s, UI_CREATE, json!({"name": "First"}), w.clone()).await;
+    assert!(ok, "{v}");
+    let bound = state(&s).await;
+    let (direction, tokens) = (
+        std::fs::read(ws.join("DESIGN.md")).unwrap(),
+        std::fs::read(ws.join("design/tokens.json")).unwrap(),
+    );
+    let design = ws.join("design");
+    let mut armed = true;
+    let (ok, v) = {
+        let mut guard = None;
+        let answer = interrupted_create(&s, &ws, "Unseen", |dir| {
+            let g = Unsearchable::new(&design);
+            armed = g.armed(&dir.join("project.json"));
+            guard = Some(g);
+        })
+        .await;
+        drop(guard);
+        answer
+    };
+    if !armed {
+        eprintln!("NOT RUN: this environment can't deny metadata access (root?)");
+        std::fs::remove_dir_all(&ws).unwrap();
+        return;
+    }
+    let text = v.to_string();
+    assert!(!ok && !text.contains("Nothing was created"), "{v}");
+    assert!(
+        text.contains("design/Unseen/project.json") && text.contains("design/Unseen/pages"),
+        "{v}"
+    );
+    assert!(
+        ws.join("design/Unseen/project.json").is_file(),
+        "kept, as named"
+    );
+    assert_eq!(std::fs::read(ws.join("DESIGN.md")).unwrap(), direction);
+    assert_eq!(
+        std::fs::read(ws.join("design/tokens.json")).unwrap(),
+        tokens
+    );
+    assert_eq!(state(&s).await, bound, "no pin or binding change");
+    let (ok, v) = call(&s, UI_EDITOR, json!({}), w).await;
+    assert!(ok && v["project"] == "design/First", "{v}");
+    std::fs::remove_dir_all(&ws).unwrap();
+}

@@ -219,13 +219,16 @@ impl Made {
         Some((identity(&m), crate::etag(&bytes)))
     }
 
-    /// Remove what is still exactly what was made; returns the paths that stay.
+    /// Remove what is still exactly what was made; returns the paths that stay. A path counts
+    /// as gone only when it is observed missing (NotFound): a failed observation (permission
+    /// denied, I/O error) leaves it uncertain, so it is kept and named, never assumed absent.
     fn undo(&self) -> Vec<PathBuf> {
         let mut left = vec![];
-        let exists = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+        let gone = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
         for (f, owned) in self.files.iter().rev() {
             let ours = owned.is_some() && Self::file_state(f) == *owned;
-            if !(ours && std::fs::remove_file(f).is_ok()) && exists(f) {
+            let removed = ours && std::fs::remove_file(f).is_ok();
+            if !(removed || gone(f)) {
                 left.push(f.clone());
             }
         }
@@ -233,7 +236,8 @@ impl Made {
             let ours = id.is_some()
                 && real_dir(d).ok().map(|m| identity(&m)) == *id
                 && d.canonicalize().ok().as_deref() == Some(d.as_path());
-            if !(ours && std::fs::remove_dir(d).is_ok()) && exists(d) {
+            let removed = ours && std::fs::remove_dir(d).is_ok();
+            if !(removed || gone(d)) {
                 left.push(d.clone());
             }
         }
