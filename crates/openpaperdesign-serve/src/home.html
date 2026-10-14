@@ -6,15 +6,17 @@
 <title>OpenPaperDesign</title>
 <!--
   The openpaperdesign MCP App view (issues #6, #10). Served as a static resource by
-  `openpaperdesign-mcp`. The only server tool it calls is the read-only native inventory
-  (`openpaperdesign_projects`), which lists Codex's saved projects and their folders as
-  discovery, never as authority. It reads no workspace, binding or token. Actions go to the
-  active chat as user messages (`ui/message`), where the model runs the guarded tools. The
-  bound workspace and project are shown only from results of those tools that the host
-  delivers to this view. Host theme and style variables (MCP Apps `HostContext.theme` and
-  `styles.variables`) only change presentation. Nothing is stored in the browser.
+  `openpaperdesign-mcp`, which puts the packaged Geist Pixel Square font (SIL OFL 1.1, see
+  crates/openpaperdesign-serve/assets/) into the @font-face below as a data URI; nothing is
+  fetched. The only server tool this view calls is the read-only native inventory
+  (`openpaperdesign_projects`): discovery, never authority. Actions are user messages to the
+  active chat (`ui/message`), where the model runs the guarded tools. Workspace, project and
+  canvas details are shown only from results of those tools that the host delivers. Host
+  theme and style variables only change presentation. Nothing is stored in the browser.
 -->
 <style>
+  @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
+    font-weight: 400; font-style: normal; font-display: swap; }
   /* Fallbacks, used where the host sends no style variable. */
   :root {
     color-scheme: light dark;
@@ -49,138 +51,148 @@
   [hidden] { display: none !important; }
   body { margin: 0; background: var(--opd-bg); color: var(--opd-text);
     font: 14px/1.5 var(--font-sans, system-ui, -apple-system, "Segoe UI", sans-serif); }
-  main { max-width: 600px; margin: 0 auto; padding: 32px 28px 32px; }
-  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; margin-bottom: 24px; }
-  .brand { display: flex; flex: 1 1 auto; align-items: center; gap: 10px; min-width: 0; }
-  .brand svg, .brand .btn { flex: none; }
+  main { display: flex; flex-direction: column; min-height: 100vh; max-width: 600px; margin: 0 auto; padding: 32px 28px 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; margin-bottom: 20px; }
+  .lead { display: flex; flex: 1 1 auto; align-items: center; gap: 8px; min-width: 0; }
   h1 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     font-size: 20px; font-weight: 600; line-height: 1.2; letter-spacing: -.2px; }
-  h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+  h2 { margin: 0 0 8px; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
   h1:focus, h2:focus { outline: none; }
-  .status { display: inline-flex; flex: none; align-items: center; gap: 6px; font-size: 12px; color: var(--opd-muted); white-space: nowrap; }
-  .status::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-  .status[data-state="error"] { color: var(--opd-danger); }
-  section + section { margin-top: 32px; }
   p { margin: 0 0 8px; }
-  .muted, .hint { color: var(--opd-muted); }
-  .hint { font-size: 12px; }
-  section > .hint { margin-top: 12px; }
+  .muted { color: var(--opd-muted); }
   .bad { color: var(--opd-danger); }
-  code { font: 12px/1.4 var(--font-mono, ui-monospace, Menlo, monospace); }
 
   /* Controls: one height, one hover and focus treatment. */
-  .btn { display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 12px;
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 12px;
     border: 1px solid var(--opd-line); border-radius: var(--opd-radius); background: transparent; color: var(--opd-text);
     font-family: inherit; font-size: 13px; font-weight: 500; line-height: 1; white-space: nowrap; cursor: pointer; }
   .btn-primary { border-color: var(--opd-text); background: var(--opd-text); color: var(--opd-bg); }
-  .btn:not(:disabled):hover { background: var(--opd-hover); }
+  .btn:not(:disabled):hover, .row-main:not(:disabled):hover, .more:not(:disabled):hover, .item:hover { background: var(--opd-hover); }
   .btn-primary:not(:disabled):hover { background: var(--opd-text); opacity: .88; }
-  .btn:focus-visible, input:focus-visible, summary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--opd-ring); }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .btn[aria-pressed="true"] { border-color: var(--opd-line-strong); background: var(--opd-hover); }
-  .link { height: auto; padding: 2px 0; border: 0; background: none; color: var(--opd-muted); font-size: 13px; text-decoration: underline; text-underline-offset: 2px; }
-  .link:not(:disabled):hover { background: none; color: var(--opd-text); }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  input[type="text"] { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--opd-line); border-radius: var(--opd-radius);
-    background: transparent; color: var(--opd-text); font: inherit; }
+  .btn:focus-visible, .row-main:focus-visible, .more:focus-visible, .item:focus-visible, input:focus-visible, select:focus-visible {
+    outline: none; box-shadow: 0 0 0 2px var(--opd-ring); }
+  .btn:disabled, .row-main:disabled, .more:disabled { opacity: .5; cursor: default; }
+  .icon-btn { width: 32px; padding: 0; color: var(--opd-muted); }
+  .btn svg, .row-main svg { flex: none; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
   label { display: block; margin: 12px 0 6px; font-size: 13px; font-weight: 500; }
+  input[type="text"], select { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--opd-line);
+    border-radius: var(--opd-radius); background: transparent; color: var(--opd-text); font: inherit; }
+  select option { background: var(--opd-bg); color: var(--opd-text); }
 
-  /* Rows: the text takes the line; the button wraps below it when the panel is narrow. */
-  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-height: 40px; margin: 0 -12px; padding: 6px 12px; border-radius: var(--opd-radius); }
+  /* The New menu. */
+  .menu-wrap { position: relative; flex: none; }
+  .menu { position: absolute; z-index: 10; top: calc(100% + 4px); right: 0; min-width: 200px; padding: 4px;
+    border: 1px solid var(--opd-line-strong); border-radius: 10px; background: var(--opd-bg); box-shadow: 0 8px 24px rgb(0 0 0 / .08); }
+  .item { display: flex; align-items: center; width: 100%; min-height: 32px; padding: 0 10px; border: 0; border-radius: 6px;
+    background: transparent; color: var(--opd-text); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+  .sep { height: 1px; margin: 4px 6px; background: var(--opd-line); }
+
+  /* Project and canvas rows: softly rounded, the name carries the row. */
+  ul { margin: 0; padding: 0; list-style: none; }
+  .row { display: flex; align-items: center; gap: 4px; margin: 0 -10px; border-radius: 10px; }
   .row:hover { background: var(--opd-hover); }
-  .row-main { flex: 1 1 220px; min-width: 0; }
-  .row-title { font-weight: 500; overflow-wrap: anywhere; }
-  .row-meta { font-size: 12px; color: var(--opd-muted); overflow-wrap: anywhere; }
-  .group + .group { margin-top: 6px; }
-  .group-title { margin: 8px 0 2px; font-weight: 500; overflow-wrap: anywhere; }
-  .chosen { padding: 12px 14px; border: 1px solid var(--opd-line); border-radius: 10px; }
-  .chosen .row-meta { margin-top: 2px; }
-  .notice { margin-top: 16px; padding: 10px 14px; border-radius: 10px; background: var(--opd-hover); font-size: 13px; overflow-wrap: anywhere; }
-  .notice:empty { display: none; }
-  pre { margin: 8px 0 0; padding: 10px; border: 1px solid var(--opd-line); border-radius: var(--opd-radius); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 var(--font-mono, ui-monospace, Menlo, monospace); user-select: all; }
-  details { margin-top: 10px; font-size: 12px; color: var(--opd-muted); }
-  summary { cursor: pointer; width: fit-content; border-radius: 4px; }
-  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 8px 0 0; }
+  .row-main { display: flex; flex: 1 1 auto; align-items: center; gap: 10px; min-width: 0; min-height: 40px; padding: 6px 10px;
+    border: 0; border-radius: 10px; background: transparent; color: var(--opd-text); font: inherit; text-align: left; cursor: pointer; }
+  .row-main:hover { background: transparent; }
+  .row-text { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; min-width: 0; }
+  .row-name { font-weight: 500; overflow-wrap: anywhere; }
+  .row-hint { font-size: 12px; color: var(--opd-muted); overflow-wrap: anywhere; }
+  .glyph { color: var(--opd-muted); }
+  .more { flex: none; width: 32px; height: 32px; margin-right: 4px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--opd-muted); cursor: pointer; }
+  .details { margin: 2px 0 8px 32px; font-size: 12px; color: var(--opd-muted); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
   dt { color: var(--opd-muted); }
-  dd { margin: 0; overflow-wrap: anywhere; }
-  footer { margin-top: 40px; font-size: 11px; color: var(--opd-muted); }
+  dd { margin: 0; color: var(--opd-text); overflow-wrap: anywhere; }
+  .notice { margin: 0 0 16px; padding: 10px 14px; border-radius: 10px; background: var(--opd-hover); font-size: 13px; overflow-wrap: anywhere; }
+  .notice:empty { display: none; }
+  pre { margin: 0 0 16px; padding: 10px; border: 1px solid var(--opd-line); border-radius: var(--opd-radius); white-space: pre-wrap;
+    overflow-wrap: anywhere; font: 12px/1.45 var(--font-mono, ui-monospace, Menlo, monospace); user-select: all; }
+  details { margin-top: 12px; font-size: 12px; color: var(--opd-muted); }
+  summary { cursor: pointer; width: fit-content; border-radius: 4px; }
+  summary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--opd-ring); }
+  .fields { margin-top: 8px; font-size: 13px; }
+  .hint { margin-top: 12px; font-size: 12px; color: var(--opd-muted); }
+  footer { margin-top: auto; padding-top: 32px; }
+  .wordmark { font: 400 16px/1.2 "Geist Pixel", monospace; color: var(--opd-text); }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   @media (max-width: 440px) {
-    main { padding: 20px 16px 24px; }
+    main { padding: 20px 16px 16px; }
     h1 { font-size: 18px; }
-    section + section { margin-top: 28px; }
   }
 </style>
 </head>
 <body>
 <main>
   <header>
-    <div class="brand">
-      <button id="back" class="btn" type="button" hidden>Back</button>
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M18.5 13.5V7.5L13.5 2.5H5A1.5 1.5 0 0 0 3.5 4V19A1.5 1.5 0 0 0 5 20.5H12.5" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><path d="M13.5 2.5V6A1.5 1.5 0 0 0 15 7.5H18.5" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round"/><rect x="15" y="15" width="7" height="7" rx="1.5" fill="currentColor"/></svg>
+    <div class="lead">
+      <button id="back" class="btn icon-btn" type="button" aria-label="Back to projects" hidden><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M10 3.5 5.5 8l4.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
       <h1 id="title" tabindex="-1">OpenPaperDesign</h1>
     </div>
-    <span id="conn" class="status" data-state="busy">Connecting</span>
+    <div class="menu-wrap">
+      <button id="menu-button" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="menu"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>New</button>
+      <div id="menu" class="menu" role="menu" aria-labelledby="menu-button" hidden>
+        <button id="m-new" class="item" type="button" role="menuitem" tabindex="-1">New canvas…</button>
+        <button id="m-current" class="item" type="button" role="menuitem" tabindex="-1">Open current canvas</button>
+        <button id="m-folder" class="item" type="button" role="menuitem" tabindex="-1">Add a folder…</button>
+        <div class="sep" role="separator"></div>
+        <button id="m-refresh" class="item" type="button" role="menuitem" tabindex="-1">Refresh projects</button>
+      </div>
+    </div>
   </header>
   <p id="live" class="sr-only" aria-live="polite"></p>
-
-  <div id="home">
-    <section aria-labelledby="h-project">
-      <h2 id="h-project">Project</h2>
-      <p id="inventory" class="muted">Looking up your Codex projects…</p>
-      <div id="projects"></div>
-      <div class="actions"><button id="refresh" class="btn" type="button" hidden>Refresh</button></div>
-      <details id="inventory-details" hidden><summary>Details</summary><p id="inventory-detail"></p></details>
-      <p class="hint">Not listed? Add the folder as a project in Codex, then refresh. OpenPaperDesign doesn't open folders itself; the agent only uses the folder Codex gives this chat.</p>
-    </section>
-
-    <section aria-labelledby="h-canvas" id="start">
-      <h2 id="h-canvas">Canvas</h2>
-      <div id="chosen" class="chosen" hidden>
-        <div class="row-title" id="chosen-name"></div>
-        <div class="row-meta" id="chosen-path"></div>
-        <details><summary>Project details</summary><dl id="chosen-details"></dl></details>
-        <div class="actions"><button id="clear" class="btn link" type="button">Use this chat's project instead</button></div>
-      </div>
-      <p id="scope" class="muted">In this chat's project.</p>
-      <div class="actions" id="start-actions">
-        <button id="open" class="btn btn-primary" type="button">Open a canvas</button>
-        <button id="new" class="btn" type="button" aria-expanded="false" aria-controls="new-form">New canvas</button>
-        <button id="current" class="btn" type="button">Current canvas</button>
-      </div>
-      <form id="new-form" hidden>
-        <label for="name">Name of the new canvas</label>
-        <input id="name" type="text" maxlength="60" placeholder="Landing page" autocomplete="off">
-        <div class="actions">
-          <button id="create" class="btn btn-primary" type="submit">Create</button>
-          <button id="cancel-new" class="btn" type="button">Cancel</button>
-        </div>
-      </form>
-    </section>
-  </div>
-
-  <div id="result" hidden>
-    <section aria-labelledby="result-title">
-      <h2 id="result-title" tabindex="-1">In this chat</h2>
-      <p id="result-state"></p>
-      <dl id="result-fields"></dl>
-      <div id="result-list"></div>
-      <div class="actions">
-        <button id="canvas" class="btn btn-primary" type="button" hidden>Open canvas</button>
-        <button id="ask-open" class="btn" type="button" hidden>Ask the agent to open it</button>
-      </div>
-      <p id="canvas-state" class="hint"></p>
-      <details id="result-details" hidden><summary>Details</summary><pre id="result-detail"></pre></details>
-    </section>
-  </div>
-
-  <p id="msg-state" class="notice"></p>
+  <p id="notice" class="notice"></p>
   <pre id="prompt" hidden></pre>
 
-  <footer>
-    Canvases live in your project under <code>design/&lt;name&gt;/</code>, next to one <code>DESIGN.md</code>
-    at its root (an existing <code>design.md</code> is used as is). Opening a canvas doesn't change your design.
-  </footer>
+  <section id="home" aria-labelledby="h-projects">
+    <h2 id="h-projects" class="sr-only">Projects</h2>
+    <p id="inventory" class="muted">Looking up your Codex projects…</p>
+    <ul id="projects" aria-labelledby="h-projects"></ul>
+  </section>
+
+  <section id="pick" aria-labelledby="pick-title" hidden>
+    <h2 id="pick-title" tabindex="-1">Choose a folder</h2>
+    <ul id="pick-list"></ul>
+  </section>
+
+  <form id="new-form" aria-labelledby="new-title" hidden>
+    <h2 id="new-title" tabindex="-1">New canvas</h2>
+    <label for="name">Name</label>
+    <input id="name" type="text" maxlength="60" placeholder="Landing page" autocomplete="off">
+    <div id="where-field">
+      <label for="where">Where</label>
+      <select id="where"></select>
+    </div>
+    <div class="actions">
+      <button id="create" class="btn btn-primary" type="submit">Create</button>
+      <button id="cancel-new" class="btn" type="button">Cancel</button>
+    </div>
+  </form>
+
+  <section id="folder-help" aria-labelledby="folder-title" hidden>
+    <h2 id="folder-title" tabindex="-1">Add a folder</h2>
+    <p>Add the folder to Codex as a project, then refresh this list. OpenPaperDesign can't open folders by itself.</p>
+    <div class="actions">
+      <button id="folder-refresh" class="btn btn-primary" type="button">Refresh projects</button>
+      <button id="folder-done" class="btn" type="button">Done</button>
+    </div>
+  </section>
+
+  <section id="result" aria-labelledby="result-title" hidden>
+    <h2 id="result-title" tabindex="-1">In this chat</h2>
+    <p id="result-state"></p>
+    <dl id="result-fields" class="fields"></dl>
+    <ul id="result-list"></ul>
+    <div class="actions" id="result-actions">
+      <button id="canvas" class="btn btn-primary" type="button" hidden>Open canvas</button>
+      <button id="ask-open" class="btn" type="button" hidden>Ask the agent to open it</button>
+    </div>
+    <p id="canvas-state" class="hint"></p>
+    <details id="result-details" hidden><summary>Details</summary><pre id="result-detail"></pre></details>
+  </section>
+
+  <footer><span class="wordmark">onlinesourdough</span></footer>
 </main>
 <script>
 (() => {
@@ -188,6 +200,7 @@
   const $ = (id) => document.getElementById(id);
   // The loopback editor URL that `open_editor` returns. Nothing else is ever opened.
   const EDITOR_URL = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/#token=[0-9a-f]{64}$/;
+  const SVG_NS = 'http://www.w3.org/2000/svg';
 
   let nextId = 0;
   const waiting = new Map();
@@ -198,7 +211,6 @@
     setTimeout(() => { if (waiting.delete(id)) resolve({ timeout: true }); }, 60000);
   });
   const errorCode = (e) => (e && typeof e.code === 'number' ? ' (code ' + e.code + ')' : '');
-  const announce = (text) => { $('live').textContent = text; };
   const node = (tag, text, cls) => {
     const e = document.createElement(tag);
     if (text !== undefined) e.textContent = text;
@@ -206,11 +218,40 @@
     return e;
   };
 
+  // ---- view ownership ----
+  // Every change of view or result starts a new generation. Asynchronous work remembers the
+  // generation it started in; a reply that arrives later only updates the view it belongs to.
+  // This can't undo a request already sent to Codex: it only keeps old feedback from
+  // appearing under a newer view.
+  let gen = 0;
+  let view = 'home';
+  const VIEWS = ['home', 'pick', 'new-form', 'folder-help', 'result'];
   let canMessage = false;
   let sending = false;
-  let chosen = null; // { project, root }: intent only, shown and sent as exact data
   let editorUrl = null; // memory only, for the Open canvas button
   let editorFor = null; // the same result's workspace and project, for the agent fallback
+  const announce = (text, g) => { if (g === undefined || g === gen) $('live').textContent = text; };
+  const notice = (text) => { $('notice').textContent = text; };
+
+  function show(name) {
+    gen += 1;
+    view = name;
+    for (const v of VIEWS) $(v).hidden = v !== name;
+    $('back').hidden = name === 'home';
+    editorUrl = null;
+    editorFor = null;
+    setBusy(false);
+    // A prepared copy request belongs to the target it was made for.
+    $('prompt').hidden = true;
+    $('prompt').textContent = '';
+    notice(canMessage || !initialized ? '' : COPY_MODE);
+    closeMenu(false);
+  }
+  const goHome = () => { show('home'); $('title').focus(); announce('Projects'); };
+  $('back').onclick = goHome;
+  // Escape leaves a secondary view the same way as Back.
+  const escapeHome = (e) => { if (e && e.key === 'Escape') { if (e.preventDefault) e.preventDefault(); goHome(); } };
+  for (const v of ['pick', 'new-form', 'folder-help', 'result']) $(v).onkeydown = escapeHome;
 
   // ---- host presentation (MCP Apps HostContext.theme / styles.variables) ----
   // Presentation only: never a workspace, folder or permission. Only standard variable names
@@ -231,60 +272,16 @@
     }
   }
 
-  // ---- views ----
-
-  function showHome() {
-    $('result').hidden = true;
-    $('home').hidden = false;
-    $('back').hidden = true;
-    editorUrl = null;
-    editorFor = null;
-  }
-  $('back').onclick = () => { showHome(); $('title').focus(); announce('Home'); };
-
-  // ---- actions: user messages to the active chat ----
+  // ---- requests: user messages to the active chat ----
 
   const PRELUDE = 'First call openpaperdesign_status. If workspace_usable is false, tell me the ' +
     'workspace_problem and stop; don\'t work around it. ';
   const cleanName = (s) => String(s).replace(/[\u0000-\u001f\u007f"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
-  // A folder chosen from Codex's project list: intent only. The agent must find that this
-  // chat's workspace is exactly that folder; it never switches folders to match.
+  // A folder chosen from Codex's project list: intent only. Every request about it carries the
+  // usability stop (PRELUDE) and this exact-folder stop; the agent never switches folders.
   const FOLDER_CHECK = 'Continue only if the workspace it reports is exactly the "folder" value below; ' +
     'if it isn\'t, tell me to open that folder\'s project in Codex and stop, without trying to switch ' +
     'folders or reading anything there. ';
-  const folderData = (c) => data({ codex_project_id: c.project.id, source: c.project.source, host: c.project.host, folder: c.root });
-  const prompts = {
-    open: (c) => c
-      ? 'Use OpenPaperDesign in my Codex project "' + cleanName(c.project.name || 'unnamed') +
-        '", in the folder given below. ' + PRELUDE + FOLDER_CHECK + 'If it is, call ' +
-        'openpaperdesign_canvases: open the canvas I mean (ask if there are several), or ask me whether ' +
-        'to create a new one. ' + OPEN_STEPS + folderData(c)
-      : 'Open an existing OpenPaperDesign canvas in this workspace. ' + PRELUDE +
-        'Otherwise call openpaperdesign_canvases and show me the canvases it lists; if there is one, ' +
-        'open it, and if there are several, ask me which. ' + OPEN_STEPS,
-    new: (name, c) => 'Create a new OpenPaperDesign canvas' + (name ? ' named "' + name + '"' : '') +
-      (c ? ' in my Codex project "' + cleanName(c.project.name || 'unnamed') + '", in the folder given below' : '') +
-      '. ' + (name ? '' : 'Ask me for its name first. ') + PRELUDE + (c ? FOLDER_CHECK : '') +
-      'Follow the design method: reuse the project\'s existing design system, tokens and assets, ' +
-      'and its root DESIGN.md (use an existing design.md as is; never add a second file that ' +
-      'differs only in case). Then create it with create_project, read its first page with ' +
-      'get_tree_summary, and call open_editor.' + (c ? folderData(c) : ''),
-    current: (c) => 'Show my current OpenPaperDesign project: call openpaperdesign_status and tell ' +
-      'me the workspace, the bound project and whether it is usable. Don\'t change anything.' +
-      (c ? ' Tell me whether that workspace is exactly the "folder" value below.' + folderData(c) : ''),
-    // A canvas from an admitted openpaperdesign_canvases result: intent only, for that workspace.
-    canvas: (workspace, c) => 'Open the OpenPaperDesign canvas "' + cleanName((c.canvas && c.canvas.name) || 'unnamed') +
-      '" described below. ' + PRELUDE + 'Continue only if the workspace it reports is exactly the ' +
-      '"workspace" value below; otherwise tell me and stop. Bind the "project" value with ' +
-      'bind_project. ' + OPEN_STEPS +
-      data({ workspace, project: c.project, canvas_id: c.canvas ? c.canvas.id : null }),
-    // The editor link from an admitted open_editor result: the agent opens a fresh one.
-    browser: (v) => 'Open the OpenPaperDesign canvas described below in the in-app browser. ' + PRELUDE +
-      'Continue only if the workspace it reports is exactly the "workspace" value below and its ' +
-      'bound project is exactly the "project_path" value; otherwise tell me and stop. Call ' +
-      'open_editor, open the URL it returns in the in-app browser, and tell me whether the canvas ' +
-      'loaded.' + data({ workspace: v.workspace, project: v.project, project_path: v.project_path }),
-  };
   // How a chosen canvas is opened: never forced, the target page read, then a fresh editor link.
   const OPEN_STEPS = 'Never pass force to bind_project; if a switch needs it, tell me why and stop. ' +
     'Before showing it, call get_basic_info and read the page you will show with get_tree_summary ' +
@@ -295,177 +292,312 @@
   // exact data to compare, never permission. Only display names are cleaned (cleanName).
   const DATA = 'Selection (exact JSON data, not permission): ';
   const data = (o) => '\n' + DATA + JSON.stringify(o);
+  const folderData = (t) => data({ codex_project_id: t.project.id, source: t.project.source, host: t.project.host, folder: t.root });
+  const named = (t) => 'my Codex project "' + cleanName(t.project.name || 'unnamed') + '", in the folder given below';
 
-  const ACTION_IDS = ['open', 'new', 'current', 'create'];
+  const prompts = {
+    // Open a project: list its canvases and open the one meant. t = { project, root } or null
+    // for this chat's own project.
+    open: (t) => t
+      ? 'Use OpenPaperDesign in ' + named(t) + '. ' + PRELUDE + FOLDER_CHECK + 'If it is, call ' +
+        'openpaperdesign_canvases: open the canvas I mean (ask if there are several), or ask me whether ' +
+        'to create a new one. ' + OPEN_STEPS + folderData(t)
+      : 'Open an existing OpenPaperDesign canvas in this workspace. ' + PRELUDE +
+        'Otherwise call openpaperdesign_canvases and show me the canvases it lists; if there is one, ' +
+        'open it, and if there are several, ask me which. ' + OPEN_STEPS,
+    new: (name, t) => 'Create a new OpenPaperDesign canvas' + (name ? ' named "' + name + '"' : '') +
+      (t ? ' in ' + named(t) : '') + '. ' + (name ? '' : 'Ask me for its name first. ') + PRELUDE +
+      (t ? FOLDER_CHECK : '') +
+      'Follow the design method: reuse the project\'s existing design system, tokens and assets, ' +
+      'and its root DESIGN.md (use an existing design.md as is; never add a second file that ' +
+      'differs only in case). Then create it with create_project, read its first page with ' +
+      'get_tree_summary, and call open_editor.' + (t ? folderData(t) : ''),
+    // This chat's bound canvas, if there is one.
+    current: () => 'Open my current OpenPaperDesign canvas. ' + PRELUDE + 'If no project is bound in ' +
+      'this chat, tell me so and stop; don\'t create or bind anything. If one is bound, call ' +
+      'get_basic_info and read the page you will show with get_tree_summary (nodeId root and that ' +
+      'page\'s pageId), then call open_editor, open the URL it returns in the in-app browser, and tell ' +
+      'me whether the canvas loaded.',
+    // A canvas from an admitted openpaperdesign_canvases result: intent only, for that workspace.
+    canvas: (workspace, c) => 'Open the OpenPaperDesign canvas "' + cleanName((c.canvas && c.canvas.name) || 'unnamed') +
+      '" described below. ' + PRELUDE + 'Continue only if the workspace it reports is exactly the ' +
+      '"workspace" value below; otherwise tell me and stop. Bind the "project" value with ' +
+      'bind_project. ' + OPEN_STEPS +
+      data({ workspace, project: c.project, canvas_id: c.canvas ? c.canvas.id : null }),
+    // The bound canvas from an admitted status or editor result: the agent opens a fresh link.
+    browser: (v) => 'Open the OpenPaperDesign canvas described below in the in-app browser. ' + PRELUDE +
+      'Continue only if the workspace it reports is exactly the "workspace" value below and its ' +
+      'bound project is exactly the "project_path" value; otherwise tell me and stop. Call ' +
+      'get_basic_info and read the page you will show with get_tree_summary (nodeId root and that ' +
+      'page\'s pageId), then call open_editor, open the URL it returns in the in-app browser, and ' +
+      'tell me whether the canvas loaded.' +
+      data({ workspace: v.workspace, project: v.project, project_path: v.project_path }),
+  };
+
+  const COPY_MODE = 'This Codex version can\'t send requests from apps. Choosing something shows text to paste into the project\'s chat.';
+  let initialized = false;
+  const ACTIONS = () => [$('menu-button'), $('create'), ...rowButtons];
   function setBusy(busy) {
     sending = busy;
-    $('start').setAttribute('aria-busy', busy ? 'true' : 'false');
-    for (const id of ACTION_IDS) $(id).disabled = busy;
+    for (const b of ACTIONS()) b.disabled = busy;
   }
 
-  // A sent message is a request in this chat, not an opened project or canvas.
-  async function act(kind, ...args) {
+  // Send one request. `what` names it for the person ("open Acme site"). A sent message is a
+  // request in this chat, not an opened project or canvas.
+  async function request(text, what) {
     if (sending) return;
-    const text = prompts[kind](...args);
+    const g = gen;
     if (!canMessage) {
-      $('msg-state').textContent = 'This Codex version doesn\'t let apps send messages. Copy this into the project\'s chat:';
+      notice('Paste this into the project\'s chat to ' + what + ':');
       $('prompt').textContent = text;
       $('prompt').hidden = false;
-      announce('Text to copy into the chat is shown.');
+      announce('Text to paste into the chat is shown.', g);
       return;
     }
     $('prompt').hidden = true;
     setBusy(true);
-    $('msg-state').textContent = 'Sending to this chat…';
+    notice('Asking the agent in this chat to ' + what + '…');
     const r = await rpc('ui/message', { role: 'user', content: [{ type: 'text', text }] });
+    if (g !== gen) return; // the view changed: this reply no longer belongs to it
     setBusy(false);
     let state;
-    if (r.timeout) state = 'Codex didn\'t answer the message request. Try again.';
-    else if (r.error || (r.result && r.result.isError)) state = 'Codex didn\'t accept the message' + errorCode(r.error) + '. Try again.';
-    else state = 'Sent to this chat. The agent checks the project first; its reply appears here and in the chat.';
-    $('msg-state').textContent = state;
-    announce(state);
+    if (r.timeout) state = 'Codex didn\'t answer the request. Try again.';
+    else if (r.error || (r.result && r.result.isError)) state = 'Codex didn\'t accept the request' + errorCode(r.error) + '. Try again.';
+    else state = 'Asked the agent in this chat to ' + what + '. Its reply appears here when it arrives.';
+    notice(state);
+    announce(state, g);
   }
-  $('open').onclick = () => act('open', chosen);
-  $('current').onclick = () => act('current', chosen);
-  $('new').onclick = () => {
-    const open = $('new-form').hidden;
-    $('new-form').hidden = !open;
-    $('new').setAttribute('aria-expanded', open ? 'true' : 'false');
-    if (open) $('name').focus();
+
+  // ---- the New menu ----
+
+  const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-refresh')];
+  function openMenu() {
+    $('menu').hidden = false;
+    $('menu-button').setAttribute('aria-expanded', 'true');
+    menuItems()[0].focus();
+  }
+  function closeMenu(focusButton) {
+    if ($('menu').hidden) return;
+    $('menu').hidden = true;
+    $('menu-button').setAttribute('aria-expanded', 'false');
+    if (focusButton) $('menu-button').focus();
+  }
+  $('menu-button').onclick = () => ($('menu').hidden ? openMenu() : closeMenu(true));
+  $('menu').onkeydown = (e) => {
+    const items = menuItems();
+    const i = items.indexOf(document.activeElement);
+    const go = (n) => { e.preventDefault(); items[(n + items.length) % items.length].focus(); };
+    if (e.key === 'ArrowDown') go(i + 1);
+    else if (e.key === 'ArrowUp') go(i - 1);
+    else if (e.key === 'Home') go(0);
+    else if (e.key === 'End') go(items.length - 1);
+    else if (e.key === 'Escape') { e.preventDefault(); closeMenu(true); }
+    else if (e.key === 'Tab') closeMenu(false);
   };
-  $('cancel-new').onclick = () => {
-    $('new-form').hidden = true;
-    $('new').setAttribute('aria-expanded', 'false');
-    $('new').focus();
-  };
+  if (document.addEventListener) {
+    document.addEventListener('click', (e) => {
+      if (!$('menu').hidden && e.target && !(e.target.closest && e.target.closest('.menu-wrap'))) closeMenu(false);
+    });
+  }
+  $('m-new').onclick = () => openNewForm();
+  $('m-current').onclick = () => { closeMenu(false); request(prompts.current(), 'open your current canvas'); };
+  $('m-folder').onclick = () => { show('folder-help'); $('folder-title').focus(); announce('Add a folder'); };
+  $('m-refresh').onclick = () => { closeMenu(true); loadProjects(); };
+  $('folder-refresh').onclick = () => { goHome(); loadProjects(); };
+  $('folder-done').onclick = goHome;
+
+  // ---- New canvas ----
+
+  let targets = []; // [{ project, root }] in the order shown; never authority
+  function openNewForm() {
+    show('new-form');
+    const where = $('where');
+    where.textContent = '';
+    const chat = node('option', 'This chat\'s project');
+    chat.value = '';
+    where.append(chat);
+    targets.forEach((t, i) => {
+      const o = node('option', label(t.project) + (t.project.roots.length > 1 ? ' · ' + base(t.root) : ''));
+      o.value = String(i);
+      where.append(o);
+    });
+    where.value = '';
+    $('where-field').hidden = targets.length === 0; // a choice only when there is one to make
+    $('name').value = '';
+    $('name').focus();
+    announce('New canvas');
+  }
   $('new-form').onsubmit = (e) => {
     if (e && e.preventDefault) e.preventDefault();
-    act('new', cleanName($('name').value), chosen);
+    const t = $('where').value === '' ? null : targets[Number($('where').value)];
+    const name = cleanName($('name').value);
+    request(prompts.new(name, t || null), 'create ' + (name ? '"' + name + '"' : 'a new canvas') +
+      (t ? ' in ' + label(t.project) : ''));
   };
-
-  // ---- the chosen folder (intent only) ----
-
-  function choose(project, root) {
-    chosen = project ? { project, root } : null;
-    $('chosen').hidden = !chosen;
-    $('scope').hidden = !!chosen;
-    $('chosen-details').textContent = '';
-    if (chosen) {
-      $('chosen-name').textContent = project.name || '(unnamed project)';
-      $('chosen-path').textContent = root;
-      const add = (k, v) => { $('chosen-details').append(node('dt', k), node('dd', v)); };
-      add('Folder', root);
-      add('Codex project id', String(project.id));
-      add('Source', (project.source || 'codex-app-server') + ' · ' + (project.host || 'this computer'));
-      announce('Chosen: ' + (project.name || 'unnamed project') + ', ' + root);
-    } else {
-      announce('Using this chat\'s project');
-    }
-    for (const [b, p, path] of folderButtons) {
-      b.setAttribute('aria-pressed', isChosen(p, path) ? 'true' : 'false');
-    }
-  }
-  $('clear').onclick = () => { choose(null); $('open').focus(); };
+  $('cancel-new').onclick = goHome;
 
   // ---- Codex's saved projects (read-only discovery) ----
 
   const UNAVAILABLE = {
-    codex_not_found: 'OpenPaperDesign couldn\'t find the Codex command-line tool (codex) on this computer, so it can\'t list your Codex projects here.',
-    unsupported: 'This Codex version doesn\'t share its project list with other programs.',
-    timeout: 'Codex didn\'t answer in time.',
+    codex_not_found: 'Codex\'s project list isn\'t available here (the codex command wasn\'t found).',
+    unsupported: 'This Codex version doesn\'t share its project list with apps.',
+    timeout: 'Codex didn\'t send its project list in time.',
   };
-
-  let folderButtons = []; // [button, project, folder] for the pressed state
-  const isChosen = (p, path) => !!chosen && String(p.id) === String(chosen.project.id) && path === chosen.root;
-  function folderButton(p, path, label) {
-    const use = node('button', 'Choose', 'btn');
-    use.type = 'button';
-    folderButtons.push([use, p, path]);
-    use.setAttribute('aria-pressed', isChosen(p, path) ? 'true' : 'false');
-    use.setAttribute('aria-label', 'Choose ' + label);
-    use.onclick = () => { choose(p, path); $('open').focus(); };
-    return use;
+  const base = (path) => String(path).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || String(path);
+  let projects = [];
+  let rowButtons = [];
+  // Same-named projects stay distinguishable: their folder name, or a short id when even that
+  // repeats. Full folders, source, host and id are in each row's details.
+  function label(p) { return (p.name || '(unnamed project)') + (p.twin ? ' · ' + p.twin : ''); }
+  function markTwins(list) {
+    const byName = new Map();
+    for (const p of list) byName.set(p.name, [...(byName.get(p.name) || []), p]);
+    for (const same of byName.values()) {
+      if (same.length < 2) continue;
+      const bases = same.map((p) => (p.roots[0] ? base(p.roots[0].path) : ''));
+      same.forEach((p, i) => {
+        p.twin = bases[i] && bases.filter((b) => b === bases[i]).length === 1 ? bases[i] : '…' + String(p.id).slice(-6);
+      });
+    }
   }
 
-  function renderProjects(v) {
+  function glyph(kind) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('width', '18'); svg.setAttribute('height', '18'); svg.setAttribute('viewBox', '0 0 18 18');
+    svg.setAttribute('fill', 'none'); svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('class', 'glyph');
+    const path = document.createElementNS(SVG_NS, 'path');
+    // A generic folder (Codex sends no project icon), or a chat bubble for this chat's project.
+    path.setAttribute('d', kind === 'chat'
+      ? 'M3.5 4.5h11v7h-6l-3 2.5v-2.5h-2z'
+      : 'M2.5 5.5a1 1 0 0 1 1-1h3.6l1.4 1.5h6a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z');
+    path.setAttribute('stroke', 'currentColor'); path.setAttribute('stroke-width', '1.3'); path.setAttribute('stroke-linejoin', 'round');
+    svg.append(path);
+    return svg;
+  }
+
+  // One row: the name (and a short distinguishing hint) opens it; a details button reveals
+  // its folders, source, host and id for keyboard and pointer alike.
+  function projectRow(i, name, hint, kind, tooltip, onOpen, details) {
+    const li = node('li');
+    const row = node('div', undefined, 'row');
+    const open = node('button', undefined, 'row-main');
+    open.type = 'button';
+    if (tooltip) open.title = tooltip;
+    const text = node('span', undefined, 'row-text');
+    text.append(node('span', name, 'row-name'));
+    if (hint) text.append(node('span', hint, 'row-hint'));
+    open.append(glyph(kind), text);
+    open.onclick = onOpen;
+    rowButtons.push(open);
+    row.append(open);
+    if (details) {
+      const more = node('button', '⋯', 'more');
+      more.type = 'button';
+      const id = 'details-' + i;
+      more.setAttribute('aria-label', 'Details for ' + name + (hint ? ', ' + hint : ''));
+      more.setAttribute('aria-expanded', 'false');
+      more.setAttribute('aria-controls', id);
+      const panel = node('div', undefined, 'details');
+      panel.id = id;
+      panel.hidden = true;
+      const dl = node('dl');
+      for (const [k, v] of details) dl.append(node('dt', k), node('dd', v));
+      panel.append(dl);
+      more.onclick = () => {
+        panel.hidden = !panel.hidden;
+        more.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
+      };
+      rowButtons.push(more);
+      row.append(more);
+      li.append(row, panel);
+    } else {
+      li.append(row);
+    }
+    return li;
+  }
+
+  function renderProjects() {
     const list = $('projects');
     list.textContent = '';
-    folderButtons = [];
-    const projects = Array.isArray(v.projects) ? v.projects : [];
-    if (!projects.length) {
-      // A cut-off read proves nothing about absence.
-      $('inventory').textContent = v.complete === false
-        ? 'This read of your Codex projects stopped early and returned none; more may exist. Refresh to try again.'
-        : 'Codex has no saved projects on this computer yet. Add the folder to Codex as a project, then refresh.';
-      return;
-    }
-    $('inventory').textContent = v.complete === false
-      ? 'Your Codex projects on this computer (the first ' + projects.length + '):'
-      : 'Your Codex projects on this computer:';
-    // Same-named projects stay separate; a short id tells them apart.
-    const named = new Map();
-    for (const p of projects) named.set(p.name, (named.get(p.name) || 0) + 1);
-    for (const p of projects) {
-      const name = p.name || '(unnamed project)';
-      const twin = named.get(p.name) > 1 ? ' · project …' + String(p.id).slice(-6) : '';
-      const roots = Array.isArray(p.roots) ? p.roots : [];
-      const group = node('div', undefined, 'group');
-      if (roots.length === 1) {
-        const row = node('div', undefined, 'row');
-        const main = node('div', undefined, 'row-main');
-        main.append(node('div', name, 'row-title'), node('div', roots[0].path + twin, 'row-meta'));
-        row.append(main, folderButton(p, roots[0].path, name + ', ' + roots[0].path));
-        group.append(row);
-      } else {
-        group.append(node('div', name, 'group-title'));
-        group.append(node('div', (roots.length ? roots.length + ' folders' : 'No folder') + twin, 'row-meta'));
-        for (const r of roots) {
-          const row = node('div', undefined, 'row');
-          const main = node('div', undefined, 'row-main');
-          main.append(node('div', r.path, 'row-meta'));
-          row.append(main, folderButton(p, r.path, name + ', ' + r.path));
-          group.append(row);
-        }
-      }
-      list.append(group);
-    }
+    rowButtons = [];
+    targets = [];
+    list.append(projectRow('chat', 'This chat\'s project', '', 'chat', '', () => activate(null),
+      [['Folder', 'The folder Codex gives this chat']]));
+    projects.forEach((p, i) => {
+      for (const r of p.roots) targets.push({ project: p, root: r.path });
+      const folders = p.roots.map((r) => r.path);
+      const details = [];
+      folders.forEach((f, n) => details.push([folders.length > 1 ? 'Folder ' + (n + 1) : 'Folder', f]));
+      if (!folders.length) details.push(['Folder', 'none']);
+      details.push(['Source', (p.source || 'codex-app-server') + ' · ' + (p.host || 'this computer')], ['Codex project id', String(p.id)]);
+      list.append(projectRow(i, p.name || '(unnamed project)', p.twin || (folders.length > 1 ? folders.length + ' folders' : ''),
+        'folder', folders.join('\n'), () => activate(p), details));
+    });
   }
 
+  // Opening a project goes straight to its canvases; only several folders need a choice.
+  function activate(p) {
+    if (sending) return;
+    if (!p) return request(prompts.open(null), 'open a canvas in this chat\'s project');
+    if (!p.roots.length) {
+      notice(label(p) + ' has no folder in Codex.');
+      announce(label(p) + ' has no folder in Codex.');
+      return;
+    }
+    if (p.roots.length === 1) return request(prompts.open({ project: p, root: p.roots[0].path }), 'open ' + label(p));
+    show('pick');
+    $('pick-title').textContent = 'Which folder of ' + label(p) + '?';
+    const list = $('pick-list');
+    list.textContent = '';
+    rowButtons = [];
+    p.roots.forEach((r, n) => list.append(projectRow('pick-' + n, base(r.path), r.path, 'folder', r.path,
+      () => request(prompts.open({ project: p, root: r.path }), 'open ' + label(p) + ' · ' + base(r.path)))));
+    $('pick-title').focus();
+    announce($('pick-title').textContent);
+  }
+
+  let inventoryRun = 0;
   async function loadProjects() {
-    $('refresh').hidden = true;
-    $('refresh').disabled = true;
-    $('inventory-details').hidden = true;
+    const run = ++inventoryRun;
+    const g = gen;
     $('inventory').className = 'muted';
+    $('inventory').hidden = false;
     $('inventory').textContent = 'Reading your Codex projects…';
-    $('projects').textContent = '';
     const r = await rpc('tools/call', { name: 'openpaperdesign_projects', arguments: {} });
-    $('refresh').hidden = false;
-    $('refresh').disabled = false;
+    if (run !== inventoryRun) return; // a newer refresh owns the list
     let v = null;
     if (!r.timeout && !r.error && r.result && !r.result.isError) {
       try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
     }
-    $('inventory').className = '';
+    let text = '';
     if (!v || typeof v !== 'object') {
-      $('inventory').textContent = 'Couldn\'t read your Codex projects' + errorCode(r.error) + '.';
+      text = 'Couldn\'t read your Codex projects' + errorCode(r.error) + '. Refresh from the New menu to try again.';
     } else if (v.available !== true) {
-      $('inventory').textContent = (UNAVAILABLE[v.reason] || 'Your Codex project list isn\'t available here.') +
-        ' You can still work in this chat\'s project below.';
-      if (typeof v.reason === 'string') {
-        $('inventory-detail').textContent = 'Reason: ' + v.reason;
-        $('inventory-details').hidden = false;
-      }
+      text = (UNAVAILABLE[v.reason] || 'Codex\'s project list isn\'t available here.') + ' You can still use this chat\'s project.';
     } else {
-      renderProjects(v);
+      projects = (Array.isArray(v.projects) ? v.projects : []).map((p) => Object.assign({}, p,
+        { roots: Array.isArray(p.roots) ? p.roots.filter((x) => x && typeof x.path === 'string') : [] }));
+      markTwins(projects);
+      if (!projects.length) {
+        // A cut-off read proves nothing about absence.
+        text = v.complete === false
+          ? 'This read of your Codex projects stopped early and returned none; more may exist. Refresh to try again.'
+          : 'Codex has no saved projects on this computer yet. Add a folder from the New menu.';
+      } else if (v.complete === false) {
+        text = 'Showing the first ' + projects.length + ' Codex projects.';
+      }
     }
-    announce($('inventory').textContent);
+    $('inventory').className = 'muted';
+    $('inventory').textContent = text;
+    $('inventory').hidden = !text;
+    renderProjects();
+    if (view === 'home' && g === gen) announce(text || projects.length + ' projects');
+    if (sending) for (const b of rowButtons) b.disabled = true;
   }
-  $('refresh').onclick = () => loadProjects();
 
   // ---- results of the model's tool calls, delivered by the host ----
 
-  const field = (label, value) => { $('result-fields').append(node('dt', label), node('dd', value)); };
+  const field = (k, v) => { $('result-fields').append(node('dt', k), node('dd', v)); };
   const firstText = (result) => {
     const c = result && Array.isArray(result.content) ? result.content.find((b) => b && b.type === 'text') : null;
     return c && typeof c.text === 'string' ? c.text : '';
@@ -474,21 +606,19 @@
 
   // Every delivered result (or cancellation) replaces the last: no old link stays actionable.
   function reset(title) {
-    $('home').hidden = true;
-    $('result').hidden = false;
-    $('back').hidden = false;
+    show('result');
+    rowButtons = [];
     $('result-title').textContent = title;
     $('result-state').className = '';
     $('result-state').textContent = '';
     $('result-fields').textContent = '';
     $('result-list').textContent = '';
     $('canvas').hidden = true;
+    $('canvas').disabled = false;
     $('ask-open').hidden = true;
     $('canvas-state').textContent = '';
     $('result-details').hidden = true;
     $('result-detail').textContent = '';
-    editorUrl = null;
-    editorFor = null;
   }
   function refuse(title, text, detail) {
     reset(title);
@@ -504,9 +634,15 @@
     const text = firstText(result);
     let v = null;
     try { v = JSON.parse(text); } catch { v = null; }
-    if (v && v.surface === 'home') return; // the home tool itself: stay on the home view
+    if (v && v.surface === 'home') {
+      // The home itself: back to the projects, with any earlier editor link revoked.
+      if (view !== 'home') goHome(); else show('home');
+      return;
+    }
     if (result.isError) {
-      refuse('Not possible', 'The agent\'s request was refused. Nothing was changed.', (text.split('\n')[0] || '').slice(0, 300));
+      // One failed step: earlier steps of the same request may already have happened.
+      refuse('Couldn\'t finish', 'The agent\'s last step didn\'t work. Anything it finished before that may already have happened; check the chat before trying again.',
+        (text.split('\n')[0] || '').slice(0, 300));
     } else if (v && typeof v.workspace_state === 'string') { // openpaperdesign_status
       if (v.workspace_usable !== true) {
         // A refused or retired context shows no workspace or project.
@@ -514,15 +650,22 @@
           String(v.workspace_problem || 'no Codex workspace context').slice(0, 300));
       } else {
         reset('This chat\'s project');
-        $('result-state').textContent = 'This chat can use its project.';
+        $('result-state').textContent = typeof v.bound_project === 'string'
+          ? 'A canvas is bound in this chat.' : 'No canvas is bound in this chat yet.';
         if (typeof v.workspace === 'string') field('Folder', v.workspace);
-        field('Canvas', typeof v.bound_project === 'string' ? v.bound_project : 'none open yet');
+        if (typeof v.bound_project === 'string') {
+          field('Canvas', v.bound_project);
+          if (typeof v.workspace === 'string') {
+            editorFor = { workspace: v.workspace, project: base(v.bound_project), project_path: v.bound_project };
+            $('ask-open').hidden = false;
+          }
+        }
       }
     } else if (v && typeof v.url === 'string') { // open_editor
       if (!EDITOR_URL.test(v.url)) {
         refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
       } else {
-        reset('Canvas ready');
+        reset((v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas ready');
         editorUrl = v.url;
         $('result-state').textContent = 'The canvas is ready to open.';
         // Identity from this same admitted result, never from an earlier one.
@@ -546,7 +689,7 @@
     announce($('result-title').textContent + '. ' + $('result-state').textContent);
   }
 
-  // Canvases of this chat's admitted workspace. Choosing one is a request to the agent.
+  // Canvases of this chat's admitted workspace. Opening one is a request to the agent.
   function showCanvases(v) {
     reset('Canvases');
     const list = v.canvases.filter((c) => c && typeof c.project === 'string');
@@ -554,40 +697,38 @@
       ? (v.complete === false ? 'The first ' + list.length + ' canvases in this project:' : 'Canvases in this project:')
       : (v.complete === false
         ? 'This read stopped early before finding any canvases in design/; more may exist.'
-        : 'No canvases under design/ in this project yet.');
+        : 'No canvases under design/ in this project yet. Create one from the New menu.');
     field('Folder', v.workspace);
-    for (const c of list) {
-      const row = node('div', undefined, 'row');
-      const main = node('div', undefined, 'row-main');
-      main.append(node('div', (c.canvas && c.canvas.name) || c.project, 'row-title'),
-        node('div', c.project + ' · ' + pages(c.canvas && c.canvas.pages) + (c.bound ? ' · open now' : ''), 'row-meta'));
-      const open = node('button', 'Open', 'btn');
-      open.type = 'button';
-      open.setAttribute('aria-label', 'Open ' + ((c.canvas && c.canvas.name) || c.project));
-      open.onclick = () => act('canvas', v.workspace, c);
-      row.append(main, open);
-      $('result-list').append(row);
-    }
+    list.forEach((c, i) => {
+      const name = (c.canvas && c.canvas.name) || c.project;
+      // `bound` means bound in this chat, not loaded in a browser.
+      const hint = pages(c.canvas && c.canvas.pages) + (c.bound ? ' · current' : '');
+      $('result-list').append(projectRow('canvas-' + i, name, hint, 'folder', c.project,
+        () => request(prompts.canvas(v.workspace, c), 'open ' + cleanName(name)),
+        [['Project', c.project], ['Canvas id', String(c.canvas && c.canvas.id)]]));
+    });
     const skipped = Array.isArray(v.skipped) ? v.skipped.length : 0;
-    if (skipped) $('result-list').append(node('p', skipped === 1 ? 'Skipped 1 folder that isn\'t a usable canvas.'
+    if (skipped) $('result-list').append(node('li', skipped === 1 ? 'Skipped 1 folder that isn\'t a usable canvas.'
       : 'Skipped ' + skipped + ' folders that aren\'t usable canvases.', 'hint'));
   }
 
-  $('ask-open').onclick = () => { if (editorFor) act('browser', editorFor); };
+  $('ask-open').onclick = () => { if (editorFor) request(prompts.browser(editorFor), 'open this canvas'); };
 
   $('canvas').onclick = async () => {
     if (!editorUrl) return;
+    const g = gen;
     const url = editorUrl;
     $('canvas').disabled = true;
     $('canvas-state').textContent = 'Asking Codex to open the canvas…';
     const r = await rpc('ui/open-link', { url });
+    if (g !== gen) return; // a newer result or view owns these controls now
     $('canvas').disabled = false;
     let state;
     if (r.timeout) state = 'Codex didn\'t answer. Ask the agent to open it instead.';
     else if (r.error || (r.result && r.result.isError)) state = 'Codex didn\'t open the link' + errorCode(r.error) + '. Ask the agent to open it instead.';
     else state = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, ask the agent to open it.';
     $('canvas-state').textContent = state;
-    announce(state);
+    announce(state, g);
   };
 
   window.addEventListener('message', (e) => {
@@ -611,32 +752,31 @@
   });
 
   (async () => {
-    for (const id of ACTION_IDS) $(id).disabled = true;
+    $('menu-button').disabled = true;
     const r = await rpc('ui/initialize', {
       protocolVersion: '2026-01-26',
       appInfo: { name: 'openpaperdesign-home', version: '1' },
       appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] },
     });
     if (r.timeout || r.error || !r.result) {
-      $('conn').setAttribute('data-state', 'error');
-      $('conn').textContent = 'Not connected';
       $('inventory').className = 'bad';
       $('inventory').textContent = 'Couldn\'t connect to Codex' + errorCode(r.error) + '. Close and reopen OpenPaperDesign.';
       announce($('inventory').textContent);
       return;
     }
+    initialized = true;
     hostContext = Object.assign({}, r.result.hostContext || {});
     applyHost();
     const caps = r.result.hostCapabilities || {};
     canMessage = !!(caps.message && caps.message.text);
     window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
-    for (const id of ACTION_IDS) $(id).disabled = false;
-    $('conn').setAttribute('data-state', 'ready');
-    $('conn').textContent = canMessage ? 'Ready' : 'Ready (copy mode)';
-    if (!canMessage) $('msg-state').textContent = 'This Codex version doesn\'t let apps send messages; each action shows text to paste into a project chat.';
+    $('menu-button').disabled = false;
+    if (!canMessage) notice(COPY_MODE);
+    renderProjects();
     // Shown for a model's status or editor result: no project list needed there.
     const tool = hostContext.toolInfo && hostContext.toolInfo.tool && hostContext.toolInfo.tool.name;
     if (!tool || tool === 'openpaperdesign_home') loadProjects();
+    else $('inventory').hidden = true;
   })();
 })();
 </script>

@@ -52,35 +52,43 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
   - There are no threads, turns, settings, auth or project writes.
   - Projects keep Codex's `codex-app-server` namespace, their ids and every root. Ids are not
     joined with desktop or cloud ids by name.
-- **The view** (issue #10 layout, 2026-10-14).
-  - The home has two sections: **Project** (the Codex projects, each folder with a `Choose`
-    button; it never picks a root) and **Canvas** (`Open a canvas`, `New canvas` with an inline
-    name form, `Current canvas`).
-  - Choosing a folder only selects it. All three actions then carry that folder as exact JSON
-    data and ask the agent to continue only if `openpaperdesign_status` reports exactly that
-    folder as the workspace, never switching folders. Without a choice they say "In this
-    chat's project" and send no folder; "Use this chat's project instead" clears a choice.
-  - Each action sends one user message to the active chat with `ui/message`, only when the host
-    advertises `message.text`; otherwise it shows the text to paste. While a message is in
-    flight the actions are disabled. "Sent to this chat" is a request, never an opened project
-    or canvas. A message or a listed root grants nothing.
-  - The bound workspace and project are shown only from admitted `openpaperdesign_status`,
-    `openpaperdesign_canvases` and `open_editor` results that the host delivers (those three
-    tools carry the view as a model-only result presentation). Each result replaces the last.
-    A cancelled call, or Back to the home, leaves nothing to open.
-  - A listed canvas's `Open` asks the agent to check that workspace, bind without `force`,
-    read the page it shows (not the bind summary), call `open_editor`, open the URL in the
-    in-app browser and say whether it loaded. An `open_editor` result also offers "Ask the
-    agent to open it", which requests a fresh link.
+- **The view** (issue #10 minimal home, 2026-10-14; supersedes the `9af7b25` layout).
+  - One quiet list of project rows: "This chat's project" first, then the Codex projects. Each
+    row shows the name and a generic icon (Codex's project list has no icon field), plus a short
+    folder-name or `…id` hint when names repeat. No paths are shown in the list; the folders
+    are an optional tooltip. A labelled details button per row reveals the folders, source,
+    host and Codex project id from the keyboard.
+  - Click or Enter on a row proceeds. A one-folder project sends its request directly. A
+    project with several folders asks "Which folder of …?" first; it never picks a root.
+    Escape or Back returns to the list.
+  - One labelled **New** menu (top right; arrow keys, Home/End, Escape with focus return):
+    New canvas (a name, and a destination select only when projects exist), Open current
+    canvas, Add a folder (a hint to add it in Codex and refresh: the view can't open folders),
+    and Refresh projects.
+  - Every request for a listed folder carries it as exact JSON data and asks the agent to call
+    `openpaperdesign_status`, stop if `workspace_usable` is false, and continue only if the
+    reported workspace is exactly that folder, never switching folders. This chat's project and
+    Open current canvas send no folder but keep the usability stop.
+  - Each action sends one user message with `ui/message`, only when the host advertises
+    `message.text`; otherwise it shows the text to paste, which is cleared whenever the target,
+    action or view changes. A request is never an opened project or canvas, and a message or a
+    listed root grants nothing.
+  - Results come only from admitted `openpaperdesign_status`, `openpaperdesign_canvases` and
+    `open_editor` results the host delivers. Each result, cancellation, Back or a delivered
+    home result replaces the view: earlier editor links, busy state and late replies (open-link,
+    message and inventory) are dropped. A bound canvas is labelled "current", not open or
+    loaded.
+  - A failed step says only that the agent's last step didn't work and that earlier steps may
+    already have happened; it never claims nothing changed.
   - It opens only the exact loopback editor URL through `ui/open-link`. Codex's
     acknowledgement is not proof that the canvas loaded.
-  - Refusals show plain recovery; the raw reason stays under Details. Status changes are
-    announced through a polite live region, and focus moves to the next action or result.
   - Host appearance: `HostContext.theme` and a fixed list of standard `styles.variables`
     (colours, fonts, radius) apply on initialize and on merged
     `ui/notifications/host-context-changed` updates, with built-in light/dark fallbacks.
     Values with `url(`, blocks or at-rules are ignored, and `styles.css.fonts` is never
     applied. This is presentation only, never a workspace or permission.
+  - The lower-left `onlinesourdough` wordmark uses Geist Pixel Square (SIL OFL 1.1), bundled
+    unmodified and served inside the view as a data URI; there is no font URL or service.
   - The only server tool it calls is the inventory, and it stores nothing.
 
 Issue #6 stays open until these are proven on a real host:

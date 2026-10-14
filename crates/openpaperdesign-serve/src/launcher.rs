@@ -74,6 +74,16 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 const HOME_URI: &str = "ui://openpaperdesign/home.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
+/// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's
+/// `onlinesourdough` wordmark. Served inside the view as a data URI: no font URL or service.
+const WORDMARK_FONT: &[u8] = include_bytes!("../assets/geist-pixel-square.woff2");
+const WORDMARK_FONT_SLOT: &str = "__OPD_WORDMARK_FONT__";
+
+/// The home view as served: `home.html` with the wordmark font in its one slot.
+fn home_html() -> &'static str {
+    static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HTML.get_or_init(|| HOME_HTML.replacen(WORDMARK_FONT_SLOT, &base64(WORDMARK_FONT), 1))
+}
 
 const NOT_BOUND: &str = "No design project is bound yet. Call bind_project with the path of an \
     existing paper-rs project folder inside this workspace, or create_project to make a new one \
@@ -894,7 +904,7 @@ impl ServerHandler for Launcher {
         let contents = serde_json::from_value(json!({
             "uri": HOME_URI,
             "mimeType": HOME_MIME,
-            "text": HOME_HTML,
+            "text": home_html(),
             "_meta": {"openai/ui": {"availableDisplayModes": ["inline", "fullscreen"]}},
         }))
         .expect("valid resource contents");

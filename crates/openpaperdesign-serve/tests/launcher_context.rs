@@ -607,6 +607,30 @@ async fn synthetic_worktree_pointer_is_opaque_and_edits_stay_inside_workspace() 
     }
 }
 
+/// Standard base64 (RFC 4648, padded), decoded independently of the launcher's encoder.
+fn decode_base64(s: &str) -> Vec<u8> {
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("not base64: {c}"),
+    };
+    let bytes = s.trim_end_matches('=').as_bytes();
+    let mut out = vec![];
+    for chunk in bytes.chunks(4) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &c)| n | u32::from(val(c)) << (18 - 6 * i));
+        for i in 0..chunk.len() - 1 {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
 /// Every pure home call, under each metadata variant: it succeeds, refuses extra arguments,
 /// serves only the exact view, and discloses neither the workspace nor the editor token.
 async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Option<&str>) {
@@ -633,13 +657,21 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
         assert_eq!(r["contents"][0]["mimeType"], "text/html;profile=mcp-app");
         let html = r["contents"][0]["text"].as_str().unwrap();
         assert!(html.contains("OpenPaperDesign") && html.contains("ui/initialize"));
-        // The command serves exactly the view in this source tree (embedded at build time).
-        let source =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.html"))
-                .unwrap();
+        // The command serves exactly the view in this source tree (embedded at build time),
+        // with the packaged, unmodified wordmark font in its one slot as a data URI.
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(crate_dir.join("src/home.html")).unwrap();
+        const SLOT: &str = "__OPD_WORDMARK_FONT__";
+        assert_eq!(source.matches(SLOT).count(), 1);
+        let (before, after) = source.split_once(SLOT).unwrap();
+        let font_b64 = html
+            .strip_prefix(before)
+            .and_then(|rest| rest.strip_suffix(after))
+            .expect("the served view is src/home.html with only the font slot filled");
         assert_eq!(
-            html, source,
-            "the embedded view is the current src/home.html"
+            decode_base64(font_b64),
+            std::fs::read(crate_dir.join("assets/geist-pixel-square.woff2")).unwrap(),
+            "the slot holds the packaged font, byte for byte"
         );
         for other in [
             "ui://openpaperdesign/home.html?x",

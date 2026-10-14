@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const plugin = join(repo, 'plugin/openpaperdesign');
@@ -163,4 +164,22 @@ test('notices and licenses are present', () => {
   for (const n of ['design', 'review-design']) {
     assert.match(readFileSync(join(plugin, 'skills', n, 'LICENSE'), 'utf8'), /MIT License/);
   }
+});
+
+test('the home view font is the unmodified Geist Pixel Square with its license and notice', () => {
+  const assets = join(repo, 'crates/openpaperdesign-serve/assets');
+  const sha = (p) => createHash('sha256').update(readFileSync(join(assets, p))).digest('hex');
+  assert.equal(sha('geist-pixel-square.woff2'), '04f9cf917a824370c77fecbd743c99d0b3dfd2c6c906de959996ac6f7fb343b3');
+  assert.equal(sha('geist-OFL.txt'), '942560b236adfa83745b2c64e5fc09ebaf91cb331751b1157eb92187e5d6e930');
+  assert.deepEqual(readFileSync(join(assets, 'geist-pixel-square.woff2')).subarray(0, 4), Buffer.from('wOF2'));
+  const license = readFileSync(join(assets, 'geist-OFL.txt'), 'utf8');
+  assert.match(license, /Copyright 2024 The Geist Project Authors/);
+  assert.match(license, /SIL OPEN FONT LICENSE Version 1\.1/);
+  const notice = readFileSync(join(plugin, 'NOTICE.md'), 'utf8');
+  assert.match(notice, /Geist Pixel Square/);
+  assert.match(readFileSync(join(repo, 'THIRD_PARTY.md'), 'utf8'), /Geist Pixel Square/);
+  // Served from the binary as a data URI: the view names no font service or font URL.
+  const home = readFileSync(join(repo, 'crates/openpaperdesign-serve/src/home.html'), 'utf8');
+  assert.ok(!/fonts\.(googleapis|gstatic)|vercel\.com|@import/.test(home));
+  assert.match(home, /url\("data:font\/woff2;base64,__OPD_WORDMARK_FONT__"\)/);
 });
