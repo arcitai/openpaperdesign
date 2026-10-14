@@ -52,25 +52,35 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
   - There are no threads, turns, settings, auth or project writes.
   - Projects keep Codex's `codex-app-server` namespace, their ids and every root. Ids are not
     joined with desktop or cloud ids by name.
-- **The view.**
-  - It shows the projects with each folder and a "Use this folder" button. It never picks a
-    root.
-  - Choosing a folder, like the other actions, sends a user message to the active chat with
-    `ui/message`, and only when the host advertises `message.text`; otherwise it shows the
-    text to paste. The message asks the agent to continue only if
-    `openpaperdesign_status` reports exactly that folder as the workspace, and never to switch
-    folders. A message or a listed root grants nothing.
-  - It shows the bound workspace and project only from admitted `openpaperdesign_status`,
-    `openpaperdesign_canvases` and `open_editor` results that the host delivers. Those three
-    tools carry the view as a model-only result presentation. Each result replaces the last,
-    and a cancelled call leaves nothing to open.
-  - A listed canvas's "Open this canvas" asks the agent to check that workspace, bind
-    without `force`, read the page it shows (not the bind summary), call `open_editor`, open
-    the URL in the in-app browser and say whether it loaded.
-  - An `open_editor` result also offers "Ask the agent to open it", which requests a fresh
-    link.
+- **The view** (issue #10 layout, 2026-10-14).
+  - The home has two sections: **Project** (the Codex projects, each folder with a `Choose`
+    button; it never picks a root) and **Canvas** (`Open a canvas`, `New canvas` with an inline
+    name form, `Current canvas`).
+  - Choosing a folder only selects it. All three actions then carry that folder as exact JSON
+    data and ask the agent to continue only if `openpaperdesign_status` reports exactly that
+    folder as the workspace, never switching folders. Without a choice they say "In this
+    chat's project" and send no folder; "Use this chat's project instead" clears a choice.
+  - Each action sends one user message to the active chat with `ui/message`, only when the host
+    advertises `message.text`; otherwise it shows the text to paste. While a message is in
+    flight the actions are disabled. "Sent to this chat" is a request, never an opened project
+    or canvas. A message or a listed root grants nothing.
+  - The bound workspace and project are shown only from admitted `openpaperdesign_status`,
+    `openpaperdesign_canvases` and `open_editor` results that the host delivers (those three
+    tools carry the view as a model-only result presentation). Each result replaces the last.
+    A cancelled call, or Back to the home, leaves nothing to open.
+  - A listed canvas's `Open` asks the agent to check that workspace, bind without `force`,
+    read the page it shows (not the bind summary), call `open_editor`, open the URL in the
+    in-app browser and say whether it loaded. An `open_editor` result also offers "Ask the
+    agent to open it", which requests a fresh link.
   - It opens only the exact loopback editor URL through `ui/open-link`. Codex's
     acknowledgement is not proof that the canvas loaded.
+  - Refusals show plain recovery; the raw reason stays under Details. Status changes are
+    announced through a polite live region, and focus moves to the next action or result.
+  - Host appearance: `HostContext.theme` and a fixed list of standard `styles.variables`
+    (colours, fonts, radius) apply on initialize and on merged
+    `ui/notifications/host-context-changed` updates, with built-in light/dark fallbacks.
+    Values with `url(`, blocks or at-rules are ignored, and `styles.css.fonts` is never
+    applied. This is presentation only, never a workspace or permission.
   - The only server tool it calls is the inventory, and it stores nothing.
 
 Issue #6 stays open until these are proven on a real host:

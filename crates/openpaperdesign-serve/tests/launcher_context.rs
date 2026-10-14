@@ -633,6 +633,14 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
         assert_eq!(r["contents"][0]["mimeType"], "text/html;profile=mcp-app");
         let html = r["contents"][0]["text"].as_str().unwrap();
         assert!(html.contains("OpenPaperDesign") && html.contains("ui/initialize"));
+        // The command serves exactly the view in this source tree (embedded at build time).
+        let source =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.html"))
+                .unwrap();
+        assert_eq!(
+            html, source,
+            "the embedded view is the current src/home.html"
+        );
         for other in [
             "ui://openpaperdesign/home.html?x",
             "ui://openpaperdesign/other.html",

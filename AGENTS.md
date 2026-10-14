@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.22 · Updated: 2026-10-14
+Revision: 0.23 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -167,7 +167,11 @@ the person.
 The view calls only that inventory tool and stores nothing (no URL, token or path). Its
 actions are user messages (`ui/message`), which grant nothing. It shows only admitted
 `openpaperdesign_status`/`open_editor` results that the host delivers, and opens only the
-exact loopback editor URL.
+exact loopback editor URL. Host theme and style variables (MCP Apps
+`HostContext.theme`/`styles.variables`) change presentation only: apply a fixed list of
+standard names with plain values, never `styles.css.fonts`, and never treat them as a
+workspace or permission. A chosen folder applies to every action as exact data; without one,
+actions say they use this chat's project.
 
 ## Model profile
 
