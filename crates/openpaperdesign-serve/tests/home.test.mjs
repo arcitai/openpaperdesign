@@ -394,7 +394,8 @@ test('a refusal without workspace context is plain, keeps the reason under Detai
   await answer(v, { refused: NO_CONTEXT });
   assert.equal(v.els['result-title'].textContent, "Can't open project files here");
   assert.equal(v.els['result-state'].className, 'bad');
-  assert.match(v.els['result-state'].textContent, /nothing was opened or changed/);
+  assert.match(v.els['result-state'].textContent, /nothing was opened or changed\. OpenPaperDesign can't open project files from here yet\.$/);
+  assert.doesNotMatch(v.els['result-state'].textContent, /chat|agent|paste/i, 'no unverified recovery route is promised');
   assert.equal(v.els['result-detail'].textContent, NO_CONTEXT);
   assert.equal(v.els['result-details'].hidden, false);
   assert.equal(v.els.canvas.hidden, true);

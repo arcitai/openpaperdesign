@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.26 · Updated: 2026-10-14
+Revision: 0.27 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -172,11 +172,21 @@ The view's basic actions call the server directly (owner correction, 2026-10-14)
 `ui/message`, a paste prompt or a model turn. The app-only `openpaperdesign_ui_canvases`,
 `_ui_create`, `_ui_open` and `_ui_editor` are admitted only from that call's own
 `codex/sandbox-state-meta` (the same `Workspace::from_meta` as model calls), and a named folder
-must equal the admitted workspace exactly. Without valid context they refuse and change nothing:
-unlike the model path they never retire a session or touch its binding. A refused direct action
-never pins either; an unpinned session is pinned only by an accepted one (a listing under its
-lock, or a create/open inside the bind handoff that installs the binding). They reuse the model path's create/bind/editor code and its one bound project; keep a
-single binding per process (no pool or second UI binding). Observed so far: app-view calls
+must equal the admitted workspace exactly. A refused direct action never pins; an unpinned
+session is pinned only by an accepted one (a listing under its lock, or a create/open inside the
+bind handoff that installs the binding). Each pin and binding records whose authority admitted
+it (`Owner::Model` or `Owner::Direct`). A view call carrying the host's context key whose
+context is invalid, downgraded or names another workspace is an observed revocation: when the
+authority in force is the view's own, it retires the session through the same
+`retire_session` fence as a model call (admission closed; started writes finish, queued and
+late HTTP, stdio and browser writers refused). A view call without that key observes nothing,
+and no view call retires what a model call admitted. Revocation is seen only on calls, for
+both origins. They reuse the model path's create/bind/editor code and its one bound project;
+keep a single binding per process (no pool or second UI binding). Project creation (both
+origins) acquires the binding's listener before writing anything; a later failure before the
+binding is installed removes exactly the files and empty folders that creation made, under
+the same lock, and names any it couldn't (never existing `design/`, direction files, tokens,
+assets or unknown content). Observed so far: app-view calls
 carry no workspace context, so these actions are refused on that host; that is the honest
 result, not a reason to borrow model context, use a picked folder or fall back to messages. The
 view stores nothing (no URL, token or path) and opens only the exact loopback editor URL. Host theme and style variables (MCP Apps

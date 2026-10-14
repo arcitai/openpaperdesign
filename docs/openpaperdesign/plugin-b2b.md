@@ -78,7 +78,20 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     Without it they refuse and change nothing: no pin, no retirement, no binding change. Even
     with valid context, a refused action (another folder, a bad name or canvas, nothing bound)
     pins nothing; only an accepted action pins an unpinned session, a create or open in the same
-    bind handoff that installs its binding. Tool
+    bind handoff that installs its binding.
+  - **Authority lifetime.** A pin or binding admitted by a direct action is owned by the view's
+    authority. A later view call that carries the host's workspace context, where that context
+    is downgraded, invalid or names another workspace, retires the session through the same
+    fence as a model call: started writes finish, queued and late HTTP, stdio and browser
+    writers are refused, and the editor endpoint closes. View calls without that context
+    never retire anything, and no view call retires a binding a model call admitted. As for
+    model calls, revocation is noticed only on calls, not while idle.
+  - **Failed creation.** Creating a canvas (view or model) acquires its listener before
+    writing anything. A later failure before the binding is installed removes exactly the
+    files and empty folders that creation made, under the same lock, keeps any existing
+    binding as it was, and names any path it couldn't remove; it never removes existing
+    `design/` content, direction files, tokens, assets or unknown files. This is not crash
+    atomic. Tool
     arguments, a listed root and a picked folder grant nothing. On the observed host (model
     view and global entry) app calls carry no workspace context, so these actions are refused
     there with a plain message; a user-opened conversation-panel tab is not yet observed.

@@ -415,13 +415,23 @@ async fn direct_success_pins_and_later_bad_input_changes_nothing() {
             json!({"root": other.to_str().unwrap()}),
             ma.clone(),
         ),
-        (UI_CANVASES, json!({}), context::writable(&other)),
         (UI_EDITOR, json!({}), app_meta()),
     ] {
         let (ok, v) = call(&s, name, args.clone(), meta).await;
         assert!(!ok, "{name} {args}: {v}");
         assert_eq!(state(&s).await, pinned, "{name} {args}");
     }
+    assert_eq!(tree(&a), files);
+    // Changed since fb22: a valid host context for another workspace is not bad input but an
+    // observed identity change. On this view-installed binding it retires the session, as a
+    // model call would (a model-installed binding is covered in launcher_tests).
+    let (ok, v) = call(&s, UI_CANVASES, json!({}), context::writable(&other)).await;
+    assert!(!ok && v.to_string().contains("canvas was closed"), "{v}");
+    let retired = state(&s).await;
+    assert!(
+        retired["invalidated"].is_string() && retired["bound"].is_null(),
+        "{retired}"
+    );
     assert_eq!(tree(&a), files);
     // A read-only success pins too.
     let r = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
@@ -432,4 +442,162 @@ async fn direct_success_pins_and_later_bad_input_changes_nothing() {
     for d in [a, other] {
         std::fs::remove_dir_all(d).unwrap();
     }
+}
+
+// ---- failed creation leaves nothing behind (and never removes what it didn't make) ----
+
+use crate::test_support::Point;
+
+fn seeded(tag: &str, with_design: bool) -> PathBuf {
+    let ws = scratch(tag);
+    std::fs::write(ws.join("DESIGN.md"), "# Direction\n").unwrap();
+    if with_design {
+        std::fs::create_dir(ws.join("design")).unwrap();
+        std::fs::write(ws.join("design/tokens.json"), "{\"ink\":\"#222\"}\n").unwrap();
+    }
+    ws
+}
+
+/// The listener is acquired before anything is written: its failure leaves no folder, no
+/// file and no pin, and the same name then works.
+#[tokio::test]
+async fn direct_create_listener_failure_writes_nothing() {
+    for with_design in [false, true] {
+        let ws = seeded("listen", with_design);
+        let s = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+        let (files, before) = (tree(&ws), state(&s).await);
+        let mut fault = Point::arm(&ws, "listen_fails", false);
+        let (ok, v) = call(
+            &s,
+            UI_CREATE,
+            json!({"name": "Failed"}),
+            context::writable(&ws),
+        )
+        .await;
+        fault.reached().await;
+        assert!(!ok && v.to_string().contains("cannot listen"), "{v}");
+        assert_eq!(tree(&ws), files, "with design/: {with_design}");
+        assert_eq!(state(&s).await, before, "nothing pinned or bound");
+        let (ok, v) = call(
+            &s,
+            UI_CREATE,
+            json!({"name": "Failed"}),
+            context::writable(&ws),
+        )
+        .await;
+        assert!(
+            ok && v["project"] == "design/Failed",
+            "the name is free: {v}"
+        );
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+}
+
+/// A failure after the files were written removes exactly what this creation made: the new
+/// folder, and design/ only if this call made it. Existing files stay byte for byte.
+#[tokio::test]
+async fn direct_create_failure_after_files_removes_only_what_it_made() {
+    for with_design in [false, true] {
+        let ws = seeded("after-files", with_design);
+        let s = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+        let (files, before) = (tree(&ws), state(&s).await);
+        let mut fault = Point::arm(&ws, "create_fails", false);
+        let (ok, v) = call(
+            &s,
+            UI_CREATE,
+            json!({"name": "Failed"}),
+            context::writable(&ws),
+        )
+        .await;
+        fault.reached().await;
+        assert!(!ok && v.to_string().contains("Nothing was created"), "{v}");
+        assert_eq!(tree(&ws), files, "with design/: {with_design}");
+        assert_eq!(
+            ws.join("design").exists(),
+            with_design,
+            "design/ only if it existed"
+        );
+        assert_eq!(state(&s).await, before);
+        // The model path uses the same creation and the same recovery.
+        let mut fault = Point::arm(&ws, "create_fails", false);
+        let (ok, v) = call(
+            &s,
+            "create_project",
+            json!({"name": "Model"}),
+            context::writable(&ws),
+        )
+        .await;
+        fault.reached().await;
+        assert!(!ok && v.to_string().contains("Nothing was created"), "{v}");
+        assert_eq!(tree(&ws), files);
+        std::fs::remove_dir_all(&ws).unwrap();
+    }
+}
+
+/// A failed creation while another canvas is bound and open leaves that binding (server,
+/// port, editor state) exactly as it was.
+#[tokio::test]
+async fn direct_failed_create_keeps_the_old_binding() {
+    let ws = seeded("keep", true);
+    let s = connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await;
+    let w = context::writable(&ws);
+    let (ok, v) = call(&s, UI_CREATE, json!({"name": "First"}), w.clone()).await;
+    assert!(ok, "{v}");
+    let (bound, files) = (state(&s).await, tree(&ws));
+    for point in ["listen_fails", "create_fails"] {
+        let mut fault = Point::arm(&ws, point, false);
+        let (ok, v) = call(
+            &s,
+            UI_CREATE,
+            json!({"name": "Second", "force": true}),
+            w.clone(),
+        )
+        .await;
+        fault.reached().await;
+        assert!(!ok, "{point}: {v}");
+        assert_eq!(
+            state(&s).await,
+            bound,
+            "{point}: same binding, port and editor"
+        );
+        assert_eq!(tree(&ws), files, "{point}");
+    }
+    let (ok, v) = call(&s, UI_EDITOR, json!({}), w).await;
+    assert!(ok && v["project"] == "design/First", "{v}");
+    std::fs::remove_dir_all(&ws).unwrap();
+}
+
+/// Content that appears in the new folder before a failure is never removed: the creation
+/// removes only its own files and names what had to stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_failed_create_never_removes_unknown_content() {
+    let ws = seeded("unknown", true);
+    let s = Arc::new(connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await);
+    let mut pause = Point::arm(&ws, "create_after_files", true);
+    let (s2, w) = (s.clone(), context::writable(&ws));
+    let creating =
+        tokio::spawn(async move { call(&s2, UI_CREATE, json!({"name": "Shared"}), w).await });
+    pause.reached().await;
+    let stray = ws.join("design/Shared/pages/notes.txt");
+    std::fs::write(&stray, "someone else's").unwrap();
+    let mut fault = Point::arm(&ws, "create_fails", false);
+    pause.resume();
+    let (ok, v) = tokio::time::timeout(std::time::Duration::from_secs(15), creating)
+        .await
+        .unwrap()
+        .unwrap();
+    fault.reached().await;
+    assert!(!ok && v.to_string().contains("these paths remain"), "{v}");
+    assert_eq!(
+        std::fs::read(&stray).unwrap(),
+        b"someone else's",
+        "never removed"
+    );
+    assert!(
+        !ws.join("design/Shared/project.json").exists(),
+        "its own files are gone"
+    );
+    assert!(ws.join("design/tokens.json").exists() && ws.join("DESIGN.md").exists());
+    assert_eq!(state(&s).await["bound"], Value::Null);
+    std::fs::remove_dir_all(&ws).unwrap();
 }

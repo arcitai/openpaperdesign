@@ -322,7 +322,7 @@
     const text = String(r.refused);
     if (NO_CONTEXT.test(text)) {
       refuse('Can\'t open project files here',
-        'Codex doesn\'t give this view access to the project folder, so nothing was opened or changed. Open the project\'s chat in Codex and use OpenPaperDesign there.',
+        'Codex doesn\'t give this view access to the project folder, so nothing was opened or changed. OpenPaperDesign can\'t open project files from here yet.',
         text);
     } else if (/force: true/.test(text) && again) {
       refuse('Switch canvases?',

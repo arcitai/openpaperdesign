@@ -12,12 +12,19 @@
 //!   carry its own supported Codex workspace context, exactly as a model call does
 //!   (`Workspace::from_meta`), and, when the view names a folder, that folder must be exactly
 //!   the admitted workspace. They reuse the model path's operations and its one bound project.
-//!   A call without valid context is refused and changes nothing: unlike the model path it
-//!   never retires a pinned workspace or its binding, because an app view's call is not that
-//!   session's context. A refused call never pins either: an unpinned session is pinned only
-//!   by an accepted action (a listing under the same lock, or a create/open in the same bind
-//!   handoff that installs its binding). Arguments, the view's choice and the picker answer
-//!   authorize nothing.
+//!   A refused call never pins: an unpinned session is pinned only by an accepted action (a
+//!   listing under the same lock, or a create/open in the same bind handoff that installs its
+//!   binding). Arguments, the view's choice and the picker answer authorize nothing.
+//!
+//! Authority lifetime. Each pin and binding records whose authority admitted it (`Owner`).
+//! A view call that carries the host's workspace context, where that context is invalid,
+//! downgraded or names another workspace identity, is an observed revocation. When the
+//! authority in force is the view's own (a binding a direct action installed, or a pin only
+//! direct actions made), it retires the session exactly as a model call would: admission
+//! closes and the bound server's writers and rollback drain through its fence, fencing queued
+//! and late HTTP, stdio and browser writers. A view call without that context observes
+//! nothing and never retires; nor does any view call retire what a model call admitted. As
+//! for model calls, revocation is seen only on calls: an idle binding isn't revisited.
 
 use super::*;
 use rmcp::model::{CancelledNotificationParam, CustomRequest, ProtocolVersion, ServerRequest};
@@ -181,7 +188,24 @@ impl Launcher {
         let get = |k: &str| map.get(k).and_then(Value::as_str);
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
         let mut state = self.state.clone().lock_owned().await;
-        let (ws, pin) = Self::admit_direct(&state, meta)?;
+        let (ws, pin) = match Self::admit_direct(&state, meta) {
+            Ok(admitted) => admitted,
+            Err(why) => {
+                let observed = state.host_context && meta.contains_key(CAPABILITY);
+                let owned = match &state.bound {
+                    Some(b) => b.owner == Owner::Direct,
+                    None => state.workspace.is_some() && state.pinned_by == Owner::Direct,
+                };
+                if observed && owned && state.invalidated.is_none() {
+                    Self::retire_session(state, why.clone()).await?;
+                    return Err(format!(
+                        "{why} This view's access to the folder changed, so its canvas was \
+                         closed: nothing more can be saved there from this session."
+                    ));
+                }
+                return Err(why);
+            }
+        };
         same_root(&ws, get("root"))?;
         // These actions end in the editor: without it, refuse before changing anything.
         if name != UI_CANVASES && !bundle_complete() {
@@ -197,6 +221,7 @@ impl Launcher {
                 let out = ws.canvases(bound.as_deref())?;
                 if pin {
                     state.workspace = Some(ws); // accepted, still under the same lock
+                    state.pinned_by = Owner::Direct;
                 }
                 return Ok(out);
             }
@@ -209,6 +234,7 @@ impl Launcher {
                 let mut v = Self::editor(&mut state, &ws)?;
                 if pin {
                     state.workspace = Some(ws); // accepted, still under the same lock
+                    state.pinned_by = Owner::Direct;
                 }
                 v["action"] = json!("reopened");
                 return text(v);
@@ -217,7 +243,8 @@ impl Launcher {
                 let name = get("name")
                     .filter(|s| !s.trim().is_empty())
                     .ok_or("a canvas name is required; nothing was created")?;
-                let (dir, _) = Self::create(state, ws.clone(), name, force, pin).await?;
+                let (dir, _) =
+                    Self::create(state, ws.clone(), name, force, pin, Owner::Direct).await?;
                 ("created", dir)
             }
             UI_OPEN => {
@@ -228,7 +255,7 @@ impl Launcher {
                     .filter(|r| !r.is_empty() && !r.contains(['/', '\\']) && *r != "." && *r != "..")
                     .ok_or("only a canvas folder directly under design/ can be opened here; nothing was opened")?;
                 let dir = Self::existing(&ws, &format!("design/{rest}"))?;
-                Self::bind(state, ws.clone(), dir.clone(), force, pin).await?;
+                Self::bind(state, ws.clone(), dir.clone(), force, pin, Owner::Direct).await?;
                 ("opened", dir)
             }
             _ => return Err(format!("unknown tool {name}")),

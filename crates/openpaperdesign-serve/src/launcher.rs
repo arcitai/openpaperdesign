@@ -142,6 +142,17 @@ struct Bound {
     task: tokio::task::JoinHandle<()>,
     /// `open_editor` gave out this server's URL, so a browser tab may be editing it.
     editor_opened: bool,
+    /// Whose admitted authority installed this binding.
+    owner: Owner,
+}
+
+/// The origin of admitted authority: a model call's context, or a direct home-view action's
+/// own context. A binding (or a pin without one) the view admitted is closed when a view call
+/// observes that context revoked; app input never retires what a model call admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    Model,
+    Direct,
 }
 
 impl Drop for Bound {
@@ -160,8 +171,73 @@ struct Launcher {
 struct LauncherState {
     host_context: bool,
     workspace: Option<Workspace>,
+    /// Who pinned `workspace`; any successful model admission makes it `Model`.
+    pinned_by: Owner,
     invalidated: Option<String>,
     bound: Option<Bound>,
+}
+
+/// What one project creation made, so a failure before its binding is installed can remove
+/// exactly that: these files (if still regular files) and these folders (only when empty),
+/// deepest first. Nothing else is ever removed, so unknown content stays and is reported.
+#[derive(Default)]
+struct Made {
+    dirs: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+impl Made {
+    /// Remove what was made; returns the paths that could not be removed.
+    fn undo(&self) -> Vec<PathBuf> {
+        let mut left = vec![];
+        for f in self.files.iter().rev() {
+            match std::fs::symlink_metadata(f) {
+                Ok(m) if m.is_file() => {
+                    if std::fs::remove_file(f).is_err() {
+                        left.push(f.clone());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => left.push(f.clone()),
+            }
+        }
+        for d in self.dirs.iter().rev() {
+            match std::fs::remove_dir(d) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => left.push(d.clone()),
+            }
+        }
+        left
+    }
+
+    /// The error for a failed creation, after undoing it: says whether anything stayed.
+    fn fail(&self, error: String) -> String {
+        let left = self.undo();
+        if left.is_empty() {
+            format!("{error}. Nothing was created.")
+        } else {
+            let names: Vec<String> = left.iter().map(|p| p.display().to_string()).collect();
+            format!(
+                "{error}. The new project could not be fully removed; these paths remain: {}",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+use tests::Listener;
+#[cfg(not(test))]
+use tokio::net::TcpListener as Listener;
+
+/// A binding prepared up to the infallible handoff.
+struct Install {
+    listener: Listener,
+    port: u16,
+    token: String,
+    rel: String,
+    prepared: crate::PreparedServer,
 }
 
 fn text(v: Value) -> ToolResult {
@@ -502,38 +578,46 @@ impl Workspace {
 
     /// Create `design/<folder>/pages/` without following links: each component is made with
     /// `create_dir` (which never follows a final symlink) or must already be a real
-    /// directory, and the result must still be inside the unchanged workspace.
-    fn create_folders(&self, folder: &str) -> Result<PathBuf, String> {
+    /// directory, and the result must still be inside the unchanged workspace. Returns the
+    /// folders this call made, so a later failure can remove exactly those; a failure here
+    /// removes them itself.
+    fn create_folders(&self, folder: &str) -> Result<(PathBuf, Made), String> {
         self.check_workspace()?;
         self.project_path(&self.path.join("design").join(folder))?;
+        let mut made = Made::default();
         let design = self.path.join("design");
         match std::fs::create_dir(&design) {
-            Ok(()) => {}
+            Ok(()) => made.dirs.push(design.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(format!("design/: {e}")),
         }
-        real_dir(&design).map_err(|_| "design/ is not a real folder (a link?); refusing")?;
+        real_dir(&design)
+            .map_err(|_| made.fail("design/ is not a real folder (a link?); refusing".into()))?;
         let dir = design.join(folder);
         match std::fs::create_dir(&dir) {
-            Ok(()) => {}
+            Ok(()) => made.dirs.push(dir.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(format!(
+                return Err(made.fail(format!(
                     "design/{folder} already exists; bind it with bind_project"
-                ));
+                )));
             }
-            Err(e) => return Err(format!("design/{folder}: {e}")),
+            Err(e) => return Err(made.fail(format!("design/{folder}: {e}"))),
         }
-        std::fs::create_dir(dir.join(paper_rs::project::PAGES_DIR))
-            .map_err(|e| format!("design/{folder}/pages: {e}"))?;
+        let pages = dir.join(paper_rs::project::PAGES_DIR);
+        std::fs::create_dir(&pages)
+            .map_err(|e| made.fail(format!("design/{folder}/pages: {e}")))?;
+        made.dirs.push(pages.clone());
         // Verify what was made before writing any file into it.
-        self.check_workspace()?;
-        for d in [&design, &dir, &dir.join(paper_rs::project::PAGES_DIR)] {
-            real_dir(d)?;
+        self.check_workspace().map_err(|e| made.fail(e))?;
+        for d in [&design, &dir, &pages] {
+            real_dir(d).map_err(|e| made.fail(e))?;
         }
         if dir.canonicalize().ok().as_deref() != Some(dir.as_path()) {
-            return Err("the new project folder isn't where it was made; refusing".into());
+            return Err(
+                made.fail("the new project folder isn't where it was made; refusing".into())
+            );
         }
-        Ok(dir)
+        Ok((dir, made))
     }
 
     fn resolve_inside(&self, path: &str) -> Result<PathBuf, String> {
@@ -574,6 +658,7 @@ impl Launcher {
             state: Arc::new(Mutex::new(LauncherState {
                 host_context: workspace.is_none(),
                 workspace,
+                pinned_by: Owner::Model,
                 invalidated: None,
                 bound: None,
             })),
@@ -613,41 +698,80 @@ impl Launcher {
         }
     }
 
-    /// Bind `dir`. With `pin`, an unpinned session is pinned to `ws` in the same handoff step
-    /// that installs the binding (a direct view action whose admission didn't pin), so the pin
-    /// and its binding appear together or not at all.
-    async fn bind(
+    /// Close this session's admission (when it has a workspace), then drain the bound server's
+    /// writers and rollback through its fence and drop the binding. The drain is owned by a
+    /// spawned task, so cancelling the caller can't stop it halfway; admission stays locked
+    /// until it completes. Returns the still-held state.
+    async fn retire_session(
         mut state: OwnedMutexGuard<LauncherState>,
-        ws: Workspace,
-        dir: PathBuf,
-        force: bool,
-        pin: bool,
-    ) -> ToolResult {
-        if let Some(b) = state.bound.as_ref()
-            && b.server.dir() == dir
-        {
-            return text(
-                json!({"bound": ws.relative(&dir), "note": "already bound; nothing changed"}),
-            );
+        reason: String,
+    ) -> Result<OwnedMutexGuard<LauncherState>, String> {
+        if state.workspace.is_some() {
+            state.invalidated = Some(reason);
         }
-        Self::may_switch(&state.bound, Some(&dir), force)?;
-        // Open and check the new project completely before touching the current binding: any
-        // error below returns with the current one (and its server) unchanged.
+        tokio::spawn(async move {
+            if let Some(old) = state.bound.as_ref() {
+                old.server.retire().await;
+            }
+            state.bound = None;
+            state
+        })
+        .await
+        .map_err(|e| format!("workspace retirement failed: {e}"))
+    }
+
+    /// The fallible network resources of a binding: a loopback listener and a fresh token.
+    /// Acquired before anything is written, so a failure here leaves no files.
+    async fn listen(key: &Path) -> Result<(Listener, u16, String), String> {
         #[cfg(test)]
-        use tests::Listener;
-        #[cfg(not(test))]
-        use tokio::net::TcpListener as Listener;
+        if crate::test_support::fault(key, "listen_fails") {
+            return Err("cannot listen on 127.0.0.1: injected test failure".into());
+        }
+        let _ = key;
         let listener = Listener::bind(("127.0.0.1", 0))
             .await
             .map_err(|e| format!("cannot listen on 127.0.0.1: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let token = new_token().map_err(|e| e.to_string())?;
+        Ok((listener, port, token))
+    }
+
+    /// Open and check the project completely, without touching the current binding: an error
+    /// here leaves the current one (and its server) unchanged.
+    fn prepare_install(
+        ws: &Workspace,
+        dir: PathBuf,
+        (listener, port, token): (Listener, u16, String),
+    ) -> Result<Install, String> {
         let rel = ws.relative(&dir);
-        let pin = pin.then(|| ws.clone());
         let prepared = Server::prepare_embedded(dir, BUNDLE_FILES, port, token.clone())
             .map_err(|e| e.to_string())?;
-        // No fallible preparation remains. Own the transition independently of the request:
-        // cancelling a bind response must not strand the current binding halfway retired.
+        Ok(Install {
+            listener,
+            port,
+            token,
+            rel,
+            prepared,
+        })
+    }
+
+    /// Install a prepared binding: no fallible preparation remains. The transition is owned
+    /// independently of the request, so cancelling a response can't strand the current binding
+    /// halfway retired. With `pin`, an unpinned session is pinned in this same step (a direct
+    /// view action whose admission didn't pin), so pin and binding appear together or not at all.
+    async fn install(
+        mut state: OwnedMutexGuard<LauncherState>,
+        install: Install,
+        pin: Option<Workspace>,
+        owner: Owner,
+    ) -> ToolResult {
+        let Install {
+            listener,
+            port,
+            token,
+            rel,
+            prepared,
+        } = install;
         tokio::spawn(async move {
             if let Some(old) = state.bound.as_ref() {
                 old.server.retire().await;
@@ -664,6 +788,7 @@ impl Launcher {
                 && state.workspace.is_none()
             {
                 state.workspace = Some(ws);
+                state.pinned_by = owner;
             }
             state.bound = Some(Bound {
                 server: server.clone(),
@@ -671,6 +796,7 @@ impl Launcher {
                 token,
                 task,
                 editor_opened: false,
+                owner,
             });
             // This summary is not the agent's read: its session must still read each page.
             let info = server
@@ -695,6 +821,28 @@ impl Launcher {
         .unwrap_or_else(|e| Err(format!("binding handoff failed unexpectedly: {e}")))
     }
 
+    /// Bind `dir` (see `install` for `pin`); `owner` is whose authority admitted it.
+    async fn bind(
+        state: OwnedMutexGuard<LauncherState>,
+        ws: Workspace,
+        dir: PathBuf,
+        force: bool,
+        pin: bool,
+        owner: Owner,
+    ) -> ToolResult {
+        if let Some(b) = state.bound.as_ref()
+            && b.server.dir() == dir
+        {
+            return text(
+                json!({"bound": ws.relative(&dir), "note": "already bound; nothing changed"}),
+            );
+        }
+        Self::may_switch(&state.bound, Some(&dir), force)?;
+        let listening = Self::listen(&ws.path).await?;
+        let install = Self::prepare_install(&ws, dir, listening)?;
+        Self::install(state, install, pin.then_some(ws), owner).await
+    }
+
     /// An existing paper-rs project inside the admitted workspace (as `bind_project` takes it).
     fn existing(ws: &Workspace, path: &str) -> Result<PathBuf, String> {
         let dir = ws.resolve_inside(path)?;
@@ -708,13 +856,16 @@ impl Launcher {
     }
 
     /// `create_project`: a new project under `<workspace>/design/<folder>/`, then bound.
-    /// Returns the new project's folder with the bind result.
+    /// Returns the new project's folder with the bind result. Nothing is written until the
+    /// binding's listener exists, and a later failure before the binding is installed removes
+    /// exactly what this call made (under the same admission lock), or names what it couldn't.
     async fn create(
         state: OwnedMutexGuard<LauncherState>,
         ws: Workspace,
         name: &str,
         force: bool,
         pin: bool,
+        owner: Owner,
     ) -> Result<(PathBuf, Vec<Out>), String> {
         // Before creating anything.
         Self::may_switch(&state.bound, None, force)?;
@@ -722,8 +873,9 @@ impl Launcher {
         if let Some(p) = workspace_problem(&ws.path) {
             return Err(format!("refusing to create a project: {p}"));
         }
+        let listening = Self::listen(&ws.path).await?;
         let folder = paper_rs::project::folder_name(name);
-        let dir = ws.create_folders(&folder)?;
+        let (dir, mut made) = ws.create_folders(&folder)?;
         // As upstream `Store::create`, but into the folder made and checked above.
         let manifest = paper_rs::project::Manifest::new(name.trim());
         let page = paper_rs::project::PageData {
@@ -736,10 +888,20 @@ impl Launcher {
             camera: None,
         };
         let p = paper_rs::project::Project { dir, manifest };
-        p.save_page(&page).map_err(|e| e.to_string())?;
-        p.write_manifest().map_err(|e| e.to_string())?;
+        made.files.push(p.page_path(&page.id));
+        made.files.push(p.dir.join(paper_rs::project::MANIFEST));
+        p.save_page(&page).map_err(|e| made.fail(e.to_string()))?;
+        p.write_manifest().map_err(|e| made.fail(e.to_string()))?;
+        #[cfg(test)]
+        {
+            crate::test_support::hit(&ws.path, "create_after_files");
+            if crate::test_support::fault(&ws.path, "create_fails") {
+                return Err(made.fail("injected test failure".into()));
+            }
+        }
         let dir = p.dir.clone();
-        let out = Self::bind(state, ws, p.dir, force, pin).await?;
+        let install = Self::prepare_install(&ws, p.dir, listening).map_err(|e| made.fail(e))?;
+        let out = Self::install(state, install, pin.then_some(ws), owner).await?;
         Ok((dir, out))
     }
 
@@ -801,25 +963,20 @@ impl Launcher {
                 })
             };
             match context {
-                Ok(ws) => state.workspace = Some(ws),
+                Ok(ws) => {
+                    state.workspace = Some(ws);
+                    state.pinned_by = Owner::Model;
+                }
                 Err(reason) => {
-                    if state.workspace.is_some() {
-                        state.invalidated = Some(reason.clone());
-                    }
                     let status = name == "openpaperdesign_status";
-                    // Own invalidation independently of the caller, just like a bind
-                    // handoff. Keep admission locked until the shared fence is drained.
-                    return tokio::spawn(async move {
-                        if let Some(old) = state.bound.as_ref() {
-                            old.server.retire().await;
-                        }
-                        state.bound = None;
-                        if status {
-                            Self::status(&state, Some(&reason))
-                        } else {
-                            Err(format!("{reason}. No call was run. If this session had a workspace, it is retired; start a fresh supported host session."))
-                        }
-                    }).await.unwrap_or_else(|e| Err(format!("workspace retirement failed: {e}")));
+                    let state = Self::retire_session(state, reason.clone()).await?;
+                    return if status {
+                        Self::status(&state, Some(&reason))
+                    } else {
+                        Err(format!(
+                            "{reason}. No call was run. If this session had a workspace, it is retired; start a fresh supported host session."
+                        ))
+                    };
                 }
             }
         }
@@ -841,9 +998,9 @@ impl Launcher {
         match name {
             "bind_project" => {
                 let dir = Self::existing(&ws, arg("path")?)?;
-                Self::bind(state, ws, dir, force, false).await
+                Self::bind(state, ws, dir, force, false, Owner::Model).await
             }
-            "create_project" => Self::create(state, ws, arg("name")?, force, false)
+            "create_project" => Self::create(state, ws, arg("name")?, force, false, Owner::Model)
                 .await
                 .map(|(_, out)| out),
             "open_editor" => text(Self::editor(&mut state, &ws)?),
