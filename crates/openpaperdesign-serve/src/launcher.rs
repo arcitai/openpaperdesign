@@ -177,35 +177,64 @@ struct LauncherState {
     bound: Option<Bound>,
 }
 
-/// What one project creation made, so a failure before its binding is installed can remove
-/// exactly that: these files (if still regular files) and these folders (only when empty),
-/// deepest first. Nothing else is ever removed, so unknown content stays and is reported.
+/// What one project creation made, as established when it happened: each folder this call
+/// created (its identity, taken right after `create_dir`) and each file this call finished
+/// writing (its identity and content revision, taken after the write). A failure before the
+/// binding is installed removes only entries that are still exactly those, deepest first: a
+/// file with the same identity and bytes, a folder with the same identity at its canonical path
+/// and only when empty. Anything replaced, changed, moved or not known to be this call's stays
+/// and is named. The check-then-remove window is the remaining path race; this is not crash
+/// atomic and doesn't serialize other writers.
 #[derive(Default)]
 struct Made {
-    dirs: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    dirs: Vec<(PathBuf, Option<(u64, u64)>)>,
+    files: Vec<(PathBuf, Option<FileState>)>,
 }
 
+/// A file's (device, inode) identity and content revision.
+type FileState = ((u64, u64), String);
+
 impl Made {
-    /// Remove what was made; returns the paths that could not be removed.
+    /// Record a folder this call just created.
+    fn dir(&mut self, path: PathBuf) {
+        let id = real_dir(&path).ok().map(|m| identity(&m));
+        self.dirs.push((path, id));
+    }
+
+    /// Record a file this call just finished writing.
+    fn file(&mut self, path: PathBuf) {
+        let owned = Self::file_state(&path);
+        self.files.push((path, owned));
+    }
+
+    /// A regular file's identity and content revision, read at its canonical path.
+    fn file_state(path: &Path) -> Option<FileState> {
+        let m = std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_file())?;
+        if path.canonicalize().ok().as_deref() != Some(path) {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        Some((identity(&m), crate::etag(&bytes)))
+    }
+
+    /// Remove what is still exactly what was made; returns the paths that stay.
     fn undo(&self) -> Vec<PathBuf> {
         let mut left = vec![];
-        for f in self.files.iter().rev() {
-            match std::fs::symlink_metadata(f) {
-                Ok(m) if m.is_file() => {
-                    if std::fs::remove_file(f).is_err() {
-                        left.push(f.clone());
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                _ => left.push(f.clone()),
+        let exists = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+        for (f, owned) in self.files.iter().rev() {
+            let ours = owned.is_some() && Self::file_state(f) == *owned;
+            if !(ours && std::fs::remove_file(f).is_ok()) && exists(f) {
+                left.push(f.clone());
             }
         }
-        for d in self.dirs.iter().rev() {
-            match std::fs::remove_dir(d) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => left.push(d.clone()),
+        for (d, id) in self.dirs.iter().rev() {
+            let ours = id.is_some()
+                && real_dir(d).ok().map(|m| identity(&m)) == *id
+                && d.canonicalize().ok().as_deref() == Some(d.as_path());
+            if !(ours && std::fs::remove_dir(d).is_ok()) && exists(d) {
+                left.push(d.clone());
             }
         }
         left
@@ -219,7 +248,8 @@ impl Made {
         } else {
             let names: Vec<String> = left.iter().map(|p| p.display().to_string()).collect();
             format!(
-                "{error}. The new project could not be fully removed; these paths remain: {}",
+                "{error}. The new project could not be fully removed; these paths remain (not \
+                 empty, changed, or not known to be this call's): {}",
                 names.join(", ")
             )
         }
@@ -587,7 +617,7 @@ impl Workspace {
         let mut made = Made::default();
         let design = self.path.join("design");
         match std::fs::create_dir(&design) {
-            Ok(()) => made.dirs.push(design.clone()),
+            Ok(()) => made.dir(design.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(format!("design/: {e}")),
         }
@@ -595,7 +625,7 @@ impl Workspace {
             .map_err(|_| made.fail("design/ is not a real folder (a link?); refusing".into()))?;
         let dir = design.join(folder);
         match std::fs::create_dir(&dir) {
-            Ok(()) => made.dirs.push(dir.clone()),
+            Ok(()) => made.dir(dir.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(made.fail(format!(
                     "design/{folder} already exists; bind it with bind_project"
@@ -606,7 +636,7 @@ impl Workspace {
         let pages = dir.join(paper_rs::project::PAGES_DIR);
         std::fs::create_dir(&pages)
             .map_err(|e| made.fail(format!("design/{folder}/pages: {e}")))?;
-        made.dirs.push(pages.clone());
+        made.dir(pages.clone());
         // Verify what was made before writing any file into it.
         self.check_workspace().map_err(|e| made.fail(e))?;
         for d in [&design, &dir, &pages] {
@@ -888,10 +918,11 @@ impl Launcher {
             camera: None,
         };
         let p = paper_rs::project::Project { dir, manifest };
-        made.files.push(p.page_path(&page.id));
-        made.files.push(p.dir.join(paper_rs::project::MANIFEST));
+        // A file becomes this call's only once its write has completed.
         p.save_page(&page).map_err(|e| made.fail(e.to_string()))?;
+        made.file(p.page_path(&page.id));
         p.write_manifest().map_err(|e| made.fail(e.to_string()))?;
+        made.file(p.dir.join(paper_rs::project::MANIFEST));
         #[cfg(test)]
         {
             crate::test_support::hit(&ws.path, "create_after_files");

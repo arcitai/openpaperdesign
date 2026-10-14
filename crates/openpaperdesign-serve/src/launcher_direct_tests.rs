@@ -8,6 +8,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::{ClientHandler, RoleClient};
+use std::io::Write as _;
 use std::sync::Mutex as StdMutex;
 
 use super::super::tests::context;
@@ -599,5 +600,142 @@ async fn direct_failed_create_never_removes_unknown_content() {
     );
     assert!(ws.join("design/tokens.json").exists() && ws.join("DESIGN.md").exists());
     assert_eq!(state(&s).await["bound"], Value::Null);
+    std::fs::remove_dir_all(&ws).unwrap();
+}
+
+/// Run a create of `name` that pauses after its files are written, apply `change` to the new
+/// project folder, then fail it before the binding is installed.
+async fn interrupted_create(
+    s: &Arc<Session>,
+    ws: &Path,
+    name: &str,
+    change: impl FnOnce(&Path),
+) -> (bool, Value) {
+    let mut pause = Point::arm(ws, "create_after_files", true);
+    let (s2, w) = (s.clone(), context::writable(ws));
+    let args = json!({"name": name, "force": true});
+    let creating = tokio::spawn(async move { call(&s2, UI_CREATE, args, w).await });
+    pause.reached().await;
+    change(&ws.join("design").join(name));
+    let mut fault = Point::arm(ws, "create_fails", false);
+    pause.resume();
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(15), creating)
+        .await
+        .unwrap()
+        .unwrap();
+    fault.reached().await;
+    answer
+}
+
+fn ino(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).unwrap().ino()
+}
+
+/// R3-F1: recovery removes only what is still exactly this creation's. A manifest replaced by
+/// another regular file, a page changed in place and a replaced folder all stay and are named;
+/// the open canvas's binding is unchanged and usable; the ordinary owned case still removes all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_create_keeps_what_is_no_longer_exactly_its_own() {
+    let ws = seeded("owned", true);
+    let s = Arc::new(connect(Host::new(Answer::Reply(json!({"action": "cancel"})))).await);
+    let w = context::writable(&ws);
+    let (ok, v) = call(&s, UI_CREATE, json!({"name": "First"}), w.clone()).await;
+    assert!(ok, "{v}");
+    let bound = state(&s).await;
+    let kept = |p: &str| std::fs::read(ws.join(p)).unwrap();
+    let (direction, tokens) = (kept("DESIGN.md"), kept("design/tokens.json"));
+    let page_of = |dir: &Path| {
+        std::fs::read_dir(dir.join("pages"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .unwrap()
+    };
+
+    // 1. The manifest is replaced (renamed over) by a different regular file.
+    let (ok, v) = interrupted_create(&s, &ws, "Replaced", |dir| {
+        let foreign = dir.join("foreign.tmp");
+        std::fs::write(&foreign, "someone else's manifest").unwrap();
+        assert_ne!(ino(&foreign), ino(&dir.join("project.json")));
+        std::fs::rename(&foreign, dir.join("project.json")).unwrap();
+    })
+    .await;
+    let dir = ws.join("design/Replaced");
+    let text = v.to_string();
+    assert!(!ok && text.contains("these paths remain"), "{v}");
+    assert!(!text.contains("Nothing was created"), "{v}");
+    assert!(text.contains("design/Replaced/project.json"), "{v}");
+    assert!(
+        text.matches("design/Replaced").count() >= 2,
+        "the manifest and its non-empty folder are both named: {v}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("project.json")).unwrap(),
+        b"someone else's manifest"
+    );
+    assert!(
+        !dir.join("pages").exists(),
+        "its own page and empty pages/ were removed"
+    );
+    assert_eq!(state(&s).await, bound, "same binding, port and editor");
+
+    // 2. The page is changed in place (same file, different bytes).
+    let (ok, v) = interrupted_create(&s, &ws, "Edited", |dir| {
+        let page = page_of(dir);
+        let before = ino(&page);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&page)
+            .unwrap()
+            .write_all(b"edited by someone else")
+            .unwrap();
+        assert_eq!(ino(&page), before);
+    })
+    .await;
+    let dir = ws.join("design/Edited");
+    assert!(!ok && v.to_string().contains("these paths remain"), "{v}");
+    assert_eq!(
+        std::fs::read(page_of(&dir)).unwrap(),
+        b"edited by someone else"
+    );
+    assert!(
+        !dir.join("project.json").exists(),
+        "its own unchanged manifest was removed"
+    );
+    assert_eq!(state(&s).await, bound);
+
+    // 3. The new folder is moved away and another empty folder put in its place.
+    let (ok, v) = interrupted_create(&s, &ws, "Swapped", |dir| {
+        std::fs::rename(dir, dir.with_extension("moved")).unwrap();
+        std::fs::create_dir(dir).unwrap();
+    })
+    .await;
+    assert!(!ok && v.to_string().contains("design/Swapped"), "{v}");
+    assert!(
+        ws.join("design/Swapped").is_dir(),
+        "the replacement folder stays"
+    );
+    assert!(
+        ws.join("design/Swapped.moved/project.json").is_file(),
+        "the moved folder is untouched"
+    );
+    assert_eq!(state(&s).await, bound);
+
+    // 4. Control: nothing changed, so everything this creation made is removed.
+    let (ok, v) = interrupted_create(&s, &ws, "Owned", |_| {}).await;
+    assert!(!ok && v.to_string().contains("Nothing was created"), "{v}");
+    assert!(!ws.join("design/Owned").exists());
+
+    assert_eq!(
+        (kept("DESIGN.md"), kept("design/tokens.json")),
+        (direction, tokens)
+    );
+    let (ok, v) = call(&s, UI_EDITOR, json!({}), w).await;
+    assert!(
+        ok && v["project"] == "design/First",
+        "the old canvas stays usable: {v}"
+    );
     std::fs::remove_dir_all(&ws).unwrap();
 }
