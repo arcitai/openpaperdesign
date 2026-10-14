@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.24 · Updated: 2026-10-14
+Revision: 0.25 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -173,7 +173,10 @@ standard names with plain values, never `styles.css.fonts`, and never treat them
 workspace or permission. A listed folder travels only as exact data, and every request for
 one keeps the `workspace_usable` stop and the exact-folder stop. Several folders are asked,
 never picked. Results, busy state and copy text belong to the view that started them: a newer
-result, cancellation or Back drops late replies and old editor links. The wordmark font
+result, cancellation or Back drops late replies and old editor links. Request buttons belong to
+the list that rendered them; the New form sends only the destinations it showed (copied when it
+opens); copy text is cleared on name/destination edits and on a choice that can't proceed.
+Result paths and the port stay under Details, cleared per result. The wordmark font
 (Geist Pixel Square, OFL, `crates/openpaperdesign-serve/assets/`) is embedded unmodified at
 serve time; never load a font by URL.
 

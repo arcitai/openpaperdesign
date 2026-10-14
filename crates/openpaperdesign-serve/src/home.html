@@ -189,7 +189,7 @@
       <button id="ask-open" class="btn" type="button" hidden>Ask the agent to open it</button>
     </div>
     <p id="canvas-state" class="hint"></p>
-    <details id="result-details" hidden><summary>Details</summary><pre id="result-detail"></pre></details>
+    <details id="result-details" hidden><summary>Details</summary><dl id="result-meta" class="fields" hidden></dl><pre id="result-detail" hidden></pre></details>
   </section>
 
   <footer><span class="wordmark">onlinesourdough</span></footer>
@@ -241,11 +241,16 @@
     editorUrl = null;
     editorFor = null;
     setBusy(false);
-    // A prepared copy request belongs to the target it was made for.
-    $('prompt').hidden = true;
-    $('prompt').textContent = '';
+    clearPrepared();
     notice(canMessage || !initialized ? '' : COPY_MODE);
     closeMenu(false);
+  }
+  // A prepared copy request belongs to the exact target, name and destination it was made for.
+  function clearPrepared() {
+    if ($('prompt').hidden) return;
+    $('prompt').hidden = true;
+    $('prompt').textContent = '';
+    notice(COPY_MODE);
   }
   const goHome = () => { show('home'); $('title').focus(); announce('Projects'); };
   $('back').onclick = goHome;
@@ -336,7 +341,10 @@
 
   const COPY_MODE = 'This Codex version can\'t send requests from apps. Choosing something shows text to paste into the project\'s chat.';
   let initialized = false;
-  const ACTIONS = () => [$('menu-button'), $('create'), ...rowButtons];
+  // Row buttons that send a request, owned by the list that rendered them. Rebuilding one list
+  // (say, the hidden home when a late inventory reply arrives) never replaces another's.
+  const rowActions = { projects: [], 'pick-list': [], 'result-list': [] };
+  const ACTIONS = () => [$('menu-button'), $('create'), $('ask-open'), ...Object.values(rowActions).flat()];
   function setBusy(busy) {
     sending = busy;
     for (const b of ACTIONS()) b.disabled = busy;
@@ -408,7 +416,10 @@
 
   // ---- New canvas ----
 
-  let targets = []; // [{ project, root }] in the order shown; never authority
+  let targets = []; // [{ project, root, tail }] in the order shown; never authority
+  // The destinations this form shows. They are copies taken when it opens, so a later refresh
+  // can't change what a shown choice sends; the next New canvas uses the new list.
+  let formTargets = [];
   function openNewForm() {
     show('new-form');
     const where = $('where');
@@ -416,9 +427,15 @@
     const chat = node('option', 'This chat\'s project');
     chat.value = '';
     where.append(chat);
-    targets.forEach((t, i) => {
-      const o = node('option', label(t.project) + (t.project.roots.length > 1 ? ' · ' + base(t.root) : ''));
+    formTargets = targets.map((t) => Object.freeze({
+      project: Object.freeze({ id: t.project.id, source: t.project.source, host: t.project.host, name: t.project.name }),
+      root: t.root,
+      text: label(t.project) + (t.project.roots.length > 1 ? ' · ' + t.tail : ''),
+    }));
+    formTargets.forEach((t, i) => {
+      const o = node('option', t.text);
       o.value = String(i);
+      o.title = t.root;
       where.append(o);
     });
     where.value = '';
@@ -429,11 +446,15 @@
   }
   $('new-form').onsubmit = (e) => {
     if (e && e.preventDefault) e.preventDefault();
-    const t = $('where').value === '' ? null : targets[Number($('where').value)];
+    const t = $('where').value === '' ? null : formTargets[Number($('where').value)];
     const name = cleanName($('name').value);
     request(prompts.new(name, t || null), 'create ' + (name ? '"' + name + '"' : 'a new canvas') +
-      (t ? ' in ' + label(t.project) : ''));
+      (t ? ' in ' + t.text : ''));
   };
+  // A changed name or destination is a new intent: text prepared for the old one goes.
+  $('name').oninput = clearPrepared;
+  $('where').oninput = clearPrepared;
+  $('where').onchange = clearPrepared;
   $('cancel-new').onclick = goHome;
 
   // ---- Codex's saved projects (read-only discovery) ----
@@ -444,8 +465,18 @@
     timeout: 'Codex didn\'t send its project list in time.',
   };
   const base = (path) => String(path).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || String(path);
+  // The shortest trailing part of each path that no other path in the list ends with.
+  function tails(paths) {
+    const parts = paths.map((p) => String(p).replace(/[\\/]+$/, '').split(/[\\/]+/));
+    return parts.map((segs, i) => {
+      for (let k = 1; k <= segs.length; k++) {
+        const t = segs.slice(-k).join('/');
+        if (parts.every((o, j) => j === i || o.slice(-k).join('/') !== t)) return t;
+      }
+      return String(paths[i]);
+    });
+  }
   let projects = [];
-  let rowButtons = [];
   // Same-named projects stay distinguishable: their folder name, or a short id when even that
   // repeats. Full folders, source, host and id are in each row's details.
   function label(p) { return (p.name || '(unnamed project)') + (p.twin ? ' · ' + p.twin : ''); }
@@ -477,7 +508,7 @@
 
   // One row: the name (and a short distinguishing hint) opens it; a details button reveals
   // its folders, source, host and id for keyboard and pointer alike.
-  function projectRow(i, name, hint, kind, tooltip, onOpen, details) {
+  function projectRow(owner, i, name, hint, kind, tooltip, onOpen, details) {
     const li = node('li');
     const row = node('div', undefined, 'row');
     const open = node('button', undefined, 'row-main');
@@ -488,7 +519,8 @@
     if (hint) text.append(node('span', hint, 'row-hint'));
     open.append(glyph(kind), text);
     open.onclick = onOpen;
-    rowButtons.push(open);
+    open.disabled = sending;
+    rowActions[owner].push(open);
     row.append(open);
     if (details) {
       const more = node('button', '⋯', 'more');
@@ -507,8 +539,7 @@
         panel.hidden = !panel.hidden;
         more.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
       };
-      rowButtons.push(more);
-      row.append(more);
+      row.append(more); // details only show; they stay usable while a request is pending
       li.append(row, panel);
     } else {
       li.append(row);
@@ -519,18 +550,19 @@
   function renderProjects() {
     const list = $('projects');
     list.textContent = '';
-    rowButtons = [];
+    rowActions.projects = [];
     targets = [];
-    list.append(projectRow('chat', 'This chat\'s project', '', 'chat', '', () => activate(null),
+    list.append(projectRow('projects', 'chat', 'This chat\'s project', '', 'chat', '', () => activate(null),
       [['Folder', 'The folder Codex gives this chat']]));
     projects.forEach((p, i) => {
-      for (const r of p.roots) targets.push({ project: p, root: r.path });
+      const tl = tails(p.roots.map((r) => r.path));
+      p.roots.forEach((r, n) => targets.push({ project: p, root: r.path, tail: tl[n] }));
       const folders = p.roots.map((r) => r.path);
       const details = [];
       folders.forEach((f, n) => details.push([folders.length > 1 ? 'Folder ' + (n + 1) : 'Folder', f]));
       if (!folders.length) details.push(['Folder', 'none']);
       details.push(['Source', (p.source || 'codex-app-server') + ' · ' + (p.host || 'this computer')], ['Codex project id', String(p.id)]);
-      list.append(projectRow(i, p.name || '(unnamed project)', p.twin || (folders.length > 1 ? folders.length + ' folders' : ''),
+      list.append(projectRow('projects', i, p.name || '(unnamed project)', p.twin || (folders.length > 1 ? folders.length + ' folders' : ''),
         'folder', folders.join('\n'), () => activate(p), details));
     });
   }
@@ -540,6 +572,7 @@
     if (sending) return;
     if (!p) return request(prompts.open(null), 'open a canvas in this chat\'s project');
     if (!p.roots.length) {
+      clearPrepared(); // nothing can proceed for this choice, so no older request stays offered
       notice(label(p) + ' has no folder in Codex.');
       announce(label(p) + ' has no folder in Codex.');
       return;
@@ -549,9 +582,10 @@
     $('pick-title').textContent = 'Which folder of ' + label(p) + '?';
     const list = $('pick-list');
     list.textContent = '';
-    rowButtons = [];
-    p.roots.forEach((r, n) => list.append(projectRow('pick-' + n, base(r.path), r.path, 'folder', r.path,
-      () => request(prompts.open({ project: p, root: r.path }), 'open ' + label(p) + ' · ' + base(r.path)))));
+    rowActions['pick-list'] = [];
+    const tl = tails(p.roots.map((r) => r.path));
+    p.roots.forEach((r, n) => list.append(projectRow('pick-list', 'pick-' + n, tl[n], r.path, 'folder', r.path,
+      () => request(prompts.open({ project: p, root: r.path }), 'open ' + label(p) + ' · ' + tl[n]))));
     $('pick-title').focus();
     announce($('pick-title').textContent);
   }
@@ -590,14 +624,19 @@
     $('inventory').className = 'muted';
     $('inventory').textContent = text;
     $('inventory').hidden = !text;
-    renderProjects();
+    renderProjects(); // replaces only the home list's controls; new ones follow the busy state
     if (view === 'home' && g === gen) announce(text || projects.length + ' projects');
-    if (sending) for (const b of rowButtons) b.disabled = true;
   }
 
   // ---- results of the model's tool calls, delivered by the host ----
 
+  // Concise identity stays in view; exact folders, project paths and the port are under Details.
   const field = (k, v) => { $('result-fields').append(node('dt', k), node('dd', v)); };
+  const meta = (k, v) => {
+    $('result-meta').append(node('dt', k), node('dd', v));
+    $('result-meta').hidden = false;
+    $('result-details').hidden = false;
+  };
   const firstText = (result) => {
     const c = result && Array.isArray(result.content) ? result.content.find((b) => b && b.type === 'text') : null;
     return c && typeof c.text === 'string' ? c.text : '';
@@ -607,7 +646,7 @@
   // Every delivered result (or cancellation) replaces the last: no old link stays actionable.
   function reset(title) {
     show('result');
-    rowButtons = [];
+    rowActions['result-list'] = [];
     $('result-title').textContent = title;
     $('result-state').className = '';
     $('result-state').textContent = '';
@@ -617,8 +656,13 @@
     $('canvas').disabled = false;
     $('ask-open').hidden = true;
     $('canvas-state').textContent = '';
+    // Nothing from an earlier result stays, open or hidden.
     $('result-details').hidden = true;
+    $('result-details').open = false;
+    $('result-meta').textContent = '';
+    $('result-meta').hidden = true;
     $('result-detail').textContent = '';
+    $('result-detail').hidden = true;
   }
   function refuse(title, text, detail) {
     reset(title);
@@ -626,6 +670,7 @@
     $('result-state').textContent = text;
     if (detail) {
       $('result-detail').textContent = detail;
+      $('result-detail').hidden = false;
       $('result-details').hidden = false;
     }
   }
@@ -652,9 +697,10 @@
         reset('This chat\'s project');
         $('result-state').textContent = typeof v.bound_project === 'string'
           ? 'A canvas is bound in this chat.' : 'No canvas is bound in this chat yet.';
-        if (typeof v.workspace === 'string') field('Folder', v.workspace);
+        if (typeof v.bound_project === 'string') field('Canvas', base(v.bound_project));
+        if (typeof v.workspace === 'string') { field('Folder', base(v.workspace)); meta('Folder path', v.workspace); }
         if (typeof v.bound_project === 'string') {
-          field('Canvas', v.bound_project);
+          meta('Canvas path', v.bound_project);
           if (typeof v.workspace === 'string') {
             editorFor = { workspace: v.workspace, project: base(v.bound_project), project_path: v.bound_project };
             $('ask-open').hidden = false;
@@ -670,9 +716,10 @@
         $('result-state').textContent = 'The canvas is ready to open.';
         // Identity from this same admitted result, never from an earlier one.
         if (v.canvas && typeof v.canvas.name === 'string') field('Canvas', v.canvas.name + ' (' + pages(v.canvas.pages) + ')');
-        if (typeof v.project === 'string') field('Project', v.project);
-        if (typeof v.workspace === 'string') field('Folder', v.workspace);
-        field('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]);
+        if (typeof v.workspace === 'string') field('Folder', base(v.workspace));
+        if (typeof v.project === 'string') meta('Project', v.project);
+        if (typeof v.workspace === 'string') meta('Folder path', v.workspace);
+        meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
         $('canvas').hidden = false;
         if (typeof v.workspace === 'string' && typeof v.project === 'string' && typeof v.project_path === 'string') {
           editorFor = { workspace: v.workspace, project: v.project, project_path: v.project_path };
@@ -698,12 +745,13 @@
       : (v.complete === false
         ? 'This read stopped early before finding any canvases in design/; more may exist.'
         : 'No canvases under design/ in this project yet. Create one from the New menu.');
-    field('Folder', v.workspace);
+    field('Folder', base(v.workspace));
+    meta('Folder path', v.workspace);
     list.forEach((c, i) => {
       const name = (c.canvas && c.canvas.name) || c.project;
       // `bound` means bound in this chat, not loaded in a browser.
       const hint = pages(c.canvas && c.canvas.pages) + (c.bound ? ' · current' : '');
-      $('result-list').append(projectRow('canvas-' + i, name, hint, 'folder', c.project,
+      $('result-list').append(projectRow('result-list', 'canvas-' + i, name, hint, 'folder', c.project,
         () => request(prompts.canvas(v.workspace, c), 'open ' + cleanName(name)),
         [['Project', c.project], ['Canvas id', String(c.canvas && c.canvas.id)]]));
     });

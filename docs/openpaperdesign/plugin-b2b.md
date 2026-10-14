@@ -62,7 +62,8 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     project with several folders asks "Which folder of …?" first; it never picks a root.
     Escape or Back returns to the list.
   - One labelled **New** menu (top right; arrow keys, Home/End, Escape with focus return):
-    New canvas (a name, and a destination select only when projects exist), Open current
+    New canvas (a name, and a destination select only when projects exist; a project's folders
+    with equal names show their shortest distinguishing path, full path as tooltip), Open current
     canvas, Add a folder (a hint to add it in Codex and refresh: the view can't open folders),
     and Refresh projects.
   - Every request for a listed folder carries it as exact JSON data and asks the agent to call
@@ -70,14 +71,21 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     reported workspace is exactly that folder, never switching folders. This chat's project and
     Open current canvas send no folder but keep the usability stop.
   - Each action sends one user message with `ui/message`, only when the host advertises
-    `message.text`; otherwise it shows the text to paste, which is cleared whenever the target,
-    action or view changes. A request is never an opened project or canvas, and a message or a
-    listed root grants nothing.
+    `message.text`; otherwise it shows the text to paste. That text is cleared when the view or
+    target changes, when the New form's name or destination is edited, and when the next chosen
+    project can't proceed (no folder); the next deliberate action makes fresh text. A request is
+    never an opened project or canvas, and a message or a listed root grants nothing.
+  - The New form keeps copies of the destinations it opened with: a refresh while it is open
+    can't change what a shown choice sends; the next New canvas uses the new list. Request
+    buttons belong to the list that rendered them, so re-rendering the hidden home list (a late
+    inventory reply) never strands the visible rows disabled. Details toggles stay usable.
   - Results come only from admitted `openpaperdesign_status`, `openpaperdesign_canvases` and
     `open_editor` results the host delivers. Each result, cancellation, Back or a delivered
     home result replaces the view: earlier editor links, busy state and late replies (open-link,
     message and inventory) are dropped. A bound canvas is labelled "current", not open or
-    loaded.
+    loaded. Results show concise identity (canvas name, folder name); the exact folder and
+    project paths and the local port are under Details, which each new result clears and closes.
+    The editor link and its token are never shown.
   - A failed step says only that the agent's last step didn't work and that earlier steps may
     already have happened; it never claims nothing changed.
   - It opens only the exact loopback editor URL through `ui/open-link`. Codex's

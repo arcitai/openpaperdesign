@@ -42,12 +42,12 @@ const IDS = ['back', 'title', 'menu-button', 'menu', 'm-new', 'm-current', 'm-fo
   'home', 'inventory', 'projects', 'pick', 'pick-title', 'pick-list', 'new-form', 'new-title', 'name', 'where-field', 'where',
   'create', 'cancel-new', 'folder-help', 'folder-title', 'folder-refresh', 'folder-done', 'result', 'result-title',
   'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'ask-open', 'canvas-state', 'result-details',
-  'result-detail'];
+  'result-meta', 'result-detail'];
 
 function mount() {
   const document = { activeElement: null };
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
-  for (const id of ['back', 'menu', 'prompt', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'ask-open', 'result-details']) {
+  for (const id of ['back', 'menu', 'prompt', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'ask-open', 'result-details', 'result-meta', 'result-detail']) {
     els[id].hidden = true;
   }
   const props = {};
@@ -474,6 +474,8 @@ test('host theme and standard style variables apply as presentation only, with p
 
 const result = (obj, isError = false) => ({ method: 'ui/notifications/tool-result', params: { content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj) }], isError } });
 const fields = (v) => v.els['result-fields'].children.map((c) => c.textContent);
+// What Details holds for a result, or null while Details is hidden.
+const meta = (v) => (v.els['result-details'].hidden ? null : v.els['result-meta'].children.map((c) => c.textContent));
 const OPENED = (name) => ({ url: URL_OK, workspace: '/w/acme', project: 'design/' + name, project_path: '/w/acme/design/' + name, canvas: { id: 'c-' + name, name, pages: 1 } });
 const CANVASES = {
   workspace: '/w/acme', design_present: true, complete: true,
@@ -489,7 +491,8 @@ test('a canvases result lists canvases; bound means current, not open; opening o
   v.from(result(CANVASES));
   assert.equal(v.els['result-title'].textContent, 'Canvases');
   assert.equal(v.els.back.hidden, false);
-  assert.deepEqual(fields(v), ['Folder', '/w/acme']);
+  assert.deepEqual(fields(v), ['Folder', 'acme'], 'concise identity in view');
+  assert.deepEqual(meta(v), ['Folder path', '/w/acme'], 'the exact folder under Details');
   const list = rows(v, 'result-list');
   assert.deepEqual(list.map((r) => [r.name, r.hint]), [['Alpha', '2 pages'], ['Beta', '1 page · current']]);
   assert.ok(!texts(v.els.result).some((t) => /open now/.test(t)), 'binding is not a loaded editor');
@@ -516,7 +519,8 @@ test('a status with a bound canvas offers a guarded resume; without one it offer
   const v = await initialized();
   v.from(result({ workspace_state: 'pinned', workspace_usable: true, workspace: '/w/acme', workspace_permission_mode: 'managed-workspace-write', bound_project: '/w/acme/design/Landing' }));
   assert.equal(v.els['result-state'].textContent, 'A canvas is bound in this chat.');
-  assert.deepEqual(fields(v), ['Folder', '/w/acme', 'Canvas', '/w/acme/design/Landing']);
+  assert.deepEqual(fields(v), ['Canvas', 'Landing', 'Folder', 'acme']);
+  assert.deepEqual(meta(v), ['Folder path', '/w/acme', 'Canvas path', '/w/acme/design/Landing']);
   assert.ok(!texts(v.els.result).some((t) => /managed-workspace-write/.test(t)), 'no permission profile');
   assert.equal(v.els['ask-open'].hidden, false);
   v.els['ask-open'].onclick();
@@ -560,7 +564,9 @@ test('an open_editor result names its own canvas; the token stays hidden; the ac
   const v = await initialized();
   v.from(result(OPENED('Beta')));
   assert.equal(v.els['result-title'].textContent, 'Beta');
-  assert.deepEqual(fields(v), ['Canvas', 'Beta (1 page)', 'Project', 'design/Beta', 'Folder', '/w/acme', 'Address', 'local, port 41234']);
+  assert.deepEqual(fields(v), ['Canvas', 'Beta (1 page)', 'Folder', 'acme']);
+  assert.deepEqual(meta(v), ['Project', 'design/Beta', 'Folder path', '/w/acme', 'Address', 'local, port 41234']);
+  assert.ok(!JSON.stringify(meta(v)).includes(TOKEN) && !JSON.stringify(meta(v)).includes('#token'), 'no link or token in Details');
   assert.ok(!JSON.stringify(texts(v.els.result)).includes(TOKEN));
   v.els.canvas.onclick();
   assert.ok(v.els.canvas.disabled);
@@ -655,6 +661,149 @@ test('messages from other windows are ignored', async () => {
   assert.deepEqual(methods(v), ['ui/initialize']);
   v.from(result({ url: URL_OK }), { postMessage() {} });
   assert.equal(v.els.canvas.hidden, true);
+});
+
+// ---- R2: intent and control ownership ----
+
+const submitNew = async (v) => { v.els['new-form'].onsubmit({ preventDefault() {} }); await flush(); };
+const options = (v) => v.els.where.children.map((o) => o.textContent);
+
+test('a refresh while New canvas is open never changes what a shown destination sends (R2-F1, P14)', async () => {
+  const OTHER = { ...BETA, roots: [{ path: '/w/other' }] };
+  for (const [kind, next, nextOptions] of [
+    ['reorder', [NOTES, BETA, ACME], ["This chat's project", 'Field notes', 'Acme site · beta', 'Acme site · acme · acme', 'Acme site · acme · acme-docs']],
+    ['removal', [ACME], ["This chat's project", 'Acme site · acme', 'Acme site · acme-docs']],
+    ['root replacement', [OTHER, ACME, NOTES], ["This chat's project", 'Acme site · other', 'Acme site · acme · acme', 'Acme site · acme · acme-docs', 'Field notes']],
+  ]) {
+    const v = await initialized();
+    v.els['m-refresh'].onclick();
+    await flush();
+    const pending = v.last('tools/call');
+    v.els['m-new'].onclick();
+    v.els.where.value = '2';
+    v.els.where.onchange();
+    v.els.name.value = 'Draft';
+    v.els.name.oninput();
+    const shown = v.els.where.children.find((o) => o.value === '2').textContent;
+    assert.equal(shown, 'Acme site · beta', kind);
+    v.from({ id: pending.id, result: toolText({ ...LISTED, projects: next }) });
+    await flush();
+    assert.equal(v.els['new-form'].hidden, false, 'the open form stays as it was');
+    assert.equal(v.els.where.children.find((o) => o.value === '2').textContent, shown);
+    await submitNew(v);
+    const text = lastMessage(v);
+    assert.match(text, /in my Codex project "Acme site", in the folder given below/);
+    assert.deepEqual(selection(text), { codex_project_id: 'prj_fixture_beta', source: 'codex-app-server', host: 'this computer', folder: '/w/beta' }, kind);
+    assert.match(text, USABLE);
+    assert.match(text, EXACT_FOLDER, 'a listed root is still only checked, never authority');
+    await ack(v);
+    v.els['m-new'].onclick();
+    assert.deepEqual(options(v), nextOptions, 'the next form uses the refreshed list');
+  }
+});
+
+test('a late inventory reply leaves the visible canvas rows to their own request (R2-F2, P15)', async () => {
+  for (const [kind, reply, state] of [
+    ['acknowledged', { result: {} }, /^Asked the agent in this chat to open Alpha\./],
+    ['refused', { error: { code: -32601, message: 'no' } }, /^Codex didn't accept the request \(code -32601\)\. Try again\.$/],
+  ]) {
+    const v = await initialized({ inventory: null });
+    const inventory = v.last('tools/call');
+    v.from(result(CANVASES));
+    const list = rows(v, 'result-list');
+    list[0].open.onclick();
+    await flush();
+    assert.ok(list.every((r) => r.open.disabled) && v.els['menu-button'].disabled, kind);
+    v.from({ id: inventory.id, result: toolText(LISTED) });
+    await flush();
+    assert.equal(v.els.result.hidden, false, 'the canvases stay in view');
+    assert.ok(rows(v).every((r) => r.open.disabled), 'the hidden home\'s new rows wait for the same request');
+    assert.ok(list.every((r) => r.open.disabled), 'the visible rows are still owned by the pending request');
+    assert.ok(list.every((r) => !r.more.disabled), 'details only show, so they stay usable');
+    await ack(v, 'ui/message', reply);
+    assert.match(v.els.notice.textContent, state);
+    assert.ok(list.every((r) => !r.open.disabled), `${kind}: the visible canvas rows are usable again`);
+    assert.ok(!v.els['menu-button'].disabled);
+    assert.ok(rows(v).every((r) => !r.open.disabled));
+    assert.equal(v.count('ui/message'), 1, 'nothing was resent');
+  }
+});
+
+test('copy text goes when its name or destination changes, or the next choice cannot proceed (R2-F3, P11-P13)', async () => {
+  const EMPTY = { ...NOTES, id: 'prj_fixture_empty', name: 'Empty', roots: [] };
+  const v = await initialized({ caps: {}, inventory: { ...LISTED, projects: [ACME, BETA, NOTES, EMPTY] } });
+  v.els['m-new'].onclick();
+  v.els.name.value = 'Draft A';
+  v.els.name.oninput();
+  v.els.where.value = '2';
+  v.els.where.onchange();
+  await submitNew(v);
+  assert.equal(v.els.prompt.hidden, false);
+  assert.match(v.els.prompt.textContent, /named "Draft A"/);
+  assert.equal(selection(v.els.prompt.textContent).folder, '/w/beta');
+  v.els.where.value = '3';
+  v.els.where.onchange();
+  assert.equal(v.els.prompt.hidden, true, 'a new destination drops the old text (P11)');
+  assert.equal(v.els.prompt.textContent, '');
+  assert.match(v.els.notice.textContent, /can't send requests from apps/);
+  await submitNew(v);
+  assert.equal(selection(v.els.prompt.textContent).folder, '/w/notes', 'the next deliberate Create makes fresh text');
+  v.els.name.value = 'Draft B';
+  v.els.name.oninput();
+  assert.equal(v.els.prompt.hidden, true, 'an edited name drops the old text (P12)');
+  await submitNew(v);
+  assert.match(v.els.prompt.textContent, /named "Draft B"/);
+  v.els.back.onclick();
+  row(v, 'Field notes').open.onclick();
+  await flush();
+  assert.equal(selection(v.els.prompt.textContent).folder, '/w/notes');
+  row(v, 'Empty').open.onclick();
+  assert.equal(v.els.prompt.hidden, true, 'a project that cannot proceed drops the old text (P13)');
+  assert.equal(v.els.notice.textContent, 'Empty has no folder in Codex.');
+  assert.equal(v.count('ui/message'), 0, 'copy mode never sends');
+});
+
+test('destinations with equal folder names show the shortest distinguishing path (R2-F4, P16)', async () => {
+  const SITE = { ...BETA, id: 'prj_fixture_site', name: 'Site', roots: [{ path: '/work/current/site' }, { path: '/archive/site' }] };
+  const v = await initialized({ inventory: { ...LISTED, projects: [SITE] } });
+  assert.deepEqual(rows(v).map((r) => [r.name, r.hint]), [["This chat's project", ''], ['Site', '2 folders']], 'the list stays quiet');
+  v.els['m-new'].onclick();
+  assert.deepEqual(v.els.where.children.slice(1).map((o) => [o.textContent, o.title]),
+    [['Site · current/site', '/work/current/site'], ['Site · archive/site', '/archive/site']]);
+  v.els.where.value = '1';
+  v.els.name.value = 'Draft';
+  await submitNew(v);
+  assert.deepEqual(selection(lastMessage(v)), { codex_project_id: 'prj_fixture_site', source: 'codex-app-server', host: 'this computer', folder: '/archive/site' });
+  await ack(v);
+  v.els['cancel-new'].onclick();
+  row(v, 'Site', '2 folders').open.onclick();
+  assert.deepEqual(rows(v, 'pick-list').map((r) => [r.name, r.hint]),
+    [['current/site', '/work/current/site'], ['archive/site', '/archive/site']], 'the folder question matches');
+});
+
+test('results keep exact paths and the port under Details, cleared for each new result (R2-F5, P17)', async () => {
+  const v = await initialized();
+  const inView = () => texts(v.els['result-fields']).concat(texts(v.els['result-state']), texts(v.els['result-list'])).join('\n');
+  for (const r of [{ workspace_state: 'pinned', workspace_usable: true, workspace: '/w/acme', bound_project: '/w/acme/design/Alpha' }, CANVASES, OPENED('Alpha')]) {
+    v.from(result(r));
+    assert.doesNotMatch(inView(), /\/w\/|41234/, 'no full folder or port in the normal view');
+    assert.equal(v.els['result-details'].hidden, false, 'Details is there to check them');
+    assert.equal(v.els['result-details'].open, false, 'and starts closed');
+    assert.ok(meta(v).includes('/w/acme'));
+    v.els['result-details'].open = true;
+  }
+  assert.ok(!JSON.stringify(meta(v)).includes(TOKEN));
+  v.from(result('The browser editor is not built in.', true));
+  assert.deepEqual(meta(v), [], 'no earlier result\'s metadata');
+  assert.equal(v.els['result-meta'].hidden, true);
+  assert.equal(v.els['result-detail'].hidden, false);
+  assert.equal(v.els['result-details'].open, false);
+  v.from(result({ workspace_state: 'pinned', workspace_usable: true, workspace: '/w/acme', bound_project: null }));
+  assert.equal(v.els['result-detail'].textContent, '', 'no earlier refusal reason');
+  assert.equal(v.els['result-detail'].hidden, true);
+  assert.deepEqual(meta(v), ['Folder path', '/w/acme']);
+  v.from({ method: 'ui/notifications/tool-cancelled', params: {} });
+  assert.equal(meta(v), null, 'nothing to show, so no Details');
 });
 
 // ---- static ----
