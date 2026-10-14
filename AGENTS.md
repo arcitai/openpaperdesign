@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.25 · Updated: 2026-10-14
+Revision: 0.26 · Updated: 2026-10-14
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -139,14 +139,18 @@ target page (`get_tree_summary` root with its `pageId`) before its first change.
 audit rejects duplicate evidence (JSON keys, repeated records). Keep the ported `design` and `review-design` skills' provenance notes and
 LICENSE files, and the plugin's `NOTICE.md`, intact.
 
-Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): three things are answered
+Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
 - The `ui://openpaperdesign/home.html` resource.
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
+- `openpaperdesign_choose_folder` (`{}` only): the host directory picker
+  (`openai/elicitation/create`, `directory` resource input) for a client that advertises
+  `extensions["openai/elicitation"].form` on a protocol before 2026-07-28. Its answer is input
+  only: never opened, listed, looked up or treated as a workspace or grant.
 
 They read or change none of the session's context, binding, project, listener or files. This
-named exemption covers only those three; never route another tool around admission.
+named exemption covers only those four; never route another tool around admission.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -164,19 +168,25 @@ writes to it. It keeps Codex's namespace and ids, and every root. A listed proje
 discovery, never authority: never join it with other ids by name, and never pick a root for
 the person.
 
-The view calls only that inventory tool and stores nothing (no URL, token or path). Its
-actions are user messages (`ui/message`), which grant nothing. It shows only admitted
-`openpaperdesign_status`/`open_editor` results that the host delivers, and opens only the
-exact loopback editor URL. Host theme and style variables (MCP Apps
+The view's basic actions call the server directly (owner correction, 2026-10-14): never
+`ui/message`, a paste prompt or a model turn. The app-only `openpaperdesign_ui_canvases`,
+`_ui_create`, `_ui_open` and `_ui_editor` are admitted only from that call's own
+`codex/sandbox-state-meta` (the same `Workspace::from_meta` as model calls), and a named folder
+must equal the admitted workspace exactly. Without valid context they refuse and change nothing:
+unlike the model path they never pin a mismatched workspace, retire a session or touch its
+binding. They reuse the model path's create/bind/editor code and its one bound project; keep a
+single binding per process (no pool or second UI binding). Observed so far: app-view calls
+carry no workspace context, so these actions are refused on that host; that is the honest
+result, not a reason to borrow model context, use a picked folder or fall back to messages. The
+view stores nothing (no URL, token or path) and opens only the exact loopback editor URL. Host theme and style variables (MCP Apps
 `HostContext.theme`/`styles.variables`) change presentation only: apply a fixed list of
 standard names with plain values, never `styles.css.fonts`, and never treat them as a
-workspace or permission. A listed folder travels only as exact data, and every request for
-one keeps the `workspace_usable` stop and the exact-folder stop. Several folders are asked,
-never picked. Results, busy state and copy text belong to the view that started them: a newer
-result, cancellation or Back drops late replies and old editor links. Request buttons belong to
-the list that rendered them; the New form sends only the destinations it showed (copied when it
-opens); copy text is cleared on name/destination edits and on a choice that can't proceed.
-Result paths and the port stay under Details, cleared per result. The wordmark font
+workspace or permission. A listed or picked folder travels only as the action's exact `root`.
+Several folders are asked, never picked. Results and busy state belong to the view that started
+them: a newer result, cancellation or Back drops late replies and old editor links. Request
+buttons belong to the list that rendered them; the New form sends only the destinations it
+showed (copied when it opens). Result paths and the port stay under Details, cleared per
+result. The wordmark font
 (Geist Pixel Square, OFL, `crates/openpaperdesign-serve/assets/`) is embedded unmodified at
 serve time; never load a font by URL.
 

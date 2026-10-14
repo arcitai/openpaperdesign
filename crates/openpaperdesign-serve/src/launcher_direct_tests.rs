@@ -1,0 +1,319 @@
+//! The folder picker over a real rmcp client/server pair (in-memory duplex): the client is a
+//! synthetic host that records the request it is sent and answers it. Its envelopes are
+//! shaped from the operator's Codex receipts; this is not evidence of the installed host.
+use super::*;
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientConfig, ContentBlock, CustomResult, ErrorCode,
+    Implementation,
+};
+use rmcp::service::{RequestContext, RunningService};
+use rmcp::{ClientHandler, RoleClient};
+use std::sync::Mutex as StdMutex;
+
+use super::super::tests::context;
+
+#[derive(Clone)]
+enum Answer {
+    Reply(Value),
+    Error(i32),
+    /// Answers only after the server stopped waiting.
+    Late(Value),
+}
+
+/// Every request the host was sent: method and params.
+type Seen = Arc<StdMutex<Vec<(String, Option<Value>)>>>;
+
+#[derive(Clone)]
+struct Host {
+    extensions: Option<Value>,
+    answer: Answer,
+    seen: Seen,
+}
+
+impl Host {
+    fn new(answer: Answer) -> Self {
+        Self {
+            extensions: Some(json!({"openai/elicitation": {"form": {}}, "openai/form": {}})),
+            answer,
+            seen: Default::default(),
+        }
+    }
+}
+
+impl ClientHandler for Host {
+    fn get_info(&self) -> ClientConfig {
+        let mut caps = ClientCapabilities::default();
+        caps.extensions = self
+            .extensions
+            .clone()
+            .map(|e| serde_json::from_value(e).unwrap());
+        ClientConfig::new(caps, Implementation::new("synthetic-host", "0"))
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CustomResult, ErrorData> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.method.clone(), request.params.clone()));
+        match &self.answer {
+            Answer::Reply(v) => Ok(CustomResult(v.clone())),
+            Answer::Error(code) => Err(ErrorData::new(ErrorCode(*code), "no picker", None)),
+            Answer::Late(v) => {
+                tokio::time::sleep(PICK_TIMEOUT * 3).await;
+                Ok(CustomResult(v.clone()))
+            }
+        }
+    }
+}
+
+struct Session {
+    client: RunningService<RoleClient, Host>,
+    launcher: Launcher,
+    seen: Seen,
+}
+
+async fn connect(host: Host) -> Session {
+    let launcher = Launcher::new(None);
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let l = launcher.clone();
+    tokio::spawn(async move {
+        let _ = l.serve(server).await.unwrap().waiting().await;
+    });
+    let seen = host.seen.clone();
+    let client = host.serve(client).await.unwrap();
+    Session {
+        client,
+        launcher,
+        seen,
+    }
+}
+
+async fn call(s: &Session, name: &str, args: Value, meta: RequestMetaObject) -> (bool, Value) {
+    let mut p = CallToolRequestParams::new(name.to_string());
+    p.arguments = args.as_object().cloned();
+    p.meta = Some(meta);
+    let r = tokio::time::timeout(std::time::Duration::from_secs(15), s.client.call_tool(p))
+        .await
+        .expect("bounded")
+        .unwrap();
+    let text = r
+        .content
+        .iter()
+        .find_map(|c| match c {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (r.is_error != Some(true), v)
+}
+
+/// The launcher's whole session state, comparable before and after.
+async fn state(s: &Session) -> Value {
+    let st = s.launcher.state.lock().await;
+    json!({
+        "workspace": st.workspace.as_ref().map(|w| (&w.path, w.id)),
+        "invalidated": st.invalidated,
+        "bound": st.bound.as_ref().map(|b| (b.server.dir().to_path_buf(), b.port, b.editor_opened)),
+    })
+}
+
+/// The app's call: what the host was observed to send from an app view (no workspace context).
+fn app_meta() -> RequestMetaObject {
+    json!({"thread_id": "t", "threadId": "t"})
+        .as_object()
+        .unwrap()
+        .clone()
+        .into()
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    use std::hash::{BuildHasher, RandomState};
+    let dir = std::env::temp_dir().join(format!(
+        "opd-direct-{tag}-{:016x}",
+        RandomState::new().hash_one(std::time::SystemTime::now())
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    dir.canonicalize().unwrap()
+}
+
+const NOWHERE: &str = "file:///nowhere/opd%20pick%20%C3%A9";
+
+#[tokio::test]
+async fn pick_sends_the_documented_directory_request_and_reports_input_only() {
+    let s = connect(Host::new(Answer::Reply(
+        json!({"action": "accept", "content": {"folder": NOWHERE}}),
+    )))
+    .await;
+    let before = state(&s).await;
+    let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+    assert!(ok, "{v}");
+    assert_eq!(v["status"], "selected");
+    assert_eq!(v["access"], "none");
+    // Decoded exactly, never looked up: this folder doesn't exist.
+    assert_eq!(v["folder"]["path"], "/nowhere/opd pick é");
+    assert_eq!(v["folder"]["name"], "opd pick é");
+    assert!(!Path::new("/nowhere").exists());
+    let seen = s.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "one correlated request");
+    let (method, params) = &seen[0];
+    assert_eq!(method, "openai/elicitation/create");
+    let params = params.clone().unwrap();
+    assert_eq!(params["mode"], "form");
+    assert_eq!(params["requestedSchema"]["required"], json!(["folder"]));
+    assert_eq!(
+        params["requestedSchema"]["properties"]["folder"],
+        json!({"type":"string","format":"uri","title":"Project folder",
+               "x-openai-input":{"type":"resource","options":[],"userOptions":{"kind":"directory"}}})
+    );
+    assert_eq!(state(&s).await, before, "nothing pinned, bound or retired");
+    // Arguments are refused before anything is asked.
+    let (ok, v) = call(&s, PICK_TOOL, json!({"folder": NOWHERE}), app_meta()).await;
+    assert!(!ok && v.to_string().contains("takes no arguments"), "{v}");
+    assert_eq!(s.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pick_answers_other_than_a_local_directory_select_nothing() {
+    let accept = |c: Value| json!({"action": "accept", "content": c});
+    let cases = [
+        (json!({"action": "decline"}), Some("declined")),
+        (
+            json!({"action": "decline", "content": null}),
+            Some("declined"),
+        ),
+        (json!({"action": "cancel"}), Some("cancelled")),
+        (
+            accept(json!({"folder": "host-resource://folder-1"})),
+            Some("opaque"),
+        ),
+        (accept(json!({"folder": "file://remote.example/x"})), None),
+        (accept(json!({"folder": "file:relative/x"})), None),
+        (accept(json!({"folder": "file:///a/../b"})), None),
+        (accept(json!({"folder": "file:///a%2Fb"})), None),
+        (accept(json!({"folder": "/plain/path"})), None),
+        (accept(json!({"folder": 7})), None),
+        (accept(json!({"folder": NOWHERE, "extra": 1})), None),
+        (accept(json!({})), None),
+        (json!({"action": "accept"}), None),
+        (
+            json!({"action": "decline", "content": {"folder": NOWHERE}}),
+            None,
+        ),
+        (json!({"action": "maybe"}), None),
+        (json!("accept"), None),
+        (json!({}), None),
+    ];
+    for (reply, status) in cases {
+        let s = connect(Host::new(Answer::Reply(reply.clone()))).await;
+        let before = state(&s).await;
+        let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+        match status {
+            Some(status) => assert!(ok && v["status"] == status, "{reply} -> {v}"),
+            None => assert!(
+                !ok && v.to_string().contains("nothing was selected"),
+                "{reply} -> {v}"
+            ),
+        }
+        assert!(v.get("folder").is_none(), "{reply} -> {v}");
+        assert_eq!(state(&s).await, before, "{reply}");
+    }
+    // rmcp decodes the answer into its typed elicitation result before the adapter sees it, so
+    // an unknown top-level field is dropped there; only `action` and `content` are read.
+    let s = connect(Host::new(Answer::Reply(
+        json!({"action": "accept", "content": {"folder": NOWHERE}, "path": "/elsewhere"}),
+    )))
+    .await;
+    let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+    assert!(ok && v["folder"]["path"] == "/nowhere/opd pick é", "{v}");
+    // A host error answer.
+    let s = connect(Host::new(Answer::Error(-32601))).await;
+    let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+    assert!(
+        ok && v == json!({"status": "unavailable", "code": -32601}),
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn pick_is_not_asked_of_a_host_without_the_picker() {
+    for extensions in [
+        None,
+        Some(json!({"openai/form": {}})),
+        Some(json!({"openai/elicitation": {}})),
+    ] {
+        let mut host = Host::new(Answer::Reply(
+            json!({"action": "accept", "content": {"folder": NOWHERE}}),
+        ));
+        host.extensions = extensions.clone();
+        let s = connect(host).await;
+        let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+        assert!(ok && v["status"] == "unsupported", "{extensions:?} -> {v}");
+        assert!(s.seen.lock().unwrap().is_empty(), "never asked");
+    }
+}
+
+#[tokio::test]
+async fn pick_timeout_then_late_answer_changes_nothing() {
+    let s = connect(Host::new(Answer::Late(
+        json!({"action": "accept", "content": {"folder": NOWHERE}}),
+    )))
+    .await;
+    let before = state(&s).await;
+    let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+    assert!(ok && v == json!({"status": "timeout"}), "{v}");
+    // Let the late answer arrive; the connection keeps working and nothing changed.
+    tokio::time::sleep(PICK_TIMEOUT * 4).await;
+    assert_eq!(state(&s).await, before);
+    let (ok, v) = call(&s, "openpaperdesign_status", json!({}), app_meta()).await;
+    assert!(ok && v["workspace_state"] == "unresolved", "{v}");
+}
+
+#[tokio::test]
+async fn pick_and_unadmitted_view_calls_leave_a_bound_session_alone() {
+    let ws = scratch("bound");
+    let meta = context::writable(&ws);
+    let s = connect(Host::new(Answer::Reply(
+        json!({"action": "accept", "content": {
+            "folder": context::uri(&ws)
+        }}),
+    )))
+    .await;
+    let (ok, v) = call(&s, "create_project", json!({"name": "Model"}), meta.clone()).await;
+    assert!(ok, "{v}");
+    let (ok, v) = call(&s, "open_editor", json!({}), meta.clone()).await;
+    assert!(ok, "{v}");
+    let before = state(&s).await;
+    assert_eq!(before["bound"][2], true, "editor opened");
+    // The picker answer names exactly the bound workspace: still input only.
+    let (ok, v) = call(&s, PICK_TOOL, json!({}), app_meta()).await;
+    assert!(ok && v["status"] == "selected", "{v}");
+    // View calls without context, with the chosen folder, are refused and retire nothing.
+    let root = ws.to_str().unwrap();
+    for (name, args) in [
+        (UI_CANVASES, json!({"root": root})),
+        (UI_CREATE, json!({"root": root, "name": "Other"})),
+        (UI_OPEN, json!({"root": root, "project": "design/Model"})),
+        (UI_EDITOR, json!({"root": root})),
+    ] {
+        let (ok, v) = call(&s, name, args, app_meta()).await;
+        assert!(
+            !ok && v.to_string().contains("no Codex workspace context"),
+            "{name}: {v}"
+        );
+    }
+    assert!(!ws.join("design/Other").exists());
+    assert_eq!(
+        state(&s).await,
+        before,
+        "same pin, binding, server and editor"
+    );
+    let (ok, v) = call(&s, "openpaperdesign_status", json!({}), meta).await;
+    assert!(ok && v["workspace_state"] == "pinned", "{v}");
+    std::fs::remove_dir_all(&ws).unwrap();
+}

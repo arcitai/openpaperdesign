@@ -708,8 +708,8 @@ async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
         .collect();
     assert_eq!(
         tools.len(),
-        36,
-        "4 own + home + projects + canvases + 29 offered"
+        41,
+        "4 own + home + projects + canvases + picker + 4 view actions + 29 offered"
     );
     let tool = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
     let home = tool("openpaperdesign_home");
@@ -731,6 +731,21 @@ async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
             json!({"ui":{"resourceUri":HOME,"visibility":["model"]}}),
             "{n}"
         );
+    }
+    // The picker and the view's direct actions are app-only, strict, and not entrypoints.
+    for n in [
+        "openpaperdesign_choose_folder",
+        "openpaperdesign_ui_canvases",
+        "openpaperdesign_ui_create",
+        "openpaperdesign_ui_open",
+        "openpaperdesign_ui_editor",
+    ] {
+        assert_eq!(
+            tool(n)["_meta"],
+            json!({"ui":{"visibility":["app"]}}),
+            "{n}"
+        );
+        assert_eq!(tool(n)["inputSchema"]["additionalProperties"], false, "{n}");
     }
     let entries = tools
         .iter()

@@ -94,7 +94,7 @@ async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
 }
 
 #[path = "../tests/support/codex_context.rs"]
-mod context;
+pub(super) mod context;
 struct Client {
     peer: rmcp::service::RunningService<rmcp::RoleClient, ()>,
     meta: RequestMetaObject,

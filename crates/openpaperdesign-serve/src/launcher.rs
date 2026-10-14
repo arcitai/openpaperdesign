@@ -50,6 +50,8 @@ mod inventory;
 #[path = "launcher_scope.rs"]
 mod scope;
 use scope::{CAPABILITY, Workspace};
+#[path = "launcher_direct.rs"]
+mod direct;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -251,6 +253,7 @@ fn own_tools() -> Vec<Tool> {
         }),
     ]
     .into_iter()
+    .chain(direct::tools())
     .map(|t| serde_json::from_value(t).expect("valid tool"))
     .collect()
 }
@@ -682,6 +685,95 @@ impl Launcher {
         .unwrap_or_else(|e| Err(format!("binding handoff failed unexpectedly: {e}")))
     }
 
+    /// An existing paper-rs project inside the admitted workspace (as `bind_project` takes it).
+    fn existing(ws: &Workspace, path: &str) -> Result<PathBuf, String> {
+        let dir = ws.resolve_inside(path)?;
+        if !dir.join(paper_rs::project::MANIFEST).is_file() {
+            return Err(format!(
+                "{} is not a paper-rs project (no project.json). Use create_project for a new one.",
+                dir.display()
+            ));
+        }
+        Ok(dir)
+    }
+
+    /// `create_project`: a new project under `<workspace>/design/<folder>/`, then bound.
+    /// Returns the new project's folder with the bind result.
+    async fn create(
+        state: OwnedMutexGuard<LauncherState>,
+        ws: Workspace,
+        name: &str,
+        force: bool,
+    ) -> Result<(PathBuf, Vec<Out>), String> {
+        // Before creating anything.
+        Self::may_switch(&state.bound, None, force)?;
+        ws.check_workspace()?;
+        if let Some(p) = workspace_problem(&ws.path) {
+            return Err(format!("refusing to create a project: {p}"));
+        }
+        let folder = paper_rs::project::folder_name(name);
+        let dir = ws.create_folders(&folder)?;
+        // As upstream `Store::create`, but into the folder made and checked above.
+        let manifest = paper_rs::project::Manifest::new(name.trim());
+        let page = paper_rs::project::PageData {
+            id: manifest.pages[0].id.clone(),
+            name: manifest.pages[0].name.clone(),
+            doc: paper_rs::model::Document {
+                name: manifest.pages[0].name.clone(),
+                ..Default::default()
+            },
+            camera: None,
+        };
+        let p = paper_rs::project::Project { dir, manifest };
+        p.save_page(&page).map_err(|e| e.to_string())?;
+        p.write_manifest().map_err(|e| e.to_string())?;
+        let dir = p.dir.clone();
+        let out = Self::bind(state, ws, p.dir, force).await?;
+        Ok((dir, out))
+    }
+
+    /// `open_editor`: the bound project's editor URL and identity.
+    fn editor(state: &mut LauncherState, ws: &Workspace) -> Result<Value, String> {
+        let Some(b) = state.bound.as_mut() else {
+            return Err(NOT_BOUND.into());
+        };
+        if !bundle_complete() {
+            return Err(
+                "This openpaperdesign-mcp was built without the browser editor. Build \
+                 the web bundle first (./scripts/build-web.sh), then reinstall \
+                 (cargo install --locked --path crates/openpaperdesign-serve). Editing \
+                 through the tools works without it."
+                    .into(),
+            );
+        }
+        // Self-contained identity from this admitted call: the validated workspace and
+        // the bound project. Its manifest is read only after the bound root's identity
+        // and entries are checked again (a replaced or linked root is refused), and
+        // reading it acknowledges no page. Nothing counts as opened unless this passes.
+        let dir = b.server.dir().to_path_buf();
+        let manifest = b.server.bound_manifest().map_err(|e| {
+            format!(
+                "The bound project {} can't be opened: {e}. Nothing was opened; bind \
+                 a project again.",
+                ws.relative(&dir)
+            )
+        })?;
+        b.editor_opened = true;
+        Ok(json!({
+            "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
+            "workspace": ws.path,
+            "project": ws.relative(&dir),
+            "project_path": dir,
+            "canvas": {
+                "id": manifest.id,
+                "name": manifest.name,
+                "pages": manifest.pages.len(),
+            },
+            "open_in": "the host's in-app browser (loopback only)",
+            "note": "The token in the URL is for this session only; don't write it into files.",
+        }))
+    }
+
     async fn run(&self, name: &str, args: Value, meta: &RequestMetaObject) -> ToolResult {
         let mut state = self.state.clone().lock_owned().await;
         if state.host_context {
@@ -737,82 +829,13 @@ impl Launcher {
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         match name {
             "bind_project" => {
-                let dir = ws.resolve_inside(arg("path")?)?;
-                if !dir.join(paper_rs::project::MANIFEST).is_file() {
-                    return Err(format!(
-                        "{} is not a paper-rs project (no project.json). Use create_project for \
-                         a new one.",
-                        dir.display()
-                    ));
-                }
+                let dir = Self::existing(&ws, arg("path")?)?;
                 Self::bind(state, ws, dir, force).await
             }
-            "create_project" => {
-                let name = arg("name")?;
-                // Before creating anything.
-                Self::may_switch(&state.bound, None, force)?;
-                ws.check_workspace()?;
-                if let Some(p) = workspace_problem(&ws.path) {
-                    return Err(format!("refusing to create a project: {p}"));
-                }
-                let folder = paper_rs::project::folder_name(name);
-                let dir = ws.create_folders(&folder)?;
-                // As upstream `Store::create`, but into the folder made and checked above.
-                let manifest = paper_rs::project::Manifest::new(name.trim());
-                let page = paper_rs::project::PageData {
-                    id: manifest.pages[0].id.clone(),
-                    name: manifest.pages[0].name.clone(),
-                    doc: paper_rs::model::Document {
-                        name: manifest.pages[0].name.clone(),
-                        ..Default::default()
-                    },
-                    camera: None,
-                };
-                let p = paper_rs::project::Project { dir, manifest };
-                p.save_page(&page).map_err(|e| e.to_string())?;
-                p.write_manifest().map_err(|e| e.to_string())?;
-                Self::bind(state, ws, p.dir, force).await
-            }
-            "open_editor" => {
-                let Some(b) = state.bound.as_mut() else {
-                    return Err(NOT_BOUND.into());
-                };
-                if !bundle_complete() {
-                    return Err(
-                        "This openpaperdesign-mcp was built without the browser editor. Build \
-                         the web bundle first (./scripts/build-web.sh), then reinstall \
-                         (cargo install --locked --path crates/openpaperdesign-serve). Editing \
-                         through the tools works without it."
-                            .into(),
-                    );
-                }
-                // Self-contained identity from this admitted call: the validated workspace and
-                // the bound project. Its manifest is read only after the bound root's identity
-                // and entries are checked again (a replaced or linked root is refused), and
-                // reading it acknowledges no page. Nothing counts as opened unless this passes.
-                let dir = b.server.dir().to_path_buf();
-                let manifest = b.server.bound_manifest().map_err(|e| {
-                    format!(
-                        "The bound project {} can't be opened: {e}. Nothing was opened; bind \
-                         a project again.",
-                        ws.relative(&dir)
-                    )
-                })?;
-                b.editor_opened = true;
-                text(json!({
-                    "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
-                    "workspace": ws.path,
-                    "project": ws.relative(&dir),
-                    "project_path": dir,
-                    "canvas": {
-                        "id": manifest.id,
-                        "name": manifest.name,
-                        "pages": manifest.pages.len(),
-                    },
-                    "open_in": "the host's in-app browser (loopback only)",
-                    "note": "The token in the URL is for this session only; don't write it into files.",
-                }))
-            }
+            "create_project" => Self::create(state, ws, arg("name")?, force)
+                .await
+                .map(|(_, out)| out),
+            "open_editor" => text(Self::editor(&mut state, &ws)?),
             "openpaperdesign_canvases" => {
                 if args.as_object().is_some_and(|a| !a.is_empty()) {
                     return Err("openpaperdesign_canvases takes no arguments; it lists this workspace's design/ folder.".into());
@@ -918,6 +941,16 @@ impl ServerHandler for Launcher {
     ) -> Result<CallToolResponse, ErrorData> {
         if request.name == HOME_TOOL {
             return Ok(to_result(home(request.arguments.as_ref())).into());
+        }
+        if request.name == direct::PICK_TOOL {
+            return Ok(to_result(
+                direct::choose_folder(request.arguments.as_ref(), &context).await,
+            )
+            .into());
+        }
+        if direct::UI_TOOLS.contains(&request.name.as_ref()) {
+            let args = Value::Object(request.arguments.unwrap_or_default());
+            return Ok(to_result(self.direct(&request.name, args, &context.meta).await).into());
         }
         if request.name == PROJECTS_TOOL {
             // rmcp cancels `ct` on `notifications/cancelled` but keeps running this handler.

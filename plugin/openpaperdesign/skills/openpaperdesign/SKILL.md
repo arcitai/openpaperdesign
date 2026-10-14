@@ -70,12 +70,14 @@ Limits (state them when relevant):
   limited to the active page.
 
 The OpenPaperDesign home (`openpaperdesign_home`, in the Codex sidebar and as a chat tab) is a
-static view. Its buttons send you requests like the steps above as ordinary user messages;
-they grant no workspace and name no authority. Follow the same steps and refusals. When a
-request names a workspace or project, continue only if `openpaperdesign_status` shows
-exactly that. Opening an existing project changes nothing in it: no `DESIGN.md`, token,
-asset or folder is created, copied or moved. A new canvas follows the
-[design](../design/SKILL.md) method.
+view whose buttons call the server directly (list, create, open and reopen canvases); they
+send you no messages. Those calls work only when they carry their own Codex workspace context
+for exactly the chosen folder, and are refused otherwise. A canvas the person created or opened
+there is the session's bound project, the same one your tools edit. Opening an existing
+project changes nothing in it: no `DESIGN.md`, token,
+asset or folder is created, copied or moved. New canvas from the home makes only an empty
+`design/<name>/` canvas; it neither writes nor reads `DESIGN.md`, tokens or assets. Design work
+on it, including a missing root `DESIGN.md`, follows the [design](../design/SKILL.md) method.
 
 `openpaperdesign_projects` lists the Codex projects saved on this computer, with every root
 folder: discovery only. When the person picks a folder there, use it only if

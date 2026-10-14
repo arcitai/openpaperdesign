@@ -58,36 +58,48 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     folder-name or `…id` hint when names repeat. No paths are shown in the list; the folders
     are an optional tooltip. A labelled details button per row reveals the folders, source,
     host and Codex project id from the keyboard.
-  - Click or Enter on a row proceeds. A one-folder project sends its request directly. A
-    project with several folders asks "Which folder of …?" first; it never picks a root.
-    Escape or Back returns to the list.
+  - Click or Enter on a row proceeds. A one-folder project opens directly. A project with
+    several folders asks "Which folder of …?" first; it never picks a root. Escape or Back
+    returns to the list.
   - One labelled **New** menu (top right; arrow keys, Home/End, Escape with focus return):
     New canvas (a name, and a destination select only when projects exist; a project's folders
     with equal names show their shortest distinguishing path, full path as tooltip), Open current
-    canvas, Add a folder (a hint to add it in Codex and refresh: the view can't open folders),
-    and Refresh projects.
-  - Every request for a listed folder carries it as exact JSON data and asks the agent to call
-    `openpaperdesign_status`, stop if `workspace_usable` is false, and continue only if the
-    reported workspace is exactly that folder, never switching folders. This chat's project and
-    Open current canvas send no folder but keep the usability stop.
-  - Each action sends one user message with `ui/message`, only when the host advertises
-    `message.text`; otherwise it shows the text to paste. That text is cleared when the view or
-    target changes, when the New form's name or destination is edited, and when the next chosen
-    project can't proceed (no folder); the next deliberate action makes fresh text. A request is
-    never an opened project or canvas, and a message or a listed root grants nothing.
+    canvas, Open a folder (the host's folder picker; without one, a hint to add the folder in
+    Codex and refresh), and Refresh projects.
+  - **Direct actions (owner correction, 2026-10-14).** Basic actions call the server directly;
+    no chat message, paste prompt or model turn. Opening a project lists its canvases
+    (`openpaperdesign_ui_canvases {root}`); a canvas opens with `openpaperdesign_ui_open {root,
+    project}`; New creates with `openpaperdesign_ui_create {root?, name}`; Open current canvas
+    uses `openpaperdesign_ui_editor`. Create and open bind the canvas (the session's one
+    binding, shared with the agent) and return its editor link, which the view asks Codex to
+    open. A switch away from an opened editor is refused until the person confirms (force).
+  - **Admission.** These app-only tools need the call's own Codex workspace context, exactly
+    as a model call (`Workspace::from_meta`), and `root` must equal that admitted workspace.
+    Without it they refuse and change nothing: no pin, no retirement, no binding change. Tool
+    arguments, a listed root and a picked folder grant nothing. On the observed host (model
+    view and global entry) app calls carry no workspace context, so these actions are refused
+    there with a plain message; a user-opened conversation-panel tab is not yet observed.
+  - **Folder picker** (`openpaperdesign_choose_folder`, answered before admission). The server
+    sends `openai/elicitation/create` with a `directory` resource input when the client
+    advertises `extensions["openai/elicitation"].form` (protocol before 2026-07-28). Only an
+    accepted local `file://` URI becomes a selection, decoded without touching the filesystem;
+    decline, cancel, timeout, an opaque or malformed answer and host errors select nothing.
+    The selection is the next action's `root` only; it is not a workspace, grant or lifetime.
+    rmcp decodes the answer into its typed elicitation result first, so unknown top-level
+    fields are dropped before the adapter reads `action` and `content`.
   - The New form keeps copies of the destinations it opened with: a refresh while it is open
     can't change what a shown choice sends; the next New canvas uses the new list. Request
     buttons belong to the list that rendered them, so re-rendering the hidden home list (a late
     inventory reply) never strands the visible rows disabled. Details toggles stay usable.
-  - Results come only from admitted `openpaperdesign_status`, `openpaperdesign_canvases` and
-    `open_editor` results the host delivers. Each result, cancellation, Back or a delivered
-    home result replaces the view: earlier editor links, busy state and late replies (open-link,
-    message and inventory) are dropped. A bound canvas is labelled "current", not open or
+  - Results come from the direct actions or from admitted model results the host delivers.
+    Each result, cancellation, Back or a delivered home result replaces the view: earlier
+    editor links, busy state and late replies (actions, open-link and inventory) are dropped.
+    A refusal, error or unreadable answer is never shown as done. A bound canvas is labelled "current", not open or
     loaded. Results show concise identity (canvas name, folder name); the exact folder and
     project paths and the local port are under Details, which each new result clears and closes.
     The editor link and its token are never shown.
-  - A failed step says only that the agent's last step didn't work and that earlier steps may
-    already have happened; it never claims nothing changed.
+  - A delivered failed model step says only that the agent's last step didn't work and that
+    earlier steps may already have happened; it never claims nothing changed.
   - It opens only the exact loopback editor URL through `ui/open-link`. Codex's
     acknowledgement is not proof that the canvas loaded.
   - Host appearance: `HostContext.theme` and a fixed list of standard `styles.variables`
@@ -97,7 +109,7 @@ entry), and its static MCP App view `ui://openpaperdesign/home.html`
     applied. This is presentation only, never a workspace or permission.
   - The lower-left `onlinesourdough` wordmark uses Geist Pixel Square (SIL OFL 1.1), bundled
     unmodified and served inside the view as a data URI; there is no font URL or service.
-  - The only server tool it calls is the inventory, and it stores nothing.
+  - It calls only the inventory, the picker and the four direct actions, and stores nothing.
 
 Issue #6 stays open until these are proven on a real host:
 1. That the installed packaged plugin reaches `codex app-server` and lists the real projects.
