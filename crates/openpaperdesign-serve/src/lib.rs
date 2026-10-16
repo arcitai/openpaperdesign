@@ -2,7 +2,11 @@
 //!
 //! - Serves the built `openpaperdesign-web` bundle and a small JSON API.
 //! - API calls need the per-launch token (`Authorization: Bearer …`); requests with a foreign
-//!   `Host` (DNS rebinding) or a cross-origin `Origin`/`Sec-Fetch-Site` are refused.
+//!   `Host` (DNS rebinding) or a cross-origin `Origin`/`Sec-Fetch-Site` are refused. One
+//!   exception: a top-level document navigation to `/` from another site (a link or redirect,
+//!   such as the host opening the editor URL) gets the static bootstrap page, which holds no
+//!   project data. The editor's capability stays in the URL fragment, never sent over HTTP; the
+//!   page's own API and MCP calls still need it as the Bearer token (see `top_level_entry`).
 //! - Pages are addressed by the ids listed in the project's manifest only; the server builds
 //!   every path itself, so no client input reaches the file system as a path.
 //! - Symbolic links are refused, fail closed: `project.json`, `pages/`, every page file and
@@ -684,6 +688,27 @@ fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The one request from another site that is let through: the browser's top-level navigation
+/// to the editor page itself, as when a link or redirect on the host's own site (its open-link)
+/// opens the editor URL. Only `GET /`, marked by the browser as a navigation
+/// (`Sec-Fetch-Mode: navigate`) of a top-level document (`Sec-Fetch-Dest: document`) from a
+/// same-site or cross-site page. It returns the static bootstrap page only: no project data,
+/// file operation or state. The editor's capability is the URL fragment (`#token=…`), which the
+/// browser never sends, so nothing here checks or needs it; every API and MCP call still needs
+/// it as a Bearer token from the page's own origin. Frames, fetches, subresources, other paths
+/// and methods stay refused, and a foreign `Origin` or `Host` is refused before this.
+fn top_level_entry(req: &Request) -> bool {
+    let h = req.headers();
+    req.method() == axum::http::Method::GET
+        && req.uri().path() == "/"
+        && header_str(h, "sec-fetch-mode") == Some("navigate")
+        && header_str(h, "sec-fetch-dest") == Some("document")
+        && matches!(
+            header_str(h, "sec-fetch-site"),
+            Some("same-site" | "cross-site")
+        )
+}
+
 /// Host / Origin / fetch-site checks for every request, token check for `/api/`.
 async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Response {
     let h = req.headers();
@@ -698,6 +723,7 @@ async fn guard(State(s): State<Arc<Server>>, req: Request, next: Next) -> Respon
     }
     if let Some(site) = header_str(h, "sec-fetch-site")
         && !matches!(site, "same-origin" | "none")
+        && !top_level_entry(&req)
     {
         return error(StatusCode::FORBIDDEN, "cross-site request");
     }
