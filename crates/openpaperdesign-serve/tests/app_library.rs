@@ -190,13 +190,19 @@ async fn two_processes_share_the_library_one_canvas_at_a_time() {
         1,
         "A's canvas is unaffected"
     );
-    call(&a, "openpaperdesign_app_close", json!({"force": true}))
-        .await
-        .unwrap();
+    // Each view names the binding it was shown (close) or confirmed replacing (switch).
+    let shown = |v: &Value| v["binding"].as_str().unwrap().to_string();
+    call(
+        &a,
+        "openpaperdesign_app_close",
+        json!({"binding": shown(&created), "force": true}),
+    )
+    .await
+    .unwrap();
     let in_b = call(
         &b,
         "openpaperdesign_app_open",
-        json!({"id": id, "force": true}),
+        json!({"id": id, "force": true, "replace": shown(&other)}),
     )
     .await
     .unwrap();

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.30 · Updated: 2026-10-16
+Revision: 0.31 · Updated: 2026-10-16
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -233,14 +233,21 @@ preparation before the old binding retires, run in an owned task, remove only wh
 theirs (naming what stays or may not be durably removed) and are never retried; a lost reply is
 recovered from the list. The canvas file (`library_payload.rs`, version 1, canvas-only) is
 bounded and fully validated before a fresh identity is published (duplicate keys, unknown
-fields, ids, case/prefix collisions, page correspondence, node graph, exact image set); images
+fields, ids, case/prefix collisions, page correspondence, node ids at most 2^53 - 1 and
+`next_id` at most 2^53 checked before upstream parsing, one rooted forest walked iteratively
+from the top level with matching parents and at most 256 levels, exact image set); images
 come only from the file or the canvas's own `assets/`, never the process image registry. Export
 reads one saved snapshot under the lease and the writer fence and says it holds saved content
 without direction or tokens. Companions (`DESIGN.md`, tokens) are unsupported in version 1 and
 refused; project-bound export is not offered. A new blank canvas infers no design system. The
 editor reports readiness itself (`POST /api/ready`); an open-link acknowledgement is never a
 load. Close retires and saves nothing in browser memory; it needs `force` once the link was
-given. Library mode defers stdio page tools: canvases are edited in the browser editor.
+given. Views share the one binding: each binding has an identity (`binding`, `<id>.<n>`) in
+editor results; close, export and readiness polls send it, and a confirmed switch sends the
+`replace` binding its refusal named; all are compared under the state lock before any effect,
+and a stale one is refused with the current canvas, files, URL and lease untouched. It is a
+stale-view check, never a credential or authority. Library mode defers stdio page tools:
+canvases are edited in the browser editor.
 
 ## Model profile
 

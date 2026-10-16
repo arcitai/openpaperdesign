@@ -214,6 +214,9 @@
   // workspace view.
   const LIBRARY = '__OPD_MODE__' === 'library';
   const CANVAS_ID = /^[0-9a-f]{16}$/;
+  const BINDING = /^[0-9a-f]{16}\.[0-9]{1,20}$/;
+  // A library switch refusal names the binding it would replace; a confirmation names exactly it.
+  const SHOWN_FOR = /\(open canvas: ([0-9a-f]{16}\.[0-9]{1,20})\)/;
   const MAX_IMPORT = 32 * 1024 * 1024;
   // The loopback editor URL that the server returns. Nothing else is ever opened.
   const EDITOR_URL = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/#token=[0-9a-f]{64}$/;
@@ -251,6 +254,7 @@
   let editorUrl = null; // memory only, for the Open canvas button
   let editorRoot = null; // the admitted workspace of the shown status/editor result, for reopening
   let editorCanvas = null; // the library canvas id of the shown editor result
+  let editorBinding = null; // and its binding: sent back so a stale action is refused
   let retryForce = null; // the refused switch the person may confirm
   const announce = (text, g) => { if (g === undefined || g === gen) $('live').textContent = text; };
   const notice = (text) => { $('notice').textContent = text; };
@@ -263,6 +267,7 @@
     editorUrl = null;
     editorRoot = null;
     editorCanvas = null;
+    editorBinding = null;
     retryForce = null;
     setBusy(false);
     notice('');
@@ -357,7 +362,10 @@
           'The open canvas\'s browser tab may still be saving edits; switching stops it. Let it show "Saved", then switch.',
           text);
       }
-      retryForce = again;
+      // The confirmation is for what this refusal showed: a library switch names the binding it
+      // replaces, and the server refuses it if that is no longer the open one.
+      const shownFor = (text.match(SHOWN_FOR) || [])[1] || null;
+      retryForce = () => again(shownFor);
       $('force').textContent = closing ? 'Close anyway' : 'Switch anyway';
       $('force').hidden = false;
     } else {
@@ -743,13 +751,18 @@
   }
   const shownCount = () => rowActions.projects.length;
 
-  async function openLibrary(id, name, force) {
-    const args = { id };
-    if (force) args.force = true;
-    const r = await act('openpaperdesign_app_open', args, 'Opening ' + name);
+  // A confirmed switch names the binding the person confirmed replacing (`replace`); the
+  // server refuses it if another view changed the open canvas meanwhile.
+  const switchArgs = (args, replace) => {
+    if (replace) Object.assign(args, { force: true, replace });
+    return args;
+  };
+
+  async function openLibrary(id, name, replace) {
+    const r = await act('openpaperdesign_app_open', switchArgs({ id }, replace), 'Opening ' + name);
     if (!r) return;
     if (r.ok) return showEditor(r.ok, false, id);
-    refused(r, () => openLibrary(id, name, true));
+    refused(r, (shownFor) => shownFor && openLibrary(id, name, shownFor));
   }
 
   // An unanswered create or import may still have happened: it is never retried, and the list
@@ -760,14 +773,12 @@
     loadLibrary();
   }
 
-  async function createLibrary(name, force) {
-    const args = { name };
-    if (force) args.force = true;
-    const r = await act('openpaperdesign_app_create', args, 'Creating "' + name + '"');
+  async function createLibrary(name, replace) {
+    const r = await act('openpaperdesign_app_create', switchArgs({ name }, replace), 'Creating "' + name + '"');
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
     if (r.fail) return unsure('created');
-    refused(r, () => createLibrary(name, true));
+    refused(r, (shownFor) => shownFor && createLibrary(name, shownFor));
   }
 
   async function reopenLibrary() {
@@ -777,17 +788,21 @@
     refused(r);
   }
 
-  async function closeCanvas(force) {
-    const r = await act('openpaperdesign_app_close', force ? { force: true } : {}, 'Closing the canvas');
+  // Close the canvas this view showed: its binding goes with the request, and with a later
+  // confirmation, so the server never closes a canvas another view opened since.
+  async function closeCanvas(binding, force) {
+    if (!binding) return;
+    const args = force ? { binding, force: true } : { binding };
+    const r = await act('openpaperdesign_app_close', args, 'Closing the canvas');
     if (!r) return;
-    if (!r.ok) return refused(r, () => closeCanvas(true), true);
+    if (!r.ok) return refused(r, () => closeCanvas(binding, true), true);
     reset('Canvas closed');
     $('result-state').textContent = 'Closed. Everything saved before closing is in your library; an edit still unsaved in a browser tab was not saved by closing.';
     $('result-title').focus();
     announce('Canvas closed');
     loadLibrary();
   }
-  $('close').onclick = () => closeCanvas(false);
+  $('close').onclick = () => closeCanvas(editorBinding, false);
 
   // A browser download of the exported text, if this view may start one. Codex doesn't tell the
   // view whether a file was saved, so this never says it was.
@@ -811,12 +826,19 @@
   }
 
   async function exportCanvas() {
-    const r = await act('openpaperdesign_app_export', {}, 'Exporting the saved canvas', 120000);
+    const binding = editorBinding;
+    const canvas = editorCanvas;
+    if (!binding) return;
+    const r = await act('openpaperdesign_app_export', { binding }, 'Exporting the saved canvas', 120000);
     if (!r) return;
     if (!r.ok) return refused(r);
     const v = r.ok;
     if (typeof v.payload !== 'string' || typeof v.file_name !== 'string') {
       return refused({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
+    }
+    // Only bytes of the canvas this view showed are offered for download.
+    if (v.binding !== binding || !v.canvas || v.canvas.id !== canvas) {
+      return refused({ fail: 'Codex answered with another canvas than the one shown here, so nothing was downloaded.' });
     }
     const name = v.file_name.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80) || 'canvas.opdcanvas.json';
     const kb = Math.max(1, Math.round(v.payload.length / 1024));
@@ -848,32 +870,32 @@
     }
     let text;
     try { text = await f.text(); } catch { notice('This view couldn\'t read that file. Nothing was imported.'); return; }
-    importCanvas(text, false);
+    importCanvas(text, null);
   };
-  async function importCanvas(text, force) {
-    const args = { payload: text };
-    if (force) args.force = true;
-    const r = await act('openpaperdesign_app_import', args, 'Importing the canvas file', 120000);
+  async function importCanvas(text, replace) {
+    const r = await act('openpaperdesign_app_import', switchArgs({ payload: text }, replace), 'Importing the canvas file', 120000);
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
     if (r.fail) return unsure('imported');
-    refused(r, () => importCanvas(text, true));
+    refused(r, (shownFor) => shownFor && importCanvas(text, shownFor));
   }
 
   // After the link was handed to Codex: whether the editor itself reported its page loaded.
   // An acknowledgement of the link is never treated as a load.
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  async function watchLoad(g, id) {
+  async function watchLoad(g, id, binding) {
+    if (!binding) return;
     for (let i = 0; i < 30; i++) {
       await later(2000);
       if (g !== gen) return;
-      const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: {} });
+      // Only this view's binding: another view's canvas never counts as this one loading.
+      const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
       if (g !== gen) return;
       let v = null;
       if (!r.timeout && !r.error && r.result && !r.result.isError) {
         try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
       }
-      if (!v || !v.canvas || v.canvas.id !== id) return;
+      if (!v || !v.canvas || v.canvas.id !== id || v.binding !== binding) return;
       if (v.editor_loaded === true) {
         const n = Number.isInteger(v.browser_saves) ? v.browser_saves : 0;
         const s = 'The editor loaded this canvas.' + (n ? ' Saved from the editor ' + n + (n === 1 ? ' time.' : ' times.') : '');
@@ -971,12 +993,14 @@
       return;
     }
     editorCanvas = id;
+    editorBinding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
     field('Canvas', name + ' (' + pages(v.canvas.pages) + ')');
     field('Stored in', 'OpenPaperDesign library');
     meta('Canvas id', id);
     if (typeof v.location === 'string') meta('Location', v.location);
-    $('close').hidden = false;
-    $('export').hidden = false;
+    // Close and Export act only on this result's own binding.
+    $('close').hidden = !editorBinding;
+    $('export').hidden = !editorBinding;
     if (v.browser_editor !== 'built in') {
       $('result-state').textContent = {
         created: 'Created and saved in your library.',
@@ -1090,7 +1114,7 @@
     else state = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, press Open canvas again.';
     $('canvas-state').textContent = state;
     announce(state, g);
-    if (LIBRARY && editorCanvas && !r.timeout && !r.error) watchLoad(g, editorCanvas);
+    if (LIBRARY && editorCanvas && !r.timeout && !r.error) watchLoad(g, editorCanvas, editorBinding);
   }
   $('canvas').onclick = openLink;
 

@@ -176,6 +176,10 @@ struct Bound {
     /// switch and close does only after the server was retired.
     doc: Option<String>,
     _lease: Option<Arc<crate::library::Lease>>,
+    /// An app-library binding's own identity (`<canvas id>.<n>`, unique in this process), which
+    /// views send back so a stale action or confirmation is refused. Not a credential and not
+    /// a path; it authorizes nothing.
+    binding: Option<String>,
 }
 
 /// The origin of admitted authority: a model call's context, or a direct home-view action's
@@ -893,6 +897,7 @@ impl Launcher {
                 task,
                 editor_opened: false,
                 owner,
+                binding: doc.as_deref().map(app::binding_id),
                 doc,
                 _lease: lease,
             });

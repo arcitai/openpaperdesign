@@ -856,9 +856,14 @@ const LIBRARY_LIST = { storage: 'app-library', complete: true, skipped: [], canv
   { id: ID1, name: 'Landing', pages: 2, modified: 2, open: false },
   { id: ID2, name: 'Notes', pages: 1, modified: 1, open: true },
   { id: '../escape', name: 'Not an id', pages: 1 }] };
+// Each editor result names its binding; the view sends it back with close, export and polls.
+const B1 = `${ID1}.1`;
+const B2 = `${ID2}.2`;
 const LIB_EDITOR = (action, id = ID1, extra = {}) => ({ action, storage: 'app-library', url: URL_OK, browser_editor: 'built in',
-  canvas: { id, name: id === ID1 ? 'Landing' : 'Notes', pages: 1 }, location: `/data/library/v1/canvases/${id}`,
-  editor_loaded: false, browser_saves: 0, ...extra });
+  binding: id === ID1 ? B1 : B2, canvas: { id, name: id === ID1 ? 'Landing' : 'Notes', pages: 1 },
+  location: `/data/library/v1/canvases/${id}`, editor_loaded: false, browser_saves: 0, ...extra });
+const SWITCH_REFUSAL = (shown) => 'The browser editor for the bound project was opened ... then call again with force: true.'
+  + ` (open canvas: ${shown})`;
 
 async function libraryView(list = LIBRARY_LIST) {
   const v = mount({ library: true });
@@ -950,13 +955,15 @@ test('library: close needs the person\'s confirmation once the editor was opened
   await answer(v, LIB_EDITOR('opened'), libAction(v));
   v.els.close.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: {} });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } },
+    'close names the binding this view showed');
   await answer(v, { refused: 'The editor of this canvas was opened. ... then close again with force: true.' }, libAction(v));
   assert.equal(v.els['result-title'].textContent, 'Close the canvas?');
   assert.equal(v.els.force.textContent, 'Close anyway');
   v.els.force.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { force: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1, force: true } },
+    'the confirmation is for the same binding');
   await answer(v, { action: 'closed', canvas: { id: ID1 } }, libAction(v));
   assert.equal(v.els['result-title'].textContent, 'Canvas closed');
   assert.match(v.els['result-state'].textContent, /not saved by closing/);
@@ -971,9 +978,9 @@ test('library: export and import move only bytes, and say plainly what this view
   await answer(v, LIB_EDITOR('opened'), libAction(v));
   v.els.export.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_export', arguments: {} });
-  await answer(v, { action: 'exported', content: 'canvas-only', file_name: 'Landing.opdcanvas.json', bytes: 38,
-    payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_export', arguments: { binding: B1 } });
+  await answer(v, { action: 'exported', binding: B1, canvas: { id: ID1, name: 'Landing' }, content: 'canvas-only',
+    file_name: 'Landing.opdcanvas.json', bytes: 38, payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
   assert.match(v.els.notice.textContent, /can't download files here, so no file was saved/, 'no claimed download');
   v.els['m-import'].onclick();
   assert.match(v.els.notice.textContent, /can't open files here\. Nothing was imported/);
@@ -1002,6 +1009,48 @@ test('library: without a built editor nothing is opened, and the canvas is still
   assert.equal(v.count('ui/open-link'), 0);
   assert.equal(v.els.canvas.hidden, true);
   assert.match(v.els['canvas-state'].textContent, /built without the browser editor/);
+});
+
+test('library: a switch confirmation names exactly the binding the refusal showed', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } }, 'no force at first');
+  await answer(v, { refused: SWITCH_REFUSAL(B2) }, libAction(v));
+  assert.equal(v.els['result-title'].textContent, 'Switch canvases?');
+  assert.equal(v.els.force.hidden, false);
+  v.els.force.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, force: true, replace: B2 } });
+  // The server finds another view changed the open canvas meanwhile: refused, shown as such.
+  await answer(v, { refused: 'The canvas this view shows isn\'t the one open in this OpenPaperDesign window any more: another view changed it. Nothing was done, and the open canvas is unchanged.' }, libAction(v));
+  assert.equal(v.count('ui/open-link'), 0);
+  assert.match(v.els['result-state'].textContent, /another view changed it/);
+  // New canvas the same way.
+  v.els.back.onclick();
+  await flush();
+  v.els['m-new'].onclick();
+  v.els.name.value = 'Pitch';
+  await submitNew(v);
+  await answer(v, { refused: SWITCH_REFUSAL(B1) }, libAction(v));
+  v.els.force.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch', force: true, replace: B1 } });
+  libOnly(v);
+});
+
+test('library: an export answer for another binding is never offered as a download', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.export.onclick();
+  await flush();
+  await answer(v, { action: 'exported', binding: B2, canvas: { id: ID2, name: 'Notes' }, content: 'canvas-only',
+    file_name: 'Notes.opdcanvas.json', bytes: 38, payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
+  assert.match(v.els['result-state'].textContent, /another canvas than the one shown here, so nothing was downloaded/);
+  assert.doesNotMatch(v.els.notice.textContent, /download/);
+  libOnly(v);
 });
 
 test('the workspace view offers no library import', async () => {

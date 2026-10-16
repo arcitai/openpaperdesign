@@ -55,6 +55,11 @@ fn url(v: &Value) -> (u16, String) {
     (port.parse().unwrap(), token.to_string())
 }
 
+/// The binding identity an editor result names (views send it back with their actions).
+fn binding(v: &Value) -> String {
+    v["binding"].as_str().unwrap().to_string()
+}
+
 async fn bound_server(l: &Launcher) -> Arc<Server> {
     l.state.lock().await.bound.as_ref().unwrap().server.clone()
 }
@@ -230,14 +235,18 @@ async fn library_create_edit_save_close_and_reopen_without_metadata() {
     let (page, nodes) = browser_edit(port, &token).await;
     assert_eq!(nodes, 1);
     assert_eq!(raw(port, &token, "POST", "/api/ready", "", "").await.0, 204);
-    let state = value(call(&lib.c, app::EDITOR, json!({})).await);
+    let b = binding(&created);
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b})).await);
     assert_eq!(state["editor_loaded"], true);
     assert_eq!(state["browser_saves"], 1);
     assert_eq!(url(&state), (port, token.clone()), "the same binding");
+    assert_eq!(binding(&state), b);
     let old = bound_server(&lib.l).await;
-    let refusal = call(&lib.c, app::CLOSE, json!({})).await.unwrap_err();
+    let refusal = call(&lib.c, app::CLOSE, json!({"binding": b}))
+        .await
+        .unwrap_err();
     assert!(refusal.contains("force: true"), "{refusal}");
-    let closed = value(call(&lib.c, app::CLOSE, json!({"force": true})).await);
+    let closed = value(call(&lib.c, app::CLOSE, json!({"binding": b, "force": true})).await);
     assert_eq!(closed["action"], "closed");
     assert!(
         closed["note"]
@@ -380,9 +389,14 @@ async fn library_leases_exclude_the_same_canvas_only() {
     assert_eq!(again["action"], "already-open");
     assert_eq!(url(&again), (port1, token1.clone()));
     let server1 = bound_server(&a.l).await;
-    let e = call(&a.c, app::OPEN, json!({"id": id2, "force": true}))
-        .await
-        .unwrap_err();
+    let b1 = binding(&one);
+    let e = call(
+        &a.c,
+        app::OPEN,
+        json!({"id": id2, "force": true, "replace": b1}),
+    )
+    .await
+    .unwrap_err();
     assert!(e.contains("open in another OpenPaperDesign window"), "{e}");
     assert!(
         Arc::ptr_eq(&bound_server(&a.l).await, &server1),
@@ -393,8 +407,21 @@ async fn library_leases_exclude_the_same_canvas_only() {
         200
     );
     // B closes Two; A switches to it, which releases One for B.
-    call(&b, app::CLOSE, json!({"force": true})).await.unwrap();
-    let switched = value(call(&a.c, app::OPEN, json!({"id": id2, "force": true})).await);
+    call(
+        &b,
+        app::CLOSE,
+        json!({"binding": binding(&two), "force": true}),
+    )
+    .await
+    .unwrap();
+    let switched = value(
+        call(
+            &a.c,
+            app::OPEN,
+            json!({"id": id2, "force": true, "replace": b1}),
+        )
+        .await,
+    );
     assert_eq!(switched["action"], "opened");
     let reopened = value(call(&b, app::OPEN, json!({"id": id1})).await);
     assert_eq!(reopened["action"], "opened");
@@ -431,7 +458,13 @@ async fn library_switch_holds_the_lease_until_the_started_writer_drained() {
     let (lb, b, task_b) = launch(&a.root).await;
     let two = value(call(&b, app::CREATE, json!({"name": "Two"})).await);
     let id2 = two["canvas"]["id"].as_str().unwrap().to_string();
-    call(&b, app::CLOSE, json!({"force": true})).await.unwrap();
+    call(
+        &b,
+        app::CLOSE,
+        json!({"binding": binding(&two), "force": true}),
+    )
+    .await
+    .unwrap();
     let one = value(call(&a.c, app::CREATE, json!({"name": "One"})).await);
     let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
     let dir1: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
@@ -449,11 +482,12 @@ async fn library_switch_holds_the_lease_until_the_started_writer_drained() {
     let l = a.l.clone();
     // The switch target, for the cancelled caller; `id2` is checked again below.
     let target = id2.clone();
+    let replace = binding(&one);
     let switch = tokio::spawn(async move {
         l.app(
             l.library.as_ref().unwrap(),
             app::OPEN,
-            json!({"id": target, "force": true}),
+            json!({"id": target, "force": true, "replace": replace}),
         )
         .await
     });
@@ -504,32 +538,26 @@ async fn library_failed_creation_keeps_the_open_canvas_and_removes_its_own_files
             "{want}: {e}"
         );
     };
+    // Each switch confirms replacing exactly the open canvas.
+    let create = |name: &str| json!({"name": name, "force": true, "replace": binding(&one)});
     let _listen = Point::arm(lib.root.as_path(), "listen_fails", false);
     check(
-        call(&lib.c, app::CREATE, json!({"name": "A", "force": true}))
-            .await
-            .unwrap_err(),
+        call(&lib.c, app::CREATE, create("A")).await.unwrap_err(),
         "listen",
     );
     let _sync = Point::arm(&canvases, "sync_dir", false);
     check(
-        call(&lib.c, app::CREATE, json!({"name": "B", "force": true}))
-            .await
-            .unwrap_err(),
+        call(&lib.c, app::CREATE, create("B")).await.unwrap_err(),
         "injected sync failure",
     );
     // Stage page, stage manifest, rename page, rename manifest (fails), then the rollback.
     crate::commit::fault::fail_at(&[3]);
-    let e = call(&lib.c, app::CREATE, json!({"name": "C", "force": true}))
-        .await
-        .unwrap_err();
+    let e = call(&lib.c, app::CREATE, create("C")).await.unwrap_err();
     crate::commit::fault::fail_at(&[]);
     check(e, "nothing was written");
     let _prepare = Point::arm(lib.root.as_path(), "app_prepare_fails", false);
     check(
-        call(&lib.c, app::CREATE, json!({"name": "D", "force": true}))
-            .await
-            .unwrap_err(),
+        call(&lib.c, app::CREATE, create("D")).await.unwrap_err(),
         "injected test failure",
     );
     assert_eq!(entries(), 1, "only the first canvas exists");
@@ -598,9 +626,13 @@ async fn library_replaced_lease_or_root_fences_old_handles() {
         403
     );
     std::fs::remove_file(lib.root.join("second-link")).unwrap();
-    call(&lib.c, app::CLOSE, json!({"force": true}))
-        .await
-        .unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&two), "force": true}),
+    )
+    .await
+    .unwrap();
     // A lease path that is a link is never followed or opened through.
     let target = lib.root.join("target-file");
     std::fs::remove_file(&lock).unwrap();
@@ -649,13 +681,20 @@ async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas()
         tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
     snapshot.reached().await;
     let c = lib.c.clone();
-    let export = tokio::spawn(async move { call(&c, app::EXPORT, json!({})).await });
+    let b1 = binding(&one);
+    let args = json!({"binding": b1});
+    let export = tokio::spawn(async move { call(&c, app::EXPORT, args).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!export.is_finished(), "export waits for the save under way");
     snapshot.resume();
     bounded(running).await.unwrap().unwrap();
     let exported = value(bounded(export).await.unwrap());
     assert_eq!(exported["content"], "canvas-only");
+    assert_eq!(
+        binding(&exported),
+        b1,
+        "the export names the binding it read"
+    );
     assert!(
         exported["file_name"]
             .as_str()
@@ -673,9 +712,13 @@ async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas()
     let source_page = std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap();
     // A bad file creates nothing and keeps the open canvas.
     let bad = file.replacen("\"format\":", "\"format\":\"x\",\"format\":", 1);
-    let e = call(&lib.c, app::IMPORT, json!({"payload": bad, "force": true}))
-        .await
-        .unwrap_err();
+    let e = call(
+        &lib.c,
+        app::IMPORT,
+        json!({"payload": bad, "force": true, "replace": b1}),
+    )
+    .await
+    .unwrap_err();
     assert!(
         e.contains("appears twice") && e.contains("Nothing was imported"),
         "{e}"
@@ -687,7 +730,14 @@ async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas()
             .count(),
         1
     );
-    let imported = value(call(&lib.c, app::IMPORT, json!({"payload": file, "force": true})).await);
+    let imported = value(
+        call(
+            &lib.c,
+            app::IMPORT,
+            json!({"payload": file, "force": true, "replace": b1}),
+        )
+        .await,
+    );
     assert_eq!(imported["action"], "imported");
     let new_id = imported["canvas"]["id"].as_str().unwrap();
     assert_ne!(new_id, id);
@@ -708,4 +758,144 @@ async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas()
         source_page
     );
     bound_server(&lib.l).await.retire().await;
+}
+
+/// A file with a node id the upstream parser would overflow on, or with a self-consistent
+/// group no top level reaches, is an ordinary refusal: nothing is published, and the open
+/// canvas, its URL and the session keep working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_refused_imports_keep_the_open_canvas_and_the_session() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "Keep"})).await);
+    let (port, token) = url(&one);
+    let b1 = binding(&one);
+    let server = bound_server(&lib.l).await;
+    let exported = value(call(&lib.c, app::EXPORT, json!({"binding": b1})).await);
+    let file: Value = serde_json::from_str(exported["payload"].as_str().unwrap()).unwrap();
+    let rect = |id: u64| json!({"id": id, "name": "R", "type": "rect", "rect": {"x": 0, "y": 0, "w": 5, "h": 5}});
+    let mut huge = file.clone();
+    huge["pages"][0]["nodes"] = json!([rect(u64::MAX)]);
+    huge["pages"][0]["root"] = json!([u64::MAX]);
+    let mut cycle = file.clone();
+    let (mut a, mut b) = (rect(900), rect(901));
+    a["parent"] = json!(901);
+    a["children"] = json!([901]);
+    b["parent"] = json!(900);
+    b["children"] = json!([900]);
+    cycle["pages"][0]["nodes"] = json!([a, b]);
+    cycle["pages"][0]["next_id"] = json!(902);
+    for (bad, want) in [
+        (huge, "above the largest allowed id"),
+        (cycle, "aren't reachable"),
+    ] {
+        let args = json!({"payload": bad.to_string(), "force": true, "replace": b1});
+        let e = call(&lib.c, app::IMPORT, args).await.unwrap_err();
+        assert!(
+            e.contains(want) && e.contains("Nothing was imported"),
+            "{want}: {e}"
+        );
+        assert!(Arc::ptr_eq(&bound_server(&lib.l).await, &server));
+        assert_eq!(
+            raw(port, &token, "GET", "/api/project", "", "").await.0,
+            200
+        );
+        let listed = value(call(&lib.c, app::LIST, json!({})).await);
+        assert_eq!(listed["canvases"].as_array().unwrap().len(), 1);
+    }
+    let again = value(call(&lib.c, app::EDITOR, json!({"binding": b1})).await);
+    assert_eq!(
+        url(&again),
+        (port, token.clone()),
+        "the session still works"
+    );
+    server.retire().await;
+}
+
+/// Two views of one process share its one binding. After the other view switches, the first
+/// view's close, export, readiness poll and switch confirmation all name a binding that is no
+/// longer open: each is refused, and the current canvas, its URL, files and lease stay. A
+/// switch refusal names the current binding, so a confirmation is bound to exactly that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_stale_views_never_act_on_another_canvas() {
+    let lib = library().await;
+    let (view2, task2) = connect_launcher(lib.l.clone(), Default::default()).await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let b1 = binding(&one);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    // View 2 is asked to confirm replacing exactly One's binding, and does.
+    let e = call(&view2, app::CREATE, json!({"name": "Two"}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("force: true") && e.contains(&format!("(open canvas: {b1})")),
+        "{e}"
+    );
+    let two = value(
+        call(
+            &view2,
+            app::CREATE,
+            json!({"name": "Two", "force": true, "replace": b1}),
+        )
+        .await,
+    );
+    let b2 = binding(&two);
+    assert_ne!(b1, b2);
+    let (port2, token2) = url(&two);
+    let server2 = bound_server(&lib.l).await;
+    let dir2: PathBuf = serde_json::from_value(two["location"].clone()).unwrap();
+    let files = || std::fs::read(dir2.join("project.json")).unwrap();
+    let before = files();
+    // View 1 still shows One.
+    for (tool, args) in [
+        (app::CLOSE, json!({"binding": b1, "force": true})),
+        (app::EXPORT, json!({"binding": b1})),
+        (app::EDITOR, json!({"binding": b1})),
+        (app::OPEN, json!({"id": id1, "force": true, "replace": b1})),
+        (
+            app::CREATE,
+            json!({"name": "Three", "force": true, "replace": b1}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(e.contains("another view changed it"), "{tool}: {e}");
+        assert!(Arc::ptr_eq(&bound_server(&lib.l).await, &server2), "{tool}");
+        assert_eq!(
+            raw(port2, &token2, "GET", "/api/project", "", "").await.0,
+            200,
+            "{tool}"
+        );
+    }
+    assert_eq!(files(), before, "Two's files are untouched");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(
+        listed["canvases"].as_array().unwrap().len(),
+        2,
+        "nothing created"
+    );
+    // A switch without the confirmation, or confirming nothing open, is refused too.
+    let e = call(&lib.c, app::OPEN, json!({"id": id1, "force": true}))
+        .await
+        .unwrap_err();
+    assert!(e.contains(&format!("(open canvas: {b2})")), "{e}");
+    let e = call(&lib.c, app::CLOSE, json!({"binding": "0123456789abcdef"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("isn't a binding"), "{e}");
+    // Without a binding, "Open current canvas" shows what is open now: Two, with its binding.
+    let current = value(call(&lib.c, app::EDITOR, json!({})).await);
+    assert_eq!(binding(&current), b2);
+    // View 2 closes Two; its old confirmation can't then open anything.
+    call(&view2, app::CLOSE, json!({"binding": b2, "force": true}))
+        .await
+        .unwrap();
+    let e = call(
+        &view2,
+        app::OPEN,
+        json!({"id": id1, "force": true, "replace": b2}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("another view changed it"), "{e}");
+    assert_eq!(open_doc(&lib.l).await, None);
+    task2.abort();
 }

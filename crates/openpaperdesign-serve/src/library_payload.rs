@@ -18,7 +18,10 @@
 //! bounds, duplicate JSON keys anywhere, unknown fields, other formats or versions, unsafe or
 //! colliding page ids (case, first six characters), an empty page list, an active page that
 //! isn't listed, page records that don't match the manifest one for one (a missing page is
-//! never imported as a blank one), duplicate node ids, an invalid node graph, and images that
+//! never imported as a blank one), duplicate node ids, node ids above 2^53 - 1 (or a `next_id`
+//! above 2^53), checked before upstream parsing, a node graph that isn't one rooted forest
+//! (every node reached once from the top level, parents matching, at most 256 levels; no
+//! disconnected group or cycle), and images that
 //! are missing, unused, duplicated, not standard base64, of another type than declared or not
 //! matching their content hash. Images come only from the file itself (on import) or from the
 //! canvas's own `assets/` folder (on export), never from the process-wide image registry.
@@ -171,8 +174,25 @@ fn check_manifest(m: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-/// Node ids of one page file are distinct, and the node counts stay in bounds.
+/// The largest node id a canvas may use: 2^53 - 1, the largest integer every JSON reader
+/// represents exactly. A page's `next_id` may be at most one more. This keeps the upstream
+/// parser's `max id + 1` and later id allocation far from overflow, so a bad id is an
+/// ordinary refusal before any upstream code sees it.
+pub(crate) const MAX_NODE_ID: u64 = (1 << 53) - 1;
+/// How deeply nodes may nest (upstream walks the tree recursively).
+pub(crate) const MAX_TREE_DEPTH: usize = 256;
+
+/// Node ids of one page file are distinct and in range, its `next_id` is in range, and the node
+/// counts stay in bounds. Runs on the raw record, before upstream parsing.
 fn count_nodes(raw: &Value, page: &str, total: &mut usize) -> Result<(), String> {
+    if let Some(next) = raw.get("next_id")
+        && next.as_u64().is_none_or(|n| n > MAX_NODE_ID + 1)
+    {
+        return Err(format!(
+            "page {page}'s next_id isn't a whole number from 0 to {}",
+            MAX_NODE_ID + 1
+        ));
+    }
     let nodes = raw
         .get("nodes")
         .and_then(Value::as_array)
@@ -192,9 +212,60 @@ fn count_nodes(raw: &Value, page: &str, total: &mut usize) -> Result<(), String>
             .get("id")
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("page {page} has a node without a numeric id"))?;
+        if id > MAX_NODE_ID {
+            return Err(format!(
+                "page {page} has node id {id}, above the largest allowed id {MAX_NODE_ID}"
+            ));
+        }
         if !seen.insert(id) {
             return Err(format!("page {page} has node id {id} twice"));
         }
+    }
+    Ok(())
+}
+
+/// The page's nodes form one rooted forest: walking from the page's top-level list (without
+/// recursion), every node is reached exactly once, each through a node that lists it as a
+/// child and that it names as its parent, no deeper than [`MAX_TREE_DEPTH`]. Upstream
+/// `Document::validate` only counts child references, so a self-consistent group that no top
+/// level reaches (a disconnected cycle) would pass it. Nothing is repaired: a page that isn't
+/// such a forest is refused.
+fn check_tree(page: &PageData) -> Result<(), String> {
+    let doc = &page.doc;
+    let mut seen = HashSet::with_capacity(doc.nodes.len());
+    let mut stack: Vec<_> = doc.root.iter().rev().map(|id| (*id, None, 1)).collect();
+    while let Some((id, parent, depth)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            return Err(format!(
+                "page {}: nodes nest deeper than {MAX_TREE_DEPTH} levels",
+                page.id
+            ));
+        }
+        let n = doc
+            .nodes
+            .get(&id)
+            .ok_or_else(|| format!("page {}: node {} is listed but missing", page.id, id.0))?;
+        if n.parent != parent {
+            return Err(format!(
+                "page {}: node {} doesn't name the node that lists it as its parent",
+                page.id, id.0
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!(
+                "page {}: node {} is listed more than once",
+                page.id, id.0
+            ));
+        }
+        stack.extend(n.children.iter().rev().map(|c| (*c, Some(id), depth + 1)));
+    }
+    if seen.len() != doc.nodes.len() {
+        return Err(format!(
+            "page {}: {} nodes aren't reachable from the page's top level (a disconnected group \
+             or cycle)",
+            page.id,
+            doc.nodes.len() - seen.len()
+        ));
     }
     Ok(())
 }
@@ -225,6 +296,7 @@ fn page_record(i: usize, v: &Value, want: &PageRef, total: &mut usize) -> Result
     page.id = want.id.clone();
     page.name = want.name.clone();
     page.doc.name = want.name.clone();
+    check_tree(&page)?;
     Ok(page)
 }
 
@@ -741,6 +813,72 @@ mod tests {
         let mut x = v.clone();
         x["assets"][0]["id"] = json!("0000000000000000");
         refused(&x, "don't match its id");
+    }
+
+    #[test]
+    fn out_of_range_ids_and_unrooted_graphs_are_refused_before_use() {
+        let (_t, _dir, v) = exported();
+        // Ids the upstream parser would add one to: refused before it runs, not a panic.
+        for id in [u64::MAX, MAX_NODE_ID + 1] {
+            let mut x = v.clone();
+            x["pages"][0]["nodes"][0]["id"] = json!(id);
+            x["pages"][0]["root"] = json!([id]);
+            refused(&x, "above the largest allowed id");
+        }
+        let mut x = v.clone();
+        x["pages"][0]["next_id"] = json!(u64::MAX);
+        refused(&x, "next_id");
+        // The largest allowed id and next_id are fine.
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["id"] = json!(MAX_NODE_ID);
+        x["pages"][0]["root"] = json!([MAX_NODE_ID]);
+        x["pages"][0]["next_id"] = json!(MAX_NODE_ID + 1);
+        validate(&x.to_string()).unwrap();
+        // A pair that names each other as parent and child, reached from no top level.
+        let mut x = v.clone();
+        let node = x["pages"][0]["nodes"][0].clone();
+        let (mut a, mut b) = (node.clone(), node);
+        a["id"] = json!(900);
+        a["parent"] = json!(901);
+        a["children"] = json!([901]);
+        b["id"] = json!(901);
+        b["parent"] = json!(900);
+        b["children"] = json!([900]);
+        x["pages"][0]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .extend([a, b]);
+        x["pages"][0]["next_id"] = json!(902);
+        let page = page_from_json(&x["pages"][0].to_string()).unwrap();
+        assert!(
+            page.doc.validate().is_ok(),
+            "upstream's own check counts child references only"
+        );
+        refused(&x, "aren't reachable");
+        // Nesting: exactly the bound is fine, one more level is refused.
+        let chain = |len: u64| {
+            let mut x = v.clone();
+            let node = x["pages"][0]["nodes"][0].clone();
+            let nodes: Vec<Value> = (0..len)
+                .map(|i| {
+                    let mut n = node.clone();
+                    n["id"] = json!(1000 + i);
+                    if i > 0 {
+                        n["parent"] = json!(1000 + i - 1);
+                    }
+                    if i + 1 < len {
+                        n["children"] = json!([1000 + i + 1]);
+                    }
+                    n
+                })
+                .collect();
+            x["pages"][0]["nodes"] = json!(nodes);
+            x["pages"][0]["root"] = json!([1000]);
+            x["pages"][0]["next_id"] = json!(1000 + len);
+            x
+        };
+        validate(&chain(MAX_TREE_DEPTH as u64).to_string()).unwrap();
+        refused(&chain(MAX_TREE_DEPTH as u64 + 1), "nest deeper");
     }
 
     #[test]

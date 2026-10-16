@@ -9,13 +9,21 @@
 //! design tools) is refused without being admitted and without touching any state, so a call
 //! without workspace context can neither use nor retire anything here. No Workspace is ever
 //! made for the library, and no argument names a path: only a server-made canvas id, a bounded
-//! name, a `force` flag or a canvas file's bytes reach the library.
+//! name, a `force` flag, a server-made binding identity or a canvas file's bytes reach it.
 //!
 //! One canvas is bound per process, through the same prepare/install/retire handoff as project
 //! mode; its lease moves with the binding and is released only after the old server drained.
 //! Creation and import run in an owned task, so a caller that goes away can't strand a
 //! half-made canvas, its cleanup or the handoff. A lost reply doesn't mean nothing happened:
 //! the canvas then shows up in the list. Nothing is retried automatically.
+//!
+//! Several views (the sidebar, chat tabs) can share this process's one binding. Each binding
+//! has its own identity (`binding`, `<canvas id>.<n>`), returned with every editor result.
+//! Close, export and the readiness poll name the binding they were shown for, and a confirmed
+//! switch (`force`) names the binding it confirmed replacing (`replace`); each is compared
+//! under the launcher's state lock before anything happens, and a stale one is refused with
+//! the current canvas, its files, URL and lease untouched. This only catches stale views: it
+//! is not a credential, a path or any authority.
 
 use super::*;
 use crate::library::payload::MAX_PAYLOAD_BYTES;
@@ -45,6 +53,58 @@ const CLOSE_NEEDS_FORCE: &str = "The editor of this canvas was opened. Closing s
     its browser tab saves to, so an edit there that isn't saved yet (the page shows an unsaved \
     change or \"Saving…\") would be lost. Let it show \"Saved\", or accept losing it, then close \
     again with force: true.";
+const STALE: &str = "The canvas this view shows isn't the one open in this OpenPaperDesign \
+    window any more: another view changed it. Nothing was done, and the open canvas is \
+    unchanged. Go back to your canvases to see what is open.";
+
+/// A new binding's identity: its canvas id and a number unique in this process.
+pub(super) fn binding_id(doc: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{doc}.{n}")
+}
+
+/// The shape of [`binding_id`]: a canvas id, a dot and 1 to 20 digits.
+fn valid_binding(s: &str) -> bool {
+    s.split_once('.').is_some_and(|(id, n)| {
+        valid_id(id) && !n.is_empty() && n.len() <= 20 && n.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// The current library binding's identity, if a canvas is open.
+fn current_binding(state: &LauncherState) -> Option<&str> {
+    state.bound.as_ref().and_then(|b| b.binding.as_deref())
+}
+
+/// A switch away from the open canvas (create, import or open of another one). Once its editor
+/// link was given, it needs `force` together with `replace`, the binding the person confirmed
+/// losing; the refusal names the current binding so a view can confirm exactly that one. A
+/// `replace` that isn't the current binding is stale and refused.
+fn library_switch(state: &LauncherState, force: bool, replace: Option<&str>) -> Result<(), String> {
+    let current = current_binding(state);
+    if let Some(r) = replace
+        && current != Some(r)
+    {
+        return Err(STALE.into());
+    }
+    match state.bound.as_ref() {
+        Some(b) if b.editor_opened && (!force || replace.is_none()) => Err(format!(
+            "{SWITCH_NEEDS_FORCE} (open canvas: {})",
+            current.unwrap_or("none")
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An action on the canvas a view shows (`binding`): there must be an open library canvas, and
+/// it must be exactly that binding.
+fn expect_binding(state: &LauncherState, binding: Option<&str>) -> Result<(), String> {
+    match current_binding(state) {
+        None => Err(NO_CANVAS.into()),
+        Some(c) if binding == Some(c) => Ok(()),
+        Some(_) => Err(STALE.into()),
+    }
+}
 
 pub(super) const INSTRUCTIONS: &str = "openpaperdesign (app library): the OpenPaperDesign home \
     in the Codex sidebar creates, opens, closes and reopens canvases that OpenPaperDesign keeps \
@@ -97,8 +157,13 @@ fn tools() -> Vec<Value> {
     let app = json!({"ui": {"visibility": ["app"]}});
     let none = json!({"type": "object", "properties": {}, "additionalProperties": false});
     let force = json!({"type": "boolean", "description": "Go ahead even though the open \
-        canvas's browser tab may still have unsaved edits; they are lost."});
+        canvas's browser tab may still have unsaved edits; they are lost. A switch also needs \
+        `replace`."});
     let id = json!({"type": "string", "pattern": "^[0-9a-f]{16}$", "description": "A canvas id from the library list."});
+    let binding = json!({"type": "string", "pattern": "^[0-9a-f]{16}\\.[0-9]{1,20}$",
+        "description": "The binding this view was shown (from an editor result). A stale one is refused."});
+    let replace = json!({"type": "string", "pattern": "^[0-9a-f]{16}\\.[0-9]{1,20}$",
+        "description": "With force: the binding the person confirmed replacing. A stale one is refused."});
     vec![
         json!({"name": LIST, "_meta": app, "inputSchema": none,
             "description": "For the home view: the canvases in OpenPaperDesign's app library \
@@ -108,31 +173,37 @@ fn tools() -> Vec<Value> {
                 and open it in the editor. No design system or direction is applied.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS},
-                "force": force
+                "force": force,
+                "replace": replace
             }, "required": ["name"], "additionalProperties": false}}),
         json!({"name": OPEN, "_meta": app,
             "description": "For the home view: open a library canvas in the editor.",
-            "inputSchema": {"type": "object", "properties": {"id": id, "force": force},
+            "inputSchema": {"type": "object", "properties": {"id": id, "force": force, "replace": replace},
                 "required": ["id"], "additionalProperties": false}}),
-        json!({"name": EDITOR, "_meta": app, "inputSchema": none,
+        json!({"name": EDITOR, "_meta": app,
             "description": "For the home view: the editor link and state of the canvas open \
-                in this window."}),
-        json!({"name": CLOSE, "_meta": app,
-            "description": "For the home view: close the open canvas (its editor server \
-                stops). Saved edits stay in the library; closing saves nothing.",
-            "inputSchema": {"type": "object", "properties": {"force": force},
+                in this window; with `binding`, only if that is still the one open.",
+            "inputSchema": {"type": "object", "properties": {"binding": binding},
                 "additionalProperties": false}}),
+        json!({"name": CLOSE, "_meta": app,
+            "description": "For the home view: close the canvas this view shows (its editor \
+                server stops). Saved edits stay in the library; closing saves nothing.",
+            "inputSchema": {"type": "object", "properties": {"binding": binding, "force": force},
+                "required": ["binding"], "additionalProperties": false}}),
         json!({"name": IMPORT, "_meta": app,
             "description": "For the home view: import an OpenPaperDesign canvas file (its \
                 text, chosen by the person) as a new library canvas, and open it. The file is \
                 checked completely first; nothing existing is overwritten or merged.",
             "inputSchema": {"type": "object", "properties": {
                 "payload": {"type": "string", "maxLength": MAX_PAYLOAD_BYTES},
-                "force": force
+                "force": force,
+                "replace": replace
             }, "required": ["payload"], "additionalProperties": false}}),
-        json!({"name": EXPORT, "_meta": app, "inputSchema": none,
-            "description": "For the home view: the open canvas as last saved, as a canvas \
-                file (canvas only: no design direction or tokens)."}),
+        json!({"name": EXPORT, "_meta": app,
+            "description": "For the home view: the canvas this view shows, as last saved, as \
+                a canvas file (canvas only: no design direction or tokens).",
+            "inputSchema": {"type": "object", "properties": {"binding": binding},
+                "required": ["binding"], "additionalProperties": false}}),
     ]
 }
 
@@ -208,15 +279,24 @@ impl Launcher {
 
     pub(super) async fn app(&self, lib: &Arc<Library>, name: &str, args: Value) -> ToolResult {
         let (strings, flags): (&[&str], &[&str]) = match name {
-            CREATE => (&["name"], &["force"]),
-            OPEN => (&["id"], &["force"]),
-            CLOSE => (&[], &["force"]),
-            IMPORT => (&["payload"], &["force"]),
+            CREATE => (&["name", "replace"], &["force"]),
+            OPEN => (&["id", "replace"], &["force"]),
+            EDITOR | EXPORT => (&["binding"], &[]),
+            CLOSE => (&["binding"], &["force"]),
+            IMPORT => (&["payload", "replace"], &["force"]),
             _ => (&[], &[]),
         };
         let map = direct::strict(&args, strings, flags)?;
         let get = |k: &str| map.get(k).and_then(Value::as_str);
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+        for k in ["binding", "replace"] {
+            if get(k).is_some_and(|b| !valid_binding(b)) {
+                return Err(format!(
+                    "`{k}` isn't a binding from an editor result; nothing was read or changed"
+                ));
+            }
+        }
+        let (binding, replace) = (get("binding"), get("replace"));
         match name {
             LIST => {
                 let state = self.state.lock().await;
@@ -226,29 +306,33 @@ impl Launcher {
             }
             CREATE => {
                 let name = canvas_name(get("name"))?;
-                self.app_create(lib, NewDocument::blank(&name), force, "created")
+                self.app_create(lib, NewDocument::blank(&name), force, replace, "created")
                     .await
             }
             OPEN => {
                 let id = get("id")
                     .filter(|s| valid_id(s))
                     .ok_or("A canvas id from the library list is required. Nothing was opened.")?;
-                self.app_open(lib, id, force).await
+                self.app_open(lib, id, force, replace).await
             }
             EDITOR => {
                 let state = self.state.clone().lock_owned().await;
                 let mut state = Self::fence_library(state).await?;
+                // Without `binding`: whichever canvas is open (the menu's "Open current canvas").
+                if binding.is_some() {
+                    expect_binding(&state, binding)?;
+                }
                 text(Self::library_editor(&mut state, lib, "reopened")?)
             }
-            CLOSE => self.app_close(force).await,
+            CLOSE => self.app_close(binding, force).await,
             IMPORT => {
                 let file =
                     get("payload").ok_or("A canvas file is required. Nothing was imported.")?;
                 // Checked completely before anything is locked or written.
                 let doc = payload::validate(file)?;
-                self.app_create(lib, doc, force, "imported").await
+                self.app_create(lib, doc, force, replace, "imported").await
             }
-            EXPORT => self.app_export().await,
+            EXPORT => self.app_export(binding).await,
             _ => Err(format!("unknown tool {name}")),
         }
     }
@@ -304,6 +388,7 @@ impl Launcher {
                 "pages": manifest.pages.len(),
                 "modified": manifest.modified,
             },
+            "binding": b.binding,
             "location": b.server.dir(),
             "library": lib.root(),
             "editor_loaded": loaded,
@@ -323,11 +408,12 @@ impl Launcher {
         lib: &Arc<Library>,
         doc: NewDocument,
         force: bool,
+        replace: Option<&str>,
         action: &'static str,
     ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
         let state = Self::fence_library(state).await?;
-        Self::may_switch(&state.bound, None, force)?;
+        library_switch(&state, force, replace)?;
         let lib2 = lib.clone();
         let id = tokio::spawn(async move {
             let lib = lib2;
@@ -365,16 +451,26 @@ impl Launcher {
 
     /// Open a library canvas. Opening the canvas that is already open here is a checked no-op;
     /// a busy, invalid or failing target leaves the open canvas, its URL and lease as they were.
-    async fn app_open(&self, lib: &Arc<Library>, id: &str, force: bool) -> ToolResult {
+    async fn app_open(
+        &self,
+        lib: &Arc<Library>,
+        id: &str,
+        force: bool,
+        replace: Option<&str>,
+    ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
         let mut state = Self::fence_library(state).await?;
+        if replace.is_some_and(|r| current_binding(&state) != Some(r)) {
+            // A confirmation shown for another binding never acts on this one.
+            return Err(STALE.into());
+        }
         if state.bound.as_ref().and_then(|b| b.doc.as_deref()) == Some(id) {
             return text(Self::library_editor(&mut state, lib, "already-open")?);
         }
         // Checked before a lease file is made for it: only an existing library canvas.
         lib.read_document(id)
             .map_err(|e| format!("This canvas can't be opened: {e}. Nothing was changed."))?;
-        Self::may_switch(&state.bound, None, force)?;
+        library_switch(&state, force, replace)?;
         let listening = Self::listen(lib.root())
             .await
             .map_err(|e| format!("{e}. Nothing was opened; the open canvas is unchanged."))?;
@@ -426,11 +522,13 @@ impl Launcher {
         })
     }
 
-    /// Close the open canvas: admission closes, started writers and rollback drain, then the
-    /// binding and its lease go. Owned, so a caller leaving can't stop it halfway. Closing
-    /// saves nothing that is only in a browser tab.
-    async fn app_close(&self, force: bool) -> ToolResult {
+    /// Close the canvas the view shows (`binding`, checked under the state lock): admission
+    /// closes, started writers and rollback drain, then the binding and its lease go. Owned, so
+    /// a caller leaving can't stop it halfway. Closing saves nothing that is only in a browser
+    /// tab. Its `force` confirmation is bound to the same `binding`.
+    async fn app_close(&self, binding: Option<&str>, force: bool) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
+        expect_binding(&state, binding)?;
         let Some(b) = state.bound.as_ref() else {
             return Err(NO_CANVAS.into());
         };
@@ -459,16 +557,23 @@ impl Launcher {
 
     /// The open canvas as last saved, as a canvas file. The snapshot is taken under its lease
     /// and writer fence (it waits for a save under way); the fence is released before the text
-    /// is returned. Only an open canvas can be exported.
-    async fn app_export(&self) -> ToolResult {
-        let (server, doc) = {
+    /// is returned. Only the open canvas the view shows (`binding`) can be exported; a binding
+    /// replaced meanwhile is retired, so its snapshot is refused rather than read from the
+    /// replacement.
+    async fn app_export(&self, binding: Option<&str>) -> ToolResult {
+        let (server, doc, current) = {
             let state = self.state.lock().await;
             let b = state
                 .bound
                 .as_ref()
                 .filter(|b| b.doc.is_some())
                 .ok_or("Open the canvas to export first. Nothing was exported.")?;
-            (b.server.clone(), b.doc.clone().unwrap_or_default())
+            expect_binding(&state, binding)?;
+            (
+                b.server.clone(),
+                b.doc.clone().unwrap_or_default(),
+                b.binding.clone(),
+            )
         };
         let e = server
             .saved_snapshot()
@@ -489,6 +594,7 @@ impl Launcher {
         let stem = stem.trim_matches('-');
         text(json!({
             "action": "exported",
+            "binding": current,
             "canvas": {"id": doc, "name": e.name},
             "content": payload::CANVAS_ONLY,
             "file_name": format!("{}.opdcanvas.json", if stem.is_empty() { "canvas" } else { stem }),

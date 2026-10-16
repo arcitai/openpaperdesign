@@ -78,7 +78,11 @@ installed check.
   nesting levels. Refused: duplicate JSON keys anywhere, unknown fields, other formats or
   versions, companions, unsafe or colliding page ids (case, first six characters), no pages, an
   active page that isn't listed, missing or misordered page records (never a blank stand-in),
-  duplicate node ids, an invalid node graph, and missing, unused, duplicate, non-standard or
+  duplicate node ids, node ids above 2^53 - 1 or a `next_id` above 2^53 (checked before the
+  upstream parser, which adds one to the largest id), a node graph that isn't one rooted forest
+  (walked iteratively from the top level: every node once, parents matching, at most 256
+  levels; upstream's own check would accept a disconnected self-consistent cycle), and missing,
+  unused, duplicate, non-standard or
   mismatched images. Images come only from the file, or on export from the canvas's own
   `assets/`, never from the process-wide image registry. Import publishes a new canvas with a
   fresh manifest id and opens it; nothing is overwritten or merged. Export needs the canvas
@@ -93,6 +97,14 @@ installed check.
   link was given, and never claims it saved browser memory. Import reads the chosen file's text
   only. Export asks the view to download the text, or says it can't; Codex never confirms a
   saved file. Stale-result, expected-identity and exact-URL guards are as before.
+- **Shared views.** Several views (sidebar, chat tabs) share the process's one binding. Each
+  binding has an identity, `binding` (`<canvas id>.<n>`, unique in the process), in every
+  editor result. `_app_close` and `_app_export` require it, `_app_editor` takes it for the
+  readiness poll, and a confirmed switch (`force`) on create, open or import sends `replace`,
+  the binding its refusal named (`(open canvas: …)`). Each is compared under the state lock
+  before any effect; a stale one is refused, and the current canvas, files, URL and lease stay.
+  The view downloads an export only if the answer names the binding and canvas it showed. The
+  identity is a stale-view check, not a credential or authority.
 - **Readiness.** The editor page posts `/api/ready` (token-checked, no content) when its
   renderer is Ready. The view reports "loaded" only from that, polled through `_app_editor`
   after the open-link acknowledgement; the acknowledgement itself is never a load. Committed
