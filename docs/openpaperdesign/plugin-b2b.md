@@ -11,6 +11,96 @@ cloud, no telemetry. Not affiliated with Paper (paper.design).
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
 surface), plugin publishing, other hosts. The later sidebar home is described in the next section.
 
+## App library (issue #6): source candidate, 2026-10-16
+
+Not built, tested, installed or qualified by its writer. The owner admitted (2026-10-16) an
+app-owned document store so that the sidebar's New, open, edit, save, close and reopen work
+without any model turn or message. The packaged `mcp.json` now starts
+`openpaperdesign-mcp --app-library ${PLUGIN_DATA}`. Codex 0.162.1's Agent Plugin MCP loader
+expands that literal placeholder to the plugin's data folder, keyed by Codex home, marketplace
+and plugin (not version), and creates it. Some loader helper paths pass no data root or fall
+back to `<plugin root>/.plugin-data`; that fallback, the package itself and the package cache
+are refused as not durable. Whether the installed Mac host uses the normal route is a later
+installed check.
+
+- **Modes.** `--app-library <dir>`, `--codex-context` and `--workspace <dir>` are mutually
+  exclusive. The workspace modes and every guard and fence below are unchanged; they are now
+  started separately (the package no longer starts `--codex-context`).
+- **Root.** An existing real folder, given as a plain absolute path. Refused: an unexpanded
+  `${…}`, relative or dotted paths, `/`, `$HOME`, links, anything inside `$PLUGIN_ROOT`, a
+  `.plugin-data` folder or a `plugins/cache` path. It is pinned by (device, inode) and
+  canonical path. No `Workspace` is made for it, and workspace protected-path rules are
+  untouched. `doctor` reports `library_usable` and creates nothing.
+- **Layout.** `<root>/library/v1/canvases/<id>/` holds one standard paper-rs project per canvas
+  (the only live copy). `<root>/library/v1/locks/<id>.lock` is its permanent lease file. Ids are
+  16 hex digits made by the server; names are data. Existing projects are never migrated or
+  copied.
+- **Tools.** In a library process only `openpaperdesign_home` (and its resource),
+  `openpaperdesign_status` (`mode: app-library`), `openpaperdesign_projects` (discovery only) and
+  the app-only `openpaperdesign_app_canvases`, `_app_create {name}`, `_app_open {id}`,
+  `_app_editor`, `_app_close {force}`, `_app_import {payload}` and `_app_export` are answered.
+  Arguments are checked by key and type, ids by format, names by length and characters.
+  Project routes, the folder picker, the `_ui_*` workspace actions and the upstream design tools
+  are refused without admission, retirement or any state change. A workspace process refuses
+  the `_app_*` names in the same way. Library stdio page tools are deferred: canvases are edited
+  in the browser editor (its loopback `/mcp` endpoint stays as before).
+- **Listing.** Read-only and bounded: at most 1000 entries scanned and 200 returned, manifests
+  at most 1 MiB, at least one page, and the active page among them. Others are reported as
+  skipped. Nothing is created, opened or locked.
+- **Lease.** Before anything opens or writes a canvas (including upstream `Project::open`,
+  whose stale-temp cleanup deletes every matching temporary file), the process takes a
+  nonblocking exclusive `File::try_lock` on the canvas's lease file. That file must be a
+  regular, single-link file; after locking, its handle and path must be the same file. A
+  canvas held elsewhere is reported busy, and the current canvas, URL and lease stay. Opening
+  the canvas already open is a checked no-op. The lease moves into the binding; a switch or
+  close retires the old server (admission closed, started writers and rollback drained)
+  before its lease is dropped. Process exit releases it. Lock files are never removed,
+  truncated, replaced or exported. The lock is advisory: it coordinates OpenPaperDesign
+  processes only.
+- **Identity checks on access.** A guard re-checks the library folders and the lease (handle,
+  path, link count) before every browser API request, every MCP call on the canvas's loopback
+  server, `open_editor`-style identity reads and export. The first failure fences that canvas
+  for good; the next library action retires it. A replaced root, library folder or lease
+  file, or a second link to it, gets 403 from then on, also after the original comes back.
+- **Create and import.** The listener is acquired first. Then a fresh id and its lease, then the
+  folders, each parent synced with errors reported (unlike upstream `atomic::write`), then the
+  files through the checked commit (staged, renamed, directories synced, rolled back on error).
+  The bounds are checked before the server is prepared, and preparation finishes before the
+  open canvas is retired. The work runs in an owned task, so a caller that goes away can't
+  strand it. On a failure only what the call made and is still exactly its own is removed, and
+  the parents of removals are synced; anything left, or a removal that may not be durable, is
+  named. Nothing is retried automatically. A lost reply after a completed create is recovered
+  from the list, and the view says so instead of retrying.
+- **Canvas file** (`library_payload.rs`). JSON with `format: "openpaperdesign-canvas"`,
+  `version: 1` and `content: "canvas-only"`: the manifest, one page record per manifest page in
+  order, and exactly the images the pages use (base64, content-hash ids). Bounds: 32 MiB of
+  text, 200 pages, 100 000 nodes per page and 200 000 in all, 256 images of at most 16 MiB, 64
+  nesting levels. Refused: duplicate JSON keys anywhere, unknown fields, other formats or
+  versions, companions, unsafe or colliding page ids (case, first six characters), no pages, an
+  active page that isn't listed, missing or misordered page records (never a blank stand-in),
+  duplicate node ids, an invalid node graph, and missing, unused, duplicate, non-standard or
+  mismatched images. Images come only from the file, or on export from the canvas's own
+  `assets/`, never from the process-wide image registry. Import publishes a new canvas with a
+  fresh manifest id and opens it; nothing is overwritten or merged. Export needs the canvas
+  open. It reads one saved snapshot under the lease and the writer fence (waiting for a save
+  under way), bounds and re-validates it, and releases the fence before answering. It holds the
+  canvas as last saved, not edits only in a browser tab. Version 1 has no `DESIGN.md`, token or
+  other companions, and says so. Project-bound export (`design/<name>/`) is not offered.
+- **View.** In a library process the home's mode slot is `library`: it lists the library's
+  canvases (no "This chat's project" row, no folder picker), creates with a name only, opens a
+  row directly, and asks Codex to open the exact loopback editor link. It shows the canvas id
+  and location under Details, and offers Close and Export. Close asks first once the editor
+  link was given, and never claims it saved browser memory. Import reads the chosen file's text
+  only. Export asks the view to download the text, or says it can't; Codex never confirms a
+  saved file. Stale-result, expected-identity and exact-URL guards are as before.
+- **Readiness.** The editor page posts `/api/ready` (token-checked, no content) when its
+  renderer is Ready. The view reports "loaded" only from that, polled through `_app_editor`
+  after the open-link acknowledgement; the acknowledgement itself is never a load. Committed
+  browser saves are counted the same way.
+- **Unchanged limits.** Commits are not crash-atomic, the broken-state fence is in memory, other
+  writers are not excluded, and actual navigation from the native sidebar is unproven (the
+  inherited Mac observation is an acknowledgement with no loopback hit).
+
 ## Sidebar home (issue #6): source candidate, 2026-10-13
 
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)

@@ -24,6 +24,11 @@
 //! there that isn't saved yet could no longer be saved: the switch then needs `force: true`,
 //! and the refusal says why. Edits made through the tools are saved by each call. When this
 //! process exits, the same applies to an open tab, without a prompt.
+//!
+//! `openpaperdesign-mcp --app-library <dir>` (what the packaged plugin starts, with Codex's
+//! `${PLUGIN_DATA}`) is a separate mode: the home view's direct actions work on canvases the app
+//! owns in that folder (see `crate::library` and `launcher_app.rs`), with no workspace and no
+//! project tool. It can't be combined with `--codex-context` or `--workspace`.
 
 use crate::agent::offered_tools;
 use crate::{Server, bundle_file_names, new_token, router};
@@ -50,8 +55,11 @@ mod inventory;
 #[path = "launcher_scope.rs"]
 mod scope;
 use scope::{CAPABILITY, Workspace};
+#[path = "launcher_app.rs"]
+mod app;
 #[path = "launcher_direct.rs"]
 mod direct;
+use crate::library::Library;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -80,11 +88,30 @@ const HOME_HTML: &str = include_str!("home.html");
 /// `onlinesourdough` wordmark. Served inside the view as a data URI: no font URL or service.
 const WORDMARK_FONT: &[u8] = include_bytes!("../assets/geist-pixel-square.woff2");
 const WORDMARK_FONT_SLOT: &str = "__OPD_WORDMARK_FONT__";
+/// The view's one mode slot: `library` in an app-library process, `workspace` otherwise. It is
+/// fixed per process and carries no path, id or state.
+const MODE_SLOT: &str = "__OPD_MODE__";
 
 /// The home view as served: `home.html` with the wordmark font in its one slot.
+#[allow(dead_code)]
 fn home_html() -> &'static str {
-    static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HTML.get_or_init(|| HOME_HTML.replacen(WORDMARK_FONT_SLOT, &base64(WORDMARK_FONT), 1))
+    home_html_for(false)
+}
+
+/// The home view for a workspace or an app-library process.
+fn home_html_for(library: bool) -> &'static str {
+    static WORKSPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static LIBRARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let (cell, mode) = if library {
+        (&LIBRARY, "library")
+    } else {
+        (&WORKSPACE, "workspace")
+    };
+    cell.get_or_init(|| {
+        HOME_HTML
+            .replacen(WORDMARK_FONT_SLOT, &base64(WORDMARK_FONT), 1)
+            .replacen(MODE_SLOT, mode, 1)
+    })
 }
 
 const NOT_BOUND: &str = "No design project is bound yet. Call bind_project with the path of an \
@@ -144,15 +171,22 @@ struct Bound {
     editor_opened: bool,
     /// Whose admitted authority installed this binding.
     owner: Owner,
+    /// An app-library canvas: its id, and its lease. The binding owns the lease only to hold it
+    /// (it is never read): the lock is released when this binding is dropped, which every
+    /// switch and close does only after the server was retired.
+    doc: Option<String>,
+    _lease: Option<Arc<crate::library::Lease>>,
 }
 
 /// The origin of admitted authority: a model call's context, or a direct home-view action's
 /// own context. A binding (or a pin without one) the view admitted is closed when a view call
 /// observes that context revoked; app input never retires what a model call admitted.
+/// `Library` is an app-library canvas, in an app-library process only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owner {
     Model,
     Direct,
+    Library,
 }
 
 impl Drop for Bound {
@@ -166,6 +200,9 @@ struct Launcher {
     state: Arc<Mutex<LauncherState>>,
     /// The one MCP client on stdio, as a session of the bound project's host.
     session: u64,
+    /// Set in an app-library process (`--app-library`): then only the library's own actions,
+    /// the home and the read-only inventory are answered.
+    library: Option<Arc<Library>>,
 }
 
 struct LauncherState {
@@ -272,6 +309,9 @@ struct Install {
     token: String,
     rel: String,
     prepared: crate::PreparedServer,
+    /// For an app-library canvas: its id and lease, moved into the installed binding.
+    doc: Option<String>,
+    lease: Option<Arc<crate::library::Lease>>,
 }
 
 fn text(v: Value) -> ToolResult {
@@ -697,7 +737,24 @@ impl Launcher {
                 bound: None,
             })),
             session: crate::agent::new_session(),
+            library: None,
         }
+    }
+
+    /// An app-library process: no workspace, no host context, and only library actions.
+    fn with_library(library: Library) -> Self {
+        let mut l = Self::new(None);
+        l.library = Some(Arc::new(library));
+        // Never consulted in library mode (no call reaches workspace admission); false keeps
+        // that true even if one did.
+        l.state = Arc::new(Mutex::new(LauncherState {
+            host_context: false,
+            workspace: None,
+            pinned_by: Owner::Library,
+            invalidated: None,
+            bound: None,
+        }));
+        l
     }
 
     fn status(state: &LauncherState, problem: Option<&str>) -> ToolResult {
@@ -786,6 +843,8 @@ impl Launcher {
             token,
             rel,
             prepared,
+            doc: None,
+            lease: None,
         })
     }
 
@@ -805,12 +864,15 @@ impl Launcher {
             token,
             rel,
             prepared,
+            doc,
+            lease,
         } = install;
         tokio::spawn(async move {
             if let Some(old) = state.bound.as_ref() {
                 old.server.retire().await;
                 old.task.abort();
             }
+            // The old binding (and its lease, if any) is dropped below, after this drain.
             // Every old writer/rollback has finished; queued and retained old handles are
             // permanently fenced. Only now may the replacement reset its same-id entries.
             let server = prepared.activate();
@@ -831,6 +893,8 @@ impl Launcher {
                 task,
                 editor_opened: false,
                 owner,
+                doc,
+                _lease: lease,
             });
             // This summary is not the agent's read: its session must still read each page.
             let info = server
@@ -1066,6 +1130,15 @@ impl ServerHandler for Launcher {
             .enable_tools()
             .enable_resources()
             .build();
+        if self.library.is_some() {
+            // No workspace context is used or asked for in an app-library process.
+            return ServerConfig::new(capabilities)
+                .with_server_info(
+                    Implementation::new("openpaperdesign", VERSION)
+                        .with_icons(serde_json::from_value(icons()).expect("valid icons")),
+                )
+                .with_instructions(app::INSTRUCTIONS.to_string());
+        }
         // Safe to advertise in standalone mode too; only --codex-context consumes it.
         capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
         ServerConfig::new(capabilities)
@@ -1098,6 +1171,9 @@ impl ServerHandler for Launcher {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        if self.library.is_some() {
+            return Ok(ListToolsResult::with_all_items(app::listed_tools()));
+        }
         let mut all = own_tools();
         all.extend(offered_tools());
         Ok(ListToolsResult::with_all_items(all))
@@ -1130,7 +1206,7 @@ impl ServerHandler for Launcher {
         let contents = serde_json::from_value(json!({
             "uri": HOME_URI,
             "mimeType": HOME_MIME,
-            "text": home_html(),
+            "text": home_html_for(self.library.is_some()),
             "_meta": {"openai/ui": {"availableDisplayModes": ["inline", "fullscreen"]}},
         }))
         .expect("valid resource contents");
@@ -1142,6 +1218,17 @@ impl ServerHandler for Launcher {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(library) = &self.library {
+            // Every call in an app-library process: never workspace admission or retirement.
+            let r = self
+                .library_call(library, &request.name, request.arguments, &context)
+                .await;
+            return Ok(to_result(r).into());
+        }
+        if app::TOOLS.contains(&request.name.as_ref()) {
+            // Refused without reading or changing any state (no admission, no retirement).
+            return Ok(to_result(Err(app::NOT_LIBRARY.to_string())).into());
+        }
         if request.name == HOME_TOOL {
             return Ok(to_result(home(request.arguments.as_ref())).into());
         }
@@ -1194,6 +1281,45 @@ fn workspace(args: &mut Vec<String>) -> Result<Option<Workspace>, String> {
     Workspace::new(&path, source).map(Some)
 }
 
+const LIBRARY_FLAG: &str = "--app-library";
+
+/// How this process runs: a workspace launcher (`--codex-context`, `--workspace` or cwd), or
+/// the app library (`--app-library <dir>`).
+enum Mode {
+    Workspace(Option<Workspace>),
+    Library(Library),
+}
+
+fn mode(args: &mut Vec<String>) -> Result<Mode, String> {
+    let n = args.iter().filter(|a| *a == LIBRARY_FLAG).count();
+    if n == 0 {
+        return workspace(args).map(Mode::Workspace);
+    }
+    if n != 1
+        || args
+            .iter()
+            .any(|a| a == "--codex-context" || a == "--workspace")
+    {
+        return Err(
+            "--app-library cannot be repeated or combined with --codex-context or --workspace"
+                .into(),
+        );
+    }
+    let i = args
+        .iter()
+        .position(|a| a == LIBRARY_FLAG)
+        .expect("counted");
+    let v = args
+        .get(i + 1)
+        .cloned()
+        .filter(|v| !v.starts_with("--"))
+        .ok_or(
+            "--app-library needs the library folder (the packaged plugin passes ${PLUGIN_DATA})",
+        )?;
+    args.drain(i..=i + 1);
+    Library::open(&v).map(Mode::Library)
+}
+
 /// Entrypoint for the stdio launcher binary.
 pub async fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -1201,18 +1327,40 @@ pub async fn main() {
         println!("openpaperdesign-mcp {VERSION}");
         return;
     }
-    let ws = workspace(&mut args).unwrap_or_else(|e| {
+    let mode = mode(&mut args).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2);
     });
+    let ws = match &mode {
+        Mode::Workspace(ws) => ws.clone(),
+        Mode::Library(_) => None,
+    };
     match args.first().map(String::as_str) {
         Some("doctor") => {
             let missing: Vec<&str> = bundle_file_names()
                 .into_iter()
                 .filter(|n| !BUNDLE_FILES.iter().any(|(f, _)| f == n))
                 .collect();
+            if let Mode::Library(lib) = &mode {
+                let problem = lib.check().err();
+                let report = json!({
+                    "version": VERSION,
+                    "mode": "app-library",
+                    "library": lib.root(),
+                    "library_usable": problem.is_none(),
+                    "library_problem": problem,
+                    "workspace": null,
+                    "browser_editor": if missing.is_empty() { "built in" } else { "missing" },
+                    "missing_bundle_files": missing,
+                    "platform_supported": cfg!(unix),
+                });
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                let ok = missing.is_empty() && cfg!(unix) && problem.is_none();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
             let report = json!({
                 "version": VERSION,
+                "mode": "workspace",
                 "workspace": ws.as_ref().map(|w| &w.path),
                 "workspace_source": ws.as_ref().map_or(CAPABILITY, |w| w.source),
                 "workspace_usable": ws.as_ref().is_some_and(|w| workspace_problem(&w.path).is_none()),
@@ -1228,13 +1376,16 @@ pub async fn main() {
         None => {}
         Some(other) => {
             eprintln!(
-                "unknown argument {other:?}\nusage: openpaperdesign-mcp [--workspace <dir> | --codex-context] [doctor] | --version"
+                "unknown argument {other:?}\nusage: openpaperdesign-mcp [--workspace <dir> | --codex-context | --app-library <dir>] [doctor] | --version"
             );
             std::process::exit(2);
         }
     }
     // MCP over stdio. Nothing else may write to stdout.
-    let launcher = Launcher::new(ws);
+    let launcher = match mode {
+        Mode::Workspace(ws) => Launcher::new(ws),
+        Mode::Library(lib) => Launcher::with_library(lib),
+    };
     match launcher.serve(rmcp::transport::stdio()).await {
         Ok(running) => {
             let _ = running.waiting().await;

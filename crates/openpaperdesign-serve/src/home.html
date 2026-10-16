@@ -15,6 +15,12 @@
   context for exactly the chosen folder, and refuses it otherwise: a listed or picked folder
   grants nothing. Host theme and style variables only change presentation. Nothing is stored
   in the browser.
+
+  Served by an app-library server (`--app-library`), the view instead lists the canvases
+  OpenPaperDesign keeps in its own data folder and creates, opens, closes, exports and imports
+  them through the `openpaperdesign_app_*` actions, again without any chat message. A file
+  chosen for import travels only as its text; an export is offered as a browser download, which
+  Codex never confirms. The server fills the view's mode slot; nothing else differs per server.
 -->
 <style>
   @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
@@ -138,12 +144,14 @@
         <button id="m-new" class="item" type="button" role="menuitem" tabindex="-1">New canvas…</button>
         <button id="m-current" class="item" type="button" role="menuitem" tabindex="-1">Open current canvas</button>
         <button id="m-folder" class="item" type="button" role="menuitem" tabindex="-1">Open a folder…</button>
+        <button id="m-import" class="item" type="button" role="menuitem" tabindex="-1" hidden>Import a canvas file…</button>
         <div class="sep" role="separator"></div>
         <button id="m-refresh" class="item" type="button" role="menuitem" tabindex="-1">Refresh projects</button>
       </div>
     </div>
   </header>
   <p id="live" class="sr-only" aria-live="polite"></p>
+  <input id="import-file" type="file" accept=".json,application/json" hidden>
   <p id="notice" class="notice"></p>
 
   <section id="home" aria-labelledby="h-projects">
@@ -189,6 +197,8 @@
       <button id="canvas" class="btn btn-primary" type="button" hidden>Open canvas</button>
       <button id="reopen" class="btn" type="button" hidden>Open in editor</button>
       <button id="force" class="btn" type="button" hidden>Switch anyway</button>
+      <button id="close" class="btn" type="button" hidden>Close canvas</button>
+      <button id="export" class="btn" type="button" hidden>Export saved canvas</button>
     </div>
     <p id="canvas-state" class="hint"></p>
     <details id="result-details" hidden><summary>Details</summary><dl id="result-meta" class="fields" hidden></dl><pre id="result-detail" hidden></pre></details>
@@ -200,6 +210,11 @@
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+  // An app-library server serves this view with its mode filled in; anything else is the
+  // workspace view.
+  const LIBRARY = '__OPD_MODE__' === 'library';
+  const CANVAS_ID = /^[0-9a-f]{16}$/;
+  const MAX_IMPORT = 32 * 1024 * 1024;
   // The loopback editor URL that the server returns. Nothing else is ever opened.
   const EDITOR_URL = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})\/#token=[0-9a-f]{64}$/;
   const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -235,6 +250,7 @@
   let sending = false;
   let editorUrl = null; // memory only, for the Open canvas button
   let editorRoot = null; // the admitted workspace of the shown status/editor result, for reopening
+  let editorCanvas = null; // the library canvas id of the shown editor result
   let retryForce = null; // the refused switch the person may confirm
   const announce = (text, g) => { if (g === undefined || g === gen) $('live').textContent = text; };
   const notice = (text) => { $('notice').textContent = text; };
@@ -246,12 +262,18 @@
     $('back').hidden = name === 'home';
     editorUrl = null;
     editorRoot = null;
+    editorCanvas = null;
     retryForce = null;
     setBusy(false);
     notice('');
     closeMenu(false);
   }
-  const goHome = () => { show('home'); $('title').focus(); announce('Projects'); };
+  const goHome = () => {
+    show('home');
+    $('title').focus();
+    announce(LIBRARY ? 'Your canvases' : 'Projects');
+    if (LIBRARY) loadLibrary();
+  };
   $('back').onclick = goHome;
   // Escape leaves a secondary view the same way as Back.
   const escapeHome = (e) => { if (e && e.key === 'Escape') { if (e.preventDefault) e.preventDefault(); goHome(); } };
@@ -282,7 +304,8 @@
   // Row buttons that run an action, owned by the list that rendered them. Rebuilding one list
   // (say, the hidden home when a late inventory reply arrives) never replaces another's.
   const rowActions = { projects: [], 'pick-list': [], 'result-list': [] };
-  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), ...Object.values(rowActions).flat()];
+  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), $('close'), $('export'),
+    ...Object.values(rowActions).flat()];
   function setBusy(busy) {
     sending = busy;
     for (const b of ACTIONS()) b.disabled = busy;
@@ -314,7 +337,7 @@
 
   // A refusal: short, plain recovery first; the server's exact reason under Details.
   const NO_CONTEXT = /no Codex workspace context/;
-  function refused(r, again) {
+  function refused(r, again, closing) {
     if (r.fail) {
       refuse('Not done', r.fail);
       return;
@@ -325,10 +348,17 @@
         'Codex doesn\'t give this view access to the project folder, so nothing was opened or changed. OpenPaperDesign can\'t open project files from here yet.',
         text);
     } else if (/force: true/.test(text) && again) {
-      refuse('Switch canvases?',
-        'The open canvas\'s browser tab may still be saving edits; switching stops it. Let it show "Saved", then switch.',
-        text);
+      if (closing) {
+        refuse('Close the canvas?',
+          'Its browser tab may still be saving edits; closing stops it. Let it show "Saved", then close.',
+          text);
+      } else {
+        refuse('Switch canvases?',
+          'The open canvas\'s browser tab may still be saving edits; switching stops it. Let it show "Saved", then switch.',
+          text);
+      }
       retryForce = again;
+      $('force').textContent = closing ? 'Close anyway' : 'Switch anyway';
       $('force').hidden = false;
     } else {
       refuse('Not done', text.split('\n')[0].split(' (')[0].slice(0, 300), text.slice(0, 600));
@@ -338,7 +368,11 @@
 
   // ---- the New menu ----
 
-  const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-refresh')];
+  // Library servers have no folder picker; workspace servers have no import.
+  $('m-folder').hidden = LIBRARY;
+  $('m-import').hidden = !LIBRARY;
+  const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-import'), $('m-refresh')]
+    .filter((b) => !b.hidden);
   function openMenu() {
     $('menu').hidden = false;
     $('menu-button').setAttribute('aria-expanded', 'true');
@@ -368,9 +402,10 @@
     });
   }
   $('m-new').onclick = () => openNewForm();
-  $('m-current').onclick = () => { closeMenu(false); reopen(null); };
+  $('m-current').onclick = () => { closeMenu(false); if (LIBRARY) reopenLibrary(); else reopen(null); };
   $('m-folder').onclick = () => { closeMenu(false); chooseFolder(); };
-  $('m-refresh').onclick = () => { closeMenu(true); loadProjects(); };
+  $('m-import').onclick = () => { closeMenu(false); chooseImport(); };
+  $('m-refresh').onclick = () => { closeMenu(true); if (LIBRARY) loadLibrary(); else loadProjects(); };
   $('folder-refresh').onclick = () => { goHome(); loadProjects(); };
   $('folder-done').onclick = goHome;
 
@@ -426,7 +461,8 @@
       where.append(o);
     });
     where.value = '';
-    $('where-field').hidden = targets.length === 0; // a choice only when there is one to make
+    // A choice only when there is one to make; library canvases always go to the library.
+    $('where-field').hidden = LIBRARY || targets.length === 0;
     $('name').value = '';
     $('name').focus();
     announce('New canvas');
@@ -440,7 +476,8 @@
       $('name').focus();
       return;
     }
-    create(name, t ? t.root : null, t ? t.text : null, false);
+    if (LIBRARY) createLibrary(name, false);
+    else create(name, t ? t.root : null, t ? t.text : null, false);
   };
   // A changed name or destination is a new intent: an old notice about it goes.
   $('name').oninput = () => { if (!sending) notice(''); };
@@ -656,6 +693,197 @@
     if (view === 'home' && g === gen) announce(text || projects.length + ' projects');
   }
 
+  // ---- the app library (an --app-library server): canvases OpenPaperDesign keeps itself ----
+  // Each row opens its canvas directly; ids come only from the server's list.
+
+  let libraryRun = 0;
+  async function loadLibrary() {
+    const run = ++libraryRun;
+    const g = gen;
+    $('inventory').className = 'muted';
+    $('inventory').hidden = false;
+    $('inventory').textContent = 'Reading your canvases…';
+    const r = await rpc('tools/call', { name: 'openpaperdesign_app_canvases', arguments: {} });
+    if (run !== libraryRun) return; // a newer refresh owns the list
+    let v = null;
+    if (!r.timeout && !r.error && r.result && !r.result.isError) {
+      try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
+    }
+    const list = $('projects');
+    list.textContent = '';
+    rowActions.projects = [];
+    let text = '';
+    if (!v || typeof v !== 'object' || !Array.isArray(v.canvases)) {
+      text = 'Couldn\'t read your canvases' + errorCode(r.error) + '. Refresh from the New menu to try again.';
+    } else {
+      const shown = v.canvases.filter((c) => c && typeof c.id === 'string' && CANVAS_ID.test(c.id));
+      shown.forEach((c, i) => {
+        const name = cleanName(c.name || '') || 'Untitled';
+        list.append(projectRow('projects', 'canvas-' + i, name, pages(c.pages) + (c.open ? ' · open here' : ''),
+          'folder', '', () => openLibrary(c.id, name, false),
+          [['Canvas id', c.id], ['Stored in', 'OpenPaperDesign library']]));
+      });
+      if (!shown.length) {
+        // A cut-off read proves nothing about absence.
+        text = v.complete === false
+          ? 'This read of your canvases stopped early and returned none; more may exist. Refresh to try again.'
+          : 'No canvases yet. Create one from the New menu.';
+      } else if (v.complete === false) {
+        text = 'Showing the first ' + shown.length + ' canvases.';
+      }
+      const skipped = Array.isArray(v.skipped) ? v.skipped.length : 0;
+      if (skipped) {
+        text = (text ? text + ' ' : '') + (skipped === 1 ? 'Skipped 1 entry that isn\'t a usable canvas.'
+          : 'Skipped ' + skipped + ' entries that aren\'t usable canvases.');
+      }
+    }
+    $('inventory').textContent = text;
+    $('inventory').hidden = !text;
+    if (view === 'home' && g === gen) announce(text || shownCount() + ' canvases');
+  }
+  const shownCount = () => rowActions.projects.length;
+
+  async function openLibrary(id, name, force) {
+    const args = { id };
+    if (force) args.force = true;
+    const r = await act('openpaperdesign_app_open', args, 'Opening ' + name);
+    if (!r) return;
+    if (r.ok) return showEditor(r.ok, false, id);
+    refused(r, () => openLibrary(id, name, true));
+  }
+
+  // An unanswered create or import may still have happened: it is never retried, and the list
+  // shows what exists.
+  function unsure(what) {
+    refuse('Not sure it was ' + what,
+      'Codex didn\'t confirm it. A new canvas may have been made anyway, so check your canvases before trying again.');
+    loadLibrary();
+  }
+
+  async function createLibrary(name, force) {
+    const args = { name };
+    if (force) args.force = true;
+    const r = await act('openpaperdesign_app_create', args, 'Creating "' + name + '"');
+    if (!r) return;
+    if (r.ok) return showEditor(r.ok);
+    if (r.fail) return unsure('created');
+    refused(r, () => createLibrary(name, true));
+  }
+
+  async function reopenLibrary() {
+    const r = await act('openpaperdesign_app_editor', {}, 'Opening the current canvas');
+    if (!r) return;
+    if (r.ok) return showEditor(r.ok);
+    refused(r);
+  }
+
+  async function closeCanvas(force) {
+    const r = await act('openpaperdesign_app_close', force ? { force: true } : {}, 'Closing the canvas');
+    if (!r) return;
+    if (!r.ok) return refused(r, () => closeCanvas(true), true);
+    reset('Canvas closed');
+    $('result-state').textContent = 'Closed. Everything saved before closing is in your library; an edit still unsaved in a browser tab was not saved by closing.';
+    $('result-title').focus();
+    announce('Canvas closed');
+    loadLibrary();
+  }
+  $('close').onclick = () => closeCanvas(false);
+
+  // A browser download of the exported text, if this view may start one. Codex doesn't tell the
+  // view whether a file was saved, so this never says it was.
+  function download(name, text) {
+    const w = window;
+    if (typeof w.Blob !== 'function' || !w.URL || typeof w.URL.createObjectURL !== 'function' || !document.body) return false;
+    try {
+      const href = w.URL.createObjectURL(new w.Blob([text], { type: 'application/json' }));
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = name;
+      a.hidden = true;
+      document.body.append(a);
+      a.click();
+      a.remove();
+      setTimeout(() => w.URL.revokeObjectURL(href), 60000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function exportCanvas() {
+    const r = await act('openpaperdesign_app_export', {}, 'Exporting the saved canvas', 120000);
+    if (!r) return;
+    if (!r.ok) return refused(r);
+    const v = r.ok;
+    if (typeof v.payload !== 'string' || typeof v.file_name !== 'string') {
+      return refused({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
+    }
+    const name = v.file_name.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80) || 'canvas.opdcanvas.json';
+    const kb = Math.max(1, Math.round(v.payload.length / 1024));
+    const said = download(name, v.payload)
+      ? 'Asked this view to download "' + name + '" (' + kb + ' KB). Codex doesn\'t tell OpenPaperDesign whether a file was saved. It holds the canvas as last saved, without design direction or tokens.'
+      : 'This view can\'t download files here, so no file was saved. The canvas itself is unchanged.';
+    notice(said);
+    announce(said);
+  }
+  $('export').onclick = exportCanvas;
+
+  // Import: the person's chosen file travels only as its text; its name or location means
+  // nothing to the server.
+  function chooseImport() {
+    const input = $('import-file');
+    if (!input || typeof input.click !== 'function') {
+      notice('This view can\'t open files here. Nothing was imported.');
+      return;
+    }
+    input.value = '';
+    input.click();
+  }
+  $('import-file').onchange = async () => {
+    const f = $('import-file').files && $('import-file').files[0];
+    if (!f) { notice('No file was chosen. Nothing was imported.'); return; }
+    if (typeof f.size === 'number' && f.size > MAX_IMPORT) {
+      notice('That file is larger than 32 MB. Nothing was imported.');
+      return;
+    }
+    let text;
+    try { text = await f.text(); } catch { notice('This view couldn\'t read that file. Nothing was imported.'); return; }
+    importCanvas(text, false);
+  };
+  async function importCanvas(text, force) {
+    const args = { payload: text };
+    if (force) args.force = true;
+    const r = await act('openpaperdesign_app_import', args, 'Importing the canvas file', 120000);
+    if (!r) return;
+    if (r.ok) return showEditor(r.ok);
+    if (r.fail) return unsure('imported');
+    refused(r, () => importCanvas(text, true));
+  }
+
+  // After the link was handed to Codex: whether the editor itself reported its page loaded.
+  // An acknowledgement of the link is never treated as a load.
+  const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function watchLoad(g, id) {
+    for (let i = 0; i < 30; i++) {
+      await later(2000);
+      if (g !== gen) return;
+      const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: {} });
+      if (g !== gen) return;
+      let v = null;
+      if (!r.timeout && !r.error && r.result && !r.result.isError) {
+        try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
+      }
+      if (!v || !v.canvas || v.canvas.id !== id) return;
+      if (v.editor_loaded === true) {
+        const n = Number.isInteger(v.browser_saves) ? v.browser_saves : 0;
+        const s = 'The editor loaded this canvas.' + (n ? ' Saved from the editor ' + n + (n === 1 ? ' time.' : ' times.') : '');
+        $('canvas-state').textContent = s;
+        announce(s, g);
+        return;
+      }
+    }
+  }
+
   // ---- results ----
 
   // Concise identity stays in view; exact folders, project paths and the port are under Details.
@@ -680,6 +908,8 @@
     $('canvas').disabled = false;
     $('reopen').hidden = true;
     $('force').hidden = true;
+    $('close').hidden = true;
+    $('export').hidden = true;
     $('canvas-state').textContent = '';
     // Nothing from an earlier result stays, open or hidden.
     $('result-details').hidden = true;
@@ -704,13 +934,18 @@
 
   // An editor result, from a direct action or a delivered open_editor result: identity from
   // this same result, never an earlier one. A direct action then asks Codex to open it.
-  function showEditor(v, delivered) {
+  function showEditor(v, delivered, expected) {
     if (typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
       refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
       return;
     }
+    if (expected && !(v.canvas && v.canvas.id === expected)) {
+      refuse('Canvas', 'Codex answered for another canvas than the one asked for, so it won\'t be opened.');
+      return;
+    }
     const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
     reset(name);
+    if (v.storage === 'app-library') return showLibraryEditor(v, delivered, name);
     editorUrl = v.url;
     $('result-state').textContent = {
       created: 'Created. Opening the canvas…',
@@ -722,6 +957,45 @@
     if (typeof v.project === 'string') meta('Project', v.project);
     if (typeof v.workspace === 'string') meta('Folder path', v.workspace);
     meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
+    $('canvas').hidden = false;
+    $('result-title').focus();
+    announce(name + '. ' + $('result-state').textContent);
+    if (!delivered && v.action) openLink();
+  }
+
+  // A library canvas: created, imported, opened or reopened in this window, from this result.
+  function showLibraryEditor(v, delivered, name) {
+    const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
+    if (!id) {
+      refuse('Canvas', 'Codex sent an answer OpenPaperDesign can\'t read. Nothing is shown as done.');
+      return;
+    }
+    editorCanvas = id;
+    field('Canvas', name + ' (' + pages(v.canvas.pages) + ')');
+    field('Stored in', 'OpenPaperDesign library');
+    meta('Canvas id', id);
+    if (typeof v.location === 'string') meta('Location', v.location);
+    $('close').hidden = false;
+    $('export').hidden = false;
+    if (v.browser_editor !== 'built in') {
+      $('result-state').textContent = {
+        created: 'Created and saved in your library.',
+        imported: 'Imported as a new canvas in your library.',
+      }[v.action] || 'Open in this window.';
+      $('canvas-state').textContent = 'This OpenPaperDesign command was built without the browser editor, so the canvas can\'t be shown here.';
+      $('result-title').focus();
+      announce(name + '. ' + $('result-state').textContent);
+      return;
+    }
+    editorUrl = v.url;
+    meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
+    $('result-state').textContent = {
+      created: 'Created and saved in your library. Opening the editor…',
+      imported: 'Imported as a new canvas in your library. Opening the editor…',
+      opened: 'Opening the editor…',
+      'already-open': 'Already open in this window. Opening the editor…',
+      reopened: 'Opening the editor…',
+    }[v.action] || 'The canvas is ready to open.';
     $('canvas').hidden = false;
     $('result-title').focus();
     announce(name + '. ' + $('result-state').textContent);
@@ -816,6 +1090,7 @@
     else state = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, press Open canvas again.';
     $('canvas-state').textContent = state;
     announce(state, g);
+    if (LIBRARY && editorCanvas && !r.timeout && !r.error) watchLoad(g, editorCanvas);
   }
   $('canvas').onclick = openLink;
 
@@ -855,9 +1130,14 @@
     applyHost();
     window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
     $('menu-button').disabled = false;
-    renderProjects();
-    // Shown for a model's status or editor result: no project list needed there.
+    // Shown for a model's status or editor result: no list needed there.
     const tool = hostContext.toolInfo && hostContext.toolInfo.tool && hostContext.toolInfo.tool.name;
+    if (LIBRARY) {
+      if (!tool || tool === 'openpaperdesign_home') loadLibrary();
+      else $('inventory').hidden = true;
+      return;
+    }
+    renderProjects();
     if (!tool || tool === 'openpaperdesign_home') loadProjects();
     else $('inventory').hidden = true;
   })();

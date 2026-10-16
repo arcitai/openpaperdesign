@@ -180,6 +180,9 @@ async function main() {
       showRenderer();
       status('Ready');
       session.canvas.focus();
+      // Tell this page's own server that the page loaded and the renderer is Ready, so the
+      // home view can tell an actual load from a navigation request. It carries nothing else.
+      api('/api/ready', { method: 'POST' }).catch(() => {});
     },
     // Terminal: shown once, in red, and the frame loop stops.
     fatal: (msg) => {

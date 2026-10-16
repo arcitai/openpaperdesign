@@ -116,10 +116,13 @@ test('mcp.json starts the stdio launcher from PATH', () => {
   assert.ok(!('url' in s));
   assert.equal(s.command, 'openpaperdesign-mcp');
   assert.ok(!s.command.includes('/'), 'a command on PATH, never a bundled relative path');
-  assert.deepEqual(s.args, ['--codex-context']);
-  // Codex 0.162.1 starts plugin servers in the plugin folder. Workspace authority
-  // comes only from the experimental metadata on actual model tool calls.
+  // The packaged server is the app library, in the plugin's host-configured data folder:
+  // Codex 0.162.1's Agent Plugin MCP loader expands the literal ${PLUGIN_DATA} placeholder in
+  // stdio arguments (no shell). No working directory, environment override or tool argument
+  // names the folder. Workspace projects use a separately started --codex-context server.
+  assert.deepEqual(s.args, ['--app-library', '${PLUGIN_DATA}']);
   assert.ok(!('cwd' in s));
+  assert.ok(!('env' in s), 'no environment override');
   assert.ok(!JSON.stringify(m).includes('token'), 'no token in config');
 });
 

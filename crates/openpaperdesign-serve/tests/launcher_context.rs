@@ -658,16 +658,24 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
         let html = r["contents"][0]["text"].as_str().unwrap();
         assert!(html.contains("OpenPaperDesign") && html.contains("ui/initialize"));
         // The command serves exactly the view in this source tree (embedded at build time),
-        // with the packaged, unmodified wordmark font in its one slot as a data URI.
+        // with its two fixed slots filled and nothing else changed: the mode slot with
+        // `workspace` (this is a workspace process), and the font slot with the packaged,
+        // unmodified wordmark font as a data URI.
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = std::fs::read_to_string(crate_dir.join("src/home.html")).unwrap();
+        const MODE_SLOT: &str = "__OPD_MODE__";
+        assert_eq!(source.matches(MODE_SLOT).count(), 1, "one mode slot");
+        let source = source.replacen(MODE_SLOT, "workspace", 1);
         const SLOT: &str = "__OPD_WORDMARK_FONT__";
-        assert_eq!(source.matches(SLOT).count(), 1);
+        assert_eq!(source.matches(SLOT).count(), 1, "one font slot");
         let (before, after) = source.split_once(SLOT).unwrap();
         let font_b64 = html
             .strip_prefix(before)
             .and_then(|rest| rest.strip_suffix(after))
-            .expect("the served view is src/home.html with only the font slot filled");
+            .expect(
+                "the served view is src/home.html with only its two fixed slots filled \
+                 (mode: workspace, and the font)",
+            );
         assert_eq!(
             decode_base64(font_b64),
             std::fs::read(crate_dir.join("assets/geist-pixel-square.woff2")).unwrap(),

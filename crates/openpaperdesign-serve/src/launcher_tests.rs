@@ -1162,3 +1162,8 @@ async fn direct_calls_never_retire_without_context_or_a_model_binding() {
     );
     assert!(status_of(&m.l).await.0.is_some());
 }
+
+// ---- the app library (`--app-library`) ----
+
+#[path = "launcher_app_tests.rs"]
+mod app_library;

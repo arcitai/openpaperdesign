@@ -18,6 +18,10 @@ const INVENTORY = 'openpaperdesign_projects';
 // direct actions. The server admits the actions only with the call's own workspace context.
 const TOOLS = new Set([INVENTORY, 'openpaperdesign_choose_folder', 'openpaperdesign_ui_canvases', 'openpaperdesign_ui_create',
   'openpaperdesign_ui_open', 'openpaperdesign_ui_editor']);
+// What the view may call when an app-library server serves it: only the library's own actions.
+const LIB_LIST = 'openpaperdesign_app_canvases';
+const LIB_TOOLS = new Set([LIB_LIST, 'openpaperdesign_app_create', 'openpaperdesign_app_open', 'openpaperdesign_app_editor',
+  'openpaperdesign_app_close', 'openpaperdesign_app_import', 'openpaperdesign_app_export']);
 
 // Fictional fixtures. Two local projects share a name; Acme has two folders.
 const ACME = { source: 'codex-app-server', host: 'this computer', id: 'prj_fixture_acme', name: 'Acme site', position: 0, recencyAt: null, roots: [{ path: '/w/acme' }, { path: '/w/acme-docs' }] };
@@ -42,16 +46,19 @@ const all = (e) => [e, ...e.children.flatMap(all)];
 const texts = (e) => all(e).filter((n) => n.tag !== 'svg' && n.tag !== 'path').map((n) => n.textContent).filter(Boolean);
 const buttons = (e) => all(e).filter((n) => n.tag === 'button');
 
-const IDS = ['back', 'title', 'menu-button', 'menu', 'm-new', 'm-current', 'm-folder', 'm-refresh', 'live', 'notice',
-  'home', 'inventory', 'projects', 'pick', 'pick-title', 'pick-list', 'new-form', 'new-title', 'name', 'where-field', 'where',
+const IDS = ['back', 'title', 'menu-button', 'menu', 'm-new', 'm-current', 'm-folder', 'm-import', 'm-refresh', 'live', 'notice',
+  'import-file', 'home', 'inventory', 'projects', 'pick', 'pick-title', 'pick-list', 'new-form', 'new-title', 'name', 'where-field', 'where',
   'create', 'cancel-new', 'folder-help', 'folder-title', 'folder-refresh', 'folder-done', 'result', 'result-title',
-  'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'reopen', 'force', 'canvas-state', 'result-details',
-  'result-meta', 'result-detail'];
+  'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'reopen', 'force', 'close', 'export', 'canvas-state',
+  'result-details', 'result-meta', 'result-detail'];
+// The view as an app-library server serves it (its one mode slot filled in).
+const libScript = script.replace("'__OPD_MODE__'", "'library'");
 
-function mount() {
+function mount({ library = false } = {}) {
   const document = { activeElement: null };
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
-  for (const id of ['back', 'menu', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'reopen', 'force', 'result-details', 'result-meta', 'result-detail']) {
+  for (const id of ['back', 'menu', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'reopen', 'force', 'close', 'export',
+    'm-import', 'import-file', 'result-details', 'result-meta', 'result-detail']) {
     els[id].hidden = true;
   }
   const props = {};
@@ -71,7 +78,7 @@ function mount() {
     createElementNS: (_ns, tag) => el(tag, document), documentElement,
   });
   Object.defineProperty(document, 'cookie', { get: forbidden, set: forbidden });
-  vm.runInNewContext(script, { window, document, setTimeout: () => 0, JSON, String, RegExp, Array, Map, Promise, Object, Number });
+  vm.runInNewContext(library ? libScript : script, { window, document, setTimeout: () => 0, JSON, String, RegExp, Array, Map, Promise, Object, Number, Math });
   const from = (m, source = parent) => listener({ source, data: { jsonrpc: '2.0', ...m } });
   const last = (method) => [...sent].reverse().find((m) => m.method === method);
   const count = (method) => sent.filter((m) => m.method === method).length;
@@ -827,7 +834,7 @@ test('the view sends no chat message, calls only its own tools, stores nothing a
   assert.ok(!/id="prompt"|Paste this/.test(html), 'no paste prompt');
   // Tool names at call sites: act('…', …) and the inventory's tools/call.
   const named = new Set([...script.matchAll(/(?:act\(|name: )'(openpaperdesign_[a-z_]+)'/g)].map((m) => m[1]));
-  assert.deepEqual([...named].sort(), [...TOOLS].sort(), 'exactly these server tools');
+  assert.deepEqual([...named].sort(), [...TOOLS, ...LIB_TOOLS].sort(), 'exactly these server tools');
   for (const banned of ['resources/read', 'localStorage', 'sessionStorage', 'indexedDB', 'document.cookie', 'fetch(', 'XMLHttpRequest', 'innerHTML',
     'openpaperdesign_status\'', 'bind_project\'', 'create_project\'', 'open_editor\'', '@import']) {
     assert.ok(!html.includes(banned), banned);
@@ -838,4 +845,168 @@ test('the view sends no chat message, calls only its own tools, stores nothing a
   assert.match(style, /\.wordmark \{ font: 400 16px\/1\.2 "Geist Pixel", monospace;/);
   assert.match(html, /<footer><span class="wordmark">onlinesourdough<\/span><\/footer>/);
   assert.match(html, /aria-label="Back to projects"/);
+  assert.equal(html.split('__OPD_MODE__').length, 2, 'exactly one mode slot');
+});
+
+// ---- served by an app-library server (--app-library) ----
+
+const ID1 = '0123456789abcdef';
+const ID2 = 'fedcba9876543210';
+const LIBRARY_LIST = { storage: 'app-library', complete: true, skipped: [], canvases: [
+  { id: ID1, name: 'Landing', pages: 2, modified: 2, open: false },
+  { id: ID2, name: 'Notes', pages: 1, modified: 1, open: true },
+  { id: '../escape', name: 'Not an id', pages: 1 }] };
+const LIB_EDITOR = (action, id = ID1, extra = {}) => ({ action, storage: 'app-library', url: URL_OK, browser_editor: 'built in',
+  canvas: { id, name: id === ID1 ? 'Landing' : 'Notes', pages: 1 }, location: `/data/library/v1/canvases/${id}`,
+  editor_loaded: false, browser_saves: 0, ...extra });
+
+async function libraryView(list = LIBRARY_LIST) {
+  const v = mount({ library: true });
+  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: {} } });
+  await flush();
+  const call = v.last('tools/call');
+  assert.deepEqual(call.params, { name: LIB_LIST, arguments: {} }, 'the library list, not the Codex inventory');
+  v.from(list.error ? { id: call.id, error: list.error } : { id: call.id, result: toolText(list) });
+  await flush();
+  return v;
+}
+const libOnly = (v) => {
+  assert.ok(methods(v).every((m) => ALLOWED.has(m)), methods(v).join());
+  for (const m of v.sent.filter((m) => m.method === 'tools/call')) assert.ok(LIB_TOOLS.has(m.params.name), m.params.name);
+  assert.equal(v.count('ui/message'), 0, 'no message to the agent, ever');
+};
+// The latest library action (every tools/call except the list).
+const libAction = (v) => [...v.sent].reverse().find((m) => m.method === 'tools/call' && m.params.name !== LIB_LIST);
+const libCalls = (v, name) => v.sent.filter((m) => m.method === 'tools/call' && m.params.name === name).length;
+
+test('library: the app\'s canvases are listed and one opens directly in the editor, with no message', async () => {
+  assert.notEqual(libScript, script, 'the mode slot is filled');
+  const v = await libraryView();
+  assert.deepEqual(rows(v).map((r) => [r.name, r.hint]), [['Landing', '2 pages'], ['Notes', '1 page · open here']],
+    'server ids only; no "This chat\'s project" row');
+  assert.equal(v.els['m-folder'].hidden, true, 'no folder picker');
+  assert.equal(v.els['m-import'].hidden, false);
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } });
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.last('ui/open-link').params.url, URL_OK);
+  assert.equal(v.els['result-state'].textContent, 'Opening the editor…');
+  assert.ok(!v.els.close.hidden && !v.els.export.hidden && !v.els.canvas.hidden);
+  const shown = ['result-fields', 'result-meta', 'result-state', 'notice', 'live'].flatMap((id) => texts(v.els[id])).join('\n');
+  assert.ok(shown.includes(ID1) && !shown.includes(TOKEN), 'the canvas id under Details, never the token');
+  await ack(v);
+  assert.match(v.els['canvas-state'].textContent, /doesn't confirm it loaded/, 'an acknowledgement is not a load');
+  assert.equal(libCalls(v, 'openpaperdesign_app_editor'), 0, 'no load is claimed without the editor\'s own report');
+  libOnly(v);
+});
+
+test('library: an answer for another canvas, or after Back, opens nothing', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened', ID2), libAction(v));
+  assert.equal(v.count('ui/open-link'), 0);
+  assert.match(v.els['result-state'].textContent, /another canvas/);
+  v.els.back.onclick();
+  await flush();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  const pending = libAction(v);
+  v.els.back.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), pending);
+  assert.equal(v.count('ui/open-link'), 0, 'a late reply belongs to the view it started in');
+  libOnly(v);
+});
+
+test('library: New creates directly with a name only; an unanswered create is never retried', async () => {
+  const v = await libraryView();
+  v.els['m-new'].onclick();
+  assert.equal(v.els['where-field'].hidden, true, 'library canvases have no destination choice');
+  v.els.name.value = 'Pitch';
+  await submitNew(v);
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch' } });
+  await answer(v, LIB_EDITOR('created'), libAction(v));
+  assert.equal(v.els['result-state'].textContent, 'Created and saved in your library. Opening the editor…');
+  assert.equal(v.count('ui/open-link'), 1);
+  const w = await libraryView();
+  w.els['m-new'].onclick();
+  w.els.name.value = 'Pitch';
+  await submitNew(w);
+  await answer(w, { error: { code: -32001, message: 'lost' } }, libAction(w));
+  assert.equal(w.els['result-title'].textContent, 'Not sure it was created');
+  assert.match(w.els['result-state'].textContent, /check your canvases before trying again/);
+  assert.equal(libCalls(w, 'openpaperdesign_app_create'), 1, 'not retried');
+  assert.equal(w.last('tools/call').params.name, LIB_LIST, 'the list is read again instead');
+  libOnly(v);
+  libOnly(w);
+});
+
+test('library: close needs the person\'s confirmation once the editor was opened and claims no save', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.close.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: {} });
+  await answer(v, { refused: 'The editor of this canvas was opened. ... then close again with force: true.' }, libAction(v));
+  assert.equal(v.els['result-title'].textContent, 'Close the canvas?');
+  assert.equal(v.els.force.textContent, 'Close anyway');
+  v.els.force.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { force: true } });
+  await answer(v, { action: 'closed', canvas: { id: ID1 } }, libAction(v));
+  assert.equal(v.els['result-title'].textContent, 'Canvas closed');
+  assert.match(v.els['result-state'].textContent, /not saved by closing/);
+  assert.equal(v.last('tools/call').params.name, LIB_LIST);
+  libOnly(v);
+});
+
+test('library: export and import move only bytes, and say plainly what this view could not do', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.export.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_export', arguments: {} });
+  await answer(v, { action: 'exported', content: 'canvas-only', file_name: 'Landing.opdcanvas.json', bytes: 38,
+    payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
+  assert.match(v.els.notice.textContent, /can't download files here, so no file was saved/, 'no claimed download');
+  v.els['m-import'].onclick();
+  assert.match(v.els.notice.textContent, /can't open files here\. Nothing was imported/);
+  let picked = 0;
+  v.els['import-file'].click = () => { picked += 1; };
+  v.els['m-import'].onclick();
+  assert.equal(picked, 1);
+  v.els['import-file'].files = [{ size: 33 * 1024 * 1024, name: 'big.json', text: async () => 'x' }];
+  await v.els['import-file'].onchange();
+  assert.match(v.els.notice.textContent, /larger than 32 MB/);
+  v.els['import-file'].files = [{ size: 9, name: '/Users/someone/secret.json', text: async () => 'FILE-TEXT' }];
+  await v.els['import-file'].onchange();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'FILE-TEXT' } },
+    'only the text, never the file name or a path');
+  await answer(v, LIB_EDITOR('imported', ID2), libAction(v));
+  assert.equal(v.els['result-state'].textContent, 'Imported as a new canvas in your library. Opening the editor…');
+  libOnly(v);
+});
+
+test('library: without a built editor nothing is opened, and the canvas is still reported saved', async () => {
+  const v = await libraryView();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened', ID1, { browser_editor: 'not built' }), libAction(v));
+  assert.equal(v.count('ui/open-link'), 0);
+  assert.equal(v.els.canvas.hidden, true);
+  assert.match(v.els['canvas-state'].textContent, /built without the browser editor/);
+});
+
+test('the workspace view offers no library import', async () => {
+  const v = await initialized();
+  assert.equal(v.els['m-import'].hidden, true);
+  assert.equal(v.els['m-folder'].hidden, false);
+  assert.ok(v.sent.every((m) => m.method !== 'tools/call' || !LIB_TOOLS.has(m.params.name)));
 });

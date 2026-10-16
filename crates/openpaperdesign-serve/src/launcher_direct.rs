@@ -104,7 +104,7 @@ pub(super) fn tools() -> Vec<Value> {
 }
 
 /// Only the named string/boolean arguments, each of the expected type.
-fn strict<'a>(
+pub(super) fn strict<'a>(
     args: &'a Value,
     strings: &[&str],
     flags: &[&str],

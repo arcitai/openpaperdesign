@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.29 · Updated: 2026-10-14
+Revision: 0.30 · Updated: 2026-10-16
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -107,14 +107,15 @@ don't bring it back without an explicit decision (collaboration is issue #2).
 ## Codex plugin
 
 `plugin/openpaperdesign/` is the local Codex plugin (`docs/openpaperdesign/plugin-b2b.md`). Its
-MCP server, `openpaperdesign-mcp`, must be on PATH. It binds only projects inside the
-workspace and embeds the web bundle at build time, so run `./scripts/build-web.sh` before
-`cargo install`. `plugin/openpaperdesign/plugin.json` is the only manifest. Codex
-discovers `skills/` and `mcp.json` itself, so the manifest has no top-level `skills`,
-`mcpServers`, `apps` or `interface`. Codex presentation goes in `extensions.com.openai`
+MCP server, `openpaperdesign-mcp`, must be on PATH. It embeds the web bundle at build time, so
+run `./scripts/build-web.sh` before `cargo install`. `plugin/openpaperdesign/plugin.json` is the
+only manifest. Codex discovers `skills/` and `mcp.json` itself, so the manifest has no top-level
+`skills`, `mcpServers`, `apps` or `interface`. Codex presentation goes in `extensions.com.openai`
 (`interface.shortDescription` ≤ 30 characters). Don't add a `.codex-plugin/` overlay.
-`mcp.json` is explicit `type: "stdio"`, args `["--codex-context"]`, with no `cwd`. The packaged
-launcher pins canonical workspace/identity from Codex 0.162.1's experimental
+`mcp.json` is explicit `type: "stdio"`, args `["--app-library", "${PLUGIN_DATA}"]` (the
+app library, below), with no `cwd` or `env`. Workspace modes (`--codex-context`, `--workspace`)
+are separately started invocations that keep every guard below; the three flags are mutually
+exclusive. In `--codex-context` mode the launcher pins canonical workspace/identity from Codex 0.162.1's experimental
 `codex/sandbox-state-meta` in `RequestContext.meta` on real model tool calls. Direct
 app-server calls omit it; arguments are never authority. Accept only the observed managed
 workspace-write shape or exact `{"type":"disabled"}` profile; never infer missing grants.
@@ -150,7 +151,8 @@ before workspace admission:
   only: never opened, listed, looked up or treated as a workspace or grant.
 
 They read or change none of the session's context, binding, project, listener or files. This
-named exemption covers only those four; never route another tool around admission.
+named exemption covers only those four (plus the fixed refusal of the app-library tool names,
+which reads and changes nothing); never route another tool around admission.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -202,6 +204,43 @@ showed (copied when it opens). Result paths and the port stay under Details, cle
 result. The wordmark font
 (Geist Pixel Square, OFL, `crates/openpaperdesign-serve/assets/`) is embedded unmodified at
 serve time; never load a font by URL.
+
+App library (issue #6, owner admission 2026-10-16, `crates/openpaperdesign-serve/src/library*.rs`,
+`launcher_app.rs`): `--app-library <dir>` is a separate process mode for canvases the app owns.
+Codex's Agent Plugin loader expands the literal `${PLUGIN_DATA}` argument (no shell); the root
+must be an existing real folder given as a plain absolute path, never `/`, `$HOME`, inside
+`$PLUGIN_ROOT`, a `.plugin-data` fallback or `plugins/cache` (not durable), and is pinned by
+identity. Library validation is its own code: never build a `Workspace` for it, never loosen
+workspace protected-path rules, never use cwd, a picked or listed folder, model metadata or a
+tool argument as a path. Layout `<root>/library/v1/canvases/<id>/` (a standard paper-rs project,
+the only live copy) and `locks/<id>.lock`; ids are 16 hex digits made by the server; names are
+data. Listing creates and locks nothing and is bounded (entries and manifest bytes). In that
+process only the home, its resource, `openpaperdesign_status` (library report), the read-only
+inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export}`
+are answered, with strict argument keys and types; every project route (including the
+`_ui_*` actions, the picker and the upstream design tools) is refused without admission or
+state change, and a workspace process refuses the `_app_*` names the same way. One binding per
+process (the page-id layout registry forbids a second slot). Each canvas needs a permanent
+per-id lease: nonblocking `File::try_lock` on a regular single-link lock file, taken before
+`Project::open` (its stale-temp cleanup) or any write, rechecked (handle and path identity, link
+count, library folders) by a guard on every browser and MCP access; a failed check fences that
+canvas for good, and the next action retires it. Lock files are never removed, truncated or
+replaced, and never exported. The lease moves into the binding and is dropped only after
+retirement drained it; same id is a checked no-op; busy, invalid or failing targets keep the
+current canvas and URL. It is advisory: no protection from other programs, no OS sandbox.
+Create/import write through the checked commit with every new folder's parent synced, finish
+preparation before the old binding retires, run in an owned task, remove only what is still
+theirs (naming what stays or may not be durably removed) and are never retried; a lost reply is
+recovered from the list. The canvas file (`library_payload.rs`, version 1, canvas-only) is
+bounded and fully validated before a fresh identity is published (duplicate keys, unknown
+fields, ids, case/prefix collisions, page correspondence, node graph, exact image set); images
+come only from the file or the canvas's own `assets/`, never the process image registry. Export
+reads one saved snapshot under the lease and the writer fence and says it holds saved content
+without direction or tokens. Companions (`DESIGN.md`, tokens) are unsupported in version 1 and
+refused; project-bound export is not offered. A new blank canvas infers no design system. The
+editor reports readiness itself (`POST /api/ready`); an open-link acknowledgement is never a
+load. Close retires and saves nothing in browser memory; it needs `force` once the link was
+given. Library mode defers stdio page tools: canvases are edited in the browser editor.
 
 ## Model profile
 

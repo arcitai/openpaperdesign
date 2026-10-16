@@ -34,6 +34,7 @@ pub mod agent;
 mod commit;
 #[doc(hidden)]
 pub mod launcher;
+pub(crate) mod library;
 mod lifecycle;
 #[cfg(test)]
 mod test_support;
@@ -89,7 +90,20 @@ const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
 
 /// Revision of a page whose file does not exist yet (listed in the manifest, never saved).
 pub const ABSENT: &str = "\"absent\"";
-const MAX_PAGE_BYTES: usize = 64 << 20;
+pub(crate) const MAX_PAGE_BYTES: usize = 64 << 20;
+
+/// An extra identity check run before every read and write of a bound project, from the
+/// browser API and the MCP host alike (the app library's root and lease, see `library`). Once
+/// it fails it keeps failing.
+pub(crate) type Guard = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// What the browser editor reported to this server: that it loaded the page and its renderer
+/// is Ready, and how many of its saves were committed. Never the URL or anything else.
+#[derive(Default)]
+pub(crate) struct EditorState {
+    ready: std::sync::atomic::AtomicBool,
+    saves: std::sync::atomic::AtomicU64,
+}
 
 pub struct Config {
     /// The project folder (must contain an upstream `project.json`).
@@ -121,6 +135,9 @@ pub struct Server {
     broken: Broken,
     /// Every page id the host has held, released only after retirement drains its writers.
     held: HeldPages,
+    /// The app library's identity check for this project, if it is a library canvas.
+    guard: Option<Guard>,
+    editor: EditorState,
 }
 
 /// Fully loaded but not yet active. Preparation has no effect on the layout registry.
@@ -210,7 +227,7 @@ pub(crate) fn plain(path: &Path, want: Kind) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn links(m: &std::fs::Metadata) -> u64 {
+pub(crate) fn links(m: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     m.nlink()
 }
@@ -223,7 +240,7 @@ pub(crate) fn dev_ino(m: &std::fs::Metadata) -> (u64, u64) {
 
 // Non-Unix: `Server::open` refuses to start, so these never run; they fail closed anyway.
 #[cfg(not(unix))]
-fn links(_m: &std::fs::Metadata) -> u64 {
+pub(crate) fn links(_m: &std::fs::Metadata) -> u64 {
     u64::MAX
 }
 
@@ -391,6 +408,7 @@ impl Server {
             BundleSource::Dir(cfg.web_dir),
             cfg.port,
             cfg.token,
+            None,
         )
         .map(PreparedServer::activate)
     }
@@ -425,7 +443,31 @@ impl Server {
             "only supported on Unix (Linux, macOS)".into(),
         ));
         #[cfg(unix)]
-        Self::open_unix(project, BundleSource::Embedded(files), port, token)
+        Self::open_unix(project, BundleSource::Embedded(files), port, token, None)
+    }
+
+    /// Like [`Server::prepare_embedded`], for an app-library canvas: `guard` (its library and
+    /// lease check, see `library::guard`) runs before upstream `Project::open` and then before
+    /// every browser and MCP read and write.
+    pub(crate) fn prepare_library(
+        project: PathBuf,
+        files: EmbeddedBundle,
+        port: u16,
+        token: String,
+        guard: Guard,
+    ) -> Result<PreparedServer, OpenError> {
+        #[cfg(not(unix))]
+        return Err(OpenError::Unsafe(
+            "only supported on Unix (Linux, macOS)".into(),
+        ));
+        #[cfg(unix)]
+        Self::open_unix(
+            project,
+            BundleSource::Embedded(files),
+            port,
+            token,
+            Some(guard),
+        )
     }
 
     #[cfg(unix)]
@@ -434,7 +476,11 @@ impl Server {
         bundle: BundleSource,
         port: u16,
         token: String,
+        guard: Option<Guard>,
     ) -> Result<PreparedServer, OpenError> {
+        if let Some(g) = &guard {
+            g().map_err(OpenError::Unsafe)?;
+        }
         let dir = project
             .canonicalize()
             .map_err(|e| OpenError::NotAProject(project.clone(), e.to_string()))?;
@@ -461,12 +507,13 @@ impl Server {
         let lifecycle = Arc::new(lifecycle::Lifecycle::default());
         let broken = Broken::default();
         let held = HeldPages::default();
-        let calls = agent::spawn_host(
+        let calls = agent::spawn_host_guarded(
             dir.clone(),
             root_id,
             lifecycle.clone(),
             broken.clone(),
             held.clone(),
+            guard.clone(),
         )
         .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = port;
@@ -484,6 +531,8 @@ impl Server {
             calls,
             broken,
             held,
+            guard,
+            editor: EditorState::default(),
         })))
     }
 
@@ -522,14 +571,44 @@ impl Server {
     /// Reading it acknowledges no page.
     pub(crate) fn bound_manifest(&self) -> Result<Manifest, String> {
         check_root(&self.dir, self.root_id)?;
+        self.check_guard()?;
         check_project_dir(&self.dir)?;
         read_manifest_checked(&self.dir)
     }
 
-    /// Root identity plus the project's own entries; run before every read and write.
+    fn check_guard(&self) -> Result<(), String> {
+        self.guard.as_ref().map_or(Ok(()), |g| g())
+    }
+
+    /// Root identity, the library guard (for a library canvas) and the project's own entries;
+    /// run before every read and write.
     fn check(&self) -> Result<(), ApiError> {
         check_root(&self.dir, self.root_id).map_err(forbidden)?;
+        self.check_guard().map_err(forbidden)?;
         check_project_dir(&self.dir).map_err(forbidden)
+    }
+
+    /// Whether the browser editor reported its page loaded and Ready, and how many browser
+    /// saves were committed. A navigation request never sets these.
+    pub(crate) fn editor_state(&self) -> (bool, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.editor.ready.load(Ordering::Acquire),
+            self.editor.saves.load(Ordering::Acquire),
+        )
+    }
+
+    /// The saved canvas as a portable file (`library::payload`): one coherent snapshot of the
+    /// files on disk, read under this binding's writer fence, so no browser or MCP save is
+    /// half-written in it (it waits for one under way). Edits still only in a browser tab are
+    /// not on disk and not in it. The fence is released before the text is handed on.
+    pub(crate) async fn saved_snapshot(&self) -> Result<library::payload::Exported, String> {
+        let _write = self.lifecycle.write.lock().await;
+        self.lifecycle.check_active()?;
+        check_root(&self.dir, self.root_id)?;
+        self.check_guard()?;
+        check_project_dir(&self.dir)?;
+        library::payload::export(&self.dir)
     }
 
     fn project(&self) -> Result<Project, ApiError> {
@@ -685,6 +764,7 @@ pub fn router(s: Arc<Server>) -> Router {
         .route("/api/project", get(get_project))
         .route("/api/pages/{id}", get(get_page).put(put_page))
         .route("/api/pages/{id}/revision", get(get_revision))
+        .route("/api/ready", axum::routing::post(post_ready))
         .nest_service(
             MCP_PATH,
             tower::ServiceBuilder::new()
@@ -728,6 +808,15 @@ async fn get_project(State(s): State<Arc<Server>>) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// The browser editor's own report that it loaded its page and its renderer is Ready (token
+/// and origin checked like every API call). It carries nothing and changes no file.
+async fn post_ready(State(s): State<Arc<Server>>) -> Response {
+    s.editor
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The manifest's entry for `id`, or an error response. Ids are checked against the
@@ -888,6 +977,9 @@ async fn put_page(
         // Committed: the revision is the hash of the bytes just written. Nothing that can
         // fail comes after the commit, so a saved page is never reported as not saved.
         let rev = etag(&writes[0].data);
+        s.editor
+            .saves
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok((
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
