@@ -36,7 +36,31 @@ pub(super) const EDITOR: &str = "openpaperdesign_app_editor";
 pub(super) const CLOSE: &str = "openpaperdesign_app_close";
 pub(super) const IMPORT: &str = "openpaperdesign_app_import";
 pub(super) const EXPORT: &str = "openpaperdesign_app_export";
-pub(super) const TOOLS: [&str; 7] = [LIST, CREATE, OPEN, EDITOR, CLOSE, IMPORT, EXPORT];
+// The in-panel editor's transport (the home view's own editor, see `panel_call`).
+pub(super) const ASSET: &str = "openpaperdesign_app_editor_asset";
+pub(super) const PAGE: &str = "openpaperdesign_app_page";
+pub(super) const REVISION: &str = "openpaperdesign_app_page_revision";
+pub(super) const SAVE: &str = "openpaperdesign_app_page_save";
+pub(super) const READY: &str = "openpaperdesign_app_ready";
+pub(super) const RELEASE: &str = "openpaperdesign_app_page_release";
+pub(super) const PANEL_TOOLS: [&str; 6] = [ASSET, PAGE, REVISION, SAVE, READY, RELEASE];
+pub(super) const TOOLS: [&str; 13] = [
+    LIST, CREATE, OPEN, EDITOR, CLOSE, IMPORT, EXPORT, ASSET, PAGE, REVISION, SAVE, READY, RELEASE,
+];
+
+/// The packaged renderer goes to the in-panel editor in parts of this many bytes (the last one
+/// shorter), in order; a renderer larger than `MAX_ASSET_BYTES` isn't sent at all.
+pub(super) const PART_BYTES: usize = 256 * 1024;
+pub(super) const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
+/// The largest page message the in-panel editor exchanges, counted as the serialized JSON
+/// (UTF-8, escaping included): a page read's result, or a save's arguments. A deliberately
+/// conservative choice, well below the 64 MiB page limit, because the host's message limits
+/// are unknown (rmcp's own stdio codec has none by default; that says nothing about the
+/// host). A larger page isn't opened in the panel, and a larger save isn't sent; neither
+/// changes any file. The browser editor link still works for them.
+pub(super) const MAX_PANEL_MESSAGE: usize = 4 * 1024 * 1024;
+/// JSON integers are exact up to 2^53 - 1.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 pub(super) const NOT_LIBRARY: &str = "This OpenPaperDesign server wasn't started for the app \
     library (it serves workspace projects), so app-library actions aren't available here. \
@@ -49,10 +73,12 @@ const NO_CANVAS: &str = "No canvas is open in this OpenPaperDesign window. Open 
     library. Nothing was changed.";
 const BUSY: &str = "This canvas is open in another OpenPaperDesign window (another Codex chat \
     or panel). Close it there first. Nothing was changed here.";
-const CLOSE_NEEDS_FORCE: &str = "The editor of this canvas was opened. Closing stops the server \
-    its browser tab saves to, so an edit there that isn't saved yet (the page shows an unsaved \
-    change or \"Saving…\") would be lost. Let it show \"Saved\", or accept losing it, then close \
-    again with force: true.";
+const CLOSE_NEEDS_FORCE: &str = "The editor of this canvas was opened (its browser tab, or the \
+    editor in another OpenPaperDesign view). Closing stops the server it saves to, so an edit \
+    there that isn't saved yet (the page shows an unsaved change or \"Saving…\") would be lost. \
+    Let it show \"Saved\", or accept losing it, then close again with force: true.";
+const UNMOUNTED: &str = "This in-panel editor isn't open on the canvas any more (it was left, \
+    or the canvas was closed or replaced). Nothing was read or changed.";
 const STALE: &str = "The canvas this view shows isn't the one open in this OpenPaperDesign \
     window any more: another view changed it. Nothing was done, and the open canvas is \
     unchanged. Go back to your canvases to see what is open.";
@@ -76,10 +102,17 @@ fn current_binding(state: &LauncherState) -> Option<&str> {
     state.bound.as_ref().and_then(|b| b.binding.as_deref())
 }
 
+/// Whether an editor may hold unsaved edits of the open canvas: its browser link was given, or
+/// an in-panel editor is mounted on it (in this view or another).
+fn editors_in_use(b: &Bound) -> bool {
+    b.editor_opened || !b.mounts.is_empty()
+}
+
 /// A switch away from the open canvas (create, import or open of another one). Once its editor
-/// link was given, it needs `force` together with `replace`, the binding the person confirmed
-/// losing; the refusal names the current binding so a view can confirm exactly that one. A
-/// `replace` that isn't the current binding is stale and refused.
+/// link was given, or while an in-panel editor is mounted on it, it needs `force` together with
+/// `replace`, the binding the person confirmed losing; the refusal names the current binding so
+/// a view can confirm exactly that one. A `replace` that isn't the current binding is stale and
+/// refused.
 fn library_switch(state: &LauncherState, force: bool, replace: Option<&str>) -> Result<(), String> {
     let current = current_binding(state);
     if let Some(r) = replace
@@ -88,7 +121,7 @@ fn library_switch(state: &LauncherState, force: bool, replace: Option<&str>) -> 
         return Err(STALE.into());
     }
     match state.bound.as_ref() {
-        Some(b) if b.editor_opened && (!force || replace.is_none()) => Err(format!(
+        Some(b) if editors_in_use(b) && (!force || replace.is_none()) => Err(format!(
             "{SWITCH_NEEDS_FORCE} (open canvas: {})",
             current.unwrap_or("none")
         )),
@@ -108,8 +141,9 @@ fn expect_binding(state: &LauncherState, binding: Option<&str>) -> Result<(), St
 
 pub(super) const INSTRUCTIONS: &str = "openpaperdesign (app library): the OpenPaperDesign home \
     in the Codex sidebar creates, opens, closes and reopens canvases that OpenPaperDesign keeps \
-    in its own data folder, and opens them in the loopback browser editor. Those actions are \
-    the person's, from the view; they need no model call. This server has no workspace and no \
+    in its own data folder, and edits them in the view itself (or, as a secondary option, in \
+    the loopback browser editor). Those actions are the person's, from the view; they need no \
+    model call. This server has no workspace and no \
     project editing tools: openpaperdesign_status reports what it serves. Workspace design \
     projects (design/<name>/ in a repository) need a separately started `openpaperdesign-mcp \
     --codex-context` server; don't claim this one can bind or edit them.";
@@ -164,6 +198,13 @@ fn tools() -> Vec<Value> {
         "description": "The binding this view was shown (from an editor result). A stale one is refused."});
     let replace = json!({"type": "string", "pattern": "^[0-9a-f]{16}\\.[0-9]{1,20}$",
         "description": "With force: the binding the person confirmed replacing. A stale one is refused."});
+    let panel = json!({"type": "boolean", "description": "The view edits the canvas in its own \
+        panel: the result has no browser editor link, and none counts as given."});
+    let page_id = json!({"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$",
+        "description": "The page this in-panel editor read first (from its first page result)."});
+    let mount = json!({"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INTEGER,
+        "description": "This in-panel editor's number (from its first page result). A released one is refused."});
+    let doc = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
     vec![
         json!({"name": LIST, "_meta": app, "inputSchema": none,
             "description": "For the home view: the canvases in OpenPaperDesign's app library \
@@ -174,17 +215,46 @@ fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS},
                 "force": force,
-                "replace": replace
+                "replace": replace,
+                "panel": panel
             }, "required": ["name"], "additionalProperties": false}}),
         json!({"name": OPEN, "_meta": app,
             "description": "For the home view: open a library canvas in the editor.",
-            "inputSchema": {"type": "object", "properties": {"id": id, "force": force, "replace": replace},
+            "inputSchema": {"type": "object", "properties": {"id": id, "force": force, "replace": replace, "panel": panel},
                 "required": ["id"], "additionalProperties": false}}),
         json!({"name": EDITOR, "_meta": app,
             "description": "For the home view: the editor link and state of the canvas open \
                 in this window; with `binding`, only if that is still the one open.",
-            "inputSchema": {"type": "object", "properties": {"binding": binding},
+            "inputSchema": {"type": "object", "properties": {"binding": binding, "panel": panel},
                 "additionalProperties": false}}),
+        json!({"name": ASSET, "_meta": app,
+            "description": "For the home view's own editor: one part of this build's packaged \
+                renderer (WebAssembly), base64. Parts are 262144 bytes, numbered from 0. Reads \
+                no canvas and no file.",
+            "inputSchema": doc(json!({"part": {"type": "integer", "minimum": 0, "maximum": 63}}), &["part"])}),
+        json!({"name": PAGE, "_meta": app,
+            "description": "For the home view's own editor: the page of the canvas this view \
+                shows. Without page_id: its active page (else its first), and the result names \
+                this editor's mount; then with page_id and mount: that exact page again.",
+            "inputSchema": doc(json!({"binding": binding, "page_id": page_id, "mount": mount}), &["binding"])}),
+        json!({"name": REVISION, "_meta": app,
+            "description": "For the home view's own editor: the current revision of its page.",
+            "inputSchema": doc(json!({"binding": binding, "page_id": page_id, "mount": mount}), &["binding", "page_id", "mount"])}),
+        json!({"name": SAVE, "_meta": app,
+            "description": "For the home view's own editor: save its page (an upstream page \
+                file), only if if_match is the page's revision now. A stale one is refused \
+                and nothing is written.",
+            "inputSchema": doc(json!({"binding": binding, "page_id": page_id, "mount": mount,
+                "if_match": {"type": "string", "maxLength": 64}, "text": {"type": "string"}}),
+                &["binding", "page_id", "mount", "if_match", "text"])}),
+        json!({"name": READY, "_meta": app,
+            "description": "For the home view's own editor: report that it loaded its page and \
+                its renderer is Ready. Changes no file.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
+        json!({"name": RELEASE, "_meta": app,
+            "description": "For the home view's own editor: it was left (Back, Close or the \
+                view going away). The canvas stays open; nothing is saved or changed.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
         json!({"name": CLOSE, "_meta": app,
             "description": "For the home view: close the canvas this view shows (its editor \
                 server stops). Saved edits stay in the library; closing saves nothing.",
@@ -197,7 +267,8 @@ fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "payload": {"type": "string", "maxLength": MAX_PAYLOAD_BYTES},
                 "force": force,
-                "replace": replace
+                "replace": replace,
+                "panel": panel
             }, "required": ["payload"], "additionalProperties": false}}),
         json!({"name": EXPORT, "_meta": app,
             "description": "For the home view: the canvas this view shows, as last saved, as \
@@ -261,13 +332,25 @@ impl Launcher {
                     "library_problem": problem,
                     "open_canvas": open,
                     "editor_opened": state.bound.as_ref().is_some_and(|b| b.editor_opened),
+                    "panel_editors": state.bound.as_ref().map_or(0, |b| b.mounts.len()),
                     "browser_editor": if bundle_complete() { "built in" } else { "not built" },
+                    "panel_editor": match panel_editor() {
+                        Ok(_) => "built in".to_string(),
+                        Err(why) => format!("not available: {why}"),
+                    },
                     "workspace": null,
                     "workspace_usable": false,
                     "workspace_problem": "This server runs the app library and has no workspace \
                         or project tools; workspace projects need a separately started \
                         openpaperdesign-mcp --codex-context server.",
                 }))
+            }
+            n if PANEL_TOOLS.contains(&n) => {
+                let args = Value::Object(args.unwrap_or_default());
+                // rmcp cancels `ct` on `notifications/cancelled` but keeps running this handler.
+                let ct = context.ct.clone();
+                self.panel_call(n, &args, async move { ct.cancelled().await })
+                    .await
             }
             n if TOOLS.contains(&n) => {
                 self.app(lib, n, Value::Object(args.unwrap_or_default()))
@@ -279,16 +362,24 @@ impl Launcher {
 
     pub(super) async fn app(&self, lib: &Arc<Library>, name: &str, args: Value) -> ToolResult {
         let (strings, flags): (&[&str], &[&str]) = match name {
-            CREATE => (&["name", "replace"], &["force"]),
-            OPEN => (&["id", "replace"], &["force"]),
-            EDITOR | EXPORT => (&["binding"], &[]),
+            CREATE => (&["name", "replace"], &["force", "panel"]),
+            OPEN => (&["id", "replace"], &["force", "panel"]),
+            EDITOR => (&["binding"], &["panel"]),
+            EXPORT => (&["binding"], &[]),
             CLOSE => (&["binding"], &["force"]),
-            IMPORT => (&["payload", "replace"], &["force"]),
+            IMPORT => (&["payload", "replace"], &["force", "panel"]),
             _ => (&[], &[]),
         };
         let map = direct::strict(&args, strings, flags)?;
         let get = |k: &str| map.get(k).and_then(Value::as_str);
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
+        // The view edits in its own panel: no browser link is handed out by this result.
+        let panel = map.get("panel").and_then(Value::as_bool).unwrap_or(false);
+        // A request for the view's own editor is refused before anything is locked, created,
+        // imported, opened or switched when this build can't serve that editor.
+        if panel {
+            Self::panel_available(lib)?;
+        }
         for k in ["binding", "replace"] {
             if get(k).is_some_and(|b| !valid_binding(b)) {
                 return Err(format!(
@@ -306,14 +397,15 @@ impl Launcher {
             }
             CREATE => {
                 let name = canvas_name(get("name"))?;
-                self.app_create(lib, NewDocument::blank(&name), force, replace, "created")
+                let doc = NewDocument::blank(&name);
+                self.app_create(lib, doc, force, replace, "created", panel)
                     .await
             }
             OPEN => {
                 let id = get("id")
                     .filter(|s| valid_id(s))
                     .ok_or("A canvas id from the library list is required. Nothing was opened.")?;
-                self.app_open(lib, id, force, replace).await
+                self.app_open(lib, id, force, replace, panel).await
             }
             EDITOR => {
                 let state = self.state.clone().lock_owned().await;
@@ -322,7 +414,7 @@ impl Launcher {
                 if binding.is_some() {
                     expect_binding(&state, binding)?;
                 }
-                text(Self::library_editor(&mut state, lib, "reopened")?)
+                text(Self::library_editor(&mut state, lib, "reopened", panel)?)
             }
             CLOSE => self.app_close(binding, force).await,
             IMPORT => {
@@ -330,7 +422,8 @@ impl Launcher {
                     get("payload").ok_or("A canvas file is required. Nothing was imported.")?;
                 // Checked completely before anything is locked or written.
                 let doc = payload::validate(file)?;
-                self.app_create(lib, doc, force, replace, "imported").await
+                self.app_create(lib, doc, force, replace, "imported", panel)
+                    .await
             }
             EXPORT => self.app_export(binding).await,
             _ => Err(format!("unknown tool {name}")),
@@ -360,11 +453,14 @@ impl Launcher {
     }
 
     /// The open library canvas's editor link and identity, from this same binding. Reading its
-    /// manifest first re-checks the canvas, the library and the lease.
+    /// manifest first re-checks the canvas, the library and the lease. With `panel`, the view
+    /// edits it in its own panel: the result carries no link and gives none out (Close and
+    /// Switch then count the panel's mount instead, see `editors_in_use`).
     fn library_editor(
         state: &mut LauncherState,
         lib: &Library,
         action: &str,
+        panel: bool,
     ) -> Result<Value, String> {
         let Some(b) = state.bound.as_mut() else {
             return Err(NO_CANVAS.into());
@@ -375,12 +471,10 @@ impl Launcher {
         let manifest = b.server.bound_manifest().map_err(|e| {
             format!("The open canvas can't be shown: {e}. Nothing was opened; close it and open it again.")
         })?;
-        b.editor_opened = true;
         let (loaded, saves) = b.server.editor_state();
-        Ok(json!({
+        let mut out = json!({
             "action": action,
             "storage": "app-library",
-            "url": format!("http://127.0.0.1:{}/#token={}", b.port, b.token),
             "browser_editor": if bundle_complete() { "built in" } else { "not built" },
             "canvas": {
                 "id": doc,
@@ -393,10 +487,25 @@ impl Launcher {
             "library": lib.root(),
             "editor_loaded": loaded,
             "browser_saves": saves,
-            "open_in": "the host's in-app browser (loopback only)",
-            "note": "Saved edits are kept in OpenPaperDesign's app library. The token in the URL \
-                is for this window only; don't write it into files.",
-        }))
+        });
+        if panel {
+            out["panel"] = json!(true);
+            out["panel_editor"] = json!(match panel_editor() {
+                Ok(_) => "built in".to_string(),
+                Err(why) => format!("not available: {why}"),
+            });
+            out["open_in"] = json!("this view");
+            out["note"] = json!("Saved edits are kept in OpenPaperDesign's app library.");
+        } else {
+            b.editor_opened = true;
+            out["url"] = json!(format!("http://127.0.0.1:{}/#token={}", b.port, b.token));
+            out["open_in"] = json!("the host's in-app browser (loopback only)");
+            out["note"] = json!(
+                "Saved edits are kept in OpenPaperDesign's app library. The token in the URL \
+                 is for this window only; don't write it into files."
+            );
+        }
+        Ok(out)
     }
 
     /// Create (or import) a canvas and open it. Fallible preparation (listener, lease, files,
@@ -410,6 +519,7 @@ impl Launcher {
         force: bool,
         replace: Option<&str>,
         action: &'static str,
+        panel: bool,
     ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
         refuse_if_shut_down(&state)?;
@@ -447,7 +557,7 @@ impl Launcher {
                  be shown. It is in the library list."
             ));
         }
-        text(Self::library_editor(&mut state, lib, action)?)
+        text(Self::library_editor(&mut state, lib, action, panel)?)
     }
 
     /// Open a library canvas. Opening the canvas that is already open here is a checked no-op;
@@ -458,6 +568,7 @@ impl Launcher {
         id: &str,
         force: bool,
         replace: Option<&str>,
+        panel: bool,
     ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
         refuse_if_shut_down(&state)?;
@@ -467,7 +578,12 @@ impl Launcher {
             return Err(STALE.into());
         }
         if state.bound.as_ref().and_then(|b| b.doc.as_deref()) == Some(id) {
-            return text(Self::library_editor(&mut state, lib, "already-open")?);
+            return text(Self::library_editor(
+                &mut state,
+                lib,
+                "already-open",
+                panel,
+            )?);
         }
         // Checked before a lease file is made for it: only an existing library canvas.
         lib.read_document(id)
@@ -501,7 +617,7 @@ impl Launcher {
                     .into(),
             );
         }
-        text(Self::library_editor(&mut state, lib, "opened")?)
+        text(Self::library_editor(&mut state, lib, "opened", panel)?)
     }
 
     fn prepare_library_install(
@@ -537,7 +653,7 @@ impl Launcher {
         let Some(doc) = b.doc.clone() else {
             return Err(NO_CANVAS.into());
         };
-        if b.editor_opened && !force {
+        if editors_in_use(b) && !force {
             return Err(CLOSE_NEEDS_FORCE.into());
         }
         tokio::spawn(async move {
@@ -604,5 +720,291 @@ impl Launcher {
             "payload": e.text,
             "note": payload::NOTE,
         }))
+    }
+}
+
+/// Only the named arguments, each of its type: `strings`, and `ints` (whole numbers from 0 to
+/// 2^53 - 1; a fraction, a sign, a float such as `1.0` or a numeric string is refused). For
+/// the in-panel editor's tools, whose numbers `direct::strict` (strings and booleans) can't
+/// check.
+fn panel_args<'a>(
+    args: &'a Value,
+    strings: &[&str],
+    ints: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let map = args
+        .as_object()
+        .ok_or("arguments must be an object; nothing was read or changed")?;
+    for (k, v) in map {
+        let ok = (strings.contains(&k.as_str()) && v.is_string())
+            || (ints.contains(&k.as_str()) && v.as_u64().is_some_and(|n| n <= MAX_SAFE_INTEGER));
+        if !ok {
+            return Err(format!(
+                "unexpected argument `{k}`, or not of its type; nothing was read or changed"
+            ));
+        }
+    }
+    Ok(map)
+}
+
+/// Part `part` of the packaged renderer: exactly `PART_BYTES` bytes from `part * PART_BYTES`
+/// (the last part shorter), base64, with the renderer's identity, total size and part count
+/// so the editor can check each answer belongs to the same renderer and comes in order. No
+/// other file is ever sent, and no argument names one.
+pub(super) fn asset_part(bytes: &[u8], identity: &str, part: u64) -> Result<Value, String> {
+    if bytes.is_empty() || bytes.len() > MAX_ASSET_BYTES {
+        return Err(format!(
+            "this build's renderer is {} bytes, outside what the in-panel editor accepts (1 to \
+             {MAX_ASSET_BYTES}); nothing was sent",
+            bytes.len()
+        ));
+    }
+    let parts = bytes.len().div_ceil(PART_BYTES);
+    let i = usize::try_from(part)
+        .ok()
+        .filter(|i| *i < parts)
+        .ok_or_else(|| {
+            format!(
+                "there is no renderer part {part}: it has {parts} parts, 0 to {}; nothing was sent",
+                parts - 1
+            )
+        })?;
+    let start = i * PART_BYTES;
+    let end = (start + PART_BYTES).min(bytes.len());
+    Ok(json!({
+        "asset": WASM_FILE,
+        "identity": identity,
+        "bytes": bytes.len(),
+        "parts": parts,
+        "part": i,
+        "offset": start,
+        "part_bytes": end - start,
+        "data": base64(&bytes[start..end]),
+    }))
+}
+
+/// An in-panel page call's refusal, as JSON the editor reads: the message, an HTTP-like status
+/// (409 with the page's current revision for a conflict, 410 when the binding or mount isn't
+/// current any more, 413 when it is too large for the panel, 400 for bad arguments) and nothing
+/// else. Every refusal means nothing was written.
+fn panel_unavailable(why: &str) -> String {
+    format!(
+        "The in-panel editor isn't available in this OpenPaperDesign build ({why}), so nothing \
+         was created, imported, opened or changed. Rebuild OpenPaperDesign with its editor \
+         (./scripts/build-web.sh), then reinstall it."
+    )
+}
+
+fn panel_refusal(status: u16, error: &str, revision: Option<&str>) -> String {
+    json!({"error": error, "status": status, "revision": revision}).to_string()
+}
+
+fn api_refusal(e: crate::ApiError) -> String {
+    panel_refusal(e.status.as_u16(), &e.msg, e.etag.as_deref())
+}
+
+impl Launcher {
+    /// Whether this build serves the in-panel editor (its module and renderer, see
+    /// `panel_editor`).
+    fn panel_available(lib: &Library) -> Result<(), String> {
+        #[cfg(test)]
+        if crate::test_support::fault(lib.root(), "panel_unavailable") {
+            return Err(panel_unavailable("injected test failure"));
+        }
+        let _ = lib;
+        panel_editor().map(|_| ()).map_err(panel_unavailable)
+    }
+
+    /// The home view's own editor (the in-panel editor): the renderer's parts, and the page,
+    /// revision, save, Ready and release calls of the canvas the view shows. The renderer part
+    /// is static packaged data. Every page call names the view's `binding`, and after its first
+    /// read the `page_id` and `mount` that read returned: all compared under the state lock
+    /// before anything is read or written (`panel_server`). They run through the same `Server`
+    /// operations as the browser's HTTP API (`Server::page`, `page_revision`, `save_page`,
+    /// `mark_ready`), with the same lifecycle, root, lease, conflict, commit and rollback rules,
+    /// never through a loopback request.
+    pub(super) async fn panel_call(
+        &self,
+        name: &str,
+        args: &Value,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> ToolResult {
+        if name == ASSET {
+            let map = panel_args(args, &[], &["part"])?;
+            let part = map
+                .get("part")
+                .and_then(Value::as_u64)
+                .ok_or("`part` (a whole number) is required; nothing was sent")?;
+            let (bytes, id) = wasm().ok_or(
+                "This OpenPaperDesign command was built without the browser editor, so it has \
+                 no renderer to send.",
+            )?;
+            return text(asset_part(bytes, id, part)?);
+        }
+        let (strings, ints, required): (&[&str], &[&str], &[&str]) = match name {
+            PAGE => (&["binding", "page_id"], &["mount"], &["binding"]),
+            REVISION => (
+                &["binding", "page_id"],
+                &["mount"],
+                &["binding", "page_id", "mount"],
+            ),
+            SAVE => (
+                &["binding", "page_id", "if_match", "text"],
+                &["mount"],
+                &["binding", "page_id", "mount", "if_match", "text"],
+            ),
+            READY | RELEASE => (&["binding"], &["mount"], &["binding", "mount"]),
+            _ => return Err(format!("unknown tool {name}")),
+        };
+        let bad = |status: u16, msg: &str| panel_refusal(status, msg, None);
+        let map = panel_args(args, strings, ints).map_err(|e| bad(400, &e))?;
+        if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
+            return Err(bad(
+                400,
+                &format!("`{k}` is required; nothing was read or changed"),
+            ));
+        }
+        let get = |k: &str| map.get(k).and_then(Value::as_str);
+        let binding = get("binding").filter(|b| valid_binding(b)).ok_or_else(|| {
+            bad(
+                400,
+                "`binding` isn't a binding from an editor result; nothing was read or changed",
+            )
+        })?;
+        let mount = map.get("mount").and_then(Value::as_u64);
+        let page_id = get("page_id");
+        if page_id.is_some_and(|p| !crate::valid_page_id(p)) {
+            return Err(bad(
+                400,
+                "`page_id` isn't a page id; nothing was read or changed",
+            ));
+        }
+        if name == PAGE && page_id.is_some() != mount.is_some() {
+            return Err(bad(
+                400,
+                "the first page read names neither page_id nor mount, and every later one names \
+                 both; nothing was read or changed",
+            ));
+        }
+        // No editor is mounted from a build that can't serve one.
+        if name == PAGE && mount.is_none() {
+            panel_editor().map_err(|why| bad(503, &panel_unavailable(why)))?;
+        }
+        if name == RELEASE {
+            let mut state = self.state.lock().await;
+            expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
+            let released = state
+                .bound
+                .as_mut()
+                .is_some_and(|b| mount.is_some_and(|m| b.mounts.remove(&m)));
+            return text(json!({"binding": binding, "released": released}));
+        }
+        let server = self
+            .panel_server(binding, mount)
+            .await
+            .map_err(|e| bad(410, &e))?;
+        match name {
+            PAGE => {
+                let page = server.page(page_id).map_err(api_refusal)?;
+                let body = String::from_utf8(page.bytes).map_err(|_| {
+                    bad(
+                        422,
+                        "the page file isn't UTF-8 text, so it can't be edited here; nothing was \
+                         changed",
+                    )
+                })?;
+                let mut out = json!({
+                    "binding": binding,
+                    "canvas": {"name": page.project},
+                    "page": {"id": page.id, "name": page.name},
+                    "revision": page.revision,
+                    "text": body,
+                });
+                // The serialized message, escaping included, plus room for the mount number.
+                let size = serde_json::to_string(&out).map_or(usize::MAX, |s| s.len() + 64);
+                if size > MAX_PANEL_MESSAGE {
+                    return Err(bad(
+                        413,
+                        &format!(
+                            "this page is {size} bytes as a message, more than the in-panel \
+                             editor's {MAX_PANEL_MESSAGE}, so it wasn't opened here; nothing was \
+                             changed. Open it in the browser editor instead."
+                        ),
+                    ));
+                }
+                let m = match mount {
+                    Some(m) => m,
+                    None => {
+                        // A new mount, only while this binding is still the open one.
+                        let mut state = self.state.lock().await;
+                        expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
+                        let b = state.bound.as_mut().ok_or_else(|| bad(410, NO_CANVAS))?;
+                        b.next_mount += 1;
+                        b.mounts.insert(b.next_mount);
+                        b.next_mount
+                    }
+                };
+                out["mount"] = json!(m);
+                text(out)
+            }
+            REVISION => {
+                let page_id = page_id.unwrap_or_default();
+                let revision = server.page_revision(page_id).map_err(api_refusal)?;
+                text(json!({"binding": binding, "page_id": page_id, "revision": revision}))
+            }
+            SAVE => {
+                let size = serde_json::to_string(args).map_or(usize::MAX, |s| s.len());
+                if size > MAX_PANEL_MESSAGE {
+                    return Err(bad(
+                        413,
+                        &format!(
+                            "this save is {size} bytes as a message, more than the in-panel \
+                             editor's {MAX_PANEL_MESSAGE}; nothing was written. Open the canvas \
+                             in the browser editor to save a page this large."
+                        ),
+                    ));
+                }
+                let page_id = page_id.unwrap_or_default();
+                let if_match = get("if_match").unwrap_or_default();
+                let body = get("text").unwrap_or_default();
+                // A save whose request is cancelled before it holds the writer fence never
+                // starts; once it holds it, it runs to its commit or rollback without waiting
+                // again (`Server::save_page`), so it can't be stopped halfway.
+                let revision = tokio::select! {
+                    biased;
+                    r = server.save_page(page_id, if_match, body) => r.map_err(api_refusal)?,
+                    () = cancelled => {
+                        return Err(bad(503, "the save was cancelled before it started; nothing was written"));
+                    }
+                };
+                text(json!({
+                    "binding": binding,
+                    "page_id": page_id,
+                    "saved": true,
+                    "revision": revision,
+                }))
+            }
+            READY => {
+                server.mark_ready().map_err(api_refusal)?;
+                text(json!({"binding": binding, "ready": true}))
+            }
+            _ => Err(format!("unknown tool {name}")),
+        }
+    }
+
+    /// The open canvas's server for an in-panel call naming `binding` (and `mount`, after the
+    /// first page read), compared under the state lock. The lock is released before the server
+    /// is used: a save then waits for the binding's writer fence without it. Close holds the
+    /// state lock while it drains that fence, so this order is never reversed.
+    async fn panel_server(&self, binding: &str, mount: Option<u64>) -> Result<Arc<Server>, String> {
+        let state = self.state.clone().lock_owned().await;
+        refuse_if_shut_down(&state)?;
+        let state = Self::fence_library(state).await?;
+        expect_binding(&state, Some(binding))?;
+        let b = state.bound.as_ref().ok_or(NO_CANVAS)?;
+        if mount.is_some_and(|m| !b.mounts.contains(&m)) {
+            return Err(UNMOUNTED.into());
+        }
+        Ok(b.server.clone())
     }
 }

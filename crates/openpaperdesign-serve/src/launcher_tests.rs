@@ -16,15 +16,24 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tower::ServiceExt as _;
 
 // A complete name list lets open_editor exercise its real lifecycle without requiring a
-// web build for cargo test. These inert bytes are not browser-rendering evidence.
+// web build for cargo test. These inert bytes are not browser-rendering evidence: the in-panel
+// module parts are one-line stand-ins (enough for the launcher to assemble and serve a module,
+// nothing that renders), and the "wasm" is 600,000 filler bytes that only exercise the bounded
+// part transfer (three parts).
 pub(super) static BUNDLE_FILES: crate::EmbeddedBundle = &[
     ("index.html", b"test fixture"),
     ("app.js", b""),
-    ("page.js", b""),
-    ("session.js", b""),
-    ("openpaperdesign_web.js", b""),
-    ("openpaperdesign_web_bg.wasm", b""),
+    ("page.js", b"export function frameStep() {}"),
+    ("session.js", b"export class Session {}"),
+    ("editor.js", b"export function opdMountEditor() {}"),
+    (
+        "panel.js",
+        b"export function opdCreatePanel() { return null; }",
+    ),
+    ("openpaperdesign_web.js", b"export function start() {}"),
+    ("openpaperdesign_web_bg.wasm", &FIXTURE_WASM),
 ];
+pub(super) static FIXTURE_WASM: [u8; 600_000] = [0x61; 600_000];
 
 type Listeners = HashMap<u16, UnboundedSender<DuplexStream>>;
 fn listeners() -> &'static Mutex<Listeners> {

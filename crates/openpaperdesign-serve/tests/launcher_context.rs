@@ -634,7 +634,8 @@ fn decode_base64(s: &str) -> Vec<u8> {
 /// Every pure home call, under each metadata variant: it succeeds, refuses extra arguments,
 /// serves only the exact view, and discloses neither the workspace nor the editor token.
 async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Option<&str>) {
-    const HOME: &str = "ui://openpaperdesign/home.html";
+    // Versioned: the view with the in-panel editor slot is `home-2`.
+    const HOME: &str = "ui://openpaperdesign/home-2.html";
     for meta in metas {
         let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
         assert!(ok, "{s}");
@@ -682,7 +683,9 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
             "the slot holds the packaged font, byte for byte"
         );
         for other in [
-            "ui://openpaperdesign/home.html?x",
+            "ui://openpaperdesign/home-2.html?x",
+            // The earlier, unversioned view URI is no longer served.
+            "ui://openpaperdesign/home.html",
             "ui://openpaperdesign/other.html",
             "file:///etc/passwd",
         ] {
@@ -702,7 +705,7 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
 /// session's workspace state alone. Every other tool keeps per-call admission and retirement.
 #[tokio::test]
 async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
-    const HOME: &str = "ui://openpaperdesign/home.html";
+    const HOME: &str = "ui://openpaperdesign/home-2.html";
     let f = Fixture::new();
     let c = f.host().await;
 

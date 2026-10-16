@@ -81,7 +81,9 @@ const PROJECTS_TOOL: &str = "openpaperdesign_projects";
 const INVENTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 /// One inventory child process at a time per session.
 static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-const HOME_URI: &str = "ui://openpaperdesign/home.html";
+/// Versioned: a view whose code changed incompatibly gets a new URI, so a host never pairs a
+/// cached older view with this server (`home-2`: the in-panel editor module).
+const HOME_URI: &str = "ui://openpaperdesign/home-2.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's
@@ -98,7 +100,9 @@ fn home_html() -> &'static str {
     home_html_for(false)
 }
 
-/// The home view for a workspace or an app-library process.
+/// The home view for a workspace or an app-library process. An app-library view also gets
+/// the in-panel editor module in its one editor slot, when this build has it (`panel_editor`);
+/// otherwise the slot keeps its `null` and the view offers the browser editor link instead.
 fn home_html_for(library: bool) -> &'static str {
     static WORKSPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     static LIBRARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -108,10 +112,102 @@ fn home_html_for(library: bool) -> &'static str {
         (&WORKSPACE, "workspace")
     };
     cell.get_or_init(|| {
-        HOME_HTML
+        let html = HOME_HTML
             .replacen(WORDMARK_FONT_SLOT, &base64(WORDMARK_FONT), 1)
-            .replacen(MODE_SLOT, mode, 1)
+            .replacen(MODE_SLOT, mode, 1);
+        match panel_editor() {
+            Ok(module) if library => html.replacen(PANEL_SLOT, module, 1),
+            _ => html,
+        }
     })
+}
+
+/// The home's in-panel editor slot: a line of its one inline module. Left as it is, the view
+/// has no in-panel editor (`opdCreatePanel` is null).
+const PANEL_SLOT: &str = "const opdCreatePanel = null; // __OPD_PANEL_MODULE__";
+/// The packaged bundle files the in-panel editor module is made of, in this order. Only these
+/// fixed, embedded files: never a path, URL or project file. The same order is assembled by
+/// `crates/openpaperdesign-web/tests/panel.test.mjs`.
+const PANEL_PARTS: [&str; 5] = [
+    "openpaperdesign_web.js",
+    "session.js",
+    "page.js",
+    "editor.js",
+    "panel.js",
+];
+/// The packaged renderer, sent to the in-panel editor in bounded parts (`app::ASSET`).
+const WASM_FILE: &str = "openpaperdesign_web_bg.wasm";
+
+fn bundle_file(files: crate::EmbeddedBundle, name: &str) -> Option<&'static [u8]> {
+    files
+        .iter()
+        .find(|(f, _)| *f == name)
+        .map(|(_, b)| *b)
+        .filter(|b| !b.is_empty())
+}
+
+/// The packaged renderer and its identity (a hash of its bytes), if this build has it. The
+/// in-panel module carries the same identity, so parts of another build are refused.
+fn wasm() -> Option<(&'static [u8], &'static str)> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let bytes = bundle_file(BUNDLE_FILES, WASM_FILE)?;
+    let id = ID.get_or_init(|| Some(crate::etag(bytes))).as_deref()?;
+    Some((bytes, id))
+}
+
+/// The in-panel editor module of this build, or why there is none.
+fn panel_editor() -> Result<&'static str, &'static str> {
+    static MODULE: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    MODULE
+        .get_or_init(|| {
+            let (_, id) = wasm().ok_or("this build has no packaged renderer")?;
+            panel_module(BUNDLE_FILES, id)
+        })
+        .as_ref()
+        .map(String::as_str)
+        .map_err(String::as_str)
+}
+
+/// One inline ES module from the fixed parts (`PANEL_PARTS`), after a line naming the renderer
+/// identity. Each part must be present, UTF-8 and free of `import` declarations (they have
+/// none; a module inlined in the view can't import), and the whole must be safe inside the
+/// view's `<script type="module">`: no `</script`, `<script` or `<!--` anywhere (case-
+/// insensitive). Nothing is evaluated, fetched or loaded by URL: the module's own code calls
+/// the glue's init with the renderer bytes it was sent.
+fn panel_module(files: crate::EmbeddedBundle, identity: &str) -> Result<String, String> {
+    let mut out = format!(
+        "// The in-panel editor (assembled by openpaperdesign-mcp from its packaged files).\n\
+         const OPD_WASM_IDENTITY = {};\n",
+        serde_json::to_string(identity).expect("a string serializes")
+    );
+    for name in PANEL_PARTS {
+        let bytes =
+            bundle_file(files, name).ok_or_else(|| format!("{name} isn't in this build"))?;
+        let text = std::str::from_utf8(bytes).map_err(|_| format!("{name} isn't UTF-8"))?;
+        if text.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("import ") || t.starts_with("import{") || t.starts_with("import(")
+        }) {
+            return Err(format!(
+                "{name} has an import, which an inline module can't load"
+            ));
+        }
+        out.push_str(&format!("\n// ---- {name} ----\n"));
+        out.push_str(text);
+        out.push('\n');
+    }
+    let lower = out.to_ascii_lowercase();
+    for bad in ["</script", "<script", "<!--"] {
+        if lower.contains(bad) {
+            return Err(format!(
+                "the editor code contains `{bad}`, so it can't be put inside the view"
+            ));
+        }
+    }
+    if !out.contains("function opdCreatePanel(") {
+        return Err("panel.js doesn't define opdCreatePanel".into());
+    }
+    Ok(out)
 }
 
 const NOT_BOUND: &str = "No design project is bound yet. Call bind_project with the path of an \
@@ -180,6 +276,12 @@ struct Bound {
     /// views send back so a stale action or confirmation is refused. Not a credential and not
     /// a path; it authorizes nothing.
     binding: Option<String>,
+    /// In-panel editors of this app-library binding that read its page and haven't been
+    /// released (Back, Close or the view's teardown release them; a view that vanished never
+    /// does, which only makes Close and Switch ask for confirmation). Like `binding`, a mount
+    /// number is a stale-view check, never a credential.
+    mounts: std::collections::BTreeSet<u64>,
+    next_mount: u64,
 }
 
 /// The origin of admitted authority: a model call's context, or a direct home-view action's
@@ -947,6 +1049,8 @@ impl Launcher {
                 binding: doc.as_deref().map(app::binding_id),
                 doc,
                 _lease: lease,
+                mounts: Default::default(),
+                next_mount: 0,
             });
             // This summary is not the agent's read: its session must still read each page.
             let info = server

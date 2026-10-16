@@ -11,6 +11,61 @@ cloud, no telemetry. Not affiliated with Paper (paper.design).
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
 surface), plugin publishing, other hosts. The later sidebar home is described in the next section.
 
+## In-panel editor (issue #6): source candidate, 2026-10-16
+
+Not built, tested, installed or qualified by its writer. On the Mac, the host received the
+library's app-origin calls, but `ui/open-link` showed no editor destination, so the basic flow
+now edits in the home view itself. The browser editor link stays a secondary action.
+
+- **Same editor.** The view runs the existing Rust/WASM renderer, `Session` (save, conflict,
+  discard, WebGPU-to-WebGL fallback) and one shared mount (`static/editor.js`, also used by
+  `app.js`). No second renderer, document store, runtime or dependency.
+- **One fixed module.** The home resource is versioned (`ui://openpaperdesign/home-2.html`).
+  Its one `<script type="module">` starts with an editor slot. An app-library server fills that
+  slot with the packaged glue, `session.js`, `page.js`, `editor.js` and `panel.js`, in that
+  order, only if no part has an import, `</script`, `<script` or `<!--`. Otherwise the slot
+  stays `null`. The view then still lists canvases but refuses New, Import and Open itself,
+  sending nothing. The server also refuses any `panel: true` request its build can't serve,
+  before any lock, file, lease, switch or mount. The browser link is never a substitute.
+  Nothing is fetched by URL or evaluated. No CSP, CORS, framing or outbound domain is added.
+- **Renderer transfer.** `openpaperdesign_app_editor_asset {part}` sends the packaged wasm in
+  sequential 262,144-byte parts, base64, 16 MiB at most. `part` must be a whole number. Each
+  answer names the renderer's identity, size, part count, offset and length. The view checks
+  them against its own module and stops on any mismatch or when the person leaves. It then
+  calls the glue's `__wbg_init({module_or_path: bytes})`.
+- **Page transport.** These tools run the same `Server` operations as the HTTP API, never a
+  loopback request:
+  - `_app_page {binding}` reads the manifest's active page (else its first) and returns a
+    `mount` number;
+  - `_app_page`, `_app_page_revision` and `_app_page_save` then name that `page_id` and `mount`;
+  - `_app_ready` and `_app_page_release` complete the set.
+
+  A save is one transaction: 409 with the current revision, rollback, the `Broken` fence, the
+  committed-save counter, and a bounded wait for the writer fence. A cancelled or expired
+  queued save never runs; a started one finishes, and Close waits for it. It changes only its
+  page and the manifest's `modified`. A removed page is refused (404).
+- **Message limits.** Page messages to and from the panel are limited to 4 MiB serialized,
+  escaping included. A larger page isn't opened in the panel, and a larger save isn't sent;
+  neither changes any file.
+- **Confirmation.** `panel: true` on create, open, import or editor returns no link and gives
+  none. Close and Switch need `force` while any editor is mounted or a link was given.
+- **Leaving.** Back and Close stop input and polling, wait for the save in flight, save what is
+  left and require `can_reload`. A conflict, a failed or unanswered save, or an edit still
+  under way keeps the editor, with "Leave without saving" as the explicit discard. The editor
+  is then disposed once: frame loop, timers, listeners, pointer capture and wasm handle.
+  `ui/resource-teardown` drains first, for up to 8 seconds. An abrupt removal or a crash saves
+  nothing. Full screen is requested only when the host lists it.
+
+Unproven until a native run on the exact candidate:
+- whether the host's CSP allows WebAssembly compilation;
+- WebGL2 or WebGPU in the panel;
+- the host's message limits for parts, pages and saves;
+- pointer capture, keyboard, focus and resize;
+- the whole direct flow: New/Open, visible edit, Saved, Close, fresh-process reopen.
+
+The synthetic tests (`home.test.mjs`, `panel.test.mjs`, `session.test.mjs`, the launcher's Rust
+tests) use stand-ins for the host, the browser and the GPU, so they prove none of it.
+
 ## App library (issue #6): source candidate, 2026-10-16
 
 Not built, tested, installed or qualified by its writer. The owner admitted (2026-10-16) an
@@ -115,10 +170,11 @@ installed check.
   before any effect; a stale one is refused, and the current canvas, files, URL and lease stay.
   The view downloads an export only if the answer names the binding and canvas it showed. The
   identity is a stale-view check, not a credential or authority.
-- **Readiness.** The editor page posts `/api/ready` (token-checked, no content) when its
-  renderer is Ready. The view reports "loaded" only from that, polled through `_app_editor`
-  after the open-link acknowledgement; the acknowledgement itself is never a load. Committed
-  browser saves are counted the same way.
+- **Readiness.** The browser editor page posts `/api/ready` (token-checked, no content) when
+  its renderer is Ready; an in-panel editor reports the same through `_app_ready`. Either sets
+  `editor_loaded` in `_app_editor` results. An open-link acknowledgement is never a load.
+  Committed saves are counted the same way. (Superseded for the view's primary flow by the
+  in-panel editor above: the view no longer opens or polls a browser link for New/Open.)
 - **Unchanged limits.** Commits are not crash-atomic, the broken-state fence is in memory, other
   writers are not excluded, and actual navigation from the native sidebar is unproven (the
   inherited Mac observation is an acknowledgement with no loopback hit).
@@ -128,7 +184,8 @@ installed check.
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
 adds `openpaperdesign_home`, a Codex sidebar (global) entry that is also a chat tab (thread
 entry), and its static MCP App view `ui://openpaperdesign/home.html`
-(`text/html;profile=mcp-app`). It also adds a read-only native project inventory,
+(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-2.html`, see
+"In-panel editor" above). It also adds a read-only native project inventory,
 `openpaperdesign_projects`, and a read-only list of this workspace's canvases,
 `openpaperdesign_canvases`. The server now lists 36 tools and one resource.
 
@@ -354,7 +411,8 @@ and purple rectangle. This is the operator's unchanged screenshot, not a generat
   - **`openpaperdesign-mcp doctor`** prints the setup as JSON (exit 0 only when the editor is
     built in and the platform is supported). `--version` prints the version.
 - **The web bundle is compiled into the command.** `build.rs` embeds
-  `target/openpaperdesign-web` (or `$OPD_WEB_BUNDLE_DIR`) when all six files exist. Otherwise
+  `target/openpaperdesign-web` (or `$OPD_WEB_BUNDLE_DIR`) when all its files exist (six at
+  the time; eight now, with the in-panel editor's `editor.js` and `panel.js`). Otherwise
   the list is empty and `open_editor` says "build the web bundle first", without guessing a
   path at run time. Editing through the tools still works without it.
 - **`plugin/openpaperdesign/`:**

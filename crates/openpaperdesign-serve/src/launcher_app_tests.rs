@@ -1090,3 +1090,864 @@ async fn library_shutdown_survives_a_waiter_cancelled_before_it_got_the_state() 
     bound_server(&lb).await.retire().await;
     task_b.abort();
 }
+
+// ---- the home view's own editor: its app-only page, revision, save, Ready, release and
+// renderer-part tools, through the real launcher and rmcp stream, on canonical library files.
+// The renderer bytes here are the inert unit fixture (`FIXTURE_WASM`); nothing renders.
+
+/// A panel tool's refusal (`panel_refusal`): its status, message and current revision.
+fn refusal(e: &str) -> Value {
+    serde_json::from_str(e).unwrap_or_else(|_| panic!("not a panel refusal: {e}"))
+}
+
+/// What the editor would save after one more rectangle on `text`.
+fn edited(text: &str) -> String {
+    let mut data = paper_rs::project::format::page_from_json(text).unwrap();
+    let id = data.doc.alloc_id();
+    data.doc.nodes.insert(
+        id,
+        paper_rs::model::Node::new(
+            id,
+            paper_rs::model::NodeKind::Rect,
+            paper_rs::geom::Rect::new(5.0, 5.0, 40.0, 30.0),
+        ),
+    );
+    data.doc.root.push(id);
+    paper_rs::project::format::page_to_json(&data)
+}
+
+fn node_count(text: &str) -> usize {
+    paper_rs::project::format::page_from_json(text)
+        .unwrap()
+        .doc
+        .nodes
+        .len()
+}
+
+fn location(v: &Value) -> PathBuf {
+    serde_json::from_value(v["location"].clone()).unwrap()
+}
+
+/// The page file and the manifest, byte for byte.
+fn files(dir: &Path, page: &str) -> (Vec<u8>, Vec<u8>) {
+    (
+        std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap(),
+        std::fs::read(dir.join("project.json")).unwrap(),
+    )
+}
+
+/// The first page read of a view's editor: (page id, mount, revision, text).
+async fn first_read(c: &Client, b: &str) -> (String, u64, String, String) {
+    let v = value(call(c, app::PAGE, json!({"binding": b})).await);
+    assert_eq!(v["binding"], json!(b));
+    (
+        v["page"]["id"].as_str().unwrap().to_string(),
+        v["mount"].as_u64().unwrap(),
+        v["revision"].as_str().unwrap().to_string(),
+        v["text"].as_str().unwrap().to_string(),
+    )
+}
+
+/// The owner's workflow with the view's own editor and no link: create, first read, save,
+/// Ready, release, close (no confirmation needed), then a fresh launcher (a new process) reopens
+/// the canvas with the edit. A link is never given, and nothing needs `ui/open-link`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_create_edit_save_close_and_reopen_through_the_app_tools() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Plan", "panel": true})).await);
+    assert_eq!(created["panel"], true);
+    assert!(created.get("url").is_none(), "no browser link: {created}");
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let b = binding(&created);
+    let dir = location(&created);
+    assert!(
+        !lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .unwrap()
+            .editor_opened,
+        "no link was given"
+    );
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    assert_eq!(
+        text.as_bytes(),
+        before.0.as_slice(),
+        "the canonical page file"
+    );
+    assert_eq!(rev, crate::etag(&before.0));
+    // The editor's own Ready report (its renderer's; this records it for the binding).
+    value(call(&lib.c, app::READY, json!({"binding": b, "mount": mount})).await);
+    let saved = value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    let after = files(&dir, &page);
+    assert_eq!(saved["revision"], json!(crate::etag(&after.0)));
+    assert_eq!(node_count(std::str::from_utf8(&after.0).unwrap()), 1);
+    let polled = value(
+        call(
+            &lib.c,
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": mount}),
+        )
+        .await,
+    );
+    assert_eq!(polled["revision"], saved["revision"]);
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b, "panel": true})).await);
+    assert_eq!(state["editor_loaded"], true);
+    assert_eq!(state["browser_saves"], 1);
+    assert!(state.get("url").is_none());
+    // While an editor is mounted, closing asks first (it may hold edits).
+    let e = call(&lib.c, app::CLOSE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("force: true"), "{e}");
+    let released = value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    assert_eq!(released["released"], true);
+    // A released editor is refused, with nothing written.
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": saved["revision"], "text": edited(&text)}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!(files(&dir, &page), after);
+    let closed = value(call(&lib.c, app::CLOSE, json!({"binding": b})).await);
+    assert_eq!(closed["action"], "closed");
+    let e = call(&lib.c, app::PAGE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&e)["status"],
+        410,
+        "a closed binding reads nothing: {e}"
+    );
+    // A fresh launcher on the same root.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::OPEN, json!({"id": id, "panel": true})).await);
+    let (page2, _, _, text2) = first_read(&c2, &binding(&reopened)).await;
+    assert_eq!(page2, page);
+    assert_eq!(node_count(&text2), 1, "the saved edit is there");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// One save transaction for both editors: the browser's HTTP save and the panel's save tool
+/// refuse each other's stale revisions (409, with the current revision, nothing written), and
+/// every commit step that fails is rolled back to byte-identical files; a failed rollback
+/// fences both. Single-threaded, so the injected commit faults reach the tool's save.
+#[tokio::test(flavor = "current_thread")]
+async fn panel_and_browser_saves_share_one_transaction_with_conflicts_and_rollback() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Shared"})).await);
+    let (port, token) = url(&created);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    // The browser saves first: the panel's save on the older revision is a conflict.
+    browser_edit(port, &token).await;
+    let now = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 409, "{e}");
+    assert_eq!(
+        r["revision"],
+        json!(crate::etag(&now.0)),
+        "the current revision"
+    );
+    assert!(r["error"].as_str().unwrap().contains("nothing was written"));
+    assert_eq!(files(&dir, &page), now);
+    // The panel saves on the current revision; then the browser's older one is refused.
+    let current = crate::etag(&now.0);
+    let mine = edited(std::str::from_utf8(&now.0).unwrap());
+    let saved = value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": current, "text": mine}),
+        )
+        .await,
+    );
+    let (st, head, _) = raw(
+        port,
+        &token,
+        "GET",
+        &format!("/api/pages/{page}/revision"),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        json!(etag_of(&head)),
+        saved["revision"],
+        "the same revision"
+    );
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {current}\r\n"),
+        &mine,
+    )
+    .await;
+    assert_eq!(st, 409, "the browser's stale save is refused too");
+    // Every failing commit step leaves both files byte-identical.
+    for at in 0..6 {
+        let before = files(&dir, &page);
+        crate::commit::fault::fail_at(&[at]);
+        let e = call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount,
+                "if_match": crate::etag(&before.0), "text": edited(std::str::from_utf8(&before.0).unwrap())}),
+        )
+        .await
+        .unwrap_err();
+        crate::commit::fault::fail_at(&[]);
+        let r = refusal(&e);
+        assert_eq!(r["status"], 500, "step {at}: {e}");
+        assert!(
+            r["error"].as_str().unwrap().contains("nothing was written"),
+            "step {at}: {e}"
+        );
+        assert_eq!(files(&dir, &page), before, "step {at}");
+    }
+    // A failed rollback fences every later write, the panel's and the browser's.
+    let before = files(&dir, &page);
+    crate::commit::fault::fail_at(&[3, 4]);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount,
+            "if_match": crate::etag(&before.0), "text": edited(std::str::from_utf8(&before.0).unwrap())}),
+    )
+    .await
+    .unwrap_err();
+    crate::commit::fault::fail_at(&[]);
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("may now be inconsistent"),
+        "{e}"
+    );
+    let fenced = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount,
+            "if_match": crate::etag(&fenced.0), "text": edited(std::str::from_utf8(&fenced.0).unwrap())}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 503, "{e}");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{page}.json")),
+        "{e}"
+    );
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {}\r\n", crate::etag(&fenced.0)),
+        &edited(std::str::from_utf8(&fenced.0).unwrap()),
+    )
+    .await;
+    assert_eq!(st, 503);
+    assert_eq!(files(&dir, &page), fenced);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// The first read takes the manifest's active page (not the first one), and later calls stay
+/// on that exact page even when the active page changes; a save changes only that page and the
+/// manifest's `modified`, keeping the other page, the page list, names, order and active page.
+/// A page removed from the manifest is refused, with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_pins_its_page_and_preserves_the_rest_of_a_multi_page_canvas() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Pages", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let mut m = crate::read_manifest_checked(&dir).unwrap();
+    let first = m.pages[0].id.clone();
+    let second = "second-page".to_string();
+    m.pages.push(paper_rs::project::PageRef {
+        id: second.clone(),
+        name: "Second".into(),
+    });
+    m.active_page = Some(second.clone());
+    std::fs::write(dir.join("project.json"), m.to_json()).unwrap();
+    let blank = paper_rs::project::PageData {
+        id: second.clone(),
+        name: "Second".into(),
+        doc: paper_rs::model::Document {
+            name: "Second".into(),
+            ..Default::default()
+        },
+        camera: None,
+    };
+    std::fs::write(
+        dir.join("pages").join(format!("{second}.json")),
+        paper_rs::project::format::page_to_json(&blank),
+    )
+    .unwrap();
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    assert_eq!(page, second, "the active page, not the first");
+    // The active page changes elsewhere; this editor's reads stay on its page.
+    let mut m2 = crate::read_manifest_checked(&dir).unwrap();
+    m2.active_page = Some(first.clone());
+    std::fs::write(dir.join("project.json"), m2.to_json()).unwrap();
+    let again = value(
+        call(
+            &lib.c,
+            app::PAGE,
+            json!({"binding": b, "page_id": page, "mount": mount}),
+        )
+        .await,
+    );
+    assert_eq!(again["page"]["id"], json!(second));
+    assert_eq!(again["mount"], json!(mount));
+    let other_before = std::fs::read(dir.join("pages").join(format!("{first}.json"))).unwrap();
+    let manifest_before = crate::read_manifest_checked(&dir).unwrap();
+    value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+        )
+        .await,
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pages").join(format!("{first}.json"))).unwrap(),
+        other_before,
+        "the other page is untouched"
+    );
+    let manifest_after = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            manifest_after
+                .pages
+                .iter()
+                .map(|p| (&p.id, &p.name))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        serde_json::to_value(
+            manifest_before
+                .pages
+                .iter()
+                .map(|p| (&p.id, &p.name))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        "page list, names and order"
+    );
+    assert_eq!(
+        manifest_after.active_page,
+        Some(first.clone()),
+        "the active page as it is on disk"
+    );
+    assert_eq!(manifest_after.id, manifest_before.id);
+    assert_eq!(manifest_after.name, manifest_before.name);
+    // A malformed or unknown page id is refused before anything is read.
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": "../project", "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 400, "{e}");
+    // The page is removed from the manifest: every call for it is refused, nothing written.
+    let mut m3 = crate::read_manifest_checked(&dir).unwrap();
+    m3.pages.retain(|p| p.id != second);
+    m3.active_page = Some(first.clone());
+    std::fs::write(dir.join("project.json"), m3.to_json()).unwrap();
+    let before = files(&dir, &second);
+    for (tool, args) in [
+        (
+            app::PAGE,
+            json!({"binding": b, "page_id": second, "mount": mount}),
+        ),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": second, "mount": mount}),
+        ),
+        (
+            app::SAVE,
+            json!({"binding": b, "page_id": second, "mount": mount, "if_match": crate::etag(&before.0), "text": edited(&text)}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 404, "{tool}: {e}");
+    }
+    assert_eq!(files(&dir, &second), before);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// The renderer parts: fixed packaged bytes only, numbered from 0, strictly whole numbers, each
+/// naming the same identity, size and count; anything else is refused and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_renderer_parts_are_bounded_strict_and_complete() {
+    let lib = library().await;
+    let identity = crate::etag(&super::FIXTURE_WASM);
+    let mut joined = String::new();
+    for part in 0..3u64 {
+        let v = value(call(&lib.c, app::ASSET, json!({"part": part})).await);
+        let start = part as usize * app::PART_BYTES;
+        let end = (start + app::PART_BYTES).min(super::FIXTURE_WASM.len());
+        assert_eq!(v["asset"], "openpaperdesign_web_bg.wasm");
+        assert_eq!(v["identity"], json!(identity));
+        assert_eq!(v["bytes"], json!(super::FIXTURE_WASM.len()));
+        assert_eq!(v["parts"], 3);
+        assert_eq!(v["part"], json!(part));
+        assert_eq!(v["offset"], json!(start));
+        assert_eq!(v["part_bytes"], json!(end - start));
+        assert_eq!(v["data"], json!(base64(&super::FIXTURE_WASM[start..end])));
+        joined.push_str(v["data"].as_str().unwrap());
+    }
+    assert!(!joined.is_empty());
+    for args in [
+        json!({"part": 3}),
+        json!({"part": 64}),
+        json!({"part": -1}),
+        json!({"part": 1.5}),
+        json!({"part": 1.0}),
+        json!({"part": "1"}),
+        json!({"part": null}),
+        json!({}),
+        json!({"part": 0, "path": "/etc/passwd"}),
+        json!({"part": 0, "binding": "0123456789abcdef.1"}),
+    ] {
+        let e = call(&lib.c, app::ASSET, args.clone()).await.unwrap_err();
+        assert!(
+            e.contains("unexpected argument")
+                || e.contains("no renderer part")
+                || e.contains("is required"),
+            "{args}: {e}"
+        );
+    }
+    // The pure part function: its bounds.
+    assert!(app::asset_part(&[], "x", 0).is_err());
+    assert!(app::asset_part(&vec![0; app::MAX_ASSET_BYTES + 1], "x", 0).is_err());
+    let exact = vec![1u8; app::PART_BYTES * 2];
+    assert_eq!(
+        app::asset_part(&exact, "x", 1).unwrap()["part_bytes"],
+        json!(app::PART_BYTES)
+    );
+    assert!(
+        app::asset_part(&exact, "x", 2).is_err(),
+        "no empty last part"
+    );
+    // Nothing was bound, locked or created for any of it.
+    assert!(lib.l.state.lock().await.bound.is_none());
+    assert!(!lib.root.join("library").exists());
+}
+
+/// Page messages are bounded for the panel separately from the 64 MiB page limit, counting
+/// JSON escaping: a page too large to send isn't opened here, and a save too large isn't sent
+/// on; neither changes a file. Bad, missing or extra arguments are refused before anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_messages_are_bounded_and_arguments_strict() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Big", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    // Mostly quotes: under the limit as bytes, over it once escaped.
+    let quoted = "\"".repeat(app::MAX_PANEL_MESSAGE / 2 + 16);
+    assert!(quoted.len() < app::MAX_PANEL_MESSAGE);
+    let before = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": quoted}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    // A page file too large for the panel: refused, unread by the editor, untouched.
+    let big = format!("{}{}", text, " ".repeat(app::MAX_PANEL_MESSAGE));
+    std::fs::write(dir.join("pages").join(format!("{page}.json")), &big).unwrap();
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": page, "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("browser editor")
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap(),
+        big.as_bytes()
+    );
+    for (tool, args) in [
+        (app::PAGE, json!({})),
+        (app::PAGE, json!({"binding": b, "page_id": page})),
+        (app::PAGE, json!({"binding": b, "mount": mount})),
+        (app::PAGE, json!({"binding": b, "extra": 1})),
+        (app::PAGE, json!({"binding": "not-a-binding"})),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": "1"}),
+        ),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": 1.0}),
+        ),
+        (app::REVISION, json!({"binding": b, "page_id": page})),
+        (
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "text": "{}"}),
+        ),
+        (app::READY, json!({"binding": b, "mount": -1})),
+        (
+            app::RELEASE,
+            json!({"binding": b, "mount": mount, "force": true}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args.clone()).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 400, "{tool} {args}: {e}");
+    }
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// Stale views: another binding's, a released mount, a canvas whose lease broke, a process that
+/// shut down: each is refused before anything is read or written. A workspace process refuses
+/// the new tool names like the other library actions, without admission or state change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_refuses_stale_bindings_broken_leases_shutdown_and_workspace_processes() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One", "panel": true})).await);
+    let b1 = binding(&one);
+    let (_, m1, _, _) = first_read(&lib.c, &b1).await;
+    value(call(&lib.c, app::RELEASE, json!({"binding": b1, "mount": m1})).await);
+    // Switching needs no confirmation once no editor is mounted and no link was given.
+    let two = value(call(&lib.c, app::CREATE, json!({"name": "Two", "panel": true})).await);
+    let b2 = binding(&two);
+    let e = call(&lib.c, app::PAGE, json!({"binding": b1}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "the old binding: {e}");
+    let (page, m2, _, _) = first_read(&lib.c, &b2).await;
+    // With an editor mounted, a switch asks first.
+    let e = call(&lib.c, app::CREATE, json!({"name": "Three", "panel": true}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("force: true") && e.contains(&b2), "{e}");
+    // The lease file is replaced: the canvas is fenced and closed, nothing read.
+    let dir = location(&two);
+    let id2 = two["canvas"]["id"].as_str().unwrap();
+    let lock = lib.root.join(format!("library/v1/locks/{id2}.lock"));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    let e = call(
+        &lib.c,
+        app::REVISION,
+        json!({"binding": b2, "page_id": page, "mount": m2}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert!(
+        lib.l.state.lock().await.bound.is_none(),
+        "the canvas was closed"
+    );
+    assert!(dir.join("project.json").is_file(), "its files stay");
+    // After shutdown nothing is answered from a binding.
+    lib.l.shutdown().await;
+    let e = call(&lib.c, app::PAGE, json!({"binding": b2}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    // A workspace process.
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    for tool in app::PANEL_TOOLS {
+        let e = call(&c, tool, json!({"binding": b2, "part": 0}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("wasn't started for the app library"),
+            "{tool}: {e}"
+        );
+    }
+    let st = l.state.lock().await;
+    assert!(st.invalidated.is_none() && st.workspace.is_none() && st.bound.is_none());
+    drop(st);
+    task.abort();
+}
+
+/// The writer fence: a save that can't start in time, or whose caller stopped waiting before it
+/// started (the tool's request cancelled), never runs; a started save finishes its commit even
+/// while Close retires the binding, and Close waits for it; afterwards the retained server
+/// refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Fence", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let server = bound_server(&lib.l).await;
+    let before = files(&dir, &page);
+    let body = edited(&text);
+    // Expired while queued.
+    let held = server.lifecycle.write.clone().lock_owned().await;
+    let e = server
+        .save_page_within(Duration::from_millis(50), &page, &rev, &body)
+        .await
+        .expect_err("refused");
+    assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(e.msg.contains("could not start in time"), "{}", e.msg);
+    // The tool's request cancelled while queued.
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    let e = lib
+        .l
+        .panel_call(app::SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled before it started"),
+        "{e}"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(files(&dir, &page), before, "neither queued save ran");
+    // A started save, paused inside its transaction, while Close retires the binding.
+    let mut started = Point::arm(&dir, "save_started", true);
+    let c = lib.c.clone();
+    let saving = tokio::spawn(async move { call(&c, app::SAVE, args).await });
+    started.reached().await;
+    value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    let c = lib.c.clone();
+    let b2 = b.clone();
+    let closing = tokio::spawn(async move { call(&c, app::CLOSE, json!({"binding": b2})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!closing.is_finished(), "Close waits for the started save");
+    started.resume();
+    let saved = value(bounded(saving).await.unwrap());
+    assert_eq!(
+        saved["saved"], true,
+        "the started save finished and says so"
+    );
+    value(bounded(closing).await.unwrap());
+    let after = files(&dir, &page);
+    assert_eq!(saved["revision"], json!(crate::etag(&after.0)));
+    assert_eq!(node_count(std::str::from_utf8(&after.0).unwrap()), 1);
+    // The retained server is retired: a late save is refused, unwritten.
+    let e = server
+        .save_page(
+            &page,
+            &crate::etag(&after.0),
+            &edited(std::str::from_utf8(&after.0).unwrap()),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(server.page(Some(&page)).is_err(), "and reads nothing");
+    assert_eq!(files(&dir, &page), after);
+}
+
+/// Stand-in parts for `panel_module` (inert text, not the real glue or editor).
+static MODULE_PARTS: [(&str, &[u8]); 6] = [
+    (
+        "openpaperdesign_web.js",
+        b"export function start() {}\nexport { start as default };",
+    ),
+    ("session.js", b"export class Session {}"),
+    ("page.js", b"export function frameStep() {}"),
+    ("editor.js", b"export function opdMountEditor() {}"),
+    (
+        "panel.js",
+        b"export function opdCreatePanel(o) { return o; }",
+    ),
+    ("openpaperdesign_web_bg.wasm", b"\0asm"),
+];
+
+fn module_parts_with(name: &str, text: &str) -> crate::EmbeddedBundle {
+    let bytes: &'static [u8] = Box::leak(text.as_bytes().to_vec().into_boxed_slice());
+    let files: Vec<(&'static str, &'static [u8])> = MODULE_PARTS
+        .iter()
+        .map(|&(f, b)| (f, if f == name { bytes } else { b }))
+        .collect();
+    Box::leak(files.into_boxed_slice())
+}
+
+/// The in-panel module is made only of the fixed packaged parts, in order, after the renderer
+/// identity, and only when it is safe inside the view's script element; otherwise the view
+/// keeps its null editor slot (and its primary actions are refused, see below).
+#[test]
+fn panel_module_is_fixed_ordered_and_safe_to_embed() {
+    let m = panel_module(&MODULE_PARTS, "\"0011\"").unwrap();
+    assert!(
+        m.contains("const OPD_WASM_IDENTITY = \"\\\"0011\\\"\";"),
+        "{m}"
+    );
+    let at = |s: &str| m.find(s).unwrap();
+    assert!(at("OPD_WASM_IDENTITY") < at("export function start"));
+    assert!(at("export function start") < at("export class Session"));
+    assert!(at("export class Session") < at("export function frameStep"));
+    assert!(at("export function frameStep") < at("export function opdMountEditor"));
+    assert!(at("export function opdMountEditor") < at("function opdCreatePanel("));
+    for (name, text, want) in [
+        ("session.js", "const s = '</SCRIPT>';", "</script"),
+        ("page.js", "// <!-- x", "<!--"),
+        ("editor.js", "const t = '<script>';", "<script"),
+        ("editor.js", "import { a } from './x.js';", "import"),
+        ("panel.js", "  import('./x.js');", "import"),
+        ("openpaperdesign_web.js", "", "isn't in this build"),
+        ("panel.js", "export function other() {}", "opdCreatePanel"),
+    ] {
+        let e = panel_module(module_parts_with(name, text), "\"0011\"").unwrap_err();
+        assert!(e.contains(want), "{name}: {e}");
+    }
+    // This test build's inert fixture parts assemble: the library view gets them in its slot,
+    // after this build's renderer identity; a workspace view never does.
+    assert!(panel_editor().is_ok());
+    let library = home_html_for(true);
+    assert!(!library.contains(PANEL_SLOT));
+    let inert = "export function opdCreatePanel() { return null; }";
+    assert!(library.contains(inert));
+    let identity = format!(
+        "const OPD_WASM_IDENTITY = {};",
+        serde_json::to_string(&crate::etag(&super::FIXTURE_WASM)).unwrap()
+    );
+    assert!(library.contains(&identity));
+    assert!(home_html_for(false).contains(PANEL_SLOT));
+    assert_eq!(library.matches("<script").count(), 1, "one script element");
+    assert!(library.contains("<script type=\"module\">"));
+    assert_eq!(
+        HOME_URI, "ui://openpaperdesign/home-2.html",
+        "versioned for the new view code"
+    );
+}
+
+/// A request for the view's own editor (`panel: true`) from a build that can't serve it is
+/// refused before anything happens: no canvas file, lease, binding, switch, mount or link.
+/// The unavailable build is simulated by a one-shot test fault; plain (link) requests from
+/// other callers keep working as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_requests_are_refused_before_any_effect_when_the_build_has_no_panel() {
+    let lib = library().await;
+    let unavailable = || Point::arm(lib.root.as_path(), "panel_unavailable", false);
+    let refused = |e: String| {
+        assert!(
+            e.contains("in-panel editor isn't available")
+                && e.contains("nothing was created, imported, opened or changed"),
+            "{e}"
+        );
+    };
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::CREATE, json!({"name": "None", "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        !lib.root.join("library").exists(),
+        "no canvas, lease or folder"
+    );
+    drop(fault);
+    // An existing canvas, made by a plain (link) request and closed again.
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Made"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let canvases = || {
+        std::fs::read_dir(lib.root.join("library/v1/canvases"))
+            .unwrap()
+            .count()
+    };
+    let count = canvases();
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::OPEN, json!({"id": id, "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    assert!(lib.l.state.lock().await.bound.is_none(), "nothing opened");
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::IMPORT, json!({"payload": "{}", "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    assert_eq!(canvases(), count, "nothing imported");
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::EDITOR, json!({"panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    // Opened for the panel (the build serves it again), then a switch request is refused
+    // before it is weighed, and the open canvas, its mounts and link state stay as they were.
+    let opened = value(call(&lib.c, app::OPEN, json!({"id": id, "panel": true})).await);
+    let b = binding(&opened);
+    let fault = unavailable();
+    refused(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Other", "panel": true, "force": true, "replace": b}),
+        )
+        .await
+        .unwrap_err(),
+    );
+    drop(fault);
+    {
+        let st = lib.l.state.lock().await;
+        let bound = st.bound.as_ref().unwrap();
+        assert_eq!(
+            bound.binding.as_deref(),
+            Some(b.as_str()),
+            "still the same canvas"
+        );
+        assert!(bound.mounts.is_empty() && !bound.editor_opened);
+    }
+    assert_eq!(canvases(), count);
+    bound_server(&lib.l).await.retire().await;
+}

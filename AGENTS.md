@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.35 · Updated: 2026-10-16
+Revision: 0.36 · Updated: 2026-10-16
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -58,6 +58,7 @@ PAPER_RS_REQUIRE_GPU=1 cargo test --locked --test headless
 cargo check --locked -p openpaperdesign-core -p openpaperdesign-web --target wasm32-unknown-unknown
 cargo test --locked -p openpaperdesign-serve -p openpaperdesign-web
 node --test crates/openpaperdesign-web/tests/session.test.mjs   # page lifecycle; Node >= 22
+node --test crates/openpaperdesign-web/tests/panel.test.mjs     # in-panel editor module; needs build-web output
 node --test plugin/tests/plugin.test.mjs                        # plugin manifests and skills
 node --test crates/openpaperdesign-serve/tests/home.test.mjs    # sidebar home view protocol
 (cd plugin/tests/design && python3 -m unittest)                 # ported design-method tests
@@ -152,7 +153,8 @@ before workspace admission:
 
 They read or change none of the session's context, binding, project, listener or files. This
 named exemption covers only those four (plus the fixed refusal of the app-library tool names,
-which reads and changes nothing); never route another tool around admission.
+which reads and changes nothing); never route another tool around admission. The home resource
+URI is versioned (`ui://openpaperdesign/home-2.html`); bump it with incompatible view code.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -217,6 +219,8 @@ the only live copy) and `locks/<id>.lock`; ids are 16 hex digits made by the ser
 data. Listing creates and locks nothing and is bounded (entries and manifest bytes). In that
 process only the home, its resource, `openpaperdesign_status` (library report), the read-only
 inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export}`
+and in-panel editor tools (`_app_editor_asset`, `_app_page`, `_app_page_revision`,
+`_app_page_save`, `_app_ready`, `_app_page_release`)
 are answered, with strict argument keys and types; every project route (including the
 `_ui_*` actions, the picker and the upstream design tools) is refused without admission or
 state change, and a workspace process refuses the `_app_*` names the same way. One binding per
@@ -261,7 +265,33 @@ Every image of an imported or exported canvas file is fully decoded with the `im
 (declared in `openpaperdesign-serve` with the root's exact requirement), never through
 `assets::register`, before anything is published; hash, signature, base64 and exact-set checks
 stay. The browser canvas still doesn't draw image fills. Library mode defers stdio page tools:
-canvases are edited in the browser editor.
+canvases are edited in the editor.
+
+In-panel editor (owner direction 2026-10-16, `static/{editor,panel}.js`, `launcher_app.rs`):
+the library home edits a canvas in its own MCP App view with the same Rust/WASM renderer,
+`Session` and editor mount as the browser page (`editor.js`, import-free, shared by `app.js`).
+The launcher inlines one fixed module into the view's one `<script type="module">` (glue,
+`session.js`, `page.js`, `editor.js`, `panel.js`, in that order) and refuses to embed text with
+`</script`, `<script`, `<!--` or an import; no eval, URL import, outbound domain, CSP, CORS or
+framing change. The renderer comes only from the packaged wasm, in sequential 256 KiB parts
+(integer `part`, identity/size/count/length checked, 16 MiB cap) and goes to the glue's own
+`__wbg_init({module_or_path: bytes})`. Page calls name the view's `binding`, then the `page_id`
+and `mount` of the first read (the manifest's active page, else its first); all are compared
+under the state lock, which is released before the writer fence (never reversed). They use the
+same `Server::{page, page_revision, save_page, mark_ready}` as HTTP: one transaction, structured
+409/rollback/`Broken`, bounded queue (an unstarted or cancelled save never runs; a started one
+finishes, and retirement waits). A save writes only its page and the manifest's `modified`.
+Panel page messages are capped at 4 MiB serialized (escaping counted), separately from the 64
+MiB page limit; larger pages stay browser-only, untouched. `panel: true` on create/open/import/
+editor returns no link and gives none; mounted panels and a given link both make Close/Switch
+need `force`. Back and Close drain (wait for the save in flight, save what is left, require
+`can_reload`); conflict, failed/unanswered save or an edit under way keep the editor until an
+explicit discard. Teardown uses the same drain, but an abrupt host removal or crash saves
+nothing. Ready is the mount's own renderer's; Saved only a matching commit answer. The browser
+link stays a secondary action, never a fallback: the view always asks for `panel`, refuses
+New/Import/Open itself without the module, and the server refuses `panel` requests its build
+can't serve before any lock, file, lease, switch or mount. Host CSP for WebAssembly, WebGL2/WebGPU, message limits, input
+and focus in the native panel are unproven: native qualification is pending.
 
 ## Model profile
 

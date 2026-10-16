@@ -21,6 +21,15 @@
   them through the `openpaperdesign_app_*` actions, again without any chat message. A file
   chosen for import travels only as its text; an export is offered as a browser download, which
   Codex never confirms. The server fills the view's mode slot; nothing else differs per server.
+
+  An app-library server also fills the view's editor slot (the first line of its one module)
+  with the in-panel editor, when its build has one: the packaged renderer glue, session.js,
+  page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that order. Then a
+  created or opened canvas is edited right here, with the same renderer and save rules as the
+  browser editor, through the app's own page tools; the browser editor link is a secondary
+  action. Without it, the slot stays `null`: the view still lists canvases, but refuses to
+  create, import or open one (nothing is sent), and the server refuses a request for the
+  view's editor that its build can't serve. The link never replaces the in-panel editor.
 -->
 <style>
   @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
@@ -125,6 +134,28 @@
   footer { margin-top: auto; padding-top: 32px; }
   .wordmark { font: 400 16px/1.2 "Geist Pixel", monospace; color: var(--opd-text); }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  /* The in-panel editor: the canvas takes the room; a small toolbar and one status line. */
+  main[data-view="editor"] { max-width: none; padding: 12px 16px 12px; }
+  main[data-view="editor"] header { margin-bottom: 8px; }
+  main[data-view="editor"] footer { padding-top: 12px; }
+  .ed-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
+  .ed-head h2 { margin: 0; }
+  .ed-status { margin: 0; font-size: 12px; color: var(--opd-muted); overflow-wrap: anywhere; }
+  .ed-status.bad { color: var(--opd-danger); }
+  .ed-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 8px 0; }
+  .ed-bar .btn { height: 28px; padding: 0 10px; font-size: 12px; }
+  .ed-bar .btn[aria-pressed="true"] { border-color: var(--opd-text); background: var(--opd-text); color: var(--opd-bg); }
+  .ed-sep { width: 1px; height: 18px; margin: 0 2px; background: var(--opd-line); }
+  .ed-stage { position: relative; height: max(320px, calc(100vh - 250px)); overflow: hidden;
+    border: 1px solid var(--opd-line); border-radius: var(--opd-radius); }
+  .ed-stage canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+  .ed-stage canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--opd-ring); }
+  .ed-conflict { display: none; position: absolute; top: 0; right: 0; left: 0; padding: 8px 12px; background: var(--opd-hover);
+    color: var(--opd-danger); font-size: 13px; border-bottom: 1px solid var(--opd-line); }
+  .ed-conflict.show { display: block; }
+  .ed-conflict button { margin-left: 4px; font: inherit; }
+  #editor .actions { margin-top: 10px; }
   @media (max-width: 440px) {
     main { padding: 20px 16px 16px; }
     h1 { font-size: 18px; }
@@ -132,7 +163,7 @@
 </style>
 </head>
 <body>
-<main>
+<main id="app" data-view="home">
   <header>
     <div class="lead">
       <button id="back" class="btn icon-btn" type="button" aria-label="Back to projects" hidden><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M10 3.5 5.5 8l4.5 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -204,9 +235,42 @@
     <details id="result-details" hidden><summary>Details</summary><dl id="result-meta" class="fields" hidden></dl><pre id="result-detail" hidden></pre></details>
   </section>
 
+  <section id="editor" aria-labelledby="ed-title" hidden>
+    <div class="ed-head">
+      <h2 id="ed-title" tabindex="-1">Canvas</h2>
+      <p id="ed-status" class="ed-status" role="status">Loading the editor…</p>
+    </div>
+    <div class="ed-bar" role="toolbar" aria-label="Canvas tools">
+      <button id="ed-select" class="btn" type="button" aria-pressed="false" title="Select (V)">Select</button>
+      <button id="ed-hand" class="btn" type="button" aria-pressed="false" title="Hand (H)">Hand</button>
+      <button id="ed-rect" class="btn" type="button" aria-pressed="false" title="Rectangle (R)">Rectangle</button>
+      <button id="ed-ellipse" class="btn" type="button" aria-pressed="false" title="Ellipse (O)">Ellipse</button>
+      <span class="ed-sep" aria-hidden="true"></span>
+      <button id="ed-undo" class="btn" type="button" title="Undo">Undo</button>
+      <button id="ed-redo" class="btn" type="button" title="Redo">Redo</button>
+      <button id="ed-delete" class="btn" type="button" title="Delete selection">Delete</button>
+    </div>
+    <div id="ed-stage" class="ed-stage">
+      <canvas id="ed-canvas" tabindex="0" aria-label="Canvas"></canvas>
+      <div id="ed-conflict" class="ed-conflict" role="alert"></div>
+    </div>
+    <div class="actions">
+      <button id="ed-close" class="btn" type="button">Close canvas</button>
+      <button id="ed-leave" class="btn" type="button" hidden>Leave without saving</button>
+      <button id="ed-export" class="btn" type="button">Export saved canvas</button>
+      <button id="ed-full" class="btn" type="button" hidden>Full screen</button>
+      <button id="ed-browser" class="btn" type="button">Open in browser</button>
+    </div>
+    <p id="ed-note" class="hint"></p>
+    <details id="ed-details"><summary>Details</summary><dl id="ed-meta" class="fields"></dl>
+      <p id="ed-renderer" class="hint"></p>
+      <p class="hint">OpenPaperDesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL OFL 1.1. Not affiliated with Paper.</p></details>
+  </section>
+
   <footer><span class="wordmark">onlinesourdough</span></footer>
 </main>
-<script>
+<script type="module">
+const opdCreatePanel = null; // __OPD_PANEL_MODULE__
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
@@ -249,7 +313,7 @@
   // links) from appearing under a newer view.
   let gen = 0;
   let view = 'home';
-  const VIEWS = ['home', 'pick', 'new-form', 'folder-help', 'result'];
+  const VIEWS = ['home', 'pick', 'new-form', 'folder-help', 'result', 'editor'];
   let sending = false;
   let editorUrl = null; // memory only, for the Open canvas button
   let editorRoot = null; // the admitted workspace of the shown status/editor result, for reopening
@@ -264,6 +328,9 @@
     view = name;
     for (const v of VIEWS) $(v).hidden = v !== name;
     $('back').hidden = name === 'home';
+    // The editor gets the room; its only ways out are Back and Close (no menu).
+    $('app').setAttribute('data-view', name);
+    $('menu-button').hidden = name === 'editor';
     editorUrl = null;
     editorRoot = null;
     editorCanvas = null;
@@ -279,7 +346,8 @@
     announce(LIBRARY ? 'Your canvases' : 'Projects');
     if (LIBRARY) loadLibrary();
   };
-  $('back').onclick = goHome;
+  // From the editor, Back first saves what is left (see leaveEditor).
+  $('back').onclick = () => (view === 'editor' ? editorBack() : goHome());
   // Escape leaves a secondary view the same way as Back.
   const escapeHome = (e) => { if (e && e.key === 'Escape') { if (e.preventDefault) e.preventDefault(); goHome(); } };
   for (const v of ['pick', 'new-form', 'folder-help', 'result']) $(v).onkeydown = escapeHome;
@@ -752,13 +820,26 @@
   const shownCount = () => rowActions.projects.length;
 
   // A confirmed switch names the binding the person confirmed replacing (`replace`); the
-  // server refuses it if another view changed the open canvas meanwhile.
+  // server refuses it if another view changed the open canvas meanwhile. Every primary action
+  // asks for this view's own editor (`panel`): the server checks it has one before it creates,
+  // imports or opens anything, and its result carries no browser link.
   const switchArgs = (args, replace) => {
     if (replace) Object.assign(args, { force: true, replace });
+    args.panel = true;
     return args;
   };
 
+  // A build without the in-panel editor module: the primary actions are refused right here,
+  // with nothing sent. The browser editor link is never a silent substitute for them.
+  function panelMissing() {
+    if (PANEL) return false;
+    refuse('Can\'t edit canvases here',
+      'This OpenPaperDesign build has no in-panel editor, so canvases can\'t be created, imported or opened in this view. Nothing was sent or changed. Rebuild OpenPaperDesign with its editor (./scripts/build-web.sh), then reinstall it.');
+    return true;
+  }
+
   async function openLibrary(id, name, replace) {
+    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_open', switchArgs({ id }, replace), 'Opening ' + name);
     if (!r) return;
     if (r.ok) return showEditor(r.ok, false, id);
@@ -774,6 +855,7 @@
   }
 
   async function createLibrary(name, replace) {
+    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_create', switchArgs({ name }, replace), 'Creating "' + name + '"');
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
@@ -782,7 +864,8 @@
   }
 
   async function reopenLibrary() {
-    const r = await act('openpaperdesign_app_editor', {}, 'Opening the current canvas');
+    if (panelMissing()) return;
+    const r = await act('openpaperdesign_app_editor', { panel: true }, 'Opening the current canvas');
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
     refused(r);
@@ -825,20 +908,21 @@
     }
   }
 
-  async function exportCanvas() {
-    const binding = editorBinding;
-    const canvas = editorCanvas;
+  // Export the canvas a view shows, as last saved. From the editor, a refusal is shown in the
+  // editor (`report`), which stays open.
+  async function exportCanvas(binding, canvas, report) {
     if (!binding) return;
+    const fail = (r) => (report ? report(String(r.refused || r.fail).split('\n')[0].slice(0, 300)) : refused(r));
     const r = await act('openpaperdesign_app_export', { binding }, 'Exporting the saved canvas', 120000);
     if (!r) return;
-    if (!r.ok) return refused(r);
+    if (!r.ok) return fail(r);
     const v = r.ok;
     if (typeof v.payload !== 'string' || typeof v.file_name !== 'string') {
-      return refused({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
+      return fail({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
     }
     // Only bytes of the canvas this view showed are offered for download.
     if (v.binding !== binding || !v.canvas || v.canvas.id !== canvas) {
-      return refused({ fail: 'Codex answered with another canvas than the one shown here, so nothing was downloaded.' });
+      return fail({ fail: 'Codex answered with another canvas than the one shown here, so nothing was downloaded.' });
     }
     const name = v.file_name.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80) || 'canvas.opdcanvas.json';
     const kb = Math.max(1, Math.round(v.payload.length / 1024));
@@ -848,11 +932,12 @@
     notice(said);
     announce(said);
   }
-  $('export').onclick = exportCanvas;
+  $('export').onclick = () => exportCanvas(editorBinding, editorCanvas);
 
   // Import: the person's chosen file travels only as its text; its name or location means
   // nothing to the server.
   function chooseImport() {
+    if (panelMissing()) return;
     const input = $('import-file');
     if (!input || typeof input.click !== 'function') {
       notice('This view can\'t open files here. Nothing was imported.');
@@ -886,6 +971,7 @@
     importCanvas(text, null);
   };
   async function importCanvas(text, replace) {
+    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_import', switchArgs({ payload: text }, replace), 'Importing the canvas file', 120000);
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
@@ -893,30 +979,216 @@
     refused(r, (shownFor) => shownFor && importCanvas(text, shownFor));
   }
 
-  // After the link was handed to Codex: whether the editor itself reported its page loaded.
-  // An acknowledgement of the link is never treated as a load.
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  async function watchLoad(g, id, binding) {
-    if (!binding) return;
-    for (let i = 0; i < 30; i++) {
-      await later(2000);
-      if (g !== gen) return;
-      // Only this view's binding: another view's canvas never counts as this one loading.
-      const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
-      if (g !== gen) return;
-      let v = null;
-      if (!r.timeout && !r.error && r.result && !r.result.isError) {
-        try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
-      }
-      if (!v || !v.canvas || v.canvas.id !== id || v.binding !== binding) return;
-      if (v.editor_loaded === true) {
-        const n = Number.isInteger(v.browser_saves) ? v.browser_saves : 0;
-        const s = 'The editor loaded this canvas.' + (n ? ' Saved from the editor ' + n + (n === 1 ? ' time.' : ' times.') : '');
-        $('canvas-state').textContent = s;
-        announce(s, g);
-        return;
-      }
+
+  // ---- the in-panel editor (an app-library view whose build has it) ----
+  // The canvas is edited right here: the renderer and its save rules are the browser editor's,
+  // and the page travels only through this view's own calls to the app library's server. Back
+  // and Close first save what is left; an editor with a change that couldn't be saved stays
+  // open until the person saves it or explicitly leaves without saving.
+
+  const PANEL = LIBRARY && typeof opdCreatePanel === 'function' ? opdCreatePanel({ rpc }) : null;
+  let panelHandle = null; // the editor mounted in the editor view, if any
+  let panelBinding = null; // the binding and canvas it edits
+  let panelCanvas = null;
+  let leaving = false;
+  let pendingLeave = 'back';
+  const ED_TOOLS = [['ed-select', 'select'], ['ed-hand', 'hand'], ['ed-rect', 'rect'], ['ed-ellipse', 'ellipse']];
+  const ED_ACTIONS = [['ed-undo', 'undo'], ['ed-redo', 'redo'], ['ed-delete', 'delete']];
+  const edStatus = (text, error) => {
+    $('ed-status').textContent = text;
+    $('ed-status').className = error ? 'ed-status bad' : 'ed-status';
+  };
+  const edRenderer = (text, error) => {
+    $('ed-renderer').textContent = text;
+    $('ed-renderer').className = error ? 'hint bad' : 'hint';
+  };
+  const edMeta = (k, v) => { $('ed-meta').append(node('dt', k), node('dd', v)); };
+  function setEditorBusy(busy) {
+    for (const id of ['ed-close', 'ed-browser', 'ed-leave', 'ed-export']) $(id).disabled = busy;
+  }
+  const fullscreenOffered = () => Array.isArray(hostContext.availableDisplayModes)
+    && hostContext.availableDisplayModes.includes('fullscreen');
+
+  function openPanel(v) {
+    const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
+    const binding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
+    if (!id || !binding || !PANEL || panelHandle) {
+      refuse('Canvas', 'Codex sent an answer OpenPaperDesign can\'t read. Nothing is shown as done.');
+      return;
     }
+    const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
+    if (v.browser_editor !== 'built in') {
+      reset(name);
+      $('result-state').textContent = {
+        created: 'Created and saved in your library.',
+        imported: 'Imported as a new canvas in your library.',
+      }[v.action] || 'Open in this window.';
+      $('canvas-state').textContent = 'This OpenPaperDesign command was built without the browser editor, so the canvas can\'t be shown here.';
+      $('result-title').focus();
+      return;
+    }
+    show('editor');
+    panelBinding = binding;
+    panelCanvas = id;
+    pendingLeave = 'back';
+    $('ed-title').textContent = name;
+    $('ed-meta').textContent = '';
+    edMeta('Canvas id', id);
+    edMeta('Stored in', 'OpenPaperDesign library');
+    if (typeof v.location === 'string') edMeta('Location', v.location);
+    edRenderer('');
+    $('ed-note').textContent = '';
+    $('ed-leave').hidden = true;
+    $('ed-full').hidden = !fullscreenOffered();
+    $('ed-conflict').textContent = '';
+    setEditorBusy(false);
+    edStatus({
+      created: 'Created and saved in your library. Loading the editor…',
+      imported: 'Imported as a new canvas in your library. Loading the editor…',
+    }[v.action] || 'Loading the editor…');
+    // Every editor gets a fresh canvas: one that held another renderer's context can't be reused.
+    const old = $('ed-canvas');
+    if (old.cloneNode && old.replaceWith) old.replaceWith(old.cloneNode(false));
+    $('ed-title').focus();
+    announce(name + '. Loading the editor');
+    const g = gen;
+    const h = PANEL.open({
+      binding,
+      refs: {
+        canvas: $('ed-canvas'), status: edStatus, renderer: edRenderer, conflict: $('ed-conflict'),
+        tools: ED_TOOLS.map(([i, t]) => [$(i), t]), actions: ED_ACTIONS.map(([i, a]) => [$(i), a]),
+      },
+      onStatus: edStatus,
+      onReady: () => announce(name + ' is ready to edit', g),
+    });
+    panelHandle = h;
+    h.started.catch((e) => {
+      if (panelHandle !== h) return;
+      // Exactly why (the renderer transfer, its compilation, graphics or the page); the view
+      // stays, with Back and Close.
+      const why = 'The editor couldn\'t start here: ' + String(e && e.message ? e.message : e).slice(0, 600);
+      edStatus(why, true);
+      announce(why, g);
+    });
+  }
+
+  // The editor is let go only when nothing in it is left unsaved (Session.drain): input and
+  // polling stop, a save under way finishes and what is left is saved. Otherwise it stays, says
+  // why, and offers to leave without saving.
+  async function leaveEditor() {
+    const h = panelHandle;
+    if (!h) return true;
+    if (leaving) return false;
+    leaving = true;
+    setEditorBusy(true);
+    edStatus('Saving your last changes…');
+    let r;
+    try {
+      r = await h.drain();
+    } catch {
+      r = 'failed';
+    }
+    leaving = false;
+    if (panelHandle !== h) return false;
+    if (r !== 'clean') {
+      h.resume();
+      setEditorBusy(false);
+      const why = {
+        conflict: 'Still open: this page was changed elsewhere, so your last change isn\'t saved. Reload from the banner (that drops your change), or leave without saving.',
+        busy: 'Still open: an edit is still under way. Finish it, then try again.',
+        failed: 'Still open: your last change couldn\'t be saved yet; it is being retried. Try again, or leave without saving.',
+        unreachable: 'Still open: Codex didn\'t confirm your last save, so it may not be saved. Try again, or leave without saving.',
+        error: 'Still open: the renderer stopped with a change that isn\'t saved. Leave without saving to drop it.',
+      }[r] || 'Still open: your last change may not be saved. Try again, or leave without saving.';
+      edStatus(why, true);
+      $('ed-leave').hidden = false;
+      announce(why);
+      return false;
+    }
+    await disposePanel();
+    return true;
+  }
+
+  // For good: the editor is undone (nothing more is saved from it) and the server told so.
+  async function disposePanel() {
+    const h = panelHandle;
+    panelHandle = null;
+    if (hostContext.displayMode === 'fullscreen') {
+      rpc('ui/request-display-mode', { mode: 'inline' }, 10000).then((r) => {
+        if (r.result && typeof r.result.mode === 'string') hostContext.displayMode = r.result.mode;
+      });
+    }
+    if (h) await h.dispose();
+  }
+
+  // Back keeps the canvas open (it stays in this window's list); Close also closes it.
+  async function editorBack() {
+    pendingLeave = 'back';
+    if (await leaveEditor()) goHome();
+  }
+  async function editorClose() {
+    pendingLeave = 'close';
+    const binding = panelBinding;
+    if (await leaveEditor()) closeCanvas(binding, false);
+  }
+  $('ed-close').onclick = editorClose;
+  $('ed-leave').onclick = async () => {
+    if (leaving || !panelHandle) return;
+    const then = pendingLeave;
+    const binding = panelBinding;
+    await disposePanel();
+    if (then === 'close') closeCanvas(binding, false);
+    else goHome();
+  };
+
+  // A secondary way to edit: the loopback browser editor, for the same binding. Getting its
+  // link counts as given (closing or switching then asks first, as before).
+  $('ed-browser').onclick = async () => {
+    const binding = panelBinding;
+    const g = gen;
+    if (!binding) return;
+    $('ed-browser').disabled = true;
+    const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
+    if (g !== gen) return;
+    $('ed-browser').disabled = false;
+    let v = null;
+    if (!r.timeout && !r.error && r.result && !r.result.isError) {
+      try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
+    }
+    if (!v || v.binding !== binding || typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
+      $('ed-note').textContent = 'No local editor link came back for this canvas, so nothing was opened.';
+      return;
+    }
+    const o = await rpc('ui/open-link', { url: v.url });
+    if (g !== gen) return;
+    $('ed-note').textContent = o.timeout ? 'Codex didn\'t answer.'
+      : (o.error || (o.result && o.result.isError)) ? 'Codex didn\'t open the link' + errorCode(o.error) + '.'
+        : 'Codex was asked to open the browser editor too; that doesn\'t confirm it loaded. Both save to this canvas, and a conflict is never merged.';
+  };
+
+  // The canvas as last saved (an edit still being saved isn't in it); the editor stays open.
+  $('ed-export').onclick = () => exportCanvas(panelBinding, panelCanvas, (text) => { $('ed-note').textContent = text; });
+
+  $('ed-full').onclick = async () => {
+    const want = hostContext.displayMode === 'fullscreen' ? 'inline' : 'fullscreen';
+    const r = await rpc('ui/request-display-mode', { mode: want }, 10000);
+    if (r.result && typeof r.result.mode === 'string') hostContext.displayMode = r.result.mode;
+    $('ed-full').textContent = hostContext.displayMode === 'fullscreen' ? 'Exit full screen' : 'Full screen';
+  };
+
+  // The host is about to remove this view: the same leaving path, for as long as the host
+  // waits. An edit that can't be saved by then is lost; a crash or an abrupt removal saves
+  // nothing.
+  async function teardown() {
+    const h = panelHandle;
+    if (!h) return;
+    try {
+      await Promise.race([h.drain(), later(8000)]);
+    } catch {
+      // Gone either way.
+    }
+    await disposePanel();
   }
 
   // ---- results ----
@@ -970,6 +1242,20 @@
   // An editor result, from a direct action or a delivered open_editor result: identity from
   // this same result, never an earlier one. A direct action then asks Codex to open it.
   function showEditor(v, delivered, expected) {
+    // A library canvas for this view's own editor: no link is involved, so none is checked.
+    if (v && v.storage === 'app-library' && v.panel === true) {
+      if (expected && !(v.canvas && v.canvas.id === expected)) {
+        refuse('Canvas', 'Codex answered for another canvas than the one asked for, so it won\'t be opened.');
+        return;
+      }
+      return openPanel(v);
+    }
+    // Any other library canvas result is not this view's to open: the browser link is only
+    // ever the editor's explicit secondary action, never the way a canvas opens here.
+    if (v && v.storage === 'app-library') {
+      refuse('Canvas', 'Codex answered without this view\'s own editor, so nothing was opened here.');
+      return;
+    }
     if (typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
       refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
       return;
@@ -980,7 +1266,6 @@
     }
     const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
     reset(name);
-    if (v.storage === 'app-library') return showLibraryEditor(v, delivered, name);
     editorUrl = v.url;
     $('result-state').textContent = {
       created: 'Created. Opening the canvas…',
@@ -992,47 +1277,6 @@
     if (typeof v.project === 'string') meta('Project', v.project);
     if (typeof v.workspace === 'string') meta('Folder path', v.workspace);
     meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
-    $('canvas').hidden = false;
-    $('result-title').focus();
-    announce(name + '. ' + $('result-state').textContent);
-    if (!delivered && v.action) openLink();
-  }
-
-  // A library canvas: created, imported, opened or reopened in this window, from this result.
-  function showLibraryEditor(v, delivered, name) {
-    const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
-    if (!id) {
-      refuse('Canvas', 'Codex sent an answer OpenPaperDesign can\'t read. Nothing is shown as done.');
-      return;
-    }
-    editorCanvas = id;
-    editorBinding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
-    field('Canvas', name + ' (' + pages(v.canvas.pages) + ')');
-    field('Stored in', 'OpenPaperDesign library');
-    meta('Canvas id', id);
-    if (typeof v.location === 'string') meta('Location', v.location);
-    // Close and Export act only on this result's own binding.
-    $('close').hidden = !editorBinding;
-    $('export').hidden = !editorBinding;
-    if (v.browser_editor !== 'built in') {
-      $('result-state').textContent = {
-        created: 'Created and saved in your library.',
-        imported: 'Imported as a new canvas in your library.',
-      }[v.action] || 'Open in this window.';
-      $('canvas-state').textContent = 'This OpenPaperDesign command was built without the browser editor, so the canvas can\'t be shown here.';
-      $('result-title').focus();
-      announce(name + '. ' + $('result-state').textContent);
-      return;
-    }
-    editorUrl = v.url;
-    meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
-    $('result-state').textContent = {
-      created: 'Created and saved in your library. Opening the editor…',
-      imported: 'Imported as a new canvas in your library. Opening the editor…',
-      opened: 'Opening the editor…',
-      'already-open': 'Already open in this window. Opening the editor…',
-      reopened: 'Opening the editor…',
-    }[v.action] || 'The canvas is ready to open.';
     $('canvas').hidden = false;
     $('result-title').focus();
     announce(name + '. ' + $('result-state').textContent);
@@ -1127,7 +1371,6 @@
     else state = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, press Open canvas again.';
     $('canvas-state').textContent = state;
     announce(state, g);
-    if (LIBRARY && editorCanvas && !r.timeout && !r.error) watchLoad(g, editorCanvas, editorBinding);
   }
   $('canvas').onclick = openLink;
 
@@ -1140,13 +1383,20 @@
       if (done) { waiting.delete(m.id); done(m); }
       return;
     }
-    if (m.method === 'ui/notifications/tool-result' && m.params) showResult(m.params);
-    else if (m.method === 'ui/notifications/tool-cancelled') {
+    // While a canvas is being edited here, a model's result never replaces the editor.
+    if (m.method === 'ui/notifications/tool-result' && m.params) {
+      if (!panelHandle) showResult(m.params);
+    } else if (m.method === 'ui/notifications/tool-cancelled') {
+      if (panelHandle) return;
       refuse('Cancelled', 'The tool call was cancelled; there is nothing to open.');
       announce('Cancelled');
     } else if (m.method === 'ui/notifications/host-context-changed' && m.params && typeof m.params === 'object') {
       hostContext = Object.assign({}, hostContext, m.params); // partial update: merge
       applyHost();
+    } else if (m.method === 'ui/resource-teardown' && m.id !== undefined) {
+      // Answered once the editor (if any) was drained and let go.
+      const id = m.id;
+      teardown().finally(() => window.parent.postMessage({ jsonrpc: '2.0', id, result: {} }, '*'));
     } else if (m.id !== undefined && m.method) window.parent.postMessage({ jsonrpc: '2.0', id: m.id, result: {} }, '*');
   });
 
