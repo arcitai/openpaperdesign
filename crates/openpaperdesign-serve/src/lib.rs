@@ -865,9 +865,11 @@ pub(crate) struct PageRead {
 }
 
 /// The page operations shared by the browser's HTTP API and the app's in-panel page tools
-/// (`launcher_app.rs`). Each one checks admission (an active binding), the root identity, the
-/// library guard and the project's own entries itself, so no caller relies on the HTTP
-/// middleware for them. HTTP keeps its own Host/Origin/token checks in front of these.
+/// (`launcher_app.rs`). Each one checks admission (an active binding) itself, so no caller
+/// relies on the HTTP middleware for it; the page reads and the save also check the root
+/// identity, the library guard and the project's own entries. `mark_ready` reads and writes no
+/// file and checks only admission (the in-panel caller re-checks the canvas, library and lease
+/// first). HTTP keeps its own Host/Origin/token checks in front of these.
 impl Server {
     fn admit(&self) -> Result<(), ApiError> {
         self.lifecycle
@@ -939,13 +941,37 @@ impl Server {
         if_match: &str,
         body: &str,
     ) -> Result<String, ApiError> {
-        self.save_page_within(SAVE_START, id, if_match, body).await
+        self.save_page_within(SAVE_START, None, id, if_match, body)
+            .await
     }
 
-    /// [`Server::save_page`] with its own bound on the wait for the writer fence.
+    /// [`Server::save_page`] for an editor whose lifetime can be revoked (`live`, an in-panel
+    /// editor's mount): it is checked again under the writer fence, so a save of an editor
+    /// that was released before the save started never runs. Revoke it, then
+    /// [`Server::drain_writer`], to know no save of that editor is still under way.
+    pub(crate) async fn save_page_while(
+        &self,
+        live: &std::sync::atomic::AtomicBool,
+        id: &str,
+        if_match: &str,
+        body: &str,
+    ) -> Result<String, ApiError> {
+        self.save_page_within(SAVE_START, Some(live), id, if_match, body)
+            .await
+    }
+
+    /// Wait until no writer (a started save, its commit or rollback, or an agent call) holds
+    /// the writer fence any more. Changes nothing.
+    pub(crate) async fn drain_writer(&self) {
+        drop(self.lifecycle.write.lock().await);
+    }
+
+    /// [`Server::save_page`] with its own bound on the wait for the writer fence and an
+    /// optional revocable editor lifetime (see [`Server::save_page_while`]).
     pub(crate) async fn save_page_within(
         &self,
         start_within: std::time::Duration,
+        live: Option<&std::sync::atomic::AtomicBool>,
         id: &str,
         if_match: &str,
         body: &str,
@@ -967,9 +993,18 @@ impl Server {
                      nothing was written",
                 )
             })?;
-        // Under the fence: admission again (a close may have retired the binding meanwhile).
+        // Under the fence: admission again (a close may have retired the binding meanwhile),
+        // and the editor's own lifetime (it may have been released meanwhile).
         self.admit()?;
-        // Started: from here on it runs to its commit or rollback, and retirement waits for it.
+        if live.is_some_and(|l| !l.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "this editor was left (released) before its save could start; it was not run \
+                 and nothing was written",
+            ));
+        }
+        // Started: from here on it runs to its commit or rollback, and retirement and a
+        // release (`drain_writer`) wait for it.
         #[cfg(test)]
         test_support::hit(&self.dir, "save_started");
         let mut p = self.project()?;

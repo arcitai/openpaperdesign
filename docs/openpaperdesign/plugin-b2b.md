@@ -40,13 +40,18 @@ now edits in the home view itself. The browser editor link stays a secondary act
   - `_app_page`, `_app_page_revision` and `_app_page_save` then name that `page_id` and `mount`;
   - `_app_ready` and `_app_page_release` complete the set.
 
-  A save is one transaction: 409 with the current revision, rollback, the `Broken` fence, the
-  committed-save counter, and a bounded wait for the writer fence. A cancelled or expired
-  queued save never runs; a started one finishes, and Close waits for it. It changes only its
-  page and the manifest's `modified`. A removed page is refused (404).
-- **Message limits.** Page messages to and from the panel are limited to 4 MiB serialized,
-  escaping included. A larger page isn't opened in the panel, and a larger save isn't sent;
-  neither changes any file.
+  The server compares the binding and the mount; it checks `page_id` only as a page of the
+  canvas (keeping to one page is the view's own rule). A save is one transaction: 409 with the
+  current revision, rollback, the `Broken` fence, the committed-save counter, and a bounded
+  wait for the writer fence. It changes only its page and the manifest's `modified`. A removed
+  page is refused (404). A save that hasn't started never runs if its request is cancelled
+  (before or while it waits for admission, or before it takes the writer fence) or if its mount
+  is released first. A started one always finishes; Close and the release wait for it.
+- **Message limits.** Page messages are limited to 4 MiB as sent, escaping included: a read as
+  the whole tool result in its JSON-RPC response, a save as its whole `tools/call` request,
+  each plus a fixed 16 KiB allowance for what a host adds. That allowance is a guess, not a
+  known host limit. A larger page isn't opened in the panel (no mount is registered), and a
+  larger save isn't sent; neither changes any file.
 - **Confirmation.** `panel: true` on create, open, import or editor returns no link and gives
   none. Close and Switch need `force` while any editor is mounted or a link was given.
 - **Leaving.** Back and Close stop input and polling, wait for the save in flight, save what is

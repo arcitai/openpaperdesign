@@ -1726,7 +1726,7 @@ async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
     // Expired while queued.
     let held = server.lifecycle.write.clone().lock_owned().await;
     let e = server
-        .save_page_within(Duration::from_millis(50), &page, &rev, &body)
+        .save_page_within(Duration::from_millis(50), None, &page, &rev, &body)
         .await
         .expect_err("refused");
     assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1754,11 +1754,22 @@ async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
     let c = lib.c.clone();
     let saving = tokio::spawn(async move { call(&c, app::SAVE, args).await });
     started.reached().await;
-    value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    // Leaving the editor: its mount is revoked at once; the release itself is acknowledged
+    // only after the started save (so it is spawned, not awaited, here).
+    let c = lib.c.clone();
+    let b1 = b.clone();
+    let releasing = tokio::spawn(async move {
+        call(&c, app::RELEASE, json!({"binding": b1, "mount": mount})).await
+    });
+    mount_revoked(&lib.l, mount).await;
     let c = lib.c.clone();
     let b2 = b.clone();
     let closing = tokio::spawn(async move { call(&c, app::CLOSE, json!({"binding": b2})).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !releasing.is_finished(),
+        "the release waits for the started save"
+    );
     assert!(!closing.is_finished(), "Close waits for the started save");
     started.resume();
     let saved = value(bounded(saving).await.unwrap());
@@ -1766,6 +1777,7 @@ async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
         saved["saved"], true,
         "the started save finished and says so"
     );
+    assert_eq!(value(bounded(releasing).await.unwrap())["released"], true);
     value(bounded(closing).await.unwrap());
     let after = files(&dir, &page);
     assert_eq!(saved["revision"], json!(crate::etag(&after.0)));
@@ -1782,6 +1794,245 @@ async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
     assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(server.page(Some(&page)).is_err(), "and reads nothing");
     assert_eq!(files(&dir, &page), after);
+}
+
+/// Wait (bounded) until `mount` is no longer one of the open binding's mounts.
+async fn mount_revoked(l: &Launcher, mount: u64) {
+    for _ in 0..1000 {
+        let gone = !l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .is_some_and(|b| b.mounts.contains_key(&mount));
+        if gone {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("mount {mount} was not revoked");
+}
+
+/// R8 F1, adapted from the independent reviewer's diagnostic (Codex review work): a release
+/// revokes its mount at once. A save of that mount admitted earlier, still waiting for the
+/// writer fence, then never runs (no page or manifest change), and the release is acknowledged
+/// only once the fence is free. The binding itself stays open: Back isn't Close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_release_revokes_a_queued_save_before_it_can_start() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Queue", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let server = bound_server(&lib.l).await;
+    let before = files(&dir, &page);
+    let held = server.lifecycle.write.clone().lock_owned().await;
+    let mut queued = Point::arm(&dir, "browser_queued", false);
+    let c = lib.c.clone();
+    let body = edited(&text);
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    let saving = tokio::spawn(async move { call(&c, app::SAVE, args).await });
+    queued.reached().await;
+    let c = lib.c.clone();
+    let b1 = b.clone();
+    let releasing = tokio::spawn(async move {
+        call(&c, app::RELEASE, json!({"binding": b1, "mount": mount})).await
+    });
+    mount_revoked(&lib.l, mount).await;
+    assert!(
+        !releasing.is_finished(),
+        "acknowledged only once the writer fence is free"
+    );
+    drop(held);
+    let result = bounded(saving).await.unwrap();
+    assert_eq!(value(bounded(releasing).await.unwrap())["released"], true);
+    let e = result.expect_err("a released queued save must never execute");
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "neither page nor manifest changed"
+    );
+    assert!(
+        lib.l.state.lock().await.bound.is_some(),
+        "the canvas stays open"
+    );
+    server.retire().await;
+}
+
+/// R8 F2, adapted from the independent reviewer's diagnostic (Codex review work): a save whose
+/// request is cancelled while it waits for admission (the launcher's state) is refused and
+/// never starts, even though the writer fence is free once the state is; an already
+/// cancelled save never takes a free fence either. Not cancelled, the same save is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_cancelled_save_never_starts_from_admission_or_a_free_fence() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Cancel", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    let body = edited(&text);
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    // Cancelled while it waits for the state.
+    let held = lib.l.state.clone().lock_owned().await;
+    let l = lib.l.clone();
+    let a = args.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let saving = tokio::spawn(async move {
+        l.panel_call(app::SAVE, &a, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tx.send(()).unwrap();
+    let e = bounded(saving).await.unwrap().unwrap_err();
+    drop(held);
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!(files(&dir, &page), before);
+    // Already cancelled, with the state and the writer fence both free.
+    let e = lib
+        .l
+        .panel_call(app::SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "no fence taken, nothing written"
+    );
+    // The control: the same save, not cancelled, is written.
+    let saved = value(
+        lib.l
+            .panel_call(app::SAVE, &args, std::future::pending::<()>())
+            .await,
+    );
+    assert_eq!(saved["saved"], true);
+    assert_ne!(files(&dir, &page), before);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// A page file whose node name is `quotes` quote characters (each escaped once in the file).
+fn quote_heavy_page(text: &str, quotes: usize) -> String {
+    let mut data = paper_rs::project::format::page_from_json(&edited(text)).unwrap();
+    let node = data.doc.root[0];
+    data.doc.nodes.get_mut(&node).unwrap().name = "\"".repeat(quotes);
+    let body = paper_rs::project::format::page_to_json(&data);
+    assert!(paper_rs::project::format::page_from_json(&body).is_ok());
+    body
+}
+
+/// R8 F3, adapted from the independent reviewer's diagnostic (Codex review work): a page read
+/// is bounded as the whole tool response it would be (the pretty JSON text inside the tool
+/// result inside the JSON-RPC response, escaped at each level, plus the host allowance), not
+/// only as its inner JSON. A quote-heavy page whose inner message fits is refused, before a
+/// mount is registered; a smaller one is answered within the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_page_reads_are_bounded_as_the_whole_tool_response() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Big", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, _, text) = first_read(&lib.c, &b).await;
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let big = quote_heavy_page(&text, 700_000);
+    let inner = json!({"text": big}).to_string().len();
+    assert!(
+        inner < app::MAX_PANEL_MESSAGE,
+        "the inner message alone fits"
+    );
+    std::fs::write(&path, &big).unwrap();
+    let before = files(&dir, &page);
+    let mounts = || async {
+        lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .map_or(0, |b| b.mounts.len())
+    };
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": page, "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    let registered = mounts().await;
+    let e = call(&lib.c, app::PAGE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "a first read too: {e}");
+    assert_eq!(mounts().await, registered, "no mount registered for it");
+    assert_eq!(files(&dir, &page), before, "files unchanged");
+    // A smaller quote-heavy page: answered, and its whole response is within the limit.
+    std::fs::write(&path, quote_heavy_page(&text, 200_000)).unwrap();
+    let mut params = CallToolRequestParams::new(app::PAGE);
+    params.arguments = json!({"binding": b, "page_id": page, "mount": mount})
+        .as_object()
+        .cloned();
+    let response = bounded(lib.c.peer.call_tool(params)).await.unwrap();
+    assert_ne!(response.is_error, Some(true));
+    let envelope = json!({"jsonrpc": "2.0", "id": 1, "result": response});
+    let wire = serde_json::to_vec(&envelope).unwrap();
+    assert!(wire.len() <= app::MAX_PANEL_MESSAGE, "{}", wire.len());
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// R8 F3 for requests: a save is bounded as the whole `tools/call` request it came in (the
+/// JSON-RPC request with its arguments, plus the host allowance), not only its arguments: an
+/// escaping-heavy save and a plain one whose arguments alone fit are refused, unwritten; one
+/// within the limit is admitted (and then refused only as not a page).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_saves_are_bounded_as_the_whole_tool_request() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Request", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, _) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    let args = |text: &str| json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": text});
+    for (what, text) in [
+        ("quotes", "\"".repeat(app::MAX_PANEL_MESSAGE / 2 - 4096)),
+        ("plain", "x".repeat(app::MAX_PANEL_MESSAGE - 1024)),
+    ] {
+        let a = args(&text);
+        assert!(
+            serde_json::to_string(&a).unwrap().len() < app::MAX_PANEL_MESSAGE,
+            "{what}: the arguments alone fit"
+        );
+        let wrapped = app::request_bytes(app::SAVE, &a);
+        assert!(wrapped > app::MAX_PANEL_MESSAGE, "{what}: {wrapped}");
+        let e = call(&lib.c, app::SAVE, a).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 413, "{what}: {e}");
+        assert_eq!(files(&dir, &page), before, "{what}: nothing written");
+    }
+    let fits = "x".repeat(app::MAX_PANEL_MESSAGE - 64 * 1024);
+    let e = call(&lib.c, app::SAVE, args(&fits)).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 422, "admitted, then not a page: {e}");
+    assert_eq!(files(&dir, &page), before);
+    bound_server(&lib.l).await.retire().await;
 }
 
 /// Stand-in parts for `panel_module` (inert text, not the real glue or editor).

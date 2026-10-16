@@ -276,13 +276,20 @@ The launcher inlines one fixed module into the view's one `<script type="module"
 framing change. The renderer comes only from the packaged wasm, in sequential 256 KiB parts
 (integer `part`, identity/size/count/length checked, 16 MiB cap) and goes to the glue's own
 `__wbg_init({module_or_path: bytes})`. Page calls name the view's `binding`, then the `page_id`
-and `mount` of the first read (the manifest's active page, else its first); all are compared
-under the state lock, which is released before the writer fence (never reversed). They use the
-same `Server::{page, page_revision, save_page, mark_ready}` as HTTP: one transaction, structured
-409/rollback/`Broken`, bounded queue (an unstarted or cancelled save never runs; a started one
-finishes, and retirement waits). A save writes only its page and the manifest's `modified`.
-Panel page messages are capped at 4 MiB serialized (escaping counted), separately from the 64
-MiB page limit; larger pages stay browser-only, untouched. `panel: true` on create/open/import/
+and `mount` of the first read (the manifest's active page, else its first). Binding and mount
+are compared under the state lock, which is released before the writer fence (never
+reversed); `page_id` is only checked as a manifest page (a mount isn't tied to a page; the view
+keeps to its own). They use the same `Server::{page, page_revision, save_page, mark_ready}` as
+HTTP: one transaction, structured 409/rollback/`Broken`, bounded queue. A save carries its
+mount's lifetime flag, checked again under the writer fence; a release clears it under the
+state lock, then waits for the fence before it is acknowledged, so a queued save of that mount
+never runs and a started one finishes first (the binding stays). A cancelled save never starts:
+cancellation is observed before and during admission and before the fence is taken. A started
+save always finishes, and retirement waits. A save writes only its page and the manifest's
+`modified`. Panel page messages are capped at 4 MiB as sent: a read as the whole tool result in
+its JSON-RPC response, a save as its whole `tools/call` request, each escaping counted, plus a
+fixed 16 KiB host allowance (not a known host limit), separately from the 64 MiB page limit;
+larger pages stay browser-only, untouched, and no mount is registered for them. `panel: true` on create/open/import/
 editor returns no link and gives none; mounted panels and a given link both make Close/Switch
 need `force`. Back and Close drain (wait for the save in flight, save what is left, require
 `can_reload`); conflict, failed/unanswered save or an edit under way keep the editor until an

@@ -279,8 +279,10 @@ struct Bound {
     /// In-panel editors of this app-library binding that read its page and haven't been
     /// released (Back, Close or the view's teardown release them; a view that vanished never
     /// does, which only makes Close and Switch ask for confirmation). Like `binding`, a mount
-    /// number is a stale-view check, never a credential.
-    mounts: std::collections::BTreeSet<u64>,
+    /// number is a stale-view check, never a credential. Each mount has its lifetime flag: a
+    /// release clears it (under the state lock), and a save admitted for that mount checks it
+    /// again under the writer fence (`Server::save_page_while`).
+    mounts: std::collections::BTreeMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     next_mount: u64,
 }
 

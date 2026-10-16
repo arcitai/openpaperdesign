@@ -380,6 +380,34 @@ test('a conflict, an unanswered save or a page too large for the panel is never 
   assert.equal(l.shown.status.at(-1), 'Save failed; retrying');
 });
 
+test('a save is bounded as the whole request it would be (envelope, escaping and host allowance), not its arguments', async () => {
+  const MAX = 4 * 1024 * 1024;
+  const bytes = (s) => new TextEncoder().encode(s).length;
+  const t = await readyEditor();
+  // Escaping-heavy: the arguments alone fit, the request as sent (plus the allowance) doesn't.
+  const quotes = '"'.repeat(MAX / 2 - 4096);
+  const args = { binding: BINDING, page_id: 'p1', mount: 1, if_match: '"r1"', text: quotes };
+  assert.ok(bytes(JSON.stringify(args)) < MAX, 'the arguments alone fit');
+  t.ed.pending = quotes;
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, 0, 'not sent');
+  assert.equal(t.shown.status.at(-1), 'Save failed; retrying');
+  // Plain text just under the arguments-only limit: not sent either.
+  t.ed.pending = 'x'.repeat(MAX - 1024);
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, 0);
+  // Well within the whole-request limit: sent, and saved.
+  const fits = 'x'.repeat(MAX - 64 * 1024);
+  t.ed.pending = fits;
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, 1);
+  assert.equal(t.srv.page.text, fits);
+  assert.equal(t.shown.status.at(-1), 'Saved');
+});
+
 test('a stale binding or released mount is refused by the server and never applied', async () => {
   const t = await readyEditor();
   t.srv.mounts.clear(); // another view closed or replaced the canvas

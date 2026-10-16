@@ -13,7 +13,9 @@
 //   the bytes. Whether the host allows that (its content security policy) and gives the view
 //   WebGL2 or WebGPU is up to the host: a refusal is shown as it came.
 // - Page calls name the view's binding, then the page id and mount number its first read
-//   returned; the server compares them before it reads or writes anything. Saves are
+//   returned. The server compares the binding and mount before it reads or writes anything
+//   and checks the page id is a page of the canvas; keeping to that one page is this
+//   editor's own rule (the server doesn't tie a mount to a page). Saves are
 //   revision-checked exactly as the browser's; a save whose answer never came is treated as
 //   unknown (it is retried, and a conflict shows if it was written meanwhile), never as saved.
 
@@ -28,8 +30,10 @@ const OPD_PANEL = Object.freeze({
   PART_BYTES: 262144,
   MAX_PARTS: 64,
   MAX_BYTES: 16 * 1024 * 1024,
-  // The server's own limit for a page message (`MAX_PANEL_MESSAGE`).
+  // The server's own limit for a page message (`MAX_PANEL_MESSAGE`), and the allowance within
+  // it for what a host adds around a forwarded request (`HOST_OVERHEAD`).
   MAX_MESSAGE: 4 * 1024 * 1024,
+  HOST_OVERHEAD: 16 * 1024,
 });
 // Why a transfer or load stopped when the person left first.
 const OPD_LEFT = 'left';
@@ -89,6 +93,11 @@ export function opdCreatePanel(opts) {
     return out;
   };
   const utf8Length = (s) => new TextEncoder().encode(s).length;
+  // A tools/call request as this view sends it (the widest id), plus the host allowance: the
+  // same shape and numbers as the server's `request_bytes`.
+  const requestBytes = (name, args) => utf8Length(JSON.stringify({
+    jsonrpc: '2.0', id: Number.MAX_SAFE_INTEGER, method: 'tools/call', params: { name, arguments: args },
+  })) + P.HOST_OVERHEAD;
 
   // The renderer's bytes, part after part, each checked against the first and against this
   // module's identity. Stops as soon as no opened editor wants it any more.
@@ -190,8 +199,9 @@ export function opdCreatePanel(opts) {
       };
       const put = async (snapshot, revision) => {
         const args = Object.assign({}, ids, { if_match: revision, text: snapshot });
-        // Too large for the panel: refused here, unsent; the change stays unsaved on screen.
-        if (utf8Length(JSON.stringify(args)) > P.MAX_MESSAGE) return { ok: false, status: 413, revision: null };
+        // Too large for the panel as the request it would be: refused here, unsent; the
+        // change stays unsaved on screen.
+        if (requestBytes(P.SAVE, args) > P.MAX_MESSAGE) return { ok: false, status: 413, revision: null };
         const r = await call(P.SAVE, args, 130000);
         if (r.ok) {
           const s = r.ok;

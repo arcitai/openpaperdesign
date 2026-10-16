@@ -59,6 +59,30 @@ pub(super) const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 /// host). A larger page isn't opened in the panel, and a larger save isn't sent; neither
 /// changes any file. The browser editor link still works for them.
 pub(super) const MAX_PANEL_MESSAGE: usize = 4 * 1024 * 1024;
+/// Room left within `MAX_PANEL_MESSAGE` for what a host adds around a tool request or result
+/// it forwards (its own ids, metadata and framing). An explicit, bounded allowance, not a known
+/// host limit; the view's `panel.js` uses the same number.
+pub(super) const HOST_OVERHEAD: usize = 16 * 1024;
+
+/// The size of `r` as this server answers it: `to_result` (what `call_tool` sends) inside a
+/// JSON-RPC response with the widest id, every level of escaping included, plus
+/// `HOST_OVERHEAD`.
+pub(super) fn response_bytes(r: &ToolResult) -> usize {
+    let wire = json!({"jsonrpc": "2.0", "id": u64::MAX, "result": to_result(r.clone())});
+    serde_json::to_vec(&wire)
+        .map_or(usize::MAX, |v| v.len())
+        .saturating_add(HOST_OVERHEAD)
+}
+
+/// The size of a `tools/call` request for `name` with `args` as the view sends it (and a host
+/// forwards it): a JSON-RPC request with the widest id, plus `HOST_OVERHEAD`.
+pub(super) fn request_bytes(name: &str, args: &Value) -> usize {
+    let wire = json!({"jsonrpc": "2.0", "id": u64::MAX, "method": "tools/call",
+        "params": {"name": name, "arguments": args}});
+    serde_json::to_vec(&wire)
+        .map_or(usize::MAX, |v| v.len())
+        .saturating_add(HOST_OVERHEAD)
+}
 /// JSON integers are exact up to 2^53 - 1.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
@@ -783,10 +807,10 @@ pub(super) fn asset_part(bytes: &[u8], identity: &str, part: u64) -> Result<Valu
     }))
 }
 
-/// An in-panel page call's refusal, as JSON the editor reads: the message, an HTTP-like status
-/// (409 with the page's current revision for a conflict, 410 when the binding or mount isn't
-/// current any more, 413 when it is too large for the panel, 400 for bad arguments) and nothing
-/// else. Every refusal means nothing was written.
+/// An admitted in-panel call: the open canvas's server and, for a call naming a mount, that
+/// mount's lifetime flag.
+type Admitted = (Arc<Server>, Option<Arc<std::sync::atomic::AtomicBool>>);
+
 fn panel_unavailable(why: &str) -> String {
     format!(
         "The in-panel editor isn't available in this OpenPaperDesign build ({why}), so nothing \
@@ -795,6 +819,10 @@ fn panel_unavailable(why: &str) -> String {
     )
 }
 
+/// An in-panel page call's refusal, as JSON the editor reads: the message, an HTTP-like status
+/// (409 with the page's current revision for a conflict, 410 when the binding or mount isn't
+/// current any more, 413 when it is too large for the panel, 400 for bad arguments, 503 when
+/// it couldn't run) and nothing else. Every refusal means nothing was written.
 fn panel_refusal(status: u16, error: &str, revision: Option<&str>) -> String {
     json!({"error": error, "status": status, "revision": revision}).to_string()
 }
@@ -817,18 +845,26 @@ impl Launcher {
 
     /// The home view's own editor (the in-panel editor): the renderer's parts, and the page,
     /// revision, save, Ready and release calls of the canvas the view shows. The renderer part
-    /// is static packaged data. Every page call names the view's `binding`, and after its first
-    /// read the `page_id` and `mount` that read returned: all compared under the state lock
-    /// before anything is read or written (`panel_server`). They run through the same `Server`
-    /// operations as the browser's HTTP API (`Server::page`, `page_revision`, `save_page`,
-    /// `mark_ready`), with the same lifecycle, root, lease, conflict, commit and rollback rules,
+    /// is static packaged data. Every page call names the view's `binding` and, after its first
+    /// read, the `mount` that read returned; both are compared under the state lock before
+    /// anything is read or written (`panel_server`, which also re-checks the canvas, library and
+    /// lease). The `page_id` is checked as a page of the canvas's manifest; a mount is not tied
+    /// to one page (the view keeps to the page it first read). The calls run through the same
+    /// `Server` operations as the browser's HTTP API (`Server::page`, `page_revision`,
+    /// `save_page_while`, `mark_ready`), with the same conflict, commit and rollback rules,
     /// never through a loopback request.
+    ///
+    /// A save is tied to its mount's lifetime: a release revokes it, and a save not started by
+    /// then never runs; a save whose request is cancelled before it starts never runs either
+    /// (`cancelled` is observed before admission, while waiting for it and before the writer
+    /// fence is taken). A started save always finishes its commit or rollback.
     pub(super) async fn panel_call(
         &self,
         name: &str,
         args: &Value,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> ToolResult {
+        tokio::pin!(cancelled);
         if name == ASSET {
             let map = panel_args(args, &[], &["part"])?;
             let part = map
@@ -890,19 +926,53 @@ impl Launcher {
         if name == PAGE && mount.is_none() {
             panel_editor().map_err(|why| bad(503, &panel_unavailable(why)))?;
         }
-        if name == RELEASE {
-            let mut state = self.state.lock().await;
-            expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
-            let released = state
-                .bound
-                .as_mut()
-                .is_some_and(|b| mount.is_some_and(|m| b.mounts.remove(&m)));
-            return text(json!({"binding": binding, "released": released}));
+        // A save too large for the panel is refused before anything else, as the request it
+        // came in (see `request_bytes`).
+        if name == SAVE {
+            let size = request_bytes(SAVE, args);
+            if size > MAX_PANEL_MESSAGE {
+                return Err(bad(
+                    413,
+                    &format!(
+                        "this save is {size} bytes as a message, more than the in-panel editor's \
+                         {MAX_PANEL_MESSAGE}; nothing was written. Open the canvas in the browser \
+                         editor to save a page this large."
+                    ),
+                ));
+            }
         }
-        let server = self
-            .panel_server(binding, mount)
-            .await
-            .map_err(|e| bad(410, &e))?;
+        if name == RELEASE {
+            let released = {
+                let mut state = self.state.lock().await;
+                expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
+                let b = state.bound.as_mut().ok_or_else(|| bad(410, NO_CANVAS))?;
+                // Revoked under the state lock: no later call is admitted for this mount, and
+                // a save admitted earlier finds it revoked under the writer fence.
+                mount.and_then(|m| b.mounts.remove(&m)).map(|live| {
+                    live.store(false, std::sync::atomic::Ordering::Release);
+                    b.server.clone()
+                })
+            };
+            // Without the state lock: a save of this editor that had already started finishes
+            // its commit or rollback before the release is acknowledged. The binding stays.
+            if let Some(server) = &released {
+                server.drain_writer().await;
+            }
+            return text(json!({"binding": binding, "released": released.is_some()}));
+        }
+        const CANCELLED: &str = "the save was cancelled before it started; nothing was written";
+        let admitted = if name == SAVE {
+            // An already cancelled save, or one cancelled while waiting for admission, never
+            // starts.
+            tokio::select! {
+                biased;
+                () = &mut cancelled => return Err(bad(503, CANCELLED)),
+                r = self.panel_server(binding, mount) => r,
+            }
+        } else {
+            self.panel_server(binding, mount).await
+        };
+        let (server, live) = admitted.map_err(|e| bad(410, &e))?;
         match name {
             PAGE => {
                 let page = server.page(page_id).map_err(api_refusal)?;
@@ -919,9 +989,13 @@ impl Launcher {
                     "page": {"id": page.id, "name": page.name},
                     "revision": page.revision,
                     "text": body,
+                    // The widest mount number, for the measurement below.
+                    "mount": MAX_SAFE_INTEGER,
                 });
-                // The serialized message, escaping included, plus room for the mount number.
-                let size = serde_json::to_string(&out).map_or(usize::MAX, |s| s.len() + 64);
+                // Measured as it would be sent: the tool result and its JSON-RPC response,
+                // every level of escaping included, and the host allowance. Refused before a
+                // mount is registered.
+                let size = response_bytes(&text(out.clone()));
                 if size > MAX_PANEL_MESSAGE {
                     return Err(bad(
                         413,
@@ -940,7 +1014,8 @@ impl Launcher {
                         expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
                         let b = state.bound.as_mut().ok_or_else(|| bad(410, NO_CANVAS))?;
                         b.next_mount += 1;
-                        b.mounts.insert(b.next_mount);
+                        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                        b.mounts.insert(b.next_mount, live);
                         b.next_mount
                     }
                 };
@@ -953,28 +1028,19 @@ impl Launcher {
                 text(json!({"binding": binding, "page_id": page_id, "revision": revision}))
             }
             SAVE => {
-                let size = serde_json::to_string(args).map_or(usize::MAX, |s| s.len());
-                if size > MAX_PANEL_MESSAGE {
-                    return Err(bad(
-                        413,
-                        &format!(
-                            "this save is {size} bytes as a message, more than the in-panel \
-                             editor's {MAX_PANEL_MESSAGE}; nothing was written. Open the canvas \
-                             in the browser editor to save a page this large."
-                        ),
-                    ));
-                }
                 let page_id = page_id.unwrap_or_default();
                 let if_match = get("if_match").unwrap_or_default();
                 let body = get("text").unwrap_or_default();
-                // A save whose request is cancelled before it holds the writer fence never
-                // starts; once it holds it, it runs to its commit or rollback without waiting
-                // again (`Server::save_page`), so it can't be stopped halfway.
+                let live = live.ok_or_else(|| bad(410, UNMOUNTED))?;
+                // Cancellation is checked first on every poll, so a cancelled save never takes
+                // even a free writer fence. Once the save holds the fence it runs to its commit
+                // or rollback within that same poll, without waiting again
+                // (`Server::save_page_while`), so it can't be stopped halfway.
                 let revision = tokio::select! {
                     biased;
-                    r = server.save_page(page_id, if_match, body) => r.map_err(api_refusal)?,
-                    () = cancelled => {
-                        return Err(bad(503, "the save was cancelled before it started; nothing was written"));
+                    () = &mut cancelled => return Err(bad(503, CANCELLED)),
+                    r = server.save_page_while(&live, page_id, if_match, body) => {
+                        r.map_err(api_refusal)?
                     }
                 };
                 text(json!({
@@ -993,18 +1059,20 @@ impl Launcher {
     }
 
     /// The open canvas's server for an in-panel call naming `binding` (and `mount`, after the
-    /// first page read), compared under the state lock. The lock is released before the server
-    /// is used: a save then waits for the binding's writer fence without it. Close holds the
-    /// state lock while it drains that fence, so this order is never reversed.
-    async fn panel_server(&self, binding: &str, mount: Option<u64>) -> Result<Arc<Server>, String> {
+    /// first page read), compared under the state lock, with that mount's lifetime flag. The
+    /// lock is released before the server is used: a save then waits for the binding's writer
+    /// fence without it. Close holds the state lock while it drains that fence, so this order is
+    /// never reversed.
+    async fn panel_server(&self, binding: &str, mount: Option<u64>) -> Result<Admitted, String> {
         let state = self.state.clone().lock_owned().await;
         refuse_if_shut_down(&state)?;
         let state = Self::fence_library(state).await?;
         expect_binding(&state, Some(binding))?;
         let b = state.bound.as_ref().ok_or(NO_CANVAS)?;
-        if mount.is_some_and(|m| !b.mounts.contains(&m)) {
-            return Err(UNMOUNTED.into());
-        }
-        Ok(b.server.clone())
+        let live = match mount {
+            Some(m) => Some(b.mounts.get(&m).cloned().ok_or(UNMOUNTED)?),
+            None => None,
+        };
+        Ok((b.server.clone(), live))
     }
 }
