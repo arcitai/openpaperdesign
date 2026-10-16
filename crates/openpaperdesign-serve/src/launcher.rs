@@ -216,6 +216,22 @@ struct LauncherState {
     pinned_by: Owner,
     invalidated: Option<String>,
     bound: Option<Bound>,
+    /// Set by [`Launcher::shutdown`] at the end of this process's service: nothing may create
+    /// a project or install a binding any more.
+    shut_down: bool,
+}
+
+/// A creation or binding that starts after the service ended (a request still in flight when
+/// the connection closed) is refused before it writes or installs anything.
+const SHUT_DOWN: &str = "This OpenPaperDesign server is shutting down; nothing was created, \
+    opened or changed.";
+
+fn refuse_if_shut_down(state: &LauncherState) -> Result<(), String> {
+    if state.shut_down {
+        Err(SHUT_DOWN.into())
+    } else {
+        Ok(())
+    }
 }
 
 /// What one project creation made, as established when it happened: each folder this call
@@ -739,6 +755,7 @@ impl Launcher {
                 pinned_by: Owner::Model,
                 invalidated: None,
                 bound: None,
+                shut_down: false,
             })),
             session: crate::agent::new_session(),
             library: None,
@@ -757,8 +774,36 @@ impl Launcher {
             pinned_by: Owner::Library,
             invalidated: None,
             bound: None,
+            shut_down: false,
         }));
         l
+    }
+
+    /// The normal end of this process's service (stdio closed, or the service failed): from now
+    /// on nothing creates a project or installs a binding, and the final binding is retired as
+    /// Close and Switch retire one: admission closes, a started browser save or MCP call and
+    /// its rollback drain, queued and late HTTP, MCP and browser writers are refused, and only
+    /// then are the binding and its lease dropped. A request still running when the connection
+    /// closed finishes first (it holds the state lock). Calling it again is harmless.
+    async fn shutdown(&self) {
+        if let Err(e) = self.begin_shutdown().await {
+            eprintln!("openpaperdesign-mcp: shutdown stopped unexpectedly: {e}");
+        }
+    }
+
+    /// The shutdown as an owned task, spawned before anything waits (not even for the state
+    /// lock): a caller cancelled at any point, including while a request in flight still holds
+    /// the state, leaves it running, so the lease is still kept until the drain is done.
+    fn begin_shutdown(&self) -> tokio::task::JoinHandle<()> {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut state = state.lock_owned().await;
+            state.shut_down = true;
+            if let Some(b) = state.bound.as_ref() {
+                b.server.retire().await;
+            }
+            state.bound = None;
+        })
     }
 
     fn status(state: &LauncherState, problem: Option<&str>) -> ToolResult {
@@ -862,6 +907,8 @@ impl Launcher {
         pin: Option<Workspace>,
         owner: Owner,
     ) -> ToolResult {
+        // Never a new binding after the service ended; the prepared server is never activated.
+        refuse_if_shut_down(&state)?;
         let Install {
             listener,
             port,
@@ -933,6 +980,7 @@ impl Launcher {
         pin: bool,
         owner: Owner,
     ) -> ToolResult {
+        refuse_if_shut_down(&state)?;
         if let Some(b) = state.bound.as_ref()
             && b.server.dir() == dir
         {
@@ -971,6 +1019,7 @@ impl Launcher {
         owner: Owner,
     ) -> Result<(PathBuf, Vec<Out>), String> {
         // Before creating anything.
+        refuse_if_shut_down(&state)?;
         Self::may_switch(&state.bound, None, force)?;
         ws.check_workspace()?;
         if let Some(p) = workspace_problem(&ws.path) {
@@ -1391,12 +1440,16 @@ pub async fn main() {
         Mode::Workspace(ws) => Launcher::new(ws),
         Mode::Library(lib) => Launcher::with_library(lib),
     };
+    // The service consumes its handler; this clone shares the state so the end can drain it.
+    let owner = launcher.clone();
     match launcher.serve(rmcp::transport::stdio()).await {
         Ok(running) => {
             let _ = running.waiting().await;
+            owner.shutdown().await;
         }
         Err(e) => {
             eprintln!("openpaperdesign-mcp: {e}");
+            owner.shutdown().await;
             std::process::exit(1);
         }
     }

@@ -909,3 +909,184 @@ async fn library_stale_views_never_act_on_another_canvas() {
     assert_eq!(open_doc(&lib.l).await, None);
     task2.abort();
 }
+
+/// The normal end of the service (its stdio client goes away) while a started MCP write is
+/// paused on the canvas's own server. `Launcher::shutdown`, run as `main` runs it after the
+/// service ends, keeps the binding and its lease until that write drained: another launcher on
+/// the same library stays busy meanwhile, a browser save queued behind the write and late
+/// requests to the old server or launcher are refused, and only then is the canvas free, with
+/// the started write saved. In-process: an in-memory stdio pair and the real rmcp protocol, not
+/// a spawned executable (the executable's own idle exit is in `tests/app_library.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_service_end_drains_the_started_writer_before_releasing_the_lease() {
+    let root = library_root();
+    let l = Launcher::with_library(Library::open(root.to_str().unwrap()).unwrap());
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (svc, owner) = (l.clone(), l.clone());
+    // The production end path: serve until the connection ends, then shut down.
+    let service = tokio::spawn(async move {
+        let running = svc.serve(server).await.unwrap();
+        let _ = running.waiting().await;
+        owner.shutdown().await;
+    });
+    let c = Client {
+        peer: ().serve(client).await.unwrap(),
+        meta: Default::default(),
+    };
+    let one = value(call(&c, app::CREATE, json!({"name": "One"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let page_file = dir.join("pages").join(format!("{page}.json"));
+    let before = std::fs::read(&page_file).unwrap();
+    let sid = mcp_session(port, &token, &page).await;
+    let old = bound_server(&l).await;
+    // A started MCP write, paused while it holds the canvas's writer lock.
+    let mut snapshot = Point::arm(&dir, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    // A browser save queued behind it.
+    let mut queued = Point::arm(&dir, "browser_queued", false);
+    let t = token.clone();
+    let body = String::from_utf8(before.clone()).unwrap();
+    let extra = format!("If-Match: {}\r\n", crate::etag(&before));
+    let path = format!("/api/pages/{page}");
+    let browser = tokio::spawn(async move { raw(port, &t, "PUT", &path, &extra, &body).await });
+    queued.reached().await;
+    // The stdio client goes away: the service ends and shutdown starts retiring the canvas.
+    c.peer.cancel().await.unwrap();
+    bounded(old.lifecycle.retiring.notified()).await;
+    let (lb, b, task_b) = launch(&root).await;
+    let e = call(&b, app::OPEN, json!({"id": id})).await.unwrap_err();
+    assert!(
+        e.contains("another OpenPaperDesign window"),
+        "the lease is kept while the started write drains: {e}"
+    );
+    assert!(
+        !service.is_finished(),
+        "shutdown waits for the started write"
+    );
+    assert_eq!(std::fs::read(&page_file).unwrap(), before, "not saved yet");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    assert_eq!(
+        bounded(browser).await.unwrap().0,
+        503,
+        "the queued browser save is refused"
+    );
+    bounded(service).await.unwrap();
+    // Late work on the old server and on the old launcher is refused; nothing new is made.
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let e = l
+        .app(
+            l.library.as_ref().unwrap(),
+            app::CREATE,
+            json!({"name": "Late"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+    assert_eq!(
+        std::fs::read_dir(root.join("library/v1/canvases"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(l.state.lock().await.bound.is_none());
+    // Only now is the canvas free, with the started write saved.
+    let reopened = value(call(&b, app::OPEN, json!({"id": id})).await);
+    let (p, t) = url(&reopened);
+    assert_eq!(
+        page_nodes(p, &t, &page).await,
+        1,
+        "the started write was saved"
+    );
+    bound_server(&lb).await.retire().await;
+    task_b.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Shutdown's owned drain exists before its first wait. Its caller is cancelled while a request
+/// in flight still holds the launcher's state (before shutdown could take it); once the state is
+/// free, the drain still retires the canvas, keeps the lease until the started write drained,
+/// refuses late work and only then frees the canvas. Without the owned task made up front, the
+/// cancelled caller would leave nothing to retire it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_shutdown_survives_a_waiter_cancelled_before_it_got_the_state() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let sid = mcp_session(port, &token, &page).await;
+    let old = bound_server(&lib.l).await;
+    let mut snapshot = Point::arm(&dir, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    // A request in flight holds the launcher's state; the shutdown caller is polled (it can't
+    // get the state) and then cancelled.
+    let held = lib.l.state.clone().lock_owned().await;
+    let waiter = tokio::time::timeout(Duration::from_millis(50), lib.l.shutdown()).await;
+    assert!(
+        waiter.is_err(),
+        "the caller was still waiting for the state"
+    );
+    drop(held);
+    // The owned drain runs anyway: it retires the canvas, and keeps the lease meanwhile.
+    bounded(old.lifecycle.retiring.notified()).await;
+    let (lb, b, task_b) = launch(&lib.root).await;
+    let e = call(&b, app::OPEN, json!({"id": id})).await.unwrap_err();
+    assert!(e.contains("another OpenPaperDesign window"), "{e}");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    // Only after the started write drained is the canvas free.
+    let mut reopened = None;
+    for _ in 0..100 {
+        match call(&b, app::OPEN, json!({"id": id})).await {
+            Ok(out) => {
+                reopened = Some(value(Ok(out)));
+                break;
+            }
+            Err(e) if e.contains("another OpenPaperDesign window") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let reopened = reopened.expect("the canvas is released after the drain");
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let e = lib
+        .l
+        .app(
+            lib.l.library.as_ref().unwrap(),
+            app::CREATE,
+            json!({"name": "Late"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+    let (p, t) = url(&reopened);
+    assert_eq!(
+        page_nodes(p, &t, &page).await,
+        1,
+        "the started write was saved"
+    );
+    bound_server(&lb).await.retire().await;
+    task_b.abort();
+}

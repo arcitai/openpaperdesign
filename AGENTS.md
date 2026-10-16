@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.33 · Updated: 2026-10-16
+Revision: 0.35 · Updated: 2026-10-16
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -226,7 +226,11 @@ per-id lease: nonblocking `File::try_lock` on a regular single-link lock file, t
 count, library folders) by a guard on every browser and MCP access; a failed check fences that
 canvas for good, and the next action retires it. Lock files are never removed, truncated or
 replaced, and never exported. The lease moves into the binding and is dropped only after
-retirement drained it; same id is a checked no-op; busy, invalid or failing targets keep the
+retirement drained it, also at the normal end of the service: when stdio closes or the service
+fails, `main` runs `Launcher::shutdown`, which refuses any later create/bind/install and retires
+the final binding (started writer and rollback drained, queued and late writers refused) in an
+owned task spawned before any wait, even for the state lock, before its lease drops (both
+modes); same id is a checked no-op; busy, invalid or failing targets keep the
 current canvas and URL. It is advisory: no protection from other programs, no OS sandbox.
 Create/import write through the checked commit with every new folder's parent synced, finish
 preparation before the old binding retires, run in an owned task, remove only what is still

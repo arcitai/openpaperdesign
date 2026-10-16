@@ -412,6 +412,7 @@ impl Launcher {
         action: &'static str,
     ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
+        refuse_if_shut_down(&state)?;
         let state = Self::fence_library(state).await?;
         library_switch(&state, force, replace)?;
         let lib2 = lib.clone();
@@ -459,6 +460,7 @@ impl Launcher {
         replace: Option<&str>,
     ) -> ToolResult {
         let state = self.state.clone().lock_owned().await;
+        refuse_if_shut_down(&state)?;
         let mut state = Self::fence_library(state).await?;
         if replace.is_some_and(|r| current_binding(&state) != Some(r)) {
             // A confirmation shown for another binding never acts on this one.
