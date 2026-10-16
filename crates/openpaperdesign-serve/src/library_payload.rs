@@ -14,7 +14,16 @@
 //! or other project files, and a file that offers such companions is refused rather than
 //! partly imported. Import validates the whole file before anything is written. No record
 //! names a path: page files are `pages/<checked page id>.json` and images
-//! `assets/<content hash>.<ext>`. Rejected: oversized files, more pages, nodes or images than the
+//! `assets/<content hash>.<ext>`. The contained manifest and pages must be exactly the current
+//! upstream formats (`paper-rs-project` version 1, `paper-rs-page` version 3), checked on the
+//! raw JSON before any upstream parsing or migration; older or legacy versions aren't
+//! supported in canvas files. Each page must also say nothing upstream's parser would drop:
+//! its JSON must match what upstream writes back from it (numbers by value, node order by id,
+//! and only the writer's known omissions explicit at their defaults), so an unknown, legacy or
+//! misplaced field in a node, style, paint or camera is refused rather than silently lost,
+//! whatever its value. Every image is fully decoded (with the `image` crate, never through
+//! upstream's process-wide registry) on import and export.
+//! Rejected: oversized files, more pages, nodes or images than the
 //! bounds, duplicate JSON keys anywhere, unknown fields, other formats or versions, unsafe or
 //! colliding page ids (case, first six characters), an empty page list, an active page that
 //! isn't listed, page records that don't match the manifest one for one (a missing page is
@@ -28,7 +37,9 @@
 
 use super::{MAX_ASSET_BYTES, MAX_ASSETS, MAX_MANIFEST_BYTES, MAX_PAGES, NewDocument, valid_id};
 use crate::{Kind, page_prefix, plain, valid_page_id};
-use paper_rs::project::format::{page_from_json, page_to_json};
+use paper_rs::project::format::{
+    PAGE_FORMAT, PAGE_VERSION, PROJECT_FORMAT, PROJECT_VERSION, page_from_json, page_to_json,
+};
 use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData, PageRef};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashSet};
@@ -182,6 +193,111 @@ pub(crate) const MAX_NODE_ID: u64 = (1 << 53) - 1;
 /// How deeply nodes may nest (upstream walks the tree recursively).
 pub(crate) const MAX_TREE_DEPTH: usize = 256;
 
+/// A contained file's raw `format` and `version`: exactly the current upstream format and
+/// version (manifest `paper-rs-project` 1, page `paper-rs-page` 3), as OpenPaperDesign writes
+/// them. Checked before upstream parsing, whose migration helper would treat a missing or
+/// malformed version as 1, narrow it to 32 bits and subtract one from it. Older page versions
+/// and the legacy single-file format are not part of canvas files: no migration runs on import.
+fn check_file_version(v: &Value, format: &str, version: u32, what: &str) -> Result<(), String> {
+    if v.get("format").and_then(Value::as_str) != Some(format) {
+        return Err(format!("{what} isn't a {format:?} file"));
+    }
+    if v.get("version").and_then(Value::as_u64) != Some(u64::from(version)) {
+        return Err(format!(
+            "{what} must have version {version}, the current {format} version (older, newer or \
+             malformed versions aren't supported in canvas files)"
+        ));
+    }
+    Ok(())
+}
+
+/// One known omission: a field name and whether a value is the default the writer leaves out.
+type Omission = (&'static str, fn(&Value) -> bool);
+
+/// What upstream's page writer deliberately leaves out when a field has its default value: the
+/// page's `camera` when there is none, and a node's `parent`, `children`, `layout`, `instance`
+/// and `component` at their defaults. Only these may be present in a file and missing from what
+/// upstream writes back; any other key, whatever its value (`null` and `[]` included), must
+/// survive.
+const PAGE_OMISSIONS: &[Omission] = &[("camera", Value::is_null)];
+const NODE_OMISSIONS: &[Omission] = &[
+    ("parent", Value::is_null),
+    ("children", |v| v.as_array().is_some_and(Vec::is_empty)),
+    ("layout", Value::is_null),
+    ("instance", Value::is_null),
+    ("component", |v| v.as_bool() == Some(false)),
+];
+
+/// Where a page record holds something the parser didn't keep, if anywhere: every key of the
+/// page, each node and everything inside them must be in `canonical` (what upstream writes back
+/// from the parsed page) with the same value, numbers compared by value. Only the omissions
+/// listed above may be missing. Upstream's structures ignore unknown fields, so an unknown,
+/// legacy or misplaced field anywhere (a node, its style, a paint, the camera) would otherwise
+/// vanish on import without notice. Input node order must already match (sorted by id).
+fn dropped(input: &Value, canonical: &Value) -> Option<String> {
+    let (Value::Object(page), Value::Object(out)) = (input, canonical) else {
+        return strict(input, canonical);
+    };
+    keys_kept(page, out, PAGE_OMISSIONS, |k, v, w| {
+        if k != "nodes" {
+            return strict(v, w);
+        }
+        match (v, w) {
+            (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+                a.iter().zip(b).enumerate().find_map(|(i, (n, m))| {
+                    let at = match (n, m) {
+                        (Value::Object(n), Value::Object(m)) => {
+                            keys_kept(n, m, NODE_OMISSIONS, |_, x, y| strict(x, y))
+                        }
+                        _ => strict(n, m),
+                    };
+                    at.map(|at| format!("[{i}]{at}"))
+                })
+            }
+            _ => Some(String::new()),
+        }
+    })
+}
+
+/// Every key of `a` is in `b` and `inner` finds nothing lost under it, unless it is one of the
+/// record's known omissions at its default value.
+fn keys_kept(
+    a: &Map<String, Value>,
+    b: &Map<String, Value>,
+    omissions: &[Omission],
+    inner: impl Fn(&str, &Value, &Value) -> Option<String>,
+) -> Option<String> {
+    a.iter().find_map(|(k, v)| match b.get(k) {
+        Some(w) => inner(k, v, w).map(|at| format!(".{}{at}", short(k))),
+        None if omissions
+            .iter()
+            .any(|(name, is_default)| *name == k.as_str() && is_default(v)) =>
+        {
+            None
+        }
+        None => Some(format!(".{}", short(k))),
+    })
+}
+
+/// `a` says exactly what `b` says: same keys, same values, numbers compared by value.
+fn strict(a: &Value, b: &Value) -> Option<String> {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => keys_kept(x, y, &[], |_, v, w| strict(v, w)),
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .find_map(|(i, (v, w))| strict(v, w).map(|at| format!("[{i}]{at}"))),
+        (Value::Number(x), Value::Number(y))
+            if x == y || matches!((x.as_f64(), y.as_f64()), (Some(p), Some(q)) if p == q) =>
+        {
+            None
+        }
+        _ if a == b => None,
+        _ => Some(String::new()),
+    }
+}
+
 /// Node ids of one page file are distinct and in range, its `next_id` is in range, and the node
 /// counts stay in bounds. Runs on the raw record, before upstream parsing.
 fn count_nodes(raw: &Value, page: &str, total: &mut usize) -> Result<(), String> {
@@ -291,12 +407,32 @@ fn page_record(i: usize, v: &Value, want: &PageRef, total: &mut usize) -> Result
             want.id
         ));
     }
+    check_file_version(v, PAGE_FORMAT, PAGE_VERSION, &format!("page record {i}"))?;
     count_nodes(v, &want.id, total)?;
     let mut page = page_from_json(&v.to_string()).map_err(|e| format!("page {}: {e}", want.id))?;
+    check_tree(&page)?;
+    // Nothing the file says may be lost on the way in (node order aside: it is by id).
+    let mut input = v.clone();
+    if let Some(nodes) = input.get_mut("nodes").and_then(Value::as_array_mut) {
+        nodes.sort_by_key(|n| n.get("id").and_then(Value::as_u64));
+    }
+    let canonical: Value =
+        serde_json::from_str(&page_to_json(&page)).map_err(|e| format!("page {}: {e}", want.id))?;
+    if let Some(at) = dropped(&input, &canonical) {
+        return Err(format!(
+            "page {} holds `{}` that this version of OpenPaperDesign doesn't keep (an unknown, \
+             legacy or non-canonical field or value); nothing is imported partially",
+            want.id,
+            if at.is_empty() {
+                "the page"
+            } else {
+                at.trim_start_matches('.')
+            }
+        ));
+    }
     page.id = want.id.clone();
     page.name = want.name.clone();
     page.doc.name = want.name.clone();
-    check_tree(&page)?;
     Ok(page)
 }
 
@@ -313,6 +449,21 @@ fn ext_of(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The bytes really are a `ext` image: decoded completely with the same `image` decoder (and
+/// its default memory limits) the editor uses, into a value that is dropped at once. Nothing is
+/// registered in upstream's process-wide image registry.
+fn decodes(bytes: &[u8], ext: &str) -> bool {
+    let format = match ext {
+        "png" => image::ImageFormat::Png,
+        "jpg" => image::ImageFormat::Jpeg,
+        "gif" => image::ImageFormat::Gif,
+        "webp" => image::ImageFormat::WebP,
+        _ => return false,
+    };
+    image::load_from_memory_with_format(bytes, format)
+        .is_ok_and(|img| img.width() > 0 && img.height() > 0)
 }
 
 fn used_images(pages: &[PageData]) -> BTreeSet<String> {
@@ -370,6 +521,13 @@ fn check_assets(v: &Value, pages: &[PageData]) -> Result<Vec<(String, Vec<u8>)>,
     }
     if let Some(x) = ids.difference(&used).next() {
         return Err(format!("image {x} isn't used by any page"));
+    }
+    // Last, as it costs the most: every image really decodes (nothing is registered).
+    for (name, bytes) in &out {
+        let (id, ext) = name.split_once('.').unwrap_or((name, ""));
+        if !decodes(bytes, ext) {
+            return Err(format!("image {id} doesn't decode as a {ext} image"));
+        }
     }
     Ok(out)
 }
@@ -441,6 +599,12 @@ fn validate_inner(text: &str) -> Result<NewDocument, String> {
             .ok_or("a manifest page entry isn't an object")?;
         keys_exactly(p, &["id", "name"], &[], "a manifest page entry")?;
     }
+    check_file_version(
+        &o["manifest"],
+        PROJECT_FORMAT,
+        PROJECT_VERSION,
+        "the manifest",
+    )?;
     let manifest =
         Manifest::from_json(&o["manifest"].to_string()).map_err(|e| format!("manifest: {e}"))?;
     check_manifest(&manifest)?;
@@ -501,6 +665,7 @@ pub(crate) fn export(dir: &Path) -> Result<Exported, String> {
             let raw: Value =
                 serde_json::from_str(&text).map_err(|e| format!("page {}: {e}", r.id))?;
             check_keys(&text).map_err(|e| format!("page {}: {e}", r.id))?;
+            check_file_version(&raw, PAGE_FORMAT, PAGE_VERSION, &format!("page {}", r.id))?;
             count_nodes(&raw, &r.id, &mut nodes)?;
             page_from_json(&text).map_err(|e| format!("page {}: {e}", r.id))?
         } else {
@@ -543,6 +708,11 @@ pub(crate) fn export(dir: &Path) -> Result<Exported, String> {
         if paper_rs::assets::hash(&bytes) != id || ext_of(&bytes) != Some(ext) {
             return Err(format!(
                 "the canvas's file for image {id} doesn't match its id or type"
+            ));
+        }
+        if !decodes(&bytes, ext) {
+            return Err(format!(
+                "the canvas's file for image {id} doesn't decode as a {ext} image"
             ));
         }
         total += bytes.len().div_ceil(3) * 4;
@@ -599,7 +769,22 @@ mod tests {
         }
     }
 
-    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot decoded by the payload checks";
+    /// A real 2×1 PNG, encoded by the same `image` crate: one red and one blue pixel.
+    fn png() -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(2, 1, |x, _| {
+            image::Rgba(if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            })
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// PNG-signed bytes that aren't an image: they pass the hash, signature and base64 checks.
+    const NOT_AN_IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nnot an image after its signature";
 
     /// A saved two-page canvas: a moved camera, a renamed second page in a deliberate order,
     /// a rectangle on each page and an image fill on the first, with its image file.
@@ -613,9 +798,9 @@ mod tests {
             .unwrap()
             .create("Portable")
             .unwrap();
-        let image = paper_rs::assets::hash(PNG);
+        let image = paper_rs::assets::hash(&png());
         std::fs::create_dir_all(p.dir.join(ASSETS_DIR)).unwrap();
-        std::fs::write(p.dir.join(ASSETS_DIR).join(format!("{image}.png")), PNG).unwrap();
+        std::fs::write(p.dir.join(ASSETS_DIR).join(format!("{image}.png")), png()).unwrap();
         let mut camera = serde_json::to_value(paper_rs::geom::Camera::default()).unwrap();
         for v in camera.as_object_mut().unwrap().values_mut() {
             if let Some(x) = v.as_f64() {
@@ -703,12 +888,56 @@ mod tests {
             "content and camera"
         );
         assert!(doc.pages.iter().any(|p| p.camera.is_some()));
-        let image = paper_rs::assets::hash(PNG);
-        assert_eq!(doc.assets, vec![(format!("{image}.png"), PNG.to_vec())]);
+        // The real image round-trips byte for byte, and decodes to the same two pixels.
+        let asset = paper_rs::assets::hash(&png());
+        assert_eq!(doc.assets, vec![(format!("{asset}.png"), png())]);
+        let pixels = image::load_from_memory(&doc.assets[0].1)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(
+            (pixels.width(), pixels.height(), pixels.get_pixel(1, 0).0),
+            (2, 1, [0, 0, 255, 255])
+        );
         // The fresh identity changes only the manifest's own id and times.
         let fresh = doc.fresh();
         assert_ne!(fresh.manifest.id, project.manifest.id);
         assert_eq!(fresh.manifest.pages, project.manifest.pages);
+    }
+
+    #[test]
+    fn images_that_dont_decode_are_refused_on_import_and_export() {
+        // Bytes with a matching content hash, a PNG signature and standard base64: only the
+        // decoder can tell they aren't an image.
+        let bad = paper_rs::assets::hash(NOT_AN_IMAGE);
+        let (_t, _dir, v) = exported();
+        let mut x = v.clone();
+        x["pages"][1]["nodes"][0]["style"]["fills"][0]["asset"] = json!(bad);
+        x["assets"] =
+            json!([{"id": bad, "ext": "png", "data": paper_rs::assets::base64(NOT_AN_IMAGE)}]);
+        refused(&x, "doesn't decode as a png image");
+        // Export doesn't bless such a file in the canvas's own assets either.
+        let (_t2, dir, _) = canvas();
+        let p = paper_rs::project::Project::open(&dir).unwrap();
+        let id = p.manifest.pages[1].id.clone();
+        let mut page = p.load_page(&id).unwrap();
+        for n in page.doc.nodes.values_mut() {
+            for f in &mut n.style.fills {
+                if let Paint::Image { asset, .. } = f {
+                    *asset = bad.clone();
+                }
+            }
+        }
+        p.save_page(&page).unwrap();
+        std::fs::write(
+            dir.join(ASSETS_DIR).join(format!("{bad}.png")),
+            NOT_AN_IMAGE,
+        )
+        .unwrap();
+        let e = export(&dir).err().unwrap();
+        assert!(e.contains("doesn't decode as a png image"), "{e}");
+        // Neither check registered anything in upstream's process-wide image registry.
+        assert!(paper_rs::assets::get(&bad).is_none());
+        assert!(paper_rs::assets::get(&paper_rs::assets::hash(&png())).is_none());
     }
 
     #[test]
@@ -813,6 +1042,98 @@ mod tests {
         let mut x = v.clone();
         x["assets"][0]["id"] = json!("0000000000000000");
         refused(&x, "don't match its id");
+    }
+
+    #[test]
+    fn contained_file_versions_must_be_the_current_ones_before_any_parsing() {
+        let (_t, _dir, v) = exported();
+        // Page versions upstream's migration would mis-handle (zero underflows, 2^32 + 2
+        // narrows to 2, a string or float would count as 1), older and newer ones alike.
+        for bad in [
+            json!(0),
+            json!(2),
+            json!(4),
+            json!(4_294_967_298_u64),
+            json!("3"),
+            json!(3.0),
+            json!(-3),
+            Value::Null,
+        ] {
+            let mut x = v.clone();
+            x["pages"][0]["version"] = bad.clone();
+            refused(&x, "must have version 3");
+            let mut x = v.clone();
+            x["manifest"]["version"] = if bad == json!(2) { json!(1.0) } else { bad };
+            refused(&x, "must have version 1");
+        }
+        // The legacy single-file format isn't a contained page, even with its own version.
+        let mut x = v.clone();
+        x["pages"][0]["format"] = json!("paper-rs");
+        x["pages"][0]["version"] = json!(1);
+        refused(&x, "isn't a \"paper-rs-page\" file");
+        let mut x = v.clone();
+        x["manifest"]["format"] = json!("paper-rs-page");
+        refused(&x, "isn't a \"paper-rs-project\" file");
+    }
+
+    #[test]
+    fn nested_content_the_parser_would_drop_is_refused_not_lost() {
+        let (_t, _dir, v) = exported();
+        // The exported file itself keeps everything (positive control).
+        validate(&v.to_string()).unwrap();
+        // The second page record's rectangle, the first page record's image fill and camera.
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["style"]["fill"] = json!("#ff0000");
+        refused(&x, "nodes[0].style.fill");
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["shadow"] = json!({"blur": 4});
+        refused(&x, "shadow");
+        let mut x = v.clone();
+        x["pages"][1]["nodes"][0]["style"]["fills"][0]["blur"] = json!(2);
+        refused(&x, "fills[0].blur");
+        let mut x = v.clone();
+        x["pages"][1]["camera"]["tilt"] = json!(1);
+        refused(&x, "camera.tilt");
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["visible"] = json!("yes");
+        refused(&x, "page");
+        // Unknown fields are refused whatever their value: `null` and `[]` included.
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["glow"] = Value::Null;
+        refused(&x, "glow");
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["style"]["effects"] = json!([]);
+        refused(&x, "nodes[0].style.effects");
+        let mut x = v.clone();
+        x["pages"][1]["camera"]["roll"] = Value::Null;
+        refused(&x, "camera.roll");
+        let mut x = v.clone();
+        x["pages"][1]["nodes"][0]["style"]["fills"][0]["filters"] = json!([]);
+        refused(&x, "fills[0].filters");
+        // A known omission is accepted only at its default value.
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["component"] = json!(true);
+        assert!(
+            validate(&x.to_string()).is_ok(),
+            "a real value is kept, not omitted"
+        );
+        let mut x = v.clone();
+        x["pages"][0]["nodes"][0]["children"] = json!(null);
+        refused(&x, "page");
+        // What the writer itself omits may be explicit, and numbers compare by value.
+        let mut x = v.clone();
+        x["pages"][0]["camera"] = Value::Null;
+        x["pages"][0]["nodes"][0]["children"] = json!([]);
+        x["pages"][0]["nodes"][0]["parent"] = Value::Null;
+        x["pages"][0]["nodes"][0]["layout"] = Value::Null;
+        x["pages"][0]["nodes"][0]["instance"] = Value::Null;
+        x["pages"][0]["nodes"][0]["component"] = json!(false);
+        let w = x["pages"][0]["nodes"][0]["rect"]["w"].as_f64().unwrap();
+        if w.fract() == 0.0 {
+            x["pages"][0]["nodes"][0]["rect"]["w"] = json!(w as u64);
+        }
+        let doc = validate(&x.to_string()).unwrap();
+        assert_eq!(doc.pages, validate(&v.to_string()).unwrap().pages);
     }
 
     #[test]

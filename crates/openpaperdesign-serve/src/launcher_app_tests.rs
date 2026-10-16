@@ -760,9 +760,10 @@ async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas()
     bound_server(&lib.l).await.retire().await;
 }
 
-/// A file with a node id the upstream parser would overflow on, or with a self-consistent
-/// group no top level reaches, is an ordinary refusal: nothing is published, and the open
-/// canvas, its URL and the session keep working.
+/// A file with a node id the upstream parser would overflow on, a self-consistent group no top
+/// level reaches, a page version upstream's migration would mis-handle, or a nested field the
+/// parser would drop is an ordinary refusal: nothing is published, and the open canvas, its
+/// URL and the session keep working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn library_refused_imports_keep_the_open_canvas_and_the_session() {
     let lib = library().await;
@@ -770,8 +771,14 @@ async fn library_refused_imports_keep_the_open_canvas_and_the_session() {
     let (port, token) = url(&one);
     let b1 = binding(&one);
     let server = bound_server(&lib.l).await;
+    // A saved rectangle, so the file has one real node with its canonical style.
+    browser_edit(port, &token).await;
     let exported = value(call(&lib.c, app::EXPORT, json!({"binding": b1})).await);
     let file: Value = serde_json::from_str(exported["payload"].as_str().unwrap()).unwrap();
+    let mut version0 = file.clone();
+    version0["pages"][0]["version"] = json!(0);
+    let mut lossy = file.clone();
+    lossy["pages"][0]["nodes"][0]["style"]["fill"] = json!("#ff0000");
     let rect = |id: u64| json!({"id": id, "name": "R", "type": "rect", "rect": {"x": 0, "y": 0, "w": 5, "h": 5}});
     let mut huge = file.clone();
     huge["pages"][0]["nodes"] = json!([rect(u64::MAX)]);
@@ -783,10 +790,13 @@ async fn library_refused_imports_keep_the_open_canvas_and_the_session() {
     b["parent"] = json!(900);
     b["children"] = json!([900]);
     cycle["pages"][0]["nodes"] = json!([a, b]);
+    cycle["pages"][0]["root"] = json!([]);
     cycle["pages"][0]["next_id"] = json!(902);
     for (bad, want) in [
         (huge, "above the largest allowed id"),
         (cycle, "aren't reachable"),
+        (version0, "must have version 3"),
+        (lossy, "style.fill"),
     ] {
         let args = json!({"payload": bad.to_string(), "force": true, "replace": b1});
         let e = call(&lib.c, app::IMPORT, args).await.unwrap_err();

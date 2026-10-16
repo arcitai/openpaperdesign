@@ -861,7 +861,14 @@
     input.value = '';
     input.click();
   }
+  // The file read belongs to the view and the selection that started it: if the person went
+  // Back, another result replaced the view or a newer file was chosen while it was being read,
+  // the read is abandoned, with no import request and no message.
+  let importPick = 0;
   $('import-file').onchange = async () => {
+    const g = gen;
+    const pick = ++importPick;
+    const current = () => g === gen && pick === importPick;
     const f = $('import-file').files && $('import-file').files[0];
     if (!f) { notice('No file was chosen. Nothing was imported.'); return; }
     if (typeof f.size === 'number' && f.size > MAX_IMPORT) {
@@ -869,7 +876,13 @@
       return;
     }
     let text;
-    try { text = await f.text(); } catch { notice('This view couldn\'t read that file. Nothing was imported.'); return; }
+    try {
+      text = await f.text();
+    } catch {
+      if (current()) notice('This view couldn\'t read that file. Nothing was imported.');
+      return;
+    }
+    if (!current()) return;
     importCanvas(text, null);
   };
   async function importCanvas(text, replace) {

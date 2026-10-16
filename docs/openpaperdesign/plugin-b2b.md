@@ -75,8 +75,18 @@ installed check.
   `version: 1` and `content: "canvas-only"`: the manifest, one page record per manifest page in
   order, and exactly the images the pages use (base64, content-hash ids). Bounds: 32 MiB of
   text, 200 pages, 100 000 nodes per page and 200 000 in all, 256 images of at most 16 MiB, 64
-  nesting levels. Refused: duplicate JSON keys anywhere, unknown fields, other formats or
-  versions, companions, unsafe or colliding page ids (case, first six characters), no pages, an
+  nesting levels. The contained manifest and pages must be exactly `paper-rs-project` version
+  1 and `paper-rs-page` version 3, checked on the raw JSON before any upstream parsing or
+  migration (upstream would treat a malformed version as 1, narrow it and subtract from it);
+  older and legacy versions aren't supported in canvas files. Each page's JSON must match what
+  upstream writes back from it (numbers by value, node order by id), so an unknown, legacy or
+  misplaced nested field is refused, not dropped, whatever its value. Only the writer's known
+  omissions may be explicit at their defaults: page `camera: null`; node `parent: null`,
+  `children: []`, `layout: null`, `instance: null`, `component: false`. Every image is fully
+  decoded with the `image` crate (the root's exact dependency, declared for the adapter), never
+  registered in upstream's process-wide registry, before anything is published or exported; the
+  browser canvas still doesn't draw image fills. Refused: duplicate JSON keys
+  anywhere, unknown fields, other formats or versions, companions, unsafe or colliding page ids (case, first six characters), no pages, an
   active page that isn't listed, missing or misordered page records (never a blank stand-in),
   duplicate node ids, node ids above 2^53 - 1 or a `next_id` above 2^53 (checked before the
   upstream parser, which adds one to the largest id), a node graph that isn't one rooted forest

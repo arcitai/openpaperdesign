@@ -1053,6 +1053,58 @@ test('library: an export answer for another binding is never offered as a downlo
   libOnly(v);
 });
 
+test('library: a file read that outlives its view or its selection sends nothing and says nothing', async () => {
+  const v = await libraryView();
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const p = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { p, resolve, reject };
+  };
+  const choose = (read) => {
+    v.els['import-file'].files = [{ size: 9, name: 'canvas.json', text: () => read }];
+    return v.els['import-file'].onchange();
+  };
+  const imports = () => libCalls(v, 'openpaperdesign_app_import');
+  // Back while the read is pending: the late text is dropped.
+  const a = deferred();
+  const readA = choose(a.p);
+  v.els.back.onclick();
+  await flush();
+  a.resolve('LATE-TEXT');
+  await readA;
+  await flush();
+  assert.equal(imports(), 0, 'no import after Back');
+  // A late read error after Back leaves the newer view's notice alone.
+  const b = deferred();
+  const readB = choose(b.p);
+  v.els.back.onclick();
+  await flush();
+  b.reject(new Error('the file went away'));
+  await readB;
+  await flush();
+  assert.doesNotMatch(v.els.notice.textContent, /couldn't read/);
+  assert.equal(imports(), 0);
+  // A newer selection in the same view wins; the older read, finishing later, sends nothing.
+  const c = deferred();
+  const readC = choose(c.p);
+  await choose(Promise.resolve('NEW-TEXT'));
+  await flush();
+  assert.equal(imports(), 1);
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'NEW-TEXT' } });
+  c.resolve('OLD-TEXT');
+  await readC;
+  await flush();
+  assert.equal(imports(), 1, 'the superseded read sends nothing');
+  // A read error for the current selection is still reported.
+  const w = await libraryView();
+  w.els['import-file'].files = [{ size: 9, name: 'canvas.json', text: () => Promise.reject(new Error('unreadable')) }];
+  await w.els['import-file'].onchange();
+  assert.match(w.els.notice.textContent, /couldn't read that file\. Nothing was imported/);
+  libOnly(v);
+  libOnly(w);
+});
+
 test('the workspace view offers no library import', async () => {
   const v = await initialized();
   assert.equal(v.els['m-import'].hidden, true);

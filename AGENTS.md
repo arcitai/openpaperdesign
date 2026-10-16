@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.31 · Updated: 2026-10-16
+Revision: 0.33 · Updated: 2026-10-16
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -233,7 +233,12 @@ preparation before the old binding retires, run in an owned task, remove only wh
 theirs (naming what stays or may not be durably removed) and are never retried; a lost reply is
 recovered from the list. The canvas file (`library_payload.rs`, version 1, canvas-only) is
 bounded and fully validated before a fresh identity is published (duplicate keys, unknown
-fields, ids, case/prefix collisions, page correspondence, node ids at most 2^53 - 1 and
+fields, contained manifest/page exactly `paper-rs-project` 1 / `paper-rs-page` 3 checked raw
+before any upstream parsing or migration, each page's JSON matching what upstream writes back
+from it so no nested field is silently dropped (only the writer's known omissions at their
+defaults may be explicit: page `camera: null`; node `parent: null`, `children: []`,
+`layout: null`, `instance: null`, `component: false`), ids, case/prefix collisions, page
+correspondence, node ids at most 2^53 - 1 and
 `next_id` at most 2^53 checked before upstream parsing, one rooted forest walked iteratively
 from the top level with matching parents and at most 256 levels, exact image set); images
 come only from the file or the canvas's own `assets/`, never the process image registry. Export
@@ -246,7 +251,12 @@ given. Views share the one binding: each binding has an identity (`binding`, `<i
 editor results; close, export and readiness polls send it, and a confirmed switch sends the
 `replace` binding its refusal named; all are compared under the state lock before any effect,
 and a stale one is refused with the current canvas, files, URL and lease untouched. It is a
-stale-view check, never a credential or authority. Library mode defers stdio page tools:
+stale-view check, never a credential or authority. An import's file read belongs to the view
+generation and selection that started it; a superseded read sends nothing and shows nothing.
+Every image of an imported or exported canvas file is fully decoded with the `image` crate
+(declared in `openpaperdesign-serve` with the root's exact requirement), never through
+`assets::register`, before anything is published; hash, signature, base64 and exact-set checks
+stay. The browser canvas still doesn't draw image fills. Library mode defers stdio page tools:
 canvases are edited in the browser editor.
 
 ## Model profile
