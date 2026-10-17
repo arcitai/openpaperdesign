@@ -2,7 +2,7 @@
 
 Updated 2026-10-13: installed qualification on exact `0078487`; prior results retain their original provenance.
 
-Scope: [issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1), slice B2b, on top
+Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
 agent deliberately binds one design project in the user's workspace, edits it over MCP, and
 opens the editable canvas in Codex's in-app browser on a loopback URL. No AIOS dependency, no
@@ -20,7 +20,7 @@ material findings (13 focused Rust checks and seven package checks). Installatio
 qualification began at 2026-10-12 22:46 UTC while R6 was still running; qualification
 completed at 23:05 UTC (2026-10-13 in Copenhagen). Distribution is source-only / local build,
 with no packaged installer or public marketplace listing. See
-[repository Releases](https://github.com/onlinesourdough/openpaperdesign/releases) for delivery status.
+[repository Releases](https://github.com/arcitai/openpaperdesign/releases) for delivery status.
 
 | Check | Observed result |
 | --- | --- |
@@ -108,7 +108,7 @@ and purple rectangle. This is the operator's unchanged screenshot, not a generat
   path at run time. Editing through the tools still works without it.
 - **`plugin/openpaperdesign/`:**
   - `plugin.json`, the only manifest (see "Packaging" below): `$schema` agent-plugins 1.0.0,
-    MIT OR Apache-2.0, repository onlinesourdough/openpaperdesign, version 0.1.0, and
+    MIT OR Apache-2.0, repository arcitai/openpaperdesign, version 0.1.0, and
     `extensions.com.openai` with `interface` and `onboardingSkill`;
   - `mcp.json`: one server, `{"type": "stdio", "command": "openpaperdesign-mcp", "args": ["--codex-context"]}`,
     with no `cwd` (see "Packaging");

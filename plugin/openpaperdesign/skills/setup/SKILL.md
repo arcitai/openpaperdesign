@@ -38,7 +38,7 @@ shape and protected-path restrictions; repository docs are not bundled with the 
 Standalone use remains `openpaperdesign-mcp --workspace <project-workspace>` (or deliberate
 process cwd); it is separate from packaged host mode. The two flags cannot be combined.
 
-To install, in a checkout of https://github.com/onlinesourdough/openpaperdesign (macOS or
+To install, in a checkout of https://github.com/arcitai/openpaperdesign (macOS or
 Linux; Rust 1.95 with the `wasm32-unknown-unknown` target, and `wasm-bindgen` CLI 0.2.129):
 
 ```sh
