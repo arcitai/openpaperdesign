@@ -18,8 +18,9 @@ Its New, open, close, import and export actions call the server directly; they s
 message and need no turn from you. Canvases live in OpenPaperDesign's own data folder
 (`library/v1/canvases/<id>/`, one standard paper-rs project each). The home hands a created or
 opened canvas to its loopback web editor (Codex's built-in browser, or a browser on this
-computer); editing inside the view is optional. Asking Codex to open the link isn't a load:
-don't say the editor loaded or saved unless the home or status shows it.
+computer); editing inside the view is optional. Asking Codex to open the link isn't a load,
+and `editor_loaded` may come from another tab: don't claim the editor loaded or saved; the
+editor itself shows Ready and Saved.
 
 You can work on the same canvas:
 

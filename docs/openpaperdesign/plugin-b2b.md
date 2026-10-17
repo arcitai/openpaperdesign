@@ -26,11 +26,16 @@ loopback editor link, and the home checks it against the loopback pattern before
 once to open it (`ui/open-link`).
 - **What it shows.** The home shows the canvas, Close and Export. Under Details it shows the
   port, never the link or its token. A link given makes Close and Switch ask the person first.
-- **Readiness.** Asking for the link is never treated as a load. The home reports "loaded"
-  only from the editor's own report (`POST /api/ready`), polled through
-  `_app_editor {binding}`.
-- **Stale and wrong results.** An answer for another canvas, or a link that isn't loopback,
-  opens nothing. A late reply after Back opens nothing either.
+- **Readiness.** Asking for the link is never treated as a load. The home reports only what
+  its request did (acknowledged, refused, failed or unanswered). Each attempt stands on its
+  own: a late reply to an earlier attempt never replaces a later one's outcome.
+- **The editor itself shows Ready and Saved.** The home doesn't infer a load. The binding's
+  `editor_loaded` is shared: an earlier tab or the optional panel can set it, so it says nothing
+  about this opening. (R11-F1, 2026-10-17, replacing the earlier poll.)
+- **Stale and wrong results.** A result opens nothing unless its canvas id is valid and its
+  binding is valid and names that same canvas. When an action named a binding ("Edit in this
+  view"), the result must carry exactly that one. An answer for another canvas, a link that
+  isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
 - **Who owns what.** Routing and lifecycle are the home's. Editing belongs to the web editor
@@ -278,8 +283,8 @@ installed check.
 - **Readiness.** The browser editor page posts `/api/ready` (token-checked, no content) when
   its renderer is Ready; an in-panel editor reports the same through `_app_ready`. Either sets
   `editor_loaded` in `_app_editor` results. An open-link acknowledgement is never a load.
-  Committed saves are counted the same way. (Superseded for the view's primary flow by the
-  in-panel editor above: the view no longer opens or polls a browser link for New/Open.)
+  Committed saves are counted the same way. (Since 2026-10-17 the home opens the link but
+  doesn't poll this shared state: it can't tell which editor set it.)
 - **Unchanged limits.** Commits are not crash-atomic, the broken-state fence is in memory, other
   writers are not excluded, and actual navigation from the native sidebar is unproven (the
   inherited Mac observation is an acknowledgement with no loopback hit).

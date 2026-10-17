@@ -67,7 +67,18 @@ const libScript = script.replace("'__OPD_MODE__'", "'library'");
 // ...with an in-panel editor in its editor slot: the test's recording fake (`fakePanel`).
 const panelScript = libScript.replace(PANEL_SLOT, 'const opdCreatePanel = __opdTestPanel;');
 
-function mount({ library = false, panel = null } = {}) {
+// `clock: true` gives the view a live, deterministic clock (`tick(ms)` runs the timers set for
+// that delay; `runAllTimers()` runs every timer set so far). Without it timers never fire.
+// Adapted from the R11 reviewer's timer-active probe harness.
+function mount({ library = false, panel = null, clock = false } = {}) {
+  const timers = [];
+  const setTimeout = clock ? (fn, ms) => { timers.push({ fn, ms }); return timers.length; } : () => 0;
+  const tick = (ms) => {
+    const due = timers.filter((t) => t.ms === ms);
+    for (const t of due) timers.splice(timers.indexOf(t), 1);
+    for (const t of due) t.fn();
+  };
+  const runAllTimers = () => { for (const t of timers.splice(0)) t.fn(); };
   const document = { activeElement: null };
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
   for (const id of ['back', 'menu', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'edit-here', 'reopen', 'force', 'close', 'export',
@@ -92,12 +103,12 @@ function mount({ library = false, panel = null } = {}) {
   });
   Object.defineProperty(document, 'cookie', { get: forbidden, set: forbidden });
   const source = panel ? panelScript : library ? libScript : script;
-  vm.runInNewContext(source, { window, document, setTimeout: () => 0, JSON, String, RegExp, Array, Map, Promise, Object, Number, Math,
+  vm.runInNewContext(source, { window, document, setTimeout, JSON, String, RegExp, Array, Map, Promise, Object, Number, Math,
     __opdTestPanel: panel });
   const from = (m, source = parent) => listener({ source, data: { jsonrpc: '2.0', ...m } });
   const last = (method) => [...sent].reverse().find((m) => m.method === method);
   const count = (method) => sent.filter((m) => m.method === method).length;
-  return { els, sent, from, last, count, parent, document, props, rootAttrs };
+  return { els, sent, from, last, count, parent, document, props, rootAttrs, timers, tick, runAllTimers };
 }
 
 const toolText = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj) }] });
@@ -882,9 +893,9 @@ const SWITCH_REFUSAL = (shown) => 'The browser editor for the bound project was 
 
 // A library view as a complete build serves it: with the in-panel editor (a recording stand-in,
 // `fakePanel`, as `v.fake`). `{ panel: false }`: a build without the editor module.
-async function libraryView(list = LIBRARY_LIST, { panel = true } = {}) {
+async function libraryView(list = LIBRARY_LIST, { panel = true, clock = false } = {}) {
   const fake = panel ? fakePanel() : null;
-  const v = mount({ library: true, panel: fake });
+  const v = mount({ library: true, panel: fake, clock });
   v.fake = fake;
   v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: {} } });
   await flush();
@@ -1459,4 +1470,151 @@ test('library: without the in-panel module, New and Open still hand off to the w
   await answer(v, LIB_EDITOR('created'), libAction(v));
   assert.equal(v.count('ui/open-link'), 2);
   libOnly(v);
+});
+
+// ---- R11: what the home says about a browser opening, and which results it opens ----
+// These run with the view's timers live (`clock: true`). Their sequences are adapted from the
+// R11 reviewer's probes (home-probes.mjs, home-binding-probes.mjs).
+
+async function openedInBrowser() {
+  const v = await libraryView(LIBRARY_LIST, { panel: false, clock: true });
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 1);
+  return v;
+}
+// Run every timer the view has set, again for any it sets meanwhile, and settle.
+async function letTimersRun(v) {
+  for (let i = 0; i < 5; i++) {
+    v.runAllTimers();
+    await flush();
+  }
+}
+const readinessPolls = (v) => libCalls(v, 'openpaperdesign_app_editor');
+
+test('R11-F1 control: the clock is live here: an unanswered opening request times out and says so', async () => {
+  const v = await openedInBrowser();
+  assert.equal(v.els['canvas-state'].textContent, 'Asking Codex to open the canvas…');
+  v.tick(60000);
+  await flush();
+  assert.equal(v.els['canvas-state'].textContent, 'Codex didn\'t answer. Press Open canvas to try again.');
+  assert.equal(v.els.canvas.disabled, false);
+  libOnly(v);
+});
+
+test('R11-F1: an acknowledged opening is reported as a request only; nothing later claims it loaded', async () => {
+  const v = await openedInBrowser();
+  await ack(v);
+  const said = v.els['canvas-state'].textContent;
+  assert.match(said, /doesn't confirm it loaded/);
+  await letTimersRun(v);
+  assert.equal(readinessPolls(v), 0, 'no readiness poll: the editor itself shows Ready');
+  assert.equal(v.els['canvas-state'].textContent, said);
+  assert.doesNotMatch(v.els.live.textContent, /loaded this canvas/);
+  libOnly(v);
+});
+
+test('R11-F1: a failed opening stays failed after the timers run', async () => {
+  for (const reply of [{ result: { isError: true } }, { error: { code: -32603, message: 'not opened' } }]) {
+    const v = await openedInBrowser();
+    await ack(v, 'ui/open-link', reply);
+    assert.match(v.els['canvas-state'].textContent, /^Codex didn't open the link/);
+    await letTimersRun(v);
+    assert.equal(readinessPolls(v), 0);
+    assert.match(v.els['canvas-state'].textContent, /^Codex didn't open the link/, JSON.stringify(reply));
+  }
+});
+
+test('R11-F1: a reply to an earlier opening attempt never replaces a later attempt\'s failure', async () => {
+  const v = await openedInBrowser();
+  const first = v.last('ui/open-link');
+  v.els.canvas.onclick(); // a retry while the first request is unanswered
+  await flush();
+  assert.equal(v.count('ui/open-link'), 2);
+  await ack(v, 'ui/open-link', { error: { code: -32603, message: 'not opened' } });
+  const failed = v.els['canvas-state'].textContent;
+  assert.match(failed, /^Codex didn't open the link \(code -32603\)/);
+  v.from({ id: first.id, result: {} }); // the first request is acknowledged late
+  await flush();
+  await letTimersRun(v);
+  assert.equal(v.els['canvas-state'].textContent, failed);
+  assert.equal(readinessPolls(v), 0);
+});
+
+test('R11-F1: readiness the binding got elsewhere (an earlier tab, the optional panel) is never this opening\'s', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  // The result carries the binding's shared readiness and saves from another editor.
+  await answer(v, LIB_EDITOR('opened', ID1, { editor_loaded: true, browser_saves: 3 }), libAction(v));
+  await ack(v);
+  await letTimersRun(v);
+  const shown = ['result-state', 'canvas-state', 'live', 'notice'].flatMap((id) => texts(v.els[id])).join('\n');
+  assert.doesNotMatch(shown, /loaded this canvas|Saved from the editor/);
+  assert.match(v.els['canvas-state'].textContent, /doesn't confirm it loaded/);
+  assert.equal(readinessPolls(v), 0);
+  assert.equal(v.fake.handles.length, 0);
+  libOnly(v);
+});
+
+test('R11-F2: a library result is opened only with a valid binding of its own canvas', async () => {
+  for (const [what, extra] of [
+    ['an omitted binding', { binding: undefined }],
+    ['an invalid binding', { binding: 'invalid' }],
+    ['another canvas\'s binding', { binding: B2 }],
+    ['no canvas id', { canvas: { name: 'Landing', pages: 1 } }],
+  ]) {
+    const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+    row(v, 'Landing', '2 pages').open.onclick();
+    await flush();
+    await answer(v, LIB_EDITOR('opened', ID1, extra), libAction(v));
+    assert.equal(v.count('ui/open-link'), 0, `${what}: no navigation`);
+    assert.match(v.els['result-state'].textContent, /canvas and binding don't match/, what);
+    for (const id of ['canvas', 'edit-here', 'close', 'export']) assert.equal(v.els[id].hidden, true, `${what}: ${id} stays hidden`);
+    // No action is left targeting anything.
+    v.els.close.onclick();
+    v.els.export.onclick();
+    v.els['edit-here'].onclick();
+    await letTimersRun(v);
+    for (const t of ['openpaperdesign_app_close', 'openpaperdesign_app_export', 'openpaperdesign_app_editor']) {
+      assert.equal(libCalls(v, t), 0, `${what}: ${t}`);
+    }
+    libOnly(v);
+  }
+  // The valid control: the same answer with its own binding opens once and enables its actions.
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 1);
+  for (const id of ['canvas', 'edit-here', 'close', 'export']) assert.equal(v.els[id].hidden, false, id);
+  v.els.close.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } });
+});
+
+test('R11-F2: "Edit in this view" accepts exactly the binding it asked for, not another opening of its canvas', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els['edit-here'].onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1, panel: true } });
+  await answer(v, PANEL_EDITOR('opened', ID1, { binding: `${ID1}.9` }), libAction(v));
+  assert.equal(v.fake.handles.length, 0, 'no editor for another opening');
+  assert.match(v.els['result-state'].textContent, /another opening of this canvas/);
+  assert.equal(v.els.close.hidden, true, 'no action targets either binding');
+  // The control: asking again from a valid result, with its own binding answered.
+  v.els.back.onclick();
+  await flush();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els['edit-here'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('opened'), libAction(v));
+  assert.equal(v.fake.handles.length, 1);
+  assert.equal(v.fake.handles[0].o.binding, B1);
 });
