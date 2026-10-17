@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.38 · Updated: 2026-10-17
+Revision: 0.39 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -321,12 +321,15 @@ project inventory, library list, New/Open/Import/Close/Export). Its primary New/
 "Open current canvas" hand the canvas to its one loopback web editor: the result's own
 same-binding link, checked against the loopback pattern and asked to open once (`ui/open-link`)
 in Codex's browser; an ordinary browser on this computer can use the same link. That counts as a
-link given, so Close/Switch then ask first. A library result is used only if its canvas id is
-valid and its binding is valid and names that canvas (and is exactly the binding an action named,
-when it named one); otherwise nothing opens and no action targets it. The home reports only what
-its opening request did (each attempt on its own; a late reply never replaces a later one) and
-never infers a load: the binding's shared `editor_loaded` can come from an earlier tab or the
-panel, so the editor itself shows Ready and Saved. The home owns
+link given, so Close/Switch then ask first. Whether a result is a library one comes from the
+view's own mode and the library action that asked, never from the reply's `storage` label alone.
+A library result is used only if its canvas id is valid and its binding is valid and names that
+canvas (and is exactly the binding an action named, when it named one), in the presentation the
+action asked for (link or panel); otherwise nothing opens and no action targets it. The home
+reports only what its opening request did (each attempt on its own, for Open canvas and the
+panel's browser button alike, from link fetch to Codex's answer; a late reply never replaces a
+later one) and never infers a load: the binding's shared `editor_loaded` can come from an
+earlier tab or the panel, so the editor itself shows Ready and Saved. The home owns
 routing and lifecycle; the web editor (browser/WASM, upstream engine) owns editing; the server
 owns the document, conflicts and authority. Don't add a second library home or editor.
 Native qualification is pending.

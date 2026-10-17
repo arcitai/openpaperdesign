@@ -1618,3 +1618,260 @@ test('R11-F2: "Edit in this view" accepts exactly the binding it asked for, not 
   assert.equal(v.fake.handles.length, 1);
   assert.equal(v.fake.handles[0].o.binding, B1);
 });
+
+// ---- R12: the in-panel editor's browser button, and library answers without their label ----
+// Live timers again. The panel opening sequence, the unlabelled Open and "Edit in this view"
+// answers and the exact-binding/Back control are adapted from the R12 reviewer's probes
+// (r12-probes.mjs).
+
+// An ordinary way the editor's buttons come back while an opening is pending: Back is refused
+// because a change isn't saved yet, and editing goes on.
+async function refusedBack(v) {
+  v.fake.handles.at(-1).nextDrain = 'failed';
+  v.els.back.onclick();
+  await flush();
+  assert.equal(v.els.editor.hidden, false);
+  assert.equal(v.els['ed-browser'].disabled, false, 'a refused Back gives the buttons back');
+}
+
+test('R12-F1: the in-panel editor\'s browser button keeps a newer failure when an older acknowledgement arrives', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const first = v.els['ed-browser'].onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1 } });
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  const firstOpening = v.last('ui/open-link');
+  assert.equal(v.els['ed-browser'].disabled, true, 'busy until Codex answers this opening');
+  await refusedBack(v);
+  const second = v.els['ed-browser'].onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  const secondOpening = v.last('ui/open-link');
+  assert.notEqual(firstOpening.id, secondOpening.id);
+  await ack(v, 'ui/open-link', { error: { code: -32603, message: 'second opening failed' } });
+  await second;
+  const failed = v.els['ed-note'].textContent;
+  assert.equal(failed, "Codex didn't open the link (code -32603).");
+  v.from({ id: firstOpening.id, result: {} }); // the first opening is acknowledged late
+  await first;
+  await letTimersRun(v);
+  assert.equal(v.els['ed-note'].textContent, failed, 'an earlier opening never replaces the later failure');
+  assert.equal(v.els['ed-browser'].disabled, false);
+  // A valid retry is still possible, and still only a request.
+  const retry = v.els['ed-browser'].onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  await ack(v);
+  await retry;
+  assert.match(v.els['ed-note'].textContent, /doesn't confirm it loaded/);
+  panelOnly(v);
+});
+
+test('R12-F1: a link fetched for an earlier press is never opened once a newer press owns the button', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const before = v.count('ui/open-link');
+  const first = v.els['ed-browser'].onclick();
+  await flush();
+  const firstFetch = libAction(v);
+  assert.equal(v.els['ed-browser'].disabled, true);
+  await refusedBack(v);
+  const second = v.els['ed-browser'].onclick();
+  await flush();
+  const secondFetch = libAction(v);
+  assert.notEqual(firstFetch.id, secondFetch.id);
+  await answer(v, LIB_EDITOR('reopened'), secondFetch);
+  await ack(v, 'ui/open-link', { result: { isError: true } });
+  await second;
+  const failed = v.els['ed-note'].textContent;
+  assert.equal(failed, "Codex didn't open the link.");
+  await answer(v, LIB_EDITOR('reopened'), firstFetch); // the first press's link comes back late
+  // Checked before waiting for that press: had it opened its link, it would wait for Codex.
+  assert.equal(v.count('ui/open-link'), before + 1, 'the earlier press opens nothing');
+  await first;
+  await letTimersRun(v);
+  assert.equal(v.count('ui/open-link'), before + 1);
+  assert.equal(v.els['ed-note'].textContent, failed);
+  // An unanswered opening still says so.
+  const third = v.els['ed-browser'].onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  v.tick(60000);
+  await third;
+  assert.equal(v.els['ed-note'].textContent, "Codex didn't answer.");
+  panelOnly(v);
+});
+
+test('R12-F1 control: the browser button opens only its own binding, and Back drops both its link and its opening', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const wrong = v.els['ed-browser'].onclick();
+  await flush();
+  const before = v.count('ui/open-link');
+  await answer(v, LIB_EDITOR('reopened', ID1, { binding: `${ID1}.9` }), libAction(v));
+  await wrong;
+  assert.equal(v.count('ui/open-link'), before);
+  assert.match(v.els['ed-note'].textContent, /nothing was opened/);
+  const valid = v.els['ed-browser'].onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  const opening = v.last('ui/open-link');
+  assert.equal(v.count('ui/open-link'), before + 1);
+  v.els.back.onclick();
+  await flush();
+  assert.equal(v.els.home.hidden, false);
+  const note = v.els['ed-note'].textContent;
+  v.from({ id: opening.id, error: { code: -32603, message: 'late failure' } });
+  await valid;
+  assert.equal(v.els['ed-note'].textContent, note, 'Back drops this opening\'s reply');
+  // A link asked for before Back is never opened after it.
+  await relist(v);
+  await openInPanel(v);
+  const opened = v.count('ui/open-link');
+  const late = v.els['ed-browser'].onclick();
+  await flush();
+  const fetch = libAction(v);
+  v.els.back.onclick();
+  await flush();
+  assert.equal(v.els.home.hidden, false);
+  await answer(v, LIB_EDITOR('reopened'), fetch);
+  await late;
+  await letTimersRun(v);
+  assert.equal(v.count('ui/open-link'), opened);
+  panelOnly(v);
+});
+
+// What a library action did with its answer.
+const outcome = (v) => ({
+  navigations: v.count('ui/open-link'),
+  mounts: v.fake ? v.fake.handles.length : 0,
+  workspace: fields(v).includes('Folder'),
+  enabled: ['canvas', 'edit-here', 'close', 'export'].filter((id) => !v.els[id].hidden),
+});
+// The library actions that hand a canvas to its web editor, each started in a fresh view. A
+// start isn't awaited: its action waits for the answer the test then gives (a flush exposes the
+// request, Import's file read included).
+const LIB_ROUTES = [
+  ['Open', (v) => row(v, 'Landing', '2 pages').open.onclick()],
+  ['New', (v) => { v.els['m-new'].onclick(); v.els.name.value = 'Pitch'; v.els['new-form'].onsubmit({ preventDefault() {} }); }],
+  ['Open current canvas', (v) => v.els['m-current'].onclick()],
+  ['Import', (v) => {
+    v.els['import-file'].files = [{ size: 9, name: 'canvas.json', text: async () => 'FILE-TEXT' }];
+    return v.els['import-file'].onchange();
+  }],
+];
+
+test('R12-F2: a known library action checks its answer whatever storage the answer claims', async () => {
+  // Collected first, so each case fails on its own.
+  const observations = [];
+  for (const storage of [undefined, 'workspace']) {
+    for (const [route, start] of LIB_ROUTES) {
+      for (const binding of [undefined, 'invalid', B2]) {
+        const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+        start(v);
+        await flush();
+        // With workspace fields too, so a workspace presentation would show.
+        await answer(v, LIB_EDITOR('opened', ID1, { storage, binding, workspace: '/w/acme', project: 'design/Landing' }), libAction(v));
+        const o = outcome(v);
+        observations.push({ storage: String(storage), route, binding: String(binding), ...o,
+          refused: /canvas and binding don't match/.test(v.els['result-state'].textContent) });
+        libOnly(v);
+      }
+    }
+  }
+  assert.equal(observations.length, 24);
+  assert.deepEqual(observations.filter((o) => o.navigations || o.mounts || o.workspace || o.enabled.length || !o.refused), []);
+  // Controls: the same routes, unlabelled, with the answer's own binding: a library result.
+  for (const [route, start] of LIB_ROUTES) {
+    const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+    start(v);
+    await flush();
+    await answer(v, LIB_EDITOR('opened', ID1, { storage: undefined }), libAction(v));
+    assert.equal(v.count('ui/open-link'), 1, route);
+    assert.deepEqual(fields(v), ['Canvas', 'Landing (1 page)', 'Stored in', 'OpenPaperDesign library'], route);
+    v.els.close.onclick();
+    await flush();
+    assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } }, route);
+    libOnly(v);
+  }
+  // A primary Open names no binding, so a newer opening of the same canvas is its answer...
+  const g = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(g, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(g, LIB_EDITOR('opened', ID1, { storage: undefined, binding: `${ID1}.9` }), libAction(g));
+  assert.equal(g.count('ui/open-link'), 1);
+  g.els.close.onclick();
+  await flush();
+  assert.deepEqual(libAction(g).params, { name: 'openpaperdesign_app_close', arguments: { binding: `${ID1}.9` } });
+  // ...but never the in-panel editor, which it didn't ask for.
+  const p = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(p, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(p, PANEL_EDITOR('opened', ID1, { storage: undefined }), libAction(p));
+  assert.deepEqual(outcome(p), { navigations: 0, mounts: 0, workspace: false, enabled: [] });
+  assert.match(p.els['result-state'].textContent, /another way of opening this canvas/);
+  libOnly(p);
+});
+
+test('R12-F2: "Edit in this view" accepts only its own binding, in this view, whatever storage the answer claims', async () => {
+  const cases = [
+    ['another opening, as a link', LIB_EDITOR('reopened', ID1, { storage: undefined, binding: `${ID1}.9` })],
+    ['another opening, in this view', PANEL_EDITOR('opened', ID1, { storage: undefined, binding: `${ID1}.9` })],
+    ['an invalid binding', PANEL_EDITOR('opened', ID1, { storage: 'workspace', binding: 'invalid' })],
+    ['no binding', PANEL_EDITOR('opened', ID1, { storage: undefined, binding: undefined })],
+    ['another canvas', PANEL_EDITOR('opened', ID2, { storage: undefined })],
+    ['its own binding, but as a link', LIB_EDITOR('reopened', ID1, { storage: undefined })],
+  ];
+  // Collected first, so each case fails on its own.
+  const observations = [];
+  for (const [what, reply] of cases) {
+    const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+    row(v, 'Landing', '2 pages').open.onclick();
+    await flush();
+    await answer(v, LIB_EDITOR('opened'), libAction(v));
+    const initial = v.count('ui/open-link');
+    v.els['edit-here'].onclick();
+    await flush();
+    assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1, panel: true } });
+    await answer(v, reply, libAction(v));
+    observations.push({ what, extraNavigations: v.count('ui/open-link') - initial, mounts: v.fake.handles.length,
+      enabled: ['canvas', 'edit-here', 'close', 'export'].filter((id) => !v.els[id].hidden) });
+    libOnly(v);
+  }
+  assert.deepEqual(observations.filter((o) => o.extraNavigations || o.mounts || o.enabled.length), []);
+  // The control: its own binding, unlabelled, mounts on it and opens nothing more.
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els['edit-here'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('opened', ID1, { storage: undefined }), libAction(v));
+  assert.equal(v.fake.handles.length, 1);
+  assert.equal(v.fake.handles[0].o.binding, B1);
+  assert.equal(v.count('ui/open-link'), 1);
+  panelOnly(v);
+});
+
+test('R12-F2: a library view treats a delivered editor result as a library one; a workspace view keeps its own', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  v.from(result(LIB_EDITOR('opened', ID1, { storage: undefined, binding: 'invalid', workspace: '/w/acme' })));
+  assert.match(v.els['result-state'].textContent, /canvas and binding don't match/);
+  assert.deepEqual(outcome(v), { navigations: 0, mounts: 0, workspace: false, enabled: [] });
+  v.from(result(LIB_EDITOR('opened', ID1, { storage: undefined })));
+  assert.deepEqual(fields(v), ['Canvas', 'Landing (1 page)', 'Stored in', 'OpenPaperDesign library']);
+  assert.equal(v.count('ui/open-link'), 0, 'a delivered result is shown, not opened');
+  assert.equal(v.els.canvas.hidden, false);
+  libOnly(v);
+  // The workspace view: its unlabelled results are workspace results, as before.
+  const w = await initialized();
+  w.from(result(EDITOR('Alpha')));
+  assert.deepEqual(fields(w), ['Canvas', 'Alpha (1 page)', 'Folder', 'acme']);
+  w.els['m-current'].onclick();
+  await flush();
+  await answer(w, EDITOR('Beta', 'reopened'));
+  assert.equal(w.count('ui/open-link'), 1);
+  assert.deepEqual(fields(w), ['Canvas', 'Beta (1 page)', 'Folder', 'acme']);
+  onlyAllowed(w);
+});

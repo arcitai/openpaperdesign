@@ -28,13 +28,17 @@ once to open it (`ui/open-link`).
   port, never the link or its token. A link given makes Close and Switch ask the person first.
 - **Readiness.** Asking for the link is never treated as a load. The home reports only what
   its request did (acknowledged, refused, failed or unanswered). Each attempt stands on its
-  own: a late reply to an earlier attempt never replaces a later one's outcome.
+  own: a late reply to an earlier attempt never replaces a later one's outcome. That holds for
+  Open canvas and for the panel's browser button, from its link fetch to Codex's answer
+  (R12-F1).
 - **The editor itself shows Ready and Saved.** The home doesn't infer a load. The binding's
   `editor_loaded` is shared: an earlier tab or the optional panel can set it, so it says nothing
   about this opening. (R11-F1, 2026-10-17, replacing the earlier poll.)
 - **Stale and wrong results.** A result opens nothing unless its canvas id is valid and its
   binding is valid and names that same canvas. When an action named a binding ("Edit in this
-  view"), the result must carry exactly that one. An answer for another canvas, a link that
+  view"), the result must carry exactly that one, in the presentation it asked for. A library
+  view treats every editor result as a library one, so a reply that omits or changes its
+  `storage` label is checked the same way (R12-F2). An answer for another canvas, a link that
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.

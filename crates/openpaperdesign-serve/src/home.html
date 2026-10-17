@@ -831,7 +831,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function openLibrary(id, name, replace) {
     const r = await act('openpaperdesign_app_open', switchArgs({ id }, replace), 'Opening ' + name);
     if (!r) return;
-    if (r.ok) return showEditor(r.ok, false, id);
+    if (r.ok) return showLibraryResult(r.ok, { canvas: id });
     refused(r, (shownFor) => shownFor && openLibrary(id, name, shownFor));
   }
 
@@ -846,7 +846,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function createLibrary(name, replace) {
     const r = await act('openpaperdesign_app_create', switchArgs({ name }, replace), 'Creating "' + name + '"');
     if (!r) return;
-    if (r.ok) return showEditor(r.ok);
+    if (r.ok) return showLibraryResult(r.ok);
     if (r.fail) return unsure('created');
     refused(r, (shownFor) => shownFor && createLibrary(name, shownFor));
   }
@@ -854,7 +854,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function reopenLibrary() {
     const r = await act('openpaperdesign_app_editor', {}, 'Opening the current canvas');
     if (!r) return;
-    if (r.ok) return showEditor(r.ok);
+    if (r.ok) return showLibraryResult(r.ok);
     refused(r);
   }
 
@@ -866,7 +866,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (!PANEL || !binding) return;
     const r = await act('openpaperdesign_app_editor', { binding, panel: true }, 'Opening it in this view');
     if (!r) return;
-    if (r.ok) return showEditor(r.ok, false, canvas, binding);
+    if (r.ok) return showLibraryResult(r.ok, { canvas, binding, panel: true });
     refused(r);
   }
   $('edit-here').onclick = editHere;
@@ -972,7 +972,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function importCanvas(text, replace) {
     const r = await act('openpaperdesign_app_import', switchArgs({ payload: text }, replace), 'Importing the canvas file', 120000);
     if (!r) return;
-    if (r.ok) return showEditor(r.ok);
+    if (r.ok) return showLibraryResult(r.ok);
     if (r.fail) return unsure('imported');
     refused(r, (shownFor) => shownFor && importCanvas(text, shownFor));
   }
@@ -980,6 +980,9 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // The home never infers that a browser opening loaded: the binding's shared readiness can come
   // from an earlier tab or the optional panel, not from this opening (R11-F1).
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // Every request to open the browser editor (Open canvas, or the in-panel editor's browser
+  // button) is its own attempt; only the latest one reports its outcome.
+  let linkAttempt = 0;
 
   // ---- the in-panel editor (an app-library view whose build has it) ----
   // The canvas is edited right here: the renderer and its save rules are the browser editor's,
@@ -1143,25 +1146,30 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   };
 
   // A secondary way to edit: the loopback browser editor, for the same binding. Getting its
-  // link counts as given (closing or switching then asks first, as before).
+  // link counts as given (closing or switching then asks first, as before). As with Open canvas,
+  // each press is one opening attempt, from asking for the link to Codex's answer: a reply to an
+  // earlier attempt, or one after Back, changes nothing (R12-F1).
   $('ed-browser').onclick = async () => {
     const binding = panelBinding;
     const g = gen;
     if (!binding) return;
+    const attempt = ++linkAttempt;
+    const current = () => g === gen && attempt === linkAttempt;
     $('ed-browser').disabled = true;
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
-    if (g !== gen) return;
-    $('ed-browser').disabled = false;
+    if (!current()) return; // a newer attempt or view owns the button and the note now
     let v = null;
     if (!r.timeout && !r.error && r.result && !r.result.isError) {
       try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
     }
     if (!v || v.binding !== binding || typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
+      $('ed-browser').disabled = leaving;
       $('ed-note').textContent = 'No local editor link came back for this canvas, so nothing was opened.';
       return;
     }
     const o = await rpc('ui/open-link', { url: v.url });
-    if (g !== gen) return;
+    if (!current()) return;
+    $('ed-browser').disabled = leaving;
     $('ed-note').textContent = o.timeout ? 'Codex didn\'t answer.'
       : (o.error || (o.result && o.result.isError)) ? 'Codex didn\'t open the link' + errorCode(o.error) + '.'
         : 'Codex was asked to open the browser editor too; that doesn\'t confirm it loaded. Both save to this canvas, and a conflict is never merged.';
@@ -1256,33 +1264,39 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     return null;
   }
 
-  // An editor result, from a direct action or a delivered open_editor result: identity from
-  // this same result, never an earlier one. A direct action then asks Codex to open it.
-  function showEditor(v, delivered, expected, expectedBinding) {
-    // A library result is checked whole before anything is opened or enabled (R11-F2).
-    if (v && v.storage === 'app-library') {
-      const why = libraryMismatch(v, expected, expectedBinding);
-      if (why) {
-        refuse('Canvas', why);
-        return;
-      }
+  // A library editor result. That it is one comes from this view's own mode or the library
+  // action that asked for it, never from the reply's label alone (R12-F2), and it is checked
+  // whole before anything is opened or enabled (R11-F2). `canvas` and `binding` are what the
+  // action asked for; `panel`, whether it asked for the in-panel editor rather than the link.
+  function showLibraryResult(v, { delivered = false, canvas = null, binding = null, panel = false } = {}) {
+    const why = libraryMismatch(v, canvas, binding) || ((v.panel === true) !== panel
+      ? 'Codex answered with another way of opening this canvas than the one asked for, so it won\'t be opened.' : null);
+    if (why) {
+      refuse('Canvas', why);
+      return;
     }
-    // A library canvas for the optional in-panel editor (asked for explicitly): no link.
-    if (v && v.storage === 'app-library' && v.panel === true) return openPanel(v);
+    // The optional in-panel editor: no link.
+    if (panel) return openPanel(v);
+    const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
     // A library canvas built without the browser editor has no link to open.
-    if (v && v.storage === 'app-library' && v.browser_editor !== 'built in') {
-      return showLibraryEditor(v, true, (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas');
-    }
+    if (v.browser_editor !== 'built in') return showLibraryEditor(v, true, name);
     if (typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
       refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
       return;
     }
-    if (expected && !(v.canvas && v.canvas.id === expected)) {
-      refuse('Canvas', 'Codex answered for another canvas than the one asked for, so it won\'t be opened.');
+    showLibraryEditor(v, delivered, name);
+  }
+
+  // An editor result, from a direct action or a delivered open_editor result: identity from
+  // this same result, never an earlier one. A direct action then asks Codex to open it. In a
+  // library view every editor result is a library one, whatever it says of itself.
+  function showEditor(v, delivered) {
+    if (LIBRARY || v.storage === 'app-library') return showLibraryResult(v, { delivered });
+    if (typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
+      refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
       return;
     }
     const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
-    if (v.storage === 'app-library') return showLibraryEditor(v, delivered, name);
     reset(name);
     editorUrl = v.url;
     $('result-state').textContent = {
@@ -1421,7 +1435,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // Ask Codex to open the editor link, and say only what that request did. Codex's
   // acknowledgement doesn't confirm a load; the editor itself shows Ready and Saved. Each request
   // is its own attempt: a reply to an earlier one never replaces a later one's outcome.
-  let linkAttempt = 0;
   async function openLink() {
     if (!editorUrl) return;
     const g = gen;
