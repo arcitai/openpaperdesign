@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.46 · Updated: 2026-10-17
+Revision: 0.47 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -34,6 +34,15 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     Enter and click-away and the rename never committed, natively too. A plain upstream bug
     fix, the same two lines in both places. (The earlier `UiState::pages_locked` host flag is
     gone: the browser editor now stores every page action, so it had no caller left.)
+  - `src/ui/pages.rs` `panel`/`run`, `src/ui/mod.rs` `commit_rename` (R22, natively too): the
+    pages panel's add, switch, duplicate, delete and move run once after its rows are drawn,
+    instead of inside the row loop (a delete of a non-final row indexed past the shortened
+    list and panicked). Before such an action, open fields are finished on the page they were
+    opened on, as a click elsewhere finishes them: the layer rename (`UiState::renaming` names
+    a node by its document-local id, which another page may reuse) is committed to the shown
+    page, the page rename (it names its row by position) is committed to its page, and other
+    keyboard focus ends, so no draft continues on the next page. `commit_rename` is the layer
+    row's existing lost-focus commit, shared. Same `Editor` page operations; upstreamable.
   - `src/editor/pages.rs`: `Editor::page_gen` is `pub` (visibility only). The browser host
     records each sent page's history generation, so a save's late answer marks only what it
     sent as saved, never a newer edit (upstream saves synchronously and has no such seam).

@@ -16,8 +16,51 @@ pub struct PagesUi {
 
 const ROW_H: f32 = 24.0;
 
+/// A page-list action chosen while the panel draws. It runs once, after the rows (`run`): a
+/// deleted, added or moved page would shift the rows still to draw, and a page's open fields
+/// must be finished on that page before another one is shown.
+enum PageAction {
+    Add,
+    Switch(usize),
+    Duplicate(usize),
+    Delete(usize),
+    Move(usize, usize),
+}
+
+/// Run a page-list action. Unfinished fields are finished first, as a click elsewhere
+/// finishes them, on the page and row they were opened for: the layer rename (it names a node
+/// of the shown page's document only; another page may have a node with the same id) and the
+/// page rename (it names its row by position). Any other field's keyboard focus ends, so a
+/// field of the shown page is never continued on the next one.
+fn run(ui: &Ui, ed: &mut Editor, st: &mut UiState, action: PageAction) {
+    super::commit_rename(ed, st);
+    if let Some((i, name)) = st.pages.renaming.take() {
+        ed.rename_page(i, &name);
+    }
+    st.pages.drag = None;
+    ui.memory_mut(|m| {
+        if let Some(f) = m.focused() {
+            m.surrender_focus(f);
+        }
+    });
+    match action {
+        PageAction::Add => {
+            ed.add_page();
+        }
+        PageAction::Switch(i) => ed.switch_page(i),
+        PageAction::Duplicate(i) => {
+            ed.duplicate_page(i);
+        }
+        PageAction::Delete(i) => {
+            ed.delete_page(i);
+        }
+        PageAction::Move(from, to) => ed.move_page(from, to),
+    }
+}
+
 pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     let p = theme::pal(ui);
+    let mut action = None;
     ui.horizontal(|ui| {
         let chevron = if st.pages.collapsed {
             Icon::ChevronRight
@@ -40,11 +83,14 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 .on_hover_text("Add page")
                 .clicked()
             {
-                ed.add_page();
+                action = Some(PageAction::Add);
             }
         });
     });
     if st.pages.collapsed {
+        if let Some(a) = action {
+            run(ui, ed, st, a);
+        }
         return;
     }
     let n = ed.pages.len();
@@ -57,7 +103,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             ui.spacing_mut().item_spacing.y = 1.0;
             let top = ui.cursor().top();
             for i in 0..n {
-                page_row(ui, ed, st, i, top);
+                page_row(ui, ed, st, i, top, &mut action);
             }
         });
     // Drop: reorder.
@@ -65,11 +111,21 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         && ui.input(|i| i.pointer.any_released())
     {
         st.pages.drag = None;
-        ed.move_page(from, to.min(n - 1));
+        action = Some(PageAction::Move(from, to.min(n - 1)));
+    }
+    if let Some(a) = action {
+        run(ui, ed, st, a);
     }
 }
 
-fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) {
+fn page_row(
+    ui: &mut Ui,
+    ed: &mut Editor,
+    st: &mut UiState,
+    i: usize,
+    top: f32,
+    action: &mut Option<PageAction>,
+) {
     let p = theme::pal(ui);
     let active = i == ed.active_page;
     let (row, resp) = ui.allocate_exact_size(
@@ -140,7 +196,7 @@ fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) 
     if resp.double_clicked() {
         st.pages.renaming = Some((i, ed.pages[i].name.clone()));
     } else if resp.clicked() {
-        ed.switch_page(i);
+        *action = Some(PageAction::Switch(i));
     }
     if resp.drag_started() {
         st.pages.drag = Some((i, i));
@@ -158,14 +214,14 @@ fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) 
             ui.close();
         }
         if ui.button("Duplicate").clicked() {
-            ed.duplicate_page(i);
+            *action = Some(PageAction::Duplicate(i));
             ui.close();
         }
         if ui
             .add_enabled(ed.pages.len() > 1, egui::Button::new("Delete"))
             .clicked()
         {
-            ed.delete_page(i);
+            *action = Some(PageAction::Delete(i));
             ui.close();
         }
     });

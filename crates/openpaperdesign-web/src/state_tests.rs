@@ -1250,6 +1250,308 @@ fn a_clean_reload_takes_the_whole_canvas_and_keeps_each_page_s_view() {
     assert!(!s.dirty());
 }
 
+// ---- R22: page actions while the pages panel draws, and fields opened on another page.
+// The first four tests are the independent R22 review's probes (r22-probes.rs), adopted with
+// their fixtures and assertions unchanged (only wrapped in this file's style).
+
+#[test]
+fn r22_deleting_the_first_of_two_pages_keeps_the_editor_running() {
+    let mut s = two_pages();
+    let button = menu_item(&mut s, "Alpha", "Delete", 100.0);
+    click(&mut s, button, 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        s.ed.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["beta22"]
+    );
+    assert_eq!(s.ed.active_page_id(), "beta22");
+}
+
+#[test]
+fn r22_deleting_the_middle_of_three_pages_keeps_the_editor_running() {
+    let mut pages = two_pages_data();
+    pages.push(page(
+        "gamma3",
+        "Gamma",
+        crate::geom::Rect::new(10.0, 10.0, 20.0, 20.0),
+    ));
+    let mut s = WebState::open(&canvas(&pages, "beta22"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    let button = menu_item(&mut s, "Beta", "Delete", 100.0);
+    click(&mut s, button, 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        s.ed.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["alpha1", "gamma3"]
+    );
+    assert_eq!(s.ed.active_page_id(), "gamma3");
+}
+
+#[test]
+fn r22_deleting_the_last_row_is_a_positive_control() {
+    let mut s = two_pages();
+    let button = menu_item(&mut s, "Beta", "Delete", 100.0);
+    click(&mut s, button, 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        s.ed.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        ["alpha1"]
+    );
+    assert_eq!(s.ed.active_page_id(), "alpha1");
+}
+
+#[test]
+fn r22_a_layer_rename_draft_never_renames_a_different_page() {
+    let mut s = two_pages();
+    click_page(&mut s, "Alpha", 100.0);
+    let id = open_rename(&mut s);
+    let beta_name = s.ed.page_doc(1).get(id).unwrap().name.clone();
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    let draft = s.ui.renaming.as_ref().unwrap().1.clone();
+    assert!(draft.contains('q'));
+    assert!(s.unsaved_work() && !s.can_reload());
+    click_page(&mut s, "Beta", 3000.0);
+    eprintln!(
+        "R22 names after switch: Alpha={:?} Beta={:?} draft={:?}",
+        s.ed.page_doc(0).get(id).map(|n| &n.name),
+        s.ed.page_doc(1).get(id).map(|n| &n.name),
+        s.ui.renaming
+    );
+    assert_eq!(s.ed.active_page_id(), "beta22");
+    assert_eq!(
+        s.ed.page_doc(1).get(id).unwrap().name,
+        beta_name,
+        "a draft started on Alpha must not edit Beta's same-numbered node"
+    );
+    assert_eq!(
+        s.ed.page_doc(0).get(id).unwrap().name,
+        draft,
+        "click-away should commit the layer rename to Alpha"
+    );
+}
+
+/// The ids of the canvas's pages, in order.
+fn page_ids(s: &WebState) -> Vec<String> {
+    s.ed.pages.iter().map(|p| p.id.clone()).collect()
+}
+
+/// The index of page `id`.
+fn page_index(s: &WebState, id: &str) -> usize {
+    s.ed.pages.iter().position(|p| p.id == id).unwrap()
+}
+
+#[test]
+fn r77_menu_deletes_of_any_row_active_or_not_keep_the_right_pages_and_shown_page() {
+    // (shown page, deleted row, pages left, page shown after).
+    for (shown, deleted, left, after) in [
+        ("Beta", "Alpha", ["beta22", "gamma3"], "beta22"),
+        ("Alpha", "Alpha", ["beta22", "gamma3"], "beta22"),
+        ("Alpha", "Beta", ["alpha1", "gamma3"], "alpha1"),
+        ("Beta", "Gamma", ["alpha1", "beta22"], "beta22"),
+        ("Gamma", "Gamma", ["alpha1", "beta22"], "beta22"),
+    ] {
+        let mut pages = two_pages_data();
+        pages.push(page(
+            "gamma3",
+            "Gamma",
+            crate::geom::Rect::new(10.0, 10.0, 20.0, 20.0),
+        ));
+        let mut s = WebState::open(&canvas(&pages, "beta22"), false, W, H).unwrap();
+        settle(&mut s, 0.0);
+        if shown != "Beta" {
+            click_page(&mut s, shown, 50.0);
+        }
+        let button = menu_item(&mut s, deleted, "Delete", 100.0);
+        click(&mut s, button, 200.0);
+        step(&mut s);
+        step(&mut s);
+        let why = format!("{deleted} deleted while {shown} is shown");
+        assert_eq!(page_ids(&s), left, "{why}");
+        assert_eq!(s.ed.active_page_id(), after, "{why}");
+        // Each page left still has its own content, and the panel still draws and works.
+        for id in left {
+            let i = page_index(&s, id);
+            assert_eq!(s.ed.page_doc(i).nodes.len(), 1, "{why}: {id}");
+        }
+        let snap = s.save_snapshot().expect("the deletion is saved");
+        let (active, list, _) = parse_save(&snap);
+        assert_eq!(active, after, "{why}");
+        let listed: Vec<&str> = list.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(listed, left, "{why}");
+    }
+    // The last page stays (upstream's Delete is disabled for it), as before.
+    let mut s = state();
+    let d = menu_item(&mut s, "Page 1", "Delete", 100.0);
+    click(&mut s, d, 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(page_ids(&s), ["p"]);
+}
+
+#[test]
+fn r77_a_layer_rename_is_finished_on_its_page_before_any_page_action() {
+    // Each page action, chosen while a layer rename draft is open on Alpha.
+    for action in ["switch", "add", "duplicate", "delete other"] {
+        let mut s = two_pages();
+        click_page(&mut s, "Alpha", 100.0);
+        let id = open_rename(&mut s);
+        assert!(
+            s.ed.page_doc(1).get(id).is_some(),
+            "Beta has a node with the same id"
+        );
+        let beta_name = s.ed.page_doc(1).get(id).unwrap().name.clone();
+        press(&mut s, "q", "KeyQ");
+        step(&mut s);
+        let draft = s.ui.renaming.as_ref().unwrap().1.clone();
+        match action {
+            "switch" => click_page(&mut s, "Beta", 3000.0),
+            "add" => {
+                // The header's +, found as the pages panel test finds it.
+                let left = s.canvas_rect().min.x as f64;
+                let (title_x, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+                let mut x = left - 4.0;
+                let mut t = 3000.0;
+                while s.ed.pages.len() == 2 && x > title_x {
+                    click(&mut s, (x, title_y), t);
+                    step(&mut s);
+                    x -= 4.0;
+                    t += 500.0;
+                }
+                step(&mut s);
+            }
+            "duplicate" => {
+                let d = menu_item(&mut s, "Beta", "Duplicate", 3000.0);
+                click(&mut s, d, 3100.0);
+                step(&mut s);
+                step(&mut s);
+            }
+            _ => {
+                let d = menu_item(&mut s, "Beta", "Delete", 3000.0);
+                click(&mut s, d, 3100.0);
+                step(&mut s);
+                step(&mut s);
+            }
+        }
+        let alpha = page_index(&s, "alpha1");
+        assert_eq!(
+            s.ed.page_doc(alpha).get(id).unwrap().name,
+            draft,
+            "{action}: finished on Alpha"
+        );
+        if let Some(beta) = s.ed.pages.iter().position(|p| p.id == "beta22") {
+            assert_eq!(
+                s.ed.page_doc(beta).get(id).unwrap().name,
+                beta_name,
+                "{action}: Beta untouched"
+            );
+        }
+        for (i, p) in s.ed.pages.iter().enumerate() {
+            if p.id != "alpha1" && p.id != "beta22" {
+                // A new page is empty; a duplicate of Beta has Beta's names.
+                assert!(
+                    s.ed.page_doc(i).get(id).is_none_or(|n| n.name == beta_name),
+                    "{action}: {}",
+                    p.name
+                );
+            }
+        }
+        assert!(s.ui.renaming.is_none(), "{action}: the field is finished");
+        assert!(!s.field_has_keyboard(), "{action}");
+    }
+}
+
+#[test]
+fn r77_the_finished_rename_saves_reopens_and_undoes_on_its_own_page_only() {
+    let mut s = two_pages();
+    click_page(&mut s, "Alpha", 100.0);
+    let id = open_rename(&mut s);
+    let old = s.ed.page_doc(0).get(id).unwrap().name.clone();
+    let beta_name = s.ed.page_doc(1).get(id).unwrap().name.clone();
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    let draft = s.ui.renaming.as_ref().unwrap().1.clone();
+    click_page(&mut s, "Beta", 3000.0);
+    // The save carries Alpha's content with the new name, and nothing of Beta's.
+    let snap = s.save_snapshot().expect("Alpha's rename and the switch");
+    let (active, _, sent) = parse_save(&snap);
+    assert_eq!(active, "beta22");
+    let ids: Vec<&str> = sent.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(ids, ["alpha1"], "only Alpha's content changed");
+    assert_eq!(sent[0].1.doc.get(id).unwrap().name, draft);
+    s.save_succeeded();
+    // Reopened as saved: the name is on Alpha, Beta's is as it was.
+    let reopened = WebState::open(&canvas(&pages_now(&s), "beta22"), false, W, H).unwrap();
+    assert_eq!(reopened.ed.page_doc(0).get(id).unwrap().name, draft);
+    assert_eq!(reopened.ed.page_doc(1).get(id).unwrap().name, beta_name);
+    // Undo belongs to Alpha's history: on Beta nothing is undone, on Alpha the rename is.
+    s.run(Action::Undo);
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta_name);
+    assert_eq!(s.ed.page_doc(0).get(id).unwrap().name, draft);
+    click_page(&mut s, "Alpha", 4000.0);
+    s.run(Action::Undo);
+    assert_eq!(s.ed.page_doc(0).get(id).unwrap().name, old, "Alpha's undo");
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta_name);
+}
+
+#[test]
+fn r77_a_page_rename_draft_is_finished_on_its_own_page_before_another_row_is_deleted() {
+    let mut s = two_pages();
+    // A double-click on Beta's row opens its rename; type a draft.
+    let p = page_row(&mut s, "Beta");
+    click(&mut s, p, 100.0);
+    step(&mut s);
+    click(&mut s, p, 150.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.pages.renaming.is_some());
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    // Alpha (the row before it) is deleted from its menu: the draft names Beta, not row 1.
+    let d = menu_item(&mut s, "Alpha", "Delete", 3000.0);
+    click(&mut s, d, 3100.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(page_ids(&s), ["beta22"]);
+    let name = s.ed.pages[0].name.clone();
+    assert!(name != "Beta" && name.contains('q'), "{name}");
+    assert!(s.ui.pages.renaming.is_none());
+}
+
+#[test]
+fn r77_an_inspector_number_draft_never_continues_on_the_next_page() {
+    for typed in ["-150", "-"] {
+        let mut s = two_pages();
+        // Beta's rectangle selected, so the next page shows the same X field.
+        click_at(&mut s, 425.0, 325.0, 0.0);
+        click_page(&mut s, "Alpha", 100.0);
+        let id = open_number_field(&mut s, "X  ");
+        assert!(s.ed.page_doc(1).get(id).is_some(), "the same id on Beta");
+        s.paste(typed);
+        step(&mut s);
+        let alpha_x = s.ed.doc.get(id).unwrap().rect.x;
+        click_page(&mut s, "Beta", 3000.0);
+        step(&mut s);
+        assert_eq!(s.ed.active_page_id(), "beta22");
+        assert_eq!(s.ed.selection, vec![id], "{typed}: Beta's own selection");
+        assert_eq!(
+            s.ed.doc.get(id).unwrap().rect.x,
+            400.0,
+            "{typed}: Beta's X untouched"
+        );
+        assert_eq!(
+            s.ed.page_doc(0).get(id).unwrap().rect.x,
+            alpha_x,
+            "{typed}: Alpha keeps what upstream applied"
+        );
+        assert!(!s.field_has_keyboard(), "{typed}: the field ended");
+        assert!(!paints(&mut s, typed), "{typed}: no draft shown on Beta");
+    }
+}
+
 /// What the owner did in a real browser, at one point of the inspector: click, select all,
 /// type "X", Enter.
 fn type_page_name(s: &mut WebState, (x, y): (f64, f64)) {

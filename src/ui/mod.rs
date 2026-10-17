@@ -482,6 +482,19 @@ fn kind_icon(k: &NodeKind) -> Icon {
     }
 }
 
+/// Finish the inline layer rename as losing focus does: its trimmed name, if not empty and
+/// changed, as one undoable edit of the shown page's node. The rename names that node by its
+/// id in the shown document, so it is finished before another page is shown (`pages::run`).
+fn commit_rename(ed: &mut Editor, st: &mut UiState) {
+    let Some((id, name)) = st.renaming.take() else {
+        return;
+    };
+    let new = name.trim().to_string();
+    if !new.is_empty() && ed.doc.get(id).is_some_and(|n| n.name != new) {
+        ed.edit("Rename", |tx| tx.node_mut(id).unwrap().name = new);
+    }
+}
+
 /// One sidebar row, drawn like an NSOutlineView row: 24pt tall, 6pt radius selection in the
 /// accent colour, subtle hover, disclosure chevron, symbol, name, and eye/lock on hover.
 fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: usize) {
@@ -620,11 +633,7 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         // Check the loss first: `request_focus` takes focus back at once, so calling it before
         // `lost_focus` would hide Enter or a click elsewhere and the rename would never commit.
         if r.lost_focus() {
-            let new = name.trim().to_string();
-            st.renaming = None;
-            if !new.is_empty() && new != n.name {
-                ed.edit("Rename", |tx| tx.node_mut(id).unwrap().name = new);
-            }
+            commit_rename(ed, st);
         } else if !r.has_focus() {
             r.request_focus();
         }
