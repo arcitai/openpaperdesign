@@ -82,8 +82,11 @@ const INVENTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1
 /// One inventory child process at a time per session.
 static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Versioned: a view whose code changed incompatibly gets a new URI, so a host never pairs a
-/// cached older view with this server (`home-2`: the in-panel editor module).
-const HOME_URI: &str = "ui://openpaperdesign/home-2.html";
+/// cached older view with this server (hosts may cache a view by its URI). `home-2` added the
+/// in-panel editor module; `home-3` makes the home browser-first: New, Open, Import and Open
+/// current canvas ask for the loopback web editor link and open it, and the in-panel editor is
+/// only the optional "Edit in this view". No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-3.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.39 · Updated: 2026-10-17
+Revision: 0.40 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -144,7 +144,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The `ui://openpaperdesign/home.html` resource.
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-3.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -154,7 +154,12 @@ before workspace admission:
 They read or change none of the session's context, binding, project, listener or files. This
 named exemption covers only those four (plus the fixed refusal of the app-library tool names,
 which reads and changes nothing); never route another tool around admission. The home resource
-URI is versioned (`ui://openpaperdesign/home-2.html`); bump it with incompatible view code.
+URI is versioned: hosts may cache a view by its URI, so any incompatible change to the view's
+code, presentation or the responses it expects gets a new URI in `HOME_URI` (every tool and
+resource registration uses it) and the URI tests. No earlier URI is served or aliased. History:
+`home.html`; `home-2` added the in-panel editor; `home-3` (2026-10-17) is the browser-first
+home, where New/Open/Import/Open current canvas open the web editor link and the panel is
+optional.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.

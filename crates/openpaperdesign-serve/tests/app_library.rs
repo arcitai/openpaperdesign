@@ -339,6 +339,119 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
     c.cancel().await.unwrap();
 }
 
+/// The home view through the real executable in app-library mode. The home entry and the one
+/// listed resource name the current versioned URI (`home-3`, the browser-first view). Reading
+/// it returns this source tree's unchanged view frame with its slots filled (checked here for
+/// shape only), with the view's MIME type, and changes nothing. Earlier, other,
+/// query and file URIs are refused, so a host that caches views by URI never pairs an older
+/// view with this server. A synthetic host, not a receipt of what a Codex host cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() {
+    use rmcp::model::ReadResourceRequestParams;
+    const HOME: &str = "ui://openpaperdesign/home-3.html";
+    const PANEL_SLOT: &str = "const opdCreatePanel = null; // __OPD_PANEL_MODULE__";
+    let t = tmp();
+    let (root, home) = (t.0.join("data"), t.0.join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let a = library(&root, &home).await;
+    let tools: Vec<Value> = a
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    let entry = tools
+        .iter()
+        .find(|t| t["name"] == "openpaperdesign_home")
+        .unwrap();
+    assert_eq!(entry["_meta"]["ui"]["resourceUri"], HOME);
+    for t in &tools {
+        if let Some(uri) = t["_meta"]["ui"].get("resourceUri") {
+            assert_eq!(uri, HOME, "{}", t["name"]);
+        }
+    }
+    let resources: Vec<Value> = a
+        .list_all_resources()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+    assert_eq!(
+        resources,
+        vec![
+            json!({"uri":HOME,"name":"openpaperdesign-home","title":"OpenPaperDesign","mimeType":"text/html;profile=mcp-app"})
+        ]
+    );
+    // An open canvas, so there is state for the reads to leave alone.
+    let created = call(&a, "openpaperdesign_app_create", json!({"name": "Kept"}))
+        .await
+        .unwrap();
+    let status = call(&a, "openpaperdesign_status", json!({})).await.unwrap();
+    assert_eq!(status["binding"], created["binding"]);
+    let listed = call(&a, "openpaperdesign_app_canvases", json!({}))
+        .await
+        .unwrap();
+    let r = a
+        .read_resource(ReadResourceRequestParams::new(HOME))
+        .await
+        .unwrap();
+    let r = serde_json::to_value(r).unwrap();
+    assert_eq!(r["contents"][0]["uri"], HOME);
+    assert_eq!(r["contents"][0]["mimeType"], "text/html;profile=mcp-app");
+    let html = r["contents"][0]["text"].as_str().unwrap();
+    // Everything outside the slots is this source tree's view, byte for byte, with the mode slot
+    // set to `library`. The two other slots are checked for shape only: the font slot holds
+    // base64 text, and the editor slot is left as it is or names `opdCreatePanel`. Neither
+    // proves the exact font or module bytes; the workspace test decodes the font, and the full
+    // byte identity is the separate production gate on the exact non-test executable.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.html");
+    let source = std::fs::read_to_string(path)
+        .unwrap()
+        .replacen("__OPD_MODE__", "library", 1);
+    let (head, rest) = source.split_once("__OPD_WORDMARK_FONT__").unwrap();
+    let (middle, tail) = rest.split_once(PANEL_SLOT).unwrap();
+    let filled = html
+        .strip_prefix(head)
+        .and_then(|h| h.strip_suffix(tail))
+        .expect("the served view is src/home.html with only its slots filled");
+    let (font, panel) = filled.split_once(middle).expect("the slots in order");
+    let base64 = |b: u8| b.is_ascii_alphanumeric() || b"+/=".contains(&b);
+    assert!(
+        !font.is_empty() && font.bytes().all(base64),
+        "the font slot holds base64"
+    );
+    assert!(
+        panel == PANEL_SLOT || panel.contains("function opdCreatePanel("),
+        "the editor slot holds this build's module or nothing"
+    );
+    for other in [
+        "ui://openpaperdesign/home-3.html?x",
+        // Earlier view URIs: never served with this server's behaviour.
+        "ui://openpaperdesign/home-2.html",
+        "ui://openpaperdesign/home.html",
+        "ui://openpaperdesign/other.html",
+        "file:///etc/passwd",
+    ] {
+        let e = a.read_resource(ReadResourceRequestParams::new(other)).await;
+        assert!(e.is_err(), "{other}");
+    }
+    assert_eq!(
+        call(&a, "openpaperdesign_status", json!({})).await.unwrap(),
+        status,
+        "reading the view changed nothing"
+    );
+    assert_eq!(
+        call(&a, "openpaperdesign_app_canvases", json!({}))
+            .await
+            .unwrap(),
+        listed
+    );
+    a.cancel().await.unwrap();
+}
+
 /// Launch refusals: conflicting flags, an unexpanded placeholder, a relative or dotted path,
 /// a missing folder, a link, the package root and the package cache. Each exits non-zero
 /// before serving anything and creates nothing.

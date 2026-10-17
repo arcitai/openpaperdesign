@@ -42,6 +42,12 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
+- **View version.** This home is `ui://openpaperdesign/home-3.html` (2026-10-17). The earlier
+  `home-2` view opened canvases in the panel and expected panel results. Hosts may cache a view
+  by its resource URI; OpenAI's [Apps UI guidance](https://developers.openai.com/plugins/build/chatgpt-ui)
+  (read 2026-10-17) asks for a new URI, everywhere it is referenced, for breaking HTML/JS/CSS
+  changes. So this server serves no earlier URI, and an older cached view is never paired with
+  its responses. This is a compatibility rule, not a diagnosis of what a Mac host cached.
 - **Who owns what.** Routing and lifecycle are the home's. Editing belongs to the web editor
   (browser/WASM hosting of upstream's engine). The document, revisions, conflicts and authority
   belong to the server.
@@ -129,7 +135,8 @@ primary and this panel is optional ("Edit in this view").
 - **Same editor.** The view runs the existing Rust/WASM renderer, `Session` (save, conflict,
   discard, WebGPU-to-WebGL fallback) and one shared mount (`static/editor.js`, also used by
   `app.js`). No second renderer, document store, runtime or dependency.
-- **One fixed module.** The home resource is versioned (`ui://openpaperdesign/home-2.html`).
+- **One fixed module.** The home resource was versioned `ui://openpaperdesign/home-2.html` for
+  this module (now `home-3`, the browser-first home above).
   Its one `<script type="module">` starts with an editor slot. An app-library server fills that
   slot with the packaged glue, `session.js`, `page.js`, `editor.js` and `panel.js`, in that
   order, only if no part has an import, `</script`, `<script` or `<!--`. Otherwise the slot
@@ -298,8 +305,8 @@ installed check.
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
 adds `openpaperdesign_home`, a Codex sidebar (global) entry that is also a chat tab (thread
 entry), and its static MCP App view `ui://openpaperdesign/home.html`
-(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-2.html`, see
-"In-panel editor" above). It also adds a read-only native project inventory,
+(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-3.html`, the
+browser-first home at the top of this record). It also adds a read-only native project inventory,
 `openpaperdesign_projects`, and a read-only list of this workspace's canvases,
 `openpaperdesign_canvases`. The server now lists 36 tools and one resource.
 
