@@ -762,15 +762,38 @@ impl WebState {
         self.ed.doc_stamp != self.saved_stamp
     }
 
-    /// An upstream UI edit that isn't in the document yet: a changed layer-rename draft
-    /// (upstream commits it on Enter or when the field loses focus), or typing queued for an egui
-    /// text field that the next layout will apply. Nothing can save it yet, and a reload would
-    /// strand it.
+    /// An egui text field has the keyboard, other than the command palette's search: an
+    /// inspector number field in its text mode (upstream `DragValue`), a colour's hex value, a
+    /// library name... Its text can be an unfinished draft that the document doesn't have yet
+    /// (`-` before a negative X; upstream applies a number only once it parses, or drops it on
+    /// Escape). Told by egui's public text-edit state for the focused widget, not by its text.
+    fn field_editing(&self) -> bool {
+        if self.ui.palette.open {
+            return false;
+        }
+        let Some(id) = self.ctx.memory(|m| m.focused()) else {
+            return false;
+        };
+        egui::widgets::text_edit::TextEditState::load(&self.ctx, id).is_some()
+    }
+
+    /// An upstream UI edit that isn't in the document yet. Nothing can save it yet, and a
+    /// reload would strand it:
+    /// - the layer-rename field: a changed draft (upstream commits it on Enter or when the field
+    ///   loses focus; an unchanged one has nothing to lose, and a reload closes it);
+    /// - any other egui text field while it has the keyboard, changed or not, until upstream
+    ///   finishes it (Enter, or focus elsewhere such as a click on the canvas) or cancels it
+    ///   (Escape). It is told apart only by focus, so an untouched field counts too: that is
+    ///   the conservative side;
+    /// - typing queued for an egui text field that the next layout will apply.
     fn ui_edit_pending(&self) -> bool {
-        let draft = self.ui.renaming.as_ref().is_some_and(|(id, text)| {
-            let text = text.trim();
-            !text.is_empty() && self.ed.doc.get(*id).is_some_and(|n| n.name != text)
-        });
+        let draft = match &self.ui.renaming {
+            Some((id, text)) => {
+                let text = text.trim();
+                !text.is_empty() && self.ed.doc.get(*id).is_some_and(|n| n.name != text)
+            }
+            None => self.field_editing(),
+        };
         let typing = (self.ui.renaming.is_some() || self.field_has_keyboard())
             && self.events.iter().any(|e| {
                 matches!(

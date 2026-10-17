@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.42 · Updated: 2026-10-17
+Revision: 0.43 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -360,9 +360,13 @@ DOM input goes to egui first; pointer input reaches `Editor` only over the retur
 rectangle and not over a floating egui area or an egui drag (as native `App::over_canvas`);
 keys reach `Editor` only while no egui text field has the keyboard. egui's own keyboard zoom
 is off in this host (Ctrl/⌘ +/- is the canvas zoom only), so egui paints at the page's device
-pixel ratio and DOM input stays in its CSS px. A changed layer-rename draft or typing queued
-for an egui field is unsaved work: it blocks a clean reload or leave (`can_reload`) and shows
-in the page's leave guard (`unsaved_work`); a reload closes the rename field. Every `AppRequest` is
+pixel ratio and DOM input stays in its CSS px. Unfinished UI input is unsaved work: a changed
+layer-rename draft, any other egui text field while it has the keyboard (an inspector number
+field holding `-`, say; told by egui's public `TextEditState` for the focused widget, the
+palette's search excepted, and conservatively busy until upstream finishes or cancels it), and
+typing queued for a field. It blocks a clean reload or leave (`can_reload`) and shows in the
+page's leave guard (`unsaved_work`); a reload closes the rename field and drops field focus.
+Every `AppRequest` is
 handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
 Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in
 a browser tab); SVG/PDF export is upstream's in-memory export offered as a download; PNG

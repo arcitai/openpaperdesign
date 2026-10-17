@@ -375,6 +375,183 @@ fn an_agent_s_change_never_meets_a_stale_rename_draft() {
     assert!(!s.dirty());
 }
 
+fn shape_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::Shape::Vec(v) => {
+            for s in v {
+                shape_text(s, out);
+            }
+        }
+        egui::Shape::Text(t) => out.push((
+            t.galley.job.text.clone(),
+            t.galley.rect.translate(t.pos.to_vec2()),
+        )),
+        _ => {}
+    }
+}
+
+/// One headless frame, returning every text it paints with its bounds (CSS px).
+fn painted_text(s: &mut WebState) -> Vec<(String, egui::Rect)> {
+    let mut l = s.layout();
+    let mut text = Vec::new();
+    for shape in &l.output.shapes {
+        shape_text(&shape.shape, &mut text);
+    }
+    l.output.textures_delta.clear();
+    s.drawn();
+    text
+}
+
+fn paints(s: &mut WebState, wanted: &str) -> bool {
+    painted_text(s).iter().any(|(t, _)| t.trim() == wanted)
+}
+
+/// Selects the rectangle, clicks upstream's inspector number field whose painted text starts
+/// with `label` ("X  ", "Y  ") at its painted bounds, and selects its text (Ctrl+A).
+/// Adapted from the R19 review's probe helper.
+fn open_number_field(s: &mut WebState, label: &str) -> crate::model::NodeId {
+    click_at(s, 150.0, 150.0, 0.0);
+    step(s);
+    step(s);
+    let id = s.ed.selection[0];
+    let text = painted_text(s);
+    let (_, bounds) = text
+        .iter()
+        .find(|(t, _)| t.starts_with(label))
+        .unwrap_or_else(|| panic!("{label:?} field not painted: {text:?}"));
+    let p = bounds.center();
+    click(s, (p.x as f64, p.y as f64), 1000.0);
+    step(s);
+    step(s);
+    assert!(
+        s.field_has_keyboard(),
+        "the {label:?} field is in its text mode"
+    );
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+    id
+}
+
+/// The rectangle's position on the axis a field edits.
+fn axis(s: &WebState, id: crate::model::NodeId, label: &str) -> f64 {
+    let r = s.ed.doc.get(id).unwrap().rect;
+    if label.starts_with('X') { r.x } else { r.y }
+}
+
+#[test]
+fn an_inspector_number_draft_is_unsaved_work_until_upstream_finishes_it() {
+    for label in ["X  ", "Y  "] {
+        let mut s = state();
+        let id = open_number_field(&mut s, label);
+        let old = axis(&s, id, label);
+        // An open number field may hold a draft: busy from the moment it has the keyboard.
+        assert!(s.unsaved_work() && !s.can_reload(), "{label}: open field");
+        // "-" before a negative number: queued, then laid out and painted, not a value yet.
+        s.paste("-");
+        assert!(!s.can_reload(), "{label}: queued");
+        step(&mut s);
+        assert!(paints(&mut s, "-"), "{label}: the field shows the draft");
+        assert_eq!(axis(&s, id, label), old, "{label}: not in the document");
+        assert!(!s.dirty(), "{label}: nothing to save yet");
+        assert!(s.save_snapshot().is_none());
+        assert!(s.unsaved_work(), "{label}: the leave guard sees it");
+        assert!(!s.can_reload(), "{label}: no clean reload or leave over it");
+        // The page loses focus (a leave starts): refused, and the draft stays.
+        s.set_focused(false);
+        step(&mut s);
+        assert!(paints(&mut s, "-"), "{label}: kept through the blur");
+        assert!(
+            !s.can_reload() && s.unsaved_work(),
+            "{label}: still unfinished"
+        );
+        s.set_focused(true);
+        step(&mut s);
+        // Completed, upstream applies it; Enter finishes the field; the change saves.
+        s.paste("150");
+        step(&mut s);
+        assert_eq!(axis(&s, id, label), -150.0, "{label}: completed");
+        press(&mut s, "Enter", "Enter");
+        step(&mut s);
+        step(&mut s);
+        assert!(!s.field_has_keyboard(), "{label}: finished");
+        assert!(s.dirty());
+        let _snap = s.save_snapshot().expect("the new position is saved");
+        s.save_succeeded();
+        assert!(
+            s.can_reload() && !s.unsaved_work(),
+            "{label}: clean after the save"
+        );
+    }
+}
+
+#[test]
+fn escape_cancels_an_inspector_number_draft_and_the_field_is_clean_again() {
+    let mut s = state();
+    let id = open_number_field(&mut s, "X  ");
+    s.paste("-");
+    step(&mut s);
+    assert!(paints(&mut s, "-"));
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    step(&mut s);
+    assert!(!s.field_has_keyboard(), "upstream cancelled the field");
+    assert!(
+        !paints(&mut s, "-"),
+        "the draft is gone, as upstream cancels it"
+    );
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(!s.dirty() && !s.unsaved_work() && s.can_reload());
+}
+
+#[test]
+fn an_agent_s_change_never_meets_a_stale_number_draft() {
+    // A "-" draft: the poll can't reload over it; the explicit discard (the conflict banner's
+    // reload) loads the agent's page and nothing of the draft comes back.
+    let mut s = state();
+    let id = open_number_field(&mut s, "X  ");
+    s.paste("-");
+    step(&mut s);
+    let agent = renamed_elsewhere(&s, id, "Agent");
+    assert!(!s.can_reload(), "the poll doesn't replace the page");
+    s.reload(&agent).unwrap();
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.doc.get(id).unwrap().name, "Agent");
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(
+        !paints(&mut s, "-"),
+        "the discarded draft isn't shown again"
+    );
+    assert!(!s.field_has_keyboard() && !s.unsaved_work() && s.can_reload());
+    // A completed value saved on the old revision: refused (409) and kept; the explicit
+    // discard loads the agent's page, and the discarded value isn't applied again.
+    let mut s = state();
+    let id = open_number_field(&mut s, "X  ");
+    // The agent's page, saved from the revision this view loaded (X 100).
+    let agent = renamed_elsewhere(&s, id, "Agent");
+    s.paste("-150");
+    step(&mut s);
+    assert_eq!(axis(&s, id, "X  "), -150.0);
+    let _snap = s.save_snapshot().expect("the local position");
+    s.save_failed();
+    assert!(
+        s.dirty() && !s.can_reload(),
+        "a conflict keeps the local change"
+    );
+    s.reload(&agent).unwrap();
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.doc.get(id).unwrap().name, "Agent");
+    assert_eq!(
+        axis(&s, id, "X  "),
+        100.0,
+        "the discarded value stays discarded"
+    );
+    assert!(!s.dirty() && !s.unsaved_work());
+}
+
 /// The egui pixel scale the next frame is painted at (headless).
 fn painted_scale(s: &mut WebState) -> f32 {
     let mut l = s.layout();
