@@ -1166,8 +1166,10 @@ test('the workspace view offers no library import', async () => {
 // against the real module in crates/openpaperdesign-web/tests/panel.test.mjs. Here a recording
 // stand-in with the factory's shape takes its place, to check what the view does around it.
 
-// The in-panel editor's own tools (panel.js calls them through the view's rpc).
-const PANEL_TOOLS = new Set([...LIB_TOOLS, 'openpaperdesign_app_editor_asset', 'openpaperdesign_app_page',
+// The in-panel editor's own tools (panel.js calls them through the view's rpc): the canvas
+// tools it uses, and the per-page ones the server still offers older views.
+const PANEL_TOOLS = new Set([...LIB_TOOLS, 'openpaperdesign_app_editor_asset', 'openpaperdesign_app_canvas',
+  'openpaperdesign_app_canvas_revision', 'openpaperdesign_app_canvas_save', 'openpaperdesign_app_page',
   'openpaperdesign_app_page_revision', 'openpaperdesign_app_page_save', 'openpaperdesign_app_ready', 'openpaperdesign_app_page_release']);
 const panelOnly = (v) => {
   assert.ok(methods(v).every((m) => ALLOWED.has(m)), methods(v).join());
@@ -1918,9 +1920,12 @@ async function realPanelView() {
   assert.equal(asset.params.name, 'openpaperdesign_app_editor_asset');
   await answer(v, { asset: 'openpaperdesign_web_bg.wasm', identity: 'r13-fixture', bytes: 1,
     parts: 1, part: 0, offset: 0, part_bytes: 1, data: 'AA==' }, asset);
-  const page = v.last('tools/call');
-  assert.equal(page.params.name, 'openpaperdesign_app_page');
-  await answer(v, { binding: B1, page: { id: 'p1', name: 'Page 1' }, text: '{}', revision: '"r1"', mount: 7 }, page);
+  // The real panel's first read: the whole canvas, naming only the binding; answered as the
+  // server's canvas tool answers it.
+  const canvas = v.last('tools/call');
+  assert.deepEqual(canvas.params, { name: 'openpaperdesign_app_canvas', arguments: { binding: B1 } });
+  await answer(v, { binding: B1, canvas: { name: 'Landing' }, revision: '"c1"', active_page: 'p1',
+    pages: [{ id: 'p1', name: 'Page 1', revision: '"r1"', text: '{}' }], mount: 7 }, canvas);
   assert.equal(await editor.handle.started, 'mounted');
   return { v, editor };
 }

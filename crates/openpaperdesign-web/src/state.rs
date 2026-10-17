@@ -20,6 +20,7 @@ use crate::geom::v2;
 use crate::io::export::{self, Format, Scope, Spec};
 use crate::keys;
 use crate::model::{Color, Document};
+use crate::project::PageData;
 use crate::project::format::{page_from_json, page_to_json};
 use crate::render::frame::{self, Layout};
 use crate::ui::{self, UiState};
@@ -90,6 +91,62 @@ const NO_IMAGE: &str =
 const LIBRARY_SESSION: &str = "Library items stay only while this editor is open; they aren't \
     saved with the canvas.";
 
+/// The page list (ids and names, in order) and the active page's id.
+type Meta = (Vec<(String, String)>, String);
+
+fn meta(ed: &Editor) -> Meta {
+    (
+        ed.pages
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect(),
+        ed.active_page_id().to_string(),
+    )
+}
+
+/// What a save in flight was taken from (see [`WebState::save_snapshot`]): the document stamp,
+/// each page whose content it carries with that page's history generation then, and the page
+/// list and active page it names. Its answer acknowledges exactly these, never a change made
+/// after the snapshot was taken.
+struct Inflight {
+    stamp: u64,
+    pages: Vec<(String, u64)>,
+    meta: Meta,
+}
+
+/// The canvas the server sent (`/api/canvas`, or the in-panel canvas read): `{active_page,
+/// pages: [{id, name, text}]}` (its other fields are the transport's), each `text` an upstream
+/// page file. The list's ids and names win over the files' (the manifest owns them, as in
+/// upstream `Project::load_page`).
+fn parse_canvas(json: &str) -> Result<(Vec<PageData>, Option<String>), String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("the canvas can't be read: {e}"))?;
+    let list = v
+        .get("pages")
+        .and_then(|p| p.as_array())
+        .filter(|l| !l.is_empty())
+        .ok_or("the canvas has no pages")?;
+    let mut pages = Vec::with_capacity(list.len());
+    for p in list {
+        let field = |k: &str| {
+            p.get(k)
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("a page of the canvas has no {k}"))
+        };
+        let (id, name) = (field("id")?, field("name")?);
+        let mut page = page_from_json(field("text")?).map_err(|e| format!("page {name:?}: {e}"))?;
+        page.id = id.to_string();
+        page.name = name.to_string();
+        page.doc.name = name.to_string();
+        pages.push(page);
+    }
+    let active = v
+        .get("active_page")
+        .and_then(|a| a.as_str())
+        .map(str::to_string);
+    Ok((pages, active))
+}
+
 pub struct WebState {
     pub ed: Editor,
     /// Upstream's workspace state (panels, palette, renaming, export settings...).
@@ -98,8 +155,8 @@ pub struct WebState {
     mac: bool,
     /// `doc_stamp` of the content last confirmed written by the server.
     saved_stamp: u64,
-    /// `doc_stamp` of the snapshot being written, if any.
-    inflight: Option<u64>,
+    /// The snapshot being written, if any.
+    inflight: Option<Inflight>,
     /// Something that can change the picture happened since the last draw.
     redraw: bool,
     /// egui input gathered since the last layout.
@@ -192,23 +249,19 @@ pub fn css_cursor(c: egui::CursorIcon) -> &'static str {
 }
 
 impl WebState {
-    /// Open an upstream page file listed in the manifest as `page_id`/`page_name`.
+    /// Open the whole canvas the server sent (see [`parse_canvas`]): every page, in list
+    /// order, on the active page it names, through upstream `Editor::open_pages`, so the pages
+    /// panel switches, adds, renames, duplicates, reorders and deletes pages as upstream does.
     pub fn open(
-        page_json: &str,
-        page_id: String,
-        page_name: String,
+        canvas_json: &str,
         mac: bool,
         css_width: f64,
         css_height: f64,
     ) -> Result<WebState, String> {
-        let mut page = page_from_json(page_json).map_err(|e| e.to_string())?;
-        // The manifest owns page ids and names (a migrated legacy file gets a fresh random id).
-        page.id = page_id;
-        page.name = page_name.clone();
-        page.doc.name = page_name;
+        let (pages, active) = parse_canvas(canvas_json)?;
         let mut ed = Editor::default();
         ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
-        ed.open_pages(vec![page], None);
+        ed.open_pages(pages, active.as_deref());
         let clipboard = Rc::new(RefCell::new(ClipboardBuf::default()));
         ed.clipboard_io = Some(Box::new(WebClipboard(clipboard.clone())));
         let ctx = egui::Context::default();
@@ -218,16 +271,10 @@ impl WebState {
         // page's input and the canvas rectangle stay in CSS px: positions would no longer match
         // what is drawn. The UI scale here is the page's device pixel ratio only.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        // This page holds one page of the canvas and saves only that page: page-list changes
-        // couldn't be stored, so the pages panel offers none (see `UiState::pages_locked`).
-        let st = UiState {
-            pages_locked: true,
-            ..Default::default()
-        };
         let mut s = WebState {
             saved_stamp: ed.doc_stamp,
             ed,
-            ui: st,
+            ui: UiState::default(),
             ctx,
             mac,
             inflight: None,
@@ -757,9 +804,13 @@ impl WebState {
         serde_json::Value::from(list).to_string()
     }
 
-    /// Content changed since the last confirmed save (or a save is in flight).
+    /// Something the canvas would lose, by upstream's own bookkeeping: a page whose content
+    /// changed since its last confirmed save (`Editor::dirty_pages`, inactive pages included),
+    /// a page-list, name or active-page change (`Editor::meta_dirty`), or a document change
+    /// since the last confirmed snapshot (`doc_stamp`). A save in flight is not a confirmed
+    /// one, so it stays dirty until its answer.
     pub fn dirty(&self) -> bool {
-        self.ed.doc_stamp != self.saved_stamp
+        self.ed.doc_stamp != self.saved_stamp || self.ed.project_dirty()
     }
 
     /// An egui text field has the keyboard, other than the command palette's search: an
@@ -782,22 +833,36 @@ impl WebState {
 
     /// An upstream UI edit that isn't in the document yet. Nothing can save it yet, and a
     /// reload would strand it:
-    /// - the layer-rename field: a changed draft (upstream commits it on Enter or when the field
-    ///   loses focus; an unchanged one has nothing to lose, and a reload closes it);
+    /// - the layer-rename or page-rename field: a changed draft (upstream commits it on Enter or
+    ///   when the field loses focus; an unchanged one has nothing to lose, and a reload closes
+    ///   it);
     /// - any other egui text field while it has the keyboard, changed or not, until upstream
     ///   finishes it (Enter, or focus elsewhere such as a click on the canvas) or cancels it
     ///   (Escape). It is told apart only by focus, so an untouched field counts too: that is
     ///   the conservative side;
     /// - typing queued for an egui text field that the next layout will apply.
     fn ui_edit_pending(&self) -> bool {
-        let draft = match &self.ui.renaming {
-            Some((id, text)) => {
-                let text = text.trim();
-                !text.is_empty() && self.ed.doc.get(*id).is_some_and(|n| n.name != text)
-            }
-            None => self.field_editing(),
+        let changed = |text: &str, name: Option<&str>| {
+            let text = text.trim();
+            !text.is_empty() && name.is_some_and(|n| n != text)
         };
-        let typing = (self.ui.renaming.is_some() || self.field_has_keyboard())
+        let layer = self
+            .ui
+            .renaming
+            .as_ref()
+            .map(|(id, text)| changed(text, self.ed.doc.get(*id).map(|n| n.name.as_str())));
+        let page = self
+            .ui
+            .pages
+            .renaming
+            .as_ref()
+            .map(|(i, text)| changed(text, self.ed.pages.get(*i).map(|p| p.name.as_str())));
+        let renaming = layer.is_some() || page.is_some();
+        let draft = match (layer, page) {
+            (None, None) => self.field_editing(),
+            (l, p) => l.unwrap_or(false) || p.unwrap_or(false),
+        };
+        let typing = (renaming || self.field_has_keyboard())
             && self.events.iter().any(|e| {
                 matches!(
                     e,
@@ -816,24 +881,46 @@ impl WebState {
         self.dirty() || self.ui_edit_pending()
     }
 
-    /// The page file to write now, or `None` when there is nothing to save, a save is
-    /// already in flight, or a gesture/text edit still owns the open transaction.
+    /// The canvas save to send now, or `None` when there is nothing to save, a save is already
+    /// in flight, or a gesture/text edit still owns the open transaction. It is
+    /// `{active_page, pages: [{id, name, text?}]}`: the whole page list in order, the active
+    /// page, and an upstream page file (`page_to_json` of `Editor::page_data`) for each page
+    /// upstream counts as changed (`Editor::dirty_pages`, a new page included); the server
+    /// writes them and the manifest as one commit. What it was taken from is kept for its
+    /// answer (see [`WebState::save_succeeded`]).
     pub fn save_snapshot(&mut self) -> Option<String> {
         if self.inflight.is_some() || self.ed.is_busy() || self.ed.text_edit.is_some() {
             return None;
         }
         self.ed.commit_pending();
-        if self.ed.doc_stamp == self.saved_stamp {
+        if !self.dirty() {
             return None;
         }
-        self.inflight = Some(self.ed.doc_stamp);
-        Some(page_to_json(&self.ed.page_data(self.ed.active_page)))
+        let changed = self.ed.dirty_pages();
+        let mut sent = Vec::with_capacity(changed.len());
+        let mut pages = Vec::with_capacity(self.ed.pages.len());
+        for (i, slot) in self.ed.pages.iter().enumerate() {
+            let mut p = serde_json::json!({"id": slot.id, "name": slot.name});
+            if changed.contains(&i) {
+                p["text"] = page_to_json(&self.ed.page_data(i)).into();
+                sent.push((slot.id.clone(), self.ed.page_gen(i)));
+            }
+            pages.push(p);
+        }
+        self.inflight = Some(Inflight {
+            stamp: self.ed.doc_stamp,
+            pages: sent,
+            meta: meta(&self.ed),
+        });
+        let save = serde_json::json!({"active_page": self.ed.active_page_id(), "pages": pages});
+        Some(save.to_string())
     }
 
-    /// Whether a newer revision from the server may replace the page now: nothing unsaved,
-    /// no save in flight, no gesture, text edit or unfinished UI edit (a changed rename draft,
-    /// queued typing) under way. Otherwise nothing is reloaded: the local change's save is
-    /// refused as a conflict (nothing merges). Leaving (`Session.drain`) is clean only then too.
+    /// Whether a newer revision from the server may replace the canvas now: nothing unsaved on
+    /// any page or in the page list, no save in flight, no gesture, text edit or unfinished UI
+    /// edit (a changed rename draft, queued typing) under way. Otherwise nothing is reloaded:
+    /// the local change's save is refused as a conflict (nothing merges). Leaving
+    /// (`Session.drain`) is clean only then too.
     pub fn can_reload(&self) -> bool {
         !self.dirty()
             && self.inflight.is_none()
@@ -842,46 +929,85 @@ impl WebState {
             && !self.ui_edit_pending()
     }
 
-    /// Load a newer revision of the same page in place, keeping the view: camera, tool, and
-    /// the selection where those nodes still exist. Undo history starts over. An open rename
-    /// field closes: it was for the replaced page, so its text (unchanged after a clean reload,
-    /// or deliberately dropped by the conflict banner's discard) never lands on the new one.
-    pub fn reload(&mut self, page_json: &str) -> Result<(), String> {
-        let mut page = page_from_json(page_json).map_err(|e| e.to_string())?;
+    /// Load the canvas as the server has it now, in place: its pages, list and active page (a
+    /// change made elsewhere to any of them shows), keeping the view: the tool, each remaining
+    /// page's camera, and on the page still shown the selection where those nodes still exist.
+    /// Undo history starts over. Only when `can_reload`, or as the explicit discard of every
+    /// local change. Open rename fields (layer or page) close and a page drag ends: they were
+    /// for the replaced canvas, so their text (unchanged after a clean reload, or deliberately
+    /// dropped by the conflict banner's discard) never lands on the new one.
+    pub fn reload(&mut self, canvas_json: &str) -> Result<(), String> {
+        let (mut pages, active) = parse_canvas(canvas_json)?;
         self.ui.renaming = None;
+        let collapsed = self.ui.pages.collapsed;
+        self.ui.pages = Default::default();
+        self.ui.pages.collapsed = collapsed;
         self.ctx.memory_mut(|m| {
             if let Some(f) = m.focused() {
                 m.surrender_focus(f);
             }
         });
-        let slot = &self.ed.pages[self.ed.active_page];
-        page.id = slot.id.clone();
-        page.name = slot.name.clone();
-        page.doc.name = slot.name.clone();
-        page.camera = Some(self.ed.camera);
+        for p in &mut pages {
+            let mine = self.ed.pages.iter().position(|s| s.id == p.id);
+            if let Some(c) = mine.and_then(|i| self.camera_of(i)) {
+                p.camera = Some(c);
+            }
+        }
+        let shown = self.ed.active_page_id().to_string();
         let selection = self.ed.selection.clone();
         let tool = self.ed.tool;
-        self.ed.open_pages(vec![page], None);
+        self.ed.open_pages(pages, active.as_deref());
         self.ed.tool = tool;
-        let kept: Vec<_> = selection
-            .into_iter()
-            .filter(|id| self.ed.doc.nodes.contains_key(id))
-            .collect();
-        self.ed.selection = kept;
+        if self.ed.active_page_id() == shown {
+            let kept: Vec<_> = selection
+                .into_iter()
+                .filter(|id| self.ed.doc.nodes.contains_key(id))
+                .collect();
+            self.ed.selection = kept;
+        }
         self.saved_stamp = self.ed.doc_stamp;
         self.inflight = None;
         self.redraw = true;
         Ok(())
     }
 
-    /// The server stored the last snapshot.
+    /// Page `i`'s camera, if it has one of its own (a page never shown yet is fit when shown).
+    fn camera_of(&self, i: usize) -> Option<crate::geom::Camera> {
+        if i == self.ed.active_page {
+            return Some(self.ed.camera);
+        }
+        let stash = self.ed.pages[i].stash.as_ref()?;
+        (!stash.needs_fit).then_some(stash.camera)
+    }
+
+    /// The server stored the snapshot in flight: exactly what it was taken from counts as
+    /// saved. A page sent then is marked saved (`Editor::mark_page_saved`) only if its history
+    /// generation is still the one sent; one edited, undone or redone since stays to save,
+    /// recorded as saved at the generation that was sent. The page list and active page count
+    /// as saved only if they are still the ones sent. Whatever changed after the snapshot (an
+    /// edit on any page, a new, renamed, moved or deleted page, a switch) stays unsaved.
     pub fn save_succeeded(&mut self) {
-        if let Some(s) = self.inflight.take() {
-            self.saved_stamp = s;
+        let Some(f) = self.inflight.take() else {
+            return;
+        };
+        self.saved_stamp = f.stamp;
+        for (id, generation) in f.pages {
+            let Some(i) = self.ed.pages.iter().position(|p| p.id == id) else {
+                continue;
+            };
+            if self.ed.page_gen(i) == generation {
+                self.ed.mark_page_saved(i);
+            } else {
+                self.ed.pages[i].saved_gen = generation;
+            }
+        }
+        if meta(&self.ed) == f.meta {
+            self.ed.meta_dirty = false;
         }
     }
 
-    /// The last snapshot was not stored (conflict or network error); it stays dirty.
+    /// The snapshot in flight was not stored (conflict, refusal or no answer): everything it
+    /// held stays unsaved, to be sent again or explicitly discarded.
     pub fn save_failed(&mut self) {
         self.inflight = None;
     }

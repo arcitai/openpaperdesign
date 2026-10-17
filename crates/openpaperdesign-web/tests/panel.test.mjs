@@ -69,15 +69,21 @@ test('the home view\'s module with the editor in its slot parses and links as on
 const BINDING = '0123456789abcdef.7';
 const PART = 262144;
 const T = {
-  ASSET: 'openpaperdesign_app_editor_asset', PAGE: 'openpaperdesign_app_page', REVISION: 'openpaperdesign_app_page_revision',
-  SAVE: 'openpaperdesign_app_page_save', READY: 'openpaperdesign_app_ready', RELEASE: 'openpaperdesign_app_page_release',
+  ASSET: 'openpaperdesign_app_editor_asset', CANVAS: 'openpaperdesign_app_canvas', REVISION: 'openpaperdesign_app_canvas_revision',
+  SAVE: 'openpaperdesign_app_canvas_save', READY: 'openpaperdesign_app_ready', RELEASE: 'openpaperdesign_app_page_release',
+  // The per-page tools stay on the server for older views; this editor never calls them.
+  PAGE: 'openpaperdesign_app_page', PAGE_SAVE: 'openpaperdesign_app_page_save',
 };
 const ok = (v) => ({ result: { content: [{ type: 'text', text: JSON.stringify(v) }] } });
 const no = (status, error, revision = null) => ({ result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error, status, revision }) }] } });
+// What the editor is given to open: the canvas's pages and active page, as text.
+const opened = (c) => JSON.stringify({ active_page: c.active_page, pages: c.pages });
 
 function fakeServer(wasm = new Uint8Array(600000).fill(0x61)) {
-  const srv = { calls: [], page: { id: 'p1', name: 'Page 1', text: '{"page":1}', revision: '"r1"' }, mounts: new Set(), next: 0,
-    wasm, identity: IDENTITY, override: {}, holds: {} };
+  // The canvas as the server has it: its pages (id, name, revision, page file), the active page
+  // and the canvas revision; `saved` is the last canvas save it stored.
+  const srv = { calls: [], canvas: { active_page: 'p1', pages: [{ id: 'p1', name: 'Page 1', revision: '"a"', text: '{"page":1}' }] },
+    revision: '"r1"', saved: undefined, mounts: new Set(), next: 0, wasm, identity: IDENTITY, override: {}, holds: {} };
   srv.part = (i) => {
     const parts = Math.ceil(srv.wasm.length / PART);
     const start = i * PART;
@@ -91,26 +97,28 @@ function fakeServer(wasm = new Uint8Array(600000).fill(0x61)) {
     srv.calls.push([name, JSON.parse(JSON.stringify(a))]);
     if (srv.holds[name]) await srv.holds[name];
     if (srv.override[name]) return srv.override[name](a);
-    const pinned = () => a.binding === BINDING && a.page_id === srv.page.id && srv.mounts.has(a.mount);
+    const pinned = () => a.binding === BINDING && srv.mounts.has(a.mount);
+    const canvas = (mount) => ok({ binding: BINDING, canvas: { name: 'Plan' }, revision: srv.revision,
+      active_page: srv.canvas.active_page, pages: srv.canvas.pages, mount });
     switch (name) {
       case T.ASSET: return ok(srv.part(a.part));
-      case T.PAGE:
+      case T.CANVAS:
         if (a.binding !== BINDING) return no(410, 'stale');
-        if (a.page_id === undefined) {
+        if (a.mount === undefined) {
           srv.mounts.add(++srv.next);
-          return ok({ binding: BINDING, canvas: { name: 'Plan' }, page: { id: srv.page.id, name: srv.page.name }, revision: srv.page.revision, text: srv.page.text, mount: srv.next });
+          return canvas(srv.next);
         }
         if (!pinned()) return no(410, 'not mounted');
-        return ok({ binding: BINDING, canvas: { name: 'Plan' }, page: { id: srv.page.id, name: srv.page.name }, revision: srv.page.revision, text: srv.page.text, mount: a.mount });
+        return canvas(a.mount);
       case T.REVISION:
         if (!pinned()) return no(410, 'not mounted');
-        return ok({ binding: BINDING, page_id: srv.page.id, revision: srv.page.revision });
+        return ok({ binding: BINDING, revision: srv.revision });
       case T.SAVE:
         if (!pinned()) return no(410, 'not mounted');
-        if (a.if_match !== srv.page.revision) return no(409, 'the page changed since it was loaded; nothing was written', srv.page.revision);
-        srv.page.text = a.text;
-        srv.page.revision = `"s${srv.calls.length}"`;
-        return ok({ binding: BINDING, page_id: srv.page.id, saved: true, revision: srv.page.revision });
+        if (a.if_match !== srv.revision) return no(409, 'the canvas changed since it was loaded; nothing was written', srv.revision);
+        srv.saved = a.text;
+        srv.revision = `"s${srv.calls.length}"`;
+        return ok({ binding: BINDING, saved: true, revision: srv.revision });
       case T.READY: return ok({ binding: BINDING, ready: true });
       case T.RELEASE: return ok({ binding: BINDING, released: srv.mounts.delete(a.mount) });
       default: throw new Error('unexpected tool ' + name);
@@ -167,9 +175,9 @@ function fakeEnv() {
 function fakeEngine() {
   const eng = { inits: [], editors: [] };
   eng.init = async (bytes) => { eng.inits.push(bytes); };
-  eng.start = async (canvas, text, pageId, pageName) => {
+  eng.start = async (canvas, text, seedHi, seedLo, mac, webgl) => {
     // The real editor's page-facing API (web.rs); the workspace itself draws in the canvas.
-    const ed = { canvas, text, pageId, pageName, calls: [], pending: undefined, isReady: false, freed: false, canReload: true,
+    const ed = { canvas, text, mac, webgl, calls: [], pending: undefined, isReady: false, freed: false, canReload: true,
       requests: [], downloads: [], clip: undefined,
       backend() { return 'mock (test)'; }, frame() {}, gpu_error() { return undefined; }, ready() { return this.isReady; },
       tool() { return 'select'; }, resize() {}, modifiers() {}, focus(f) { this.calls.push('focus:' + f); },
@@ -221,13 +229,13 @@ test('the renderer comes in order, part after part, checked, and is compiled onc
   const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {} });
   assert.equal(await h.started, 'mounted');
   assert.deepEqual(t.srv.calls.map(([n, a]) => (n === T.ASSET ? `asset ${a.part}` : n)).slice(0, 4),
-    ['asset 0', 'asset 1', 'asset 2', T.PAGE], 'three parts, in order, then the page');
+    ['asset 0', 'asset 1', 'asset 2', T.CANVAS], 'three parts, in order, then the canvas');
   assert.equal(t.engine.inits.length, 1);
   assert.deepEqual(t.engine.inits[0], wasm, 'exactly the packaged bytes');
-  assert.deepEqual(t.srv.named(T.PAGE)[0], { binding: BINDING }, 'the first read names only the binding');
+  assert.deepEqual(t.srv.named(T.CANVAS)[0], { binding: BINDING }, 'the first read names only the binding');
   const ed = t.engine.editors[0];
-  assert.equal(ed.pageId, 'p1');
-  assert.equal(ed.text, '{"page":1}');
+  assert.equal(ed.text, opened(t.srv.canvas), 'the editor opens the whole canvas');
+  assert.equal(JSON.parse(ed.text).pages[0].text, '{"page":1}', 'each page as its upstream page file');
   // A second editor in the same view reuses the compiled renderer.
   await h.dispose();
   const h2 = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {} });
@@ -252,7 +260,7 @@ test('a wrong, mixed, out-of-order, short or oversized part stops the transfer w
     const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {} });
     await assert.rejects(h.started, want, what);
     assert.equal(t.engine.inits.length, 0, `${what}: nothing compiled`);
-    assert.equal(srv.named(T.PAGE).length, 0, `${what}: no page read`);
+    assert.equal(srv.named(T.CANVAS).length, 0, `${what}: no canvas read`);
   }
   // A refused part is reported as the server said it.
   const srv = fakeServer();
@@ -263,7 +271,7 @@ test('a wrong, mixed, out-of-order, short or oversized part stops the transfer w
   const c = setup();
   c.engine.init = async () => { throw new Error('WebAssembly.instantiate(): Refused to compile or instantiate WebAssembly module because \'unsafe-eval\' is not allowed'); };
   await assert.rejects(c.panel.open({ binding: BINDING, refs: c.refs }).started, /Refused to compile/);
-  assert.equal(c.srv.named(T.PAGE).length, 0);
+  assert.equal(c.srv.named(T.CANVAS).length, 0);
 });
 
 test('leaving during the transfer stops it; leaving during the first read releases the mount it got', async () => {
@@ -278,15 +286,15 @@ test('leaving during the transfer stops it; leaving during the first read releas
   assert.equal(await h.started, 'left');
   assert.equal(srv.named(T.ASSET).length, 1, 'no part after leaving');
   assert.equal(t.engine.inits.length, 0);
-  assert.equal(srv.named(T.PAGE).length, 0);
-  // The page read under way.
+  assert.equal(srv.named(T.CANVAS).length, 0);
+  // The canvas read under way.
   const s2 = fakeServer();
   let answer;
-  s2.holds[T.PAGE] = new Promise((r) => { answer = r; });
+  s2.holds[T.CANVAS] = new Promise((r) => { answer = r; });
   const t2 = setup(s2);
   const h2 = t2.panel.open({ binding: BINDING, refs: t2.refs });
   await flush();
-  assert.equal(s2.named(T.PAGE).length, 1);
+  assert.equal(s2.named(T.CANVAS).length, 1);
   await h2.dispose();
   answer();
   assert.equal(await h2.started, 'left');
@@ -295,7 +303,7 @@ test('leaving during the transfer stops it; leaving during the first read releas
   assert.equal(t2.engine.editors.length, 0, 'no editor booted');
 });
 
-test('an edit is saved through the page tool, pinned to its page and mount; Ready is the renderer\'s own', async () => {
+test('an edit is saved through the canvas tool, pinned to its mount; Ready is the renderer\'s own', async () => {
   const t = await readyEditor();
   assert.ok(t.shown.status.includes('Ready'));
   assert.deepEqual(t.srv.named(T.READY), [{ binding: BINDING, mount: 1 }]);
@@ -304,17 +312,19 @@ test('an edit is saved through the page tool, pinned to its page and mount; Read
   assert.equal(t.refs.canvas.captured, 3);
   t.refs.canvas.fire('pointerup', { pointerId: 3, button: 0, clientX: 9, clientY: 9, timeStamp: 2 });
   assert.deepEqual(t.ed.calls.slice(0, 2), ['down', 'up']);
-  t.ed.pending = '{"page":1,"edit":true}';
+  t.ed.pending = '{"pages":[],"edit":true}';
   t.env.every(300);
   await flush();
-  assert.deepEqual(t.srv.named(T.SAVE), [{ binding: BINDING, page_id: 'p1', mount: 1, if_match: '"r1"', text: '{"page":1,"edit":true}' }]);
-  assert.equal(t.srv.page.text, '{"page":1,"edit":true}', 'the canonical page has it');
+  assert.deepEqual(t.srv.named(T.SAVE), [{ binding: BINDING, mount: 1, if_match: '"r1"', text: '{"pages":[],"edit":true}' }]);
+  assert.equal(t.srv.saved, '{"pages":[],"edit":true}', 'the server has the canvas save');
   assert.equal(t.shown.status.at(-1), 'Saved');
   assert.ok(t.ed.calls.includes('saved'));
-  // Polls name the same page and mount.
+  // Polls name the same mount.
   t.env.every(1000);
   await flush();
-  assert.deepEqual(t.srv.named(T.REVISION).at(-1), { binding: BINDING, page_id: 'p1', mount: 1 });
+  assert.deepEqual(t.srv.named(T.REVISION).at(-1), { binding: BINDING, mount: 1 });
+  // The per-page tools are never this editor's.
+  assert.equal(t.srv.named(T.PAGE).length + t.srv.named(T.PAGE_SAVE).length, 0);
   // The canvas's keys are the editor's, not the view's (its Escape is Back).
   const key = { key: 'Escape', code: 'Escape', repeat: false };
   t.refs.canvas.fire('keydown', key);
@@ -337,7 +347,7 @@ test('leaving waits for the save under way and saves what is left; then everythi
   answer();
   assert.equal(await leaving, 'clean');
   assert.deepEqual(t.srv.named(T.SAVE).map((a) => a.text), ['{"v":1}', '{"v":2}']);
-  assert.equal(t.srv.page.text, '{"v":2}');
+  assert.equal(t.srv.saved, '{"v":2}');
   await t.h.dispose();
   await t.h.dispose();
   assert.equal(t.ed.freed, true);
@@ -353,9 +363,9 @@ test('leaving waits for the save under way and saves what is left; then everythi
 });
 
 test('a conflict, an unanswered save or a page too large for the panel is never shown as saved, and keeps the editor', async () => {
-  // Conflict: the page changed elsewhere.
+  // Conflict: the canvas changed elsewhere (any page, the list or the active page).
   const c = await readyEditor();
-  c.srv.page.revision = '"elsewhere"';
+  c.srv.revision = '"elsewhere"';
   c.ed.pending = '{"mine":1}';
   c.env.every(300);
   await flush();
@@ -389,7 +399,7 @@ test('a save is bounded as the whole request it would be (envelope, escaping and
   const t = await readyEditor();
   // Escaping-heavy: the arguments alone fit, the request as sent (plus the allowance) doesn't.
   const quotes = '"'.repeat(MAX / 2 - 4096);
-  const args = { binding: BINDING, page_id: 'p1', mount: 1, if_match: '"r1"', text: quotes };
+  const args = { binding: BINDING, mount: 1, if_match: '"r1"', text: quotes };
   assert.ok(bytes(JSON.stringify(args)) < MAX, 'the arguments alone fit');
   t.ed.pending = quotes;
   t.env.every(300);
@@ -407,7 +417,7 @@ test('a save is bounded as the whole request it would be (envelope, escaping and
   t.env.every(300);
   await flush();
   assert.equal(t.srv.named(T.SAVE).length, 1);
-  assert.equal(t.srv.page.text, fits);
+  assert.equal(t.srv.saved, fits);
   assert.equal(t.shown.status.at(-1), 'Saved');
 });
 
@@ -420,7 +430,7 @@ test('what the workspace asks the page for: Save saves now, Home goes back throu
   ed.isReady = true;
   t.env.frame(16);
   await flush();
-  // Upstream's Save (⌘S or File > Save Now): the same checked page save, at once.
+  // Upstream's Save (⌘S or File > Save Now): the same checked canvas save, at once.
   ed.pending = '{"page":1,"saved":"now"}';
   ed.requests.push('save');
   t.env.frame(32);
@@ -448,9 +458,54 @@ test('a stale binding or released mount is refused by the server and never appli
   t.ed.pending = '{"mine":1}';
   t.env.every(300);
   await flush();
-  assert.equal(t.srv.page.text, '{"page":1}', 'nothing written');
+  assert.equal(t.srv.saved, undefined, 'nothing written');
   assert.equal(t.shown.status.at(-1), 'Save failed; retrying');
   t.env.every(1000);
   await flush();
   assert.ok(!t.ed.calls.some((c) => c.startsWith('reload')), 'a refused poll loads nothing');
+});
+
+test('the whole canvas travels: every page and the active page open, and a change elsewhere reloads all of it', async () => {
+  const srv = fakeServer();
+  srv.canvas = {
+    active_page: 'p2',
+    pages: [{ id: 'p1', name: 'Plan', revision: '"a"', text: '{"page":1}' },
+      { id: 'p2', name: 'Notes', revision: '"b"', text: '{"page":2}' }],
+  };
+  const t = await readyEditor(setup(srv));
+  const first = JSON.parse(t.ed.text);
+  assert.equal(first.active_page, 'p2', 'the remembered active page');
+  assert.deepEqual(first.pages.map((p) => [p.id, p.name, p.text]),
+    [['p1', 'Plan', '{"page":1}'], ['p2', 'Notes', '{"page":2}']], 'every page, in list order');
+  // An agent added a page and switched to it: the canvas revision moves, and a clean editor
+  // loads the whole canvas in place.
+  srv.canvas = { active_page: 'p3', pages: [...srv.canvas.pages, { id: 'p3', name: 'Agent', revision: '"c"', text: '{"page":3}' }] };
+  srv.revision = '"r2"';
+  t.env.every(1000);
+  await flush();
+  const reloaded = t.ed.calls.filter((c) => c.startsWith('reload:')).map((c) => JSON.parse(c.slice('reload:'.length)));
+  assert.equal(reloaded.length, 1);
+  assert.equal(reloaded[0].active_page, 'p3');
+  assert.deepEqual(reloaded[0].pages.map((p) => p.id), ['p1', 'p2', 'p3']);
+  assert.equal(t.shown.status.at(-1), 'Updated with changes made elsewhere');
+  // The next save is based on that revision.
+  t.ed.pending = '{"pages":[]}';
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).at(-1).if_match, '"r2"');
+  assert.equal(t.shown.status.at(-1), 'Saved');
+});
+
+test('an answer for another binding, or without pages, is never opened', async () => {
+  for (const bad of [{ binding: '0123456789abcdef.8' }, { pages: [] }, { pages: [{ id: 'p1', name: 'P' }] }, { active_page: 5 }]) {
+    const srv = fakeServer();
+    srv.override[T.CANVAS] = (a) => {
+      srv.mounts.add(++srv.next);
+      return ok(Object.assign({ binding: BINDING, revision: srv.revision, active_page: 'p1', pages: srv.canvas.pages, mount: srv.next }, bad));
+    };
+    const t = setup(srv);
+    await assert.rejects(t.panel.open({ binding: BINDING, refs: t.refs }).started, /another canvas/, JSON.stringify(bad));
+    assert.equal(t.engine.editors.length, 0, 'no editor booted');
+    assert.deepEqual(srv.named(T.RELEASE), [{ binding: BINDING, mount: 1 }], 'its mount is released');
+  }
 });

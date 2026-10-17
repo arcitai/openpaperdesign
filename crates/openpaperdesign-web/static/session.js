@@ -25,9 +25,11 @@
 
 export class Session {
   /**
+   * `page` is what the editor edits as one unit: the whole canvas (every page, the page list and
+   * the active page) as the server sends it, and its one canvas revision.
    * deps: {
    *   boot(canvas, page, webgl) -> Promise<editor>   page = { text, revision }
-   *   fetchPage() -> Promise<page>                    the page as the server has it now
+   *   fetchPage() -> Promise<page>                    the canvas as the server has it now
    *   replaceCanvas(old) -> canvas                    a fresh canvas in place of `old`
    *   observeResize(canvas, onResize) -> { disconnect() }
    *   put(snapshot, revision) -> Promise<{ ok, status, revision }>

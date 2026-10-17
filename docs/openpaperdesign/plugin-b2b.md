@@ -42,18 +42,20 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home is `ui://openpaperdesign/home-4.html` (2026-10-17: its editor
-  hosts upstream's workspace UI and has no tool buttons of its own; `home-3` was the
-  browser-first home with them). The earlier `home-2` view opened canvases in the panel and
-  expected panel results. Hosts may cache a view
+- **View version.** This home is `ui://openpaperdesign/home-5.html` (2026-10-17: its editor
+  loads and saves the whole canvas, every page, the page list and the active page; its renderer
+  starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
+  (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still
+  loading one page; `home-3` was the browser-first home with them. The earlier `home-2` view
+  opened canvases in the panel and expected panel results. Hosts may cache a view
   by its resource URI; OpenAI's [Apps UI guidance](https://developers.openai.com/plugins/build/chatgpt-ui)
   (read 2026-10-17) asks for a new URI, everywhere it is referenced, for breaking HTML/JS/CSS
-  changes. So a fresh tool listing or resource read gets `home-4` under a cache key no older
+  changes. So a fresh tool listing or resource read gets `home-5` under a cache key no older
   view used, and a read of an earlier URI is refused. That guidance promises no eviction.
   - **What it doesn't do.** It doesn't evict or refresh a view a host already has open, and it
     doesn't stop such a view from making ordinary tool calls. The server doesn't learn which
     view version is calling (`panel: true` is still a supported request).
-  - **Still unproven.** Which `home-4` metadata, resource and visible view a native host
+  - **Still unproven.** Which `home-5` metadata, resource and visible view a native host
     actually uses still has to be shown through its supported lifecycle.
   - **Not a diagnosis.** This is a compatibility rule, not an explanation of what a Mac host
     cached.
@@ -90,15 +92,17 @@ its actual contracts are verified; compatibility is not assumed.
   inventory. The library actions were app-only, and every upstream design tool was refused.
 
 **Reuse map (upstream paper-rs).** The pinned baseline is upstream `0b1b91da` (from the
-2026-10-12 feasibility record). Verified there, not a claim about upstream's latest; no new
-upstream source change in this delta.
+2026-10-12 feasibility record). Verified there, not a claim about upstream's latest. Upstream
+source changes are listed in `AGENTS.md` (2026-10-17 page persistence: the page-rename focus
+fix and `Editor::page_gen` visibility; the `pages_locked` flag was removed again).
 
 | Upstream part | How it's used |
 |---|---|
 | Agent catalogue and execution (`mcp::tools`, `mcp::exec`, `mcp::css`/`html`) | Directly, in the serve crate's host (`agent.rs` `BoundHost`: an upstream `Editor` on its own thread). The library adds only the binding envelope. |
 | Document, scene and project structures (`model`, `project`, `project::format`) | Directly: library canvases are standard paper-rs projects. Saves write upstream's page and manifest format. |
 | Editor, tools, pointer/keyboard/undo (`editor`, `history`, `layout`, `text`, …) | In the browser through `#[path]` in `openpaperdesign-web` (`WebState` feeds DOM input through egui to `Editor`), and on the server through the agent host. |
-| Workspace UI (`ui`: layers, inspector, pages, palette, library, menus, floating tools, help) and its frame (`render::frame::{layout, Painter}`) | Directly, since 2026-10-17: `#[path]` in `openpaperdesign-web`, with upstream's `egui-wgpu` on the editor's own device. One host flag upstream (`UiState::pages_locked`, native default unchanged). |
+| Workspace UI (`ui`: layers, inspector, pages, palette, library, menus, floating tools, help) and its frame (`render::frame::{layout, Painter}`) | Directly, since 2026-10-17: `#[path]` in `openpaperdesign-web`, with upstream's `egui-wgpu` on the editor's own device. The pages panel is live: the whole canvas travels (below). |
+| Pages (`editor::pages`: `open_pages`, `PageSlot`/`PageStash`, add/switch/rename/duplicate/move/delete, `dirty_pages`, `mark_page_saved`, `page_data`) | Directly, in `WebState`: every page loaded with its own history, selection and camera; a save sends the list, the active page and each changed page's upstream file; its answer acknowledges exactly what it sent (`Editor::page_gen`, made `pub`). The server writes them with one checked commit (`Server::save_canvas_within`, `/api/canvas`, `_app_canvas_save`). |
 | Renderer (`render::{draw, gpu, mesh, rough, scene, tess}`) | Directly, compiled to wasm32 (wgpu WebGPU/WebGL2). |
 | Core `#[path]` crate, web/WASM wrappers | Ours: `openpaperdesign-core`/`-web` compile upstream modules unchanged. Our code is `state`/`web` glue, `health` and `keys`. |
 | Session lifecycle and editor mount (`static/session.js`, `editor.js`, `panel.js`) | Ours: hosting, fallback, save/conflict, disposal. |
@@ -110,7 +114,7 @@ upstream source change in this delta.
   the earlier four-tool DOM toolbar):
   - DOM input goes to egui, and canvas input to `Editor` as `App::over_canvas` does.
   - Every `AppRequest` is handled explicitly:
-    - Save is the checked page save;
+    - Save is the checked canvas save;
     - Home, New and Open go to the host's navigation;
     - SVG and PDF are upstream's in-memory export, as a download;
     - PNG and Copy as PNG (GPU read-back), Duplicate project and placing images are refused
@@ -118,8 +122,6 @@ upstream source change in this delta.
   - Clipboard goes through the page's copy/cut/paste events.
 
   Still not done:
-  - **Pages:** page-list actions are disabled (`pages_locked`), because the page saves one
-    page.
   - **Library tab:** session-only.
   - **Unsupported in the browser:** IME composition, copying out of egui fields outside a
     copy event, DOM accessibility of the egui UI, and image fills.
@@ -160,7 +162,7 @@ primary and this panel is optional ("Edit in this view").
   discard, WebGPU-to-WebGL fallback) and one shared mount (`static/editor.js`, also used by
   `app.js`). No second renderer, document store, runtime or dependency.
 - **One fixed module.** The home resource was versioned `ui://openpaperdesign/home-2.html` for
-  this module (now `home-4`, the browser-first home above).
+  this module (now `home-5`, the browser-first home above).
   Its one `<script type="module">` starts with an editor slot. An app-library server fills that
   slot with the packaged glue, `session.js`, `page.js`, `editor.js` and `panel.js`, in that
   order, only if no part has an import, `</script`, `<script` or `<!--`. Otherwise the slot
@@ -329,7 +331,7 @@ installed check.
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
 adds `openpaperdesign_home`, a Codex sidebar (global) entry that is also a chat tab (thread
 entry), and its static MCP App view `ui://openpaperdesign/home.html`
-(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-4.html`, the
+(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-5.html`, the
 browser-first home at the top of this record). It also adds a read-only native project inventory,
 `openpaperdesign_projects`, and a read-only list of this workspace's canvases,
 `openpaperdesign_canvases`. The server now lists 36 tools and one resource.

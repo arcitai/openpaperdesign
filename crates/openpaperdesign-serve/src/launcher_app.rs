@@ -53,9 +53,39 @@ pub(super) const REVISION: &str = "openpaperdesign_app_page_revision";
 pub(super) const SAVE: &str = "openpaperdesign_app_page_save";
 pub(super) const READY: &str = "openpaperdesign_app_ready";
 pub(super) const RELEASE: &str = "openpaperdesign_app_page_release";
-pub(super) const PANEL_TOOLS: [&str; 6] = [ASSET, PAGE, REVISION, SAVE, READY, RELEASE];
-pub(super) const TOOLS: [&str; 13] = [
-    LIST, CREATE, OPEN, EDITOR, CLOSE, IMPORT, EXPORT, ASSET, PAGE, REVISION, SAVE, READY, RELEASE,
+// The whole canvas (every page, the page list and the active page) for the in-panel editor,
+// as the browser editor's `/api/canvas`; the per-page tools above stay as they were.
+pub(super) const CANVAS: &str = "openpaperdesign_app_canvas";
+pub(super) const CANVAS_REVISION: &str = "openpaperdesign_app_canvas_revision";
+pub(super) const CANVAS_SAVE: &str = "openpaperdesign_app_canvas_save";
+pub(super) const PANEL_TOOLS: [&str; 9] = [
+    ASSET,
+    PAGE,
+    REVISION,
+    SAVE,
+    READY,
+    RELEASE,
+    CANVAS,
+    CANVAS_REVISION,
+    CANVAS_SAVE,
+];
+pub(super) const TOOLS: [&str; 16] = [
+    LIST,
+    CREATE,
+    OPEN,
+    EDITOR,
+    CLOSE,
+    IMPORT,
+    EXPORT,
+    ASSET,
+    PAGE,
+    REVISION,
+    SAVE,
+    READY,
+    RELEASE,
+    CANVAS,
+    CANVAS_REVISION,
+    CANVAS_SAVE,
 ];
 
 /// The packaged renderer goes to the in-panel editor in parts of this many bytes (the last one
@@ -299,6 +329,23 @@ fn tools() -> Vec<Value> {
             "description": "For the home view's own editor: it was left (Back, Close or the \
                 view going away). The canvas stays open; nothing is saved or changed.",
             "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
+        json!({"name": CANVAS, "_meta": app,
+            "description": "For the home view's own editor: the whole canvas this view shows \
+                (every page in list order as an upstream page file, the active page, and the \
+                canvas revision). Without mount the result names this editor's mount; then \
+                with mount.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding"])}),
+        json!({"name": CANVAS_REVISION, "_meta": app,
+            "description": "For the home view's own editor: the current canvas revision (any \
+                page, the page list or the active page).",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
+        json!({"name": CANVAS_SAVE, "_meta": app,
+            "description": "For the home view's own editor: save the canvas (the page list, \
+                the active page and each changed page), only if if_match is the canvas \
+                revision now. A stale one is refused and nothing is written.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount,
+                "if_match": {"type": "string", "maxLength": 64}, "text": {"type": "string"}}),
+                &["binding", "mount", "if_match", "text"])}),
         json!({"name": CLOSE, "_meta": app,
             "description": "For the home view: close the canvas this view shows (its editor \
                 server stops). Saved edits stay in the library; closing saves nothing.",
@@ -871,16 +918,17 @@ impl Launcher {
         panel_editor().map(|_| ()).map_err(panel_unavailable)
     }
 
-    /// The home view's own editor (the in-panel editor): the renderer's parts, and the page,
-    /// revision, save, Ready and release calls of the canvas the view shows. The renderer part
-    /// is static packaged data. Every page call names the view's `binding` and, after its first
-    /// read, the `mount` that read returned; both are compared under the state lock before
-    /// anything is read or written (`panel_server`, which also re-checks the canvas, library and
-    /// lease). The `page_id` is checked as a page of the canvas's manifest; a mount is not tied
-    /// to one page (the view keeps to the page it first read). The calls run through the same
-    /// `Server` operations as the browser's HTTP API (`Server::page`, `page_revision`,
-    /// `save_page_while`, `mark_ready`), with the same conflict, commit and rollback rules,
-    /// never through a loopback request.
+    /// The home view's own editor (the in-panel editor): the renderer's parts, and the canvas
+    /// (every page, the page list and the active page), its revision and save, the per-page
+    /// read, revision and save (kept as they were), Ready and release calls of the canvas the
+    /// view shows. The renderer part is static packaged data. Every page or canvas call names
+    /// the view's `binding` and, after its first read, the `mount` that read returned; both are
+    /// compared under the state lock before anything is read or written (`panel_server`, which
+    /// also re-checks the canvas, library and lease). A `page_id` is checked as a page of the
+    /// canvas's manifest; a mount is not tied to one page. The calls run through the same
+    /// `Server` operations as the browser's HTTP API (`Server::canvas`, `canvas_revision`,
+    /// `save_canvas_while`, `page`, `page_revision`, `save_page_while`, `mark_ready`), with the
+    /// same conflict, commit and rollback rules, never through a loopback request.
     ///
     /// A save is tied to its mount's lifetime: a release revokes it, and a save not started by
     /// then never runs; a save whose request is cancelled before it starts never runs either
@@ -918,6 +966,13 @@ impl Launcher {
                 &["binding", "page_id", "mount", "if_match", "text"],
             ),
             READY | RELEASE => (&["binding"], &["mount"], &["binding", "mount"]),
+            CANVAS => (&["binding"], &["mount"], &["binding"]),
+            CANVAS_REVISION => (&["binding"], &["mount"], &["binding", "mount"]),
+            CANVAS_SAVE => (
+                &["binding", "if_match", "text"],
+                &["mount"],
+                &["binding", "mount", "if_match", "text"],
+            ),
             _ => return Err(format!("unknown tool {name}")),
         };
         let bad = |status: u16, msg: &str| panel_refusal(status, msg, None);
@@ -951,13 +1006,14 @@ impl Launcher {
             ));
         }
         // No editor is mounted from a build that can't serve one.
-        if name == PAGE && mount.is_none() {
+        if (name == PAGE || name == CANVAS) && mount.is_none() {
             panel_editor().map_err(|why| bad(503, &panel_unavailable(why)))?;
         }
+        let save = name == SAVE || name == CANVAS_SAVE;
         // A save too large for the panel is refused before anything else, as the request it
         // came in (see `request_bytes`).
-        if name == SAVE {
-            let size = request_bytes(SAVE, args);
+        if save {
+            let size = request_bytes(name, args);
             if size > MAX_PANEL_MESSAGE {
                 return Err(bad(
                     413,
@@ -989,7 +1045,7 @@ impl Launcher {
             return text(json!({"binding": binding, "released": released.is_some()}));
         }
         const CANCELLED: &str = "the save was cancelled before it started; nothing was written";
-        let admitted = if name == SAVE {
+        let admitted = if save {
             // An already cancelled save, or one cancelled while waiting for admission, never
             // starts.
             tokio::select! {
@@ -1034,21 +1090,49 @@ impl Launcher {
                         ),
                     ));
                 }
-                let m = match mount {
-                    Some(m) => m,
-                    None => {
-                        // A new mount, only while this binding is still the open one.
-                        let mut state = self.state.lock().await;
-                        expect_binding(&state, Some(binding)).map_err(|e| bad(410, &e))?;
-                        let b = state.bound.as_mut().ok_or_else(|| bad(410, NO_CANVAS))?;
-                        b.next_mount += 1;
-                        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                        b.mounts.insert(b.next_mount, live);
-                        b.next_mount
+                out["mount"] = json!(self.mount_for(binding, mount).await?);
+                text(out)
+            }
+            CANVAS => {
+                let canvas = server.canvas().await.map_err(api_refusal)?;
+                let mut out = canvas.to_json().map_err(api_refusal)?;
+                out["binding"] = json!(binding);
+                // The widest mount number, for the measurement below.
+                out["mount"] = json!(MAX_SAFE_INTEGER);
+                // Measured as it would be sent, as a page read is; refused before a mount is
+                // registered.
+                let size = response_bytes(&text(out.clone()));
+                if size > MAX_PANEL_MESSAGE {
+                    return Err(bad(
+                        413,
+                        &format!(
+                            "this canvas is {size} bytes as a message, more than the in-panel \
+                             editor's {MAX_PANEL_MESSAGE}, so it wasn't opened here; nothing was \
+                             changed. Open it in the browser editor instead."
+                        ),
+                    ));
+                }
+                out["mount"] = json!(self.mount_for(binding, mount).await?);
+                text(out)
+            }
+            CANVAS_REVISION => {
+                let revision = server.canvas_revision().map_err(api_refusal)?;
+                text(json!({"binding": binding, "revision": revision}))
+            }
+            CANVAS_SAVE => {
+                let if_match = get("if_match").unwrap_or_default();
+                let body = get("text").unwrap_or_default();
+                let live = live.ok_or_else(|| bad(410, UNMOUNTED))?;
+                // As for a page save: cancellation first on every poll; once the save holds the
+                // fence it runs to its commit or rollback within that poll.
+                let revision = tokio::select! {
+                    biased;
+                    () = &mut cancelled => return Err(bad(503, CANCELLED)),
+                    r = server.save_canvas_while(&live, if_match, body) => {
+                        r.map_err(api_refusal)?
                     }
                 };
-                out["mount"] = json!(m);
-                text(out)
+                text(json!({"binding": binding, "saved": true, "revision": revision}))
             }
             REVISION => {
                 let page_id = page_id.unwrap_or_default();
@@ -1102,5 +1186,23 @@ impl Launcher {
             None => None,
         };
         Ok((b.server.clone(), live))
+    }
+
+    /// The mount of an in-panel read: the one it names, or for a first read (none) a new one,
+    /// registered only while `binding` is still the open one.
+    async fn mount_for(&self, binding: &str, mount: Option<u64>) -> Result<u64, String> {
+        if let Some(m) = mount {
+            return Ok(m);
+        }
+        let mut state = self.state.lock().await;
+        expect_binding(&state, Some(binding)).map_err(|e| panel_refusal(410, &e, None))?;
+        let b = state
+            .bound
+            .as_mut()
+            .ok_or_else(|| panel_refusal(410, NO_CANVAS, None))?;
+        b.next_mount += 1;
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        b.mounts.insert(b.next_mount, live);
+        Ok(b.next_mount)
     }
 }

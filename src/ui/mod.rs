@@ -44,10 +44,6 @@ pub struct UiState {
     pub layer_drag: Option<(NodeId, Option<LayerDrop>)>,
     /// Row rects of the last layers-panel frame (for drop targeting).
     pub layer_rows: Vec<(NodeId, egui::Rect, usize)>,
-    /// The host can't store page-list changes, so the pages panel shows the pages without
-    /// letting them be added, renamed, duplicated, deleted, reordered or switched. `false`
-    /// (the default, and the native app) keeps every page action.
-    pub pages_locked: bool,
 }
 
 /// Where a dragged layer lands relative to a row.

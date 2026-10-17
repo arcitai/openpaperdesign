@@ -261,7 +261,8 @@ impl Editor {
         self.revision += 1;
     }
 
-    fn page_gen(&self, i: usize) -> u64 {
+    /// Page `i`'s history generation (what `dirty_pages` compares with its `saved_gen`).
+    pub fn page_gen(&self, i: usize) -> u64 {
         if i == self.active_page {
             self.history.generation()
         } else {

@@ -5,8 +5,8 @@
 //!
 //! Time comes from the page (`performance.now()` / `event.timeStamp`), never from
 //! `std::time`, which panics on wasm32-unknown-unknown. Saving is pulled by the page:
-//! [`WebEditor::save_snapshot`] hands out the page file to PUT, and the server's revision
-//! check decides whether it lands.
+//! [`WebEditor::save_snapshot`] hands out the canvas save to send (page list, active page and
+//! each changed page), and the server's canvas revision check decides whether it lands.
 
 use crate::editor::Button;
 use crate::health::{self, Acquired, Health, Step};
@@ -69,19 +69,17 @@ fn install_panic_hook() {
     });
 }
 
-/// Open `page_json` (an upstream page file, listed in the manifest as `page_id`/`page_name`)
-/// on `canvas`.
+/// Open `canvas_json` (the whole canvas as the server sends it: every page, the page list and
+/// the active page, see `WebState::open`) on `canvas`.
 ///
 /// `seed` comes from `crypto.getRandomValues`: fastrand has no entropy source on
 /// wasm32-unknown-unknown and would otherwise start from a fixed seed, so ids made with
-/// `project::new_id` (pages) could repeat across sessions.
+/// `project::new_id` (new and duplicated pages) could repeat across sessions.
 #[allow(clippy::too_many_arguments)]
 #[wasm_bindgen]
 pub async fn start(
     canvas: web_sys::HtmlCanvasElement,
-    page_json: String,
-    page_id: String,
-    page_name: String,
+    canvas_json: String,
     seed_hi: u32,
     seed_lo: u32,
     mac: bool,
@@ -92,8 +90,7 @@ pub async fn start(
 ) -> Result<WebEditor, JsError> {
     install_panic_hook();
     fastrand::seed(((seed_hi as u64) << 32) | seed_lo as u64);
-    let state = WebState::open(&page_json, page_id, page_name, mac, css_width, css_height)
-        .map_err(js_err)?;
+    let state = WebState::open(&canvas_json, mac, css_width, css_height).map_err(js_err)?;
 
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = if force_webgl {
@@ -431,9 +428,9 @@ impl WebEditor {
         self.state.can_reload()
     }
 
-    /// Load a newer revision of this page in place (see [`WebState::reload`]).
-    pub fn reload(&mut self, page_json: &str) -> Result<(), JsError> {
-        self.state.reload(page_json).map_err(js_err)
+    /// Load the canvas as the server has it now, in place (see [`WebState::reload`]).
+    pub fn reload(&mut self, canvas_json: &str) -> Result<(), JsError> {
+        self.state.reload(canvas_json).map_err(js_err)
     }
 
     pub fn save_failed(&mut self) {

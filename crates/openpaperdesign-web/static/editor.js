@@ -250,8 +250,9 @@ export function opdMountEditor(opts) {
       if (disposed) return;
       const c = opts.conflictBox;
       c.replaceChildren();
-      c.append('This page was changed elsewhere (for example by an agent) since your unsaved '
-        + 'change. Nothing was overwritten, and your change is not saved. ');
+      c.append('This canvas was changed elsewhere (a page, the page list or the active page, for '
+        + 'example by an agent) since your unsaved change. Nothing was overwritten, and your '
+        + 'change is not saved. ');
       const b = c.ownerDocument.createElement('button');
       b.type = 'button';
       b.textContent = 'Reload (discard my unsaved change)';

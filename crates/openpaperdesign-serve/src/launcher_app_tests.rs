@@ -1534,6 +1534,126 @@ async fn panel_pins_its_page_and_preserves_the_rest_of_a_multi_page_canvas() {
     bound_server(&lib.l).await.retire().await;
 }
 
+/// The in-panel editor's canvas tools (what panel.js uses since the pages panel is live): the
+/// first read names only the binding and returns every page, the active page, the canvas
+/// revision and a mount; a save of the page list, names, active page and the changed pages'
+/// content is one commit on the current revision, which the poll and a re-read follow; a save
+/// on the old revision is a conflict with nothing written; a cancelled save never starts; a
+/// released mount is refused; arguments are strict; and a fresh process reopens the canvas with
+/// every page and the remembered active page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_canvas_tools_save_every_page_and_the_active_page_and_reopen_them() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Pages", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let b = binding(&created);
+    let dir = location(&created);
+    let read = value(call(&lib.c, app::CANVAS, json!({"binding": b})).await);
+    assert_eq!(binding(&read), b);
+    let mount = read["mount"].as_u64().unwrap();
+    let rev = read["revision"].as_str().unwrap().to_string();
+    let first = read["active_page"].as_str().unwrap().to_string();
+    assert_eq!(read["pages"].as_array().unwrap().len(), 1);
+    let text = read["pages"][0]["text"].as_str().unwrap().to_string();
+    assert_eq!(text.as_bytes(), files(&dir, &first).0.as_slice());
+    let ids = json!({"binding": b, "mount": mount});
+    // The first page renamed and edited, a new page with its content, the new page active.
+    let second: String = first
+        .chars()
+        .enumerate()
+        .map(|(i, c)| match (i < 6, c) {
+            (true, '0') => '1',
+            (true, _) => '0',
+            (false, c) => c,
+        })
+        .collect();
+    let blank = paper_rs::project::PageData {
+        id: second.clone(),
+        name: "Notes".into(),
+        doc: Default::default(),
+        camera: None,
+    };
+    let save = json!({"active_page": second, "pages": [
+        {"id": first, "name": "Plan", "text": edited(&text)},
+        {"id": second, "name": "Notes", "text": paper_rs::project::format::page_to_json(&blank)},
+    ]})
+    .to_string();
+    let saved = value(
+        call(
+            &lib.c,
+            app::CANVAS_SAVE,
+            json!({"binding": b, "mount": mount, "if_match": rev, "text": save}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    let polled = value(call(&lib.c, app::CANVAS_REVISION, ids.clone()).await);
+    assert_eq!(polled["revision"], saved["revision"]);
+    let m = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(m.active_page.as_deref(), Some(second.as_str()));
+    let names: Vec<&str> = m.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Plan", "Notes"]);
+    let page1 = files(&dir, &first);
+    assert_eq!(node_count(std::str::from_utf8(&page1.0).unwrap()), 1);
+    assert!(dir.join("pages").join(format!("{second}.json")).is_file());
+    let reread = value(call(&lib.c, app::CANVAS, ids.clone()).await);
+    assert_eq!(reread["mount"], json!(mount));
+    assert_eq!(reread["revision"], saved["revision"]);
+    assert_eq!(reread["active_page"], json!(second));
+    // A save on the old revision: a conflict naming the current one; nothing written.
+    let before = (files(&dir, &first), files(&dir, &second));
+    let stale = json!({"binding": b, "mount": mount, "if_match": rev, "text": save});
+    let e = call(&lib.c, app::CANVAS_SAVE, stale).await.unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 409, "{e}");
+    assert_eq!(r["revision"], saved["revision"]);
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // A cancelled save never starts.
+    let args = json!({"binding": b, "mount": mount, "if_match": saved["revision"], "text": save});
+    let e = lib
+        .l
+        .panel_call(app::CANVAS_SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // Strict arguments.
+    for (tool, bad) in [
+        (app::CANVAS, json!({"binding": b, "page_id": first})),
+        (app::CANVAS_REVISION, json!({"binding": b})),
+        (
+            app::CANVAS_SAVE,
+            json!({"binding": b, "mount": mount, "text": save}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, bad).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 400, "{tool}: {e}");
+    }
+    // Released: refused, nothing written.
+    value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    let e = call(&lib.c, app::CANVAS_SAVE, args).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    let e = call(&lib.c, app::CANVAS_REVISION, ids).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // Closed, then a fresh process: every page and the remembered active page.
+    value(call(&lib.c, app::CLOSE, json!({"binding": b})).await);
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::OPEN, json!({"id": id, "panel": true})).await);
+    let again = value(call(&c2, app::CANVAS, json!({"binding": binding(&reopened)})).await);
+    assert_eq!(again["active_page"], json!(second));
+    let names: Vec<&str> = again["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Plan", "Notes"]);
+    assert_eq!(node_count(again["pages"][0]["text"].as_str().unwrap()), 1);
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
 /// The renderer parts: fixed packaged bytes only, numbered from 0, strictly whole numbers, each
 /// naming the same identity, size and count; anything else is refused and nothing is sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2129,8 +2249,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-4.html",
-        "versioned for the workspace view code"
+        HOME_URI, "ui://openpaperdesign/home-5.html",
+        "versioned for the whole-canvas view code"
     );
 }
 

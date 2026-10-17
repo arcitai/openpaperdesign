@@ -88,9 +88,11 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// in-panel editor module; `home-3` makes the home browser-first: New, Open, Import and Open
 /// current canvas ask for the loopback web editor link and open it, and the in-panel editor is
 /// only the optional "Edit in this view"; `home-4` hosts upstream's whole workspace UI in that
-/// editor (no tool buttons of the view's own; the workspace's Home is the view's Back). No
-/// earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-4.html";
+/// editor (no tool buttons of the view's own; the workspace's Home is the view's Back);
+/// `home-5` edits and saves the whole canvas (every page, the page list and the active page):
+/// its renderer starts on the whole canvas and its in-panel editor reads and saves through the
+/// `_app_canvas*` tools. No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-5.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

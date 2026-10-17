@@ -15,8 +15,6 @@ pub struct PagesUi {
 }
 
 const ROW_H: f32 = 24.0;
-/// Why page actions are off when the host can't store them (`UiState::pages_locked`).
-pub(super) const LOCKED: &str = "Pages can't be added, changed or switched here yet.";
 
 pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     let p = theme::pal(ui);
@@ -38,29 +36,16 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let locked = st.pages_locked;
-            ui.add_enabled_ui(!locked, |ui| {
-                if theme::icon_button(ui, Icon::Plus, 20.0, false)
-                    .on_hover_text("Add page")
-                    .on_disabled_hover_text(LOCKED)
-                    .clicked()
-                {
-                    ed.add_page();
-                }
-            });
+            if theme::icon_button(ui, Icon::Plus, 20.0, false)
+                .on_hover_text("Add page")
+                .clicked()
+            {
+                ed.add_page();
+            }
         });
     });
     if st.pages.collapsed {
         return;
-    }
-    if st.pages_locked {
-        st.pages.renaming = None;
-        st.pages.drag = None;
-        ui.label(
-            RichText::new(LOCKED)
-                .size(theme::SECONDARY)
-                .color(p.secondary),
-        );
     }
     let n = ed.pages.len();
     let max_h = (n as f32 * (ROW_H + 1.0)).min(6.5 * (ROW_H + 1.0));
@@ -87,14 +72,9 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
 fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) {
     let p = theme::pal(ui);
     let active = i == ed.active_page;
-    let locked = st.pages_locked;
     let (row, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_H),
-        if locked {
-            egui::Sense::hover()
-        } else {
-            egui::Sense::click_and_drag()
-        },
+        egui::Sense::click_and_drag(),
     );
     if active {
         ui.painter().rect_filled(row, 6.0, p.pressed);
@@ -130,12 +110,15 @@ fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) 
             name_rect.shrink2(egui::vec2(0.0, 2.0)),
             egui::TextEdit::singleline(name),
         );
-        r.request_focus();
+        // Focus is taken only until the field has it: asked for again after Enter or a click
+        // elsewhere, it would keep the field focused, so it never lost focus and never renamed.
         if r.lost_focus() {
             let (idx, name) = st.pages.renaming.take().unwrap();
             if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 ed.rename_page(idx, &name);
             }
+        } else if !r.has_focus() {
+            r.request_focus();
         }
     } else {
         let font = if active {
@@ -153,11 +136,6 @@ fn page_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, i: usize, top: f32) 
                 g,
                 Color32::PLACEHOLDER,
             );
-    }
-    if locked {
-        // Shown only: no switch, rename, drag or context menu reaches the editor.
-        let _ = resp.on_hover_text(LOCKED);
-        return;
     }
     if resp.double_clicked() {
         st.pages.renaming = Some((i, ed.pages[i].name.clone()));

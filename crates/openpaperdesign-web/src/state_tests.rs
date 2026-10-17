@@ -12,21 +12,96 @@ use crate::render::scene::{self, SceneCache};
 const W: f64 = 1280.0;
 const H: f64 = 800.0;
 
-/// One 200×100 rectangle at world (100, 100); camera at zoom 1, no pan; laid out once.
-fn state() -> WebState {
+/// Page `id` named `name` with one rectangle at `rect` (world); camera at zoom 1, no pan.
+fn page(id: &str, name: &str, rect: crate::geom::Rect) -> PageData {
     let mut doc = Document::default();
-    let id = doc.alloc_id();
-    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
-    doc.nodes.insert(id, Node::new(id, NodeKind::Rect, rect));
-    doc.root.push(id);
-    let page = PageData {
-        id: "p".into(),
-        name: "Page 1".into(),
+    let n = doc.alloc_id();
+    doc.nodes.insert(n, Node::new(n, NodeKind::Rect, rect));
+    doc.root.push(n);
+    PageData {
+        id: id.into(),
+        name: name.into(),
         doc,
         camera: Some(Default::default()),
-    };
-    let json = page_to_json(&page);
-    let mut s = WebState::open(&json, "p".into(), "Page 1".into(), false, W, H).unwrap();
+    }
+}
+
+/// The canvas as the server sends it (`/api/canvas`): `pages` in list order, `active` shown.
+fn canvas(pages: &[PageData], active: &str) -> String {
+    let list: Vec<serde_json::Value> = pages
+        .iter()
+        .map(|p| {
+            serde_json::json!({"id": p.id, "name": p.name, "revision": "\"r\"", "text": page_to_json(p)})
+        })
+        .collect();
+    serde_json::json!({"canvas": {"name": "Canvas"}, "revision": "\"c\"", "active_page": active, "pages": list})
+        .to_string()
+}
+
+/// Every page of the editor as it is now (what a server would serve once all of it was saved).
+fn pages_now(s: &WebState) -> Vec<PageData> {
+    (0..s.ed.pages.len()).map(|i| s.ed.page_data(i)).collect()
+}
+
+/// A canvas save as the editor sends it: the active page, the page list `(id, name)` and the
+/// pages whose content it carries `(id, page file)`.
+type Save = (String, Vec<(String, String)>, Vec<(String, PageData)>);
+
+fn parse_save(snap: &str) -> Save {
+    let v: serde_json::Value = serde_json::from_str(snap).unwrap();
+    let list = v["pages"].as_array().unwrap();
+    let id = |p: &serde_json::Value| p["id"].as_str().unwrap().to_string();
+    let names = list
+        .iter()
+        .map(|p| (id(p), p["name"].as_str().unwrap().to_string()))
+        .collect();
+    let sent = list
+        .iter()
+        .filter_map(|p| {
+            let text = p.get("text")?.as_str()?;
+            Some((id(p), page_from_json(text).unwrap()))
+        })
+        .collect();
+    (v["active_page"].as_str().unwrap().to_string(), names, sent)
+}
+
+/// The one page file a canvas save carries.
+fn sent_page(snap: &str) -> PageData {
+    let (_, _, mut sent) = parse_save(snap);
+    assert_eq!(sent.len(), 1, "one page's content");
+    sent.remove(0).1
+}
+
+/// One 200×100 rectangle at world (100, 100) on the canvas's one page; camera at zoom 1, no
+/// pan; laid out once.
+fn state() -> WebState {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages = [page("p", "Page 1", rect)];
+    let mut s = WebState::open(&canvas(&pages, "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    s
+}
+
+/// Two pages: "Alpha" (a 200×100 rectangle at (100, 100)) and "Beta" (a 50×50 one at
+/// (400, 300)), as the server has them.
+fn two_pages_data() -> Vec<PageData> {
+    vec![
+        page(
+            "alpha1",
+            "Alpha",
+            crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0),
+        ),
+        page(
+            "beta22",
+            "Beta",
+            crate::geom::Rect::new(400.0, 300.0, 50.0, 50.0),
+        ),
+    ]
+}
+
+/// [`two_pages_data`] opened on its remembered active page, "Beta"; laid out.
+fn two_pages() -> WebState {
+    let mut s = WebState::open(&canvas(&two_pages_data(), "beta22"), false, W, H).unwrap();
     settle(&mut s, 0.0);
     s
 }
@@ -271,11 +346,11 @@ fn press(s: &mut WebState, key: &str, code: &str) {
     s.key_up(key, code);
 }
 
-/// The page with node `id` renamed to `name`, as an agent saved it.
+/// The canvas with node `id` of the first page renamed to `name`, as an agent saved it.
 fn renamed_elsewhere(s: &WebState, id: crate::model::NodeId, name: &str) -> String {
-    let mut page = s.ed.page_data(0);
-    page.doc.nodes.get_mut(&id).unwrap().name = name.into();
-    page_to_json(&page)
+    let mut pages = pages_now(s);
+    pages[0].doc.nodes.get_mut(&id).unwrap().name = name.into();
+    canvas(&pages, s.ed.active_page_id())
 }
 
 #[test]
@@ -756,7 +831,7 @@ fn inspector_edits_are_coalesced_undoable_changes_of_the_saved_page() {
     }
     assert_eq!(s.ed.doc.get(id).unwrap().rect.w, 230.0);
     let snap = s.save_snapshot().expect("a change to save");
-    let saved = page_from_json(&snap).unwrap();
+    let saved = sent_page(&snap);
     assert_eq!(saved.doc.get(id).unwrap().rect.w, 230.0);
     s.save_succeeded();
     s.run(Action::Undo);
@@ -767,85 +842,412 @@ fn inspector_edits_are_coalesced_undoable_changes_of_the_saved_page() {
     );
 }
 
-// ---- pages: shown, never changed
+// ---- pages: upstream's pages panel on the whole canvas, saved as one canvas
 
-/// Page ids and names, active page, document stamp, the page file, selection, undo depth.
-type PageState = (
-    Vec<(String, String)>,
-    usize,
-    u64,
-    String,
-    Vec<crate::model::NodeId>,
-    usize,
-);
-
-/// Everything a page action could disturb.
-fn page_state(s: &WebState) -> PageState {
-    (
-        s.ed.pages
-            .iter()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .collect(),
-        s.ed.active_page,
-        s.ed.doc_stamp,
-        page_to_json(&s.ed.page_data(s.ed.active_page)),
-        s.ed.selection.clone(),
-        s.ed.history.undo_len(),
-    )
+/// Where text `wanted` is painted (its centre, CSS px) in the region `within` accepts.
+fn painted_at(s: &mut WebState, wanted: &str, within: impl Fn(egui::Rect) -> bool) -> (f64, f64) {
+    let text = painted_text(s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, r)| t.trim() == wanted && within(*r))
+        .unwrap_or_else(|| panic!("{wanted:?} isn't painted there: {text:?}"));
+    (r.center().x as f64, r.center().y as f64)
 }
 
-/// Clicks and double-clicks over the top of the left sidebar: the pages panel's header (with
-/// Add page) and first row, above the layers tabs and their arrange buttons.
-fn press_the_pages_panel(s: &mut WebState) {
-    let c = s.canvas_rect();
-    let mut t = 1000.0;
-    let mut y = 4.0;
-    while y < 56.0 {
-        let mut x = 4.0;
-        while x < c.min.x as f64 {
-            for _ in 0..2 {
-                click(s, (x, y), t);
-                t += 30.0;
-            }
-            step(s);
-            t += 500.0;
-            x += 12.0;
+/// The row of page `name` in upstream's pages panel (the left sidebar).
+fn page_row(s: &mut WebState, name: &str) -> (f64, f64) {
+    let left = s.canvas_rect().min.x;
+    painted_at(s, name, |r| r.max.x <= left)
+}
+
+/// A click on page `name`'s row, laid out.
+fn click_page(s: &mut WebState, name: &str, t: f64) {
+    let p = page_row(s, name);
+    click(s, p, t);
+    step(s);
+    step(s);
+}
+
+/// Item `item` of page `name`'s context menu (upstream's Rename, Duplicate, Delete), opening
+/// the menu with a secondary click on the row if it isn't shown.
+fn menu_item(s: &mut WebState, name: &str, item: &str, t: f64) -> (f64, f64) {
+    if !paints(s, item) {
+        let (x, y) = page_row(s, name);
+        s.pointer_down(x, y, Button::Secondary, t);
+        s.pointer_up(x, y, Button::Secondary, t + 10.0);
+        step(s);
+        step(s);
+    }
+    painted_at(s, item, |_| true)
+}
+
+#[test]
+fn every_page_opens_on_the_remembered_one_and_a_switch_saves_as_the_page_list() {
+    let mut s = two_pages();
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "Beta"], "every page, in list order");
+    assert_eq!(s.ed.page_name(), "Beta", "the remembered active page");
+    assert!(!s.dirty() && s.can_reload());
+    assert!(s.save_snapshot().is_none(), "nothing to save");
+    // A click on Alpha's row in upstream's pages panel switches to it.
+    click_page(&mut s, "Alpha", 100.0);
+    assert_eq!(s.ed.page_name(), "Alpha");
+    assert!(
+        s.dirty() && !s.can_reload(),
+        "the active page is the canvas's to save"
+    );
+    let snap = s.save_snapshot().expect("a page-list save");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, "alpha1");
+    assert_eq!(
+        list,
+        [
+            ("alpha1".to_string(), "Alpha".to_string()),
+            ("beta22".to_string(), "Beta".to_string())
+        ]
+    );
+    assert!(sent.is_empty(), "no page's content changed");
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload() && !s.unsaved_work());
+}
+
+#[test]
+fn each_page_keeps_its_own_history_selection_and_camera_across_switches() {
+    let mut s = two_pages();
+    // Beta: its rectangle selected and moved (one undoable edit), its camera panned.
+    click_at(&mut s, 425.0, 325.0, 0.0);
+    let b = s.ed.selection[0];
+    ui::inspector::apply(&mut s.ed, "x", &[b], |n| n.rect.x = 410.0);
+    s.ed.camera.pan = v2(-30.0, 20.0);
+    step(&mut s);
+    // Alpha, through the pages panel: its own (empty) selection and view; delete its rectangle.
+    click_page(&mut s, "Alpha", 200.0);
+    assert_eq!(s.ed.page_name(), "Alpha");
+    assert!(s.ed.selection.is_empty(), "Alpha's own selection");
+    assert_eq!(s.ed.camera.pan, V2::ZERO, "Alpha's own camera");
+    click_at(&mut s, 150.0, 150.0, 400.0);
+    assert_eq!(s.ed.selection.len(), 1);
+    assert!(s.key_down("Delete", "Delete", false));
+    assert!(s.ed.doc.nodes.is_empty());
+    // Back on Beta: its edit, selection and camera as they were; its undo is its own.
+    click_page(&mut s, "Beta", 600.0);
+    assert_eq!(s.ed.page_name(), "Beta");
+    assert_eq!(s.ed.selection, vec![b]);
+    assert_eq!(s.ed.camera.pan, v2(-30.0, 20.0));
+    assert_eq!(s.ed.doc.get(b).unwrap().rect.x, 410.0);
+    s.run(Action::Undo);
+    assert_eq!(s.ed.doc.get(b).unwrap().rect.x, 400.0, "Beta's own undo");
+    assert_eq!(s.ed.page_doc(0).nodes.len(), 0, "Alpha's deletion is kept");
+    // Both pages changed since they were loaded: both are saved, as they are now.
+    let snap = s.save_snapshot().expect("both pages");
+    let (active, _, sent) = parse_save(&snap);
+    assert_eq!(active, "beta22");
+    let ids: Vec<&str> = sent.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["alpha1", "beta22"]);
+    assert!(sent[0].1.doc.nodes.is_empty(), "Alpha's deletion");
+    assert_eq!(
+        sent[1].1.doc.get(b).unwrap().rect.x,
+        400.0,
+        "Beta as undone"
+    );
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn the_pages_panel_renames_on_enter_or_a_click_away_and_escape_or_a_discard_drops_it() {
+    for finish in ["Enter", "click", "Escape", "discard"] {
+        let mut s = two_pages();
+        // A double-click on the row opens upstream's rename field.
+        let p = page_row(&mut s, "Beta");
+        click(&mut s, p, 100.0);
+        step(&mut s);
+        click(&mut s, p, 150.0);
+        step(&mut s);
+        step(&mut s);
+        assert!(s.ui.pages.renaming.is_some(), "{finish}: the field is open");
+        assert!(s.field_has_keyboard(), "{finish}: with the keyboard");
+        assert!(s.can_reload(), "{finish}: nothing typed, nothing to lose");
+        press(&mut s, "q", "KeyQ");
+        assert!(!s.can_reload(), "{finish}: queued typing");
+        step(&mut s);
+        assert_eq!(s.ed.page_name(), "Beta", "{finish}: a draft");
+        assert!(
+            !s.dirty() && s.unsaved_work() && !s.can_reload(),
+            "{finish}: the draft is guarded"
+        );
+        assert!(s.save_snapshot().is_none(), "{finish}: nothing to save yet");
+        s.set_focused(false);
+        step(&mut s);
+        assert!(
+            s.ui.pages.renaming.is_some() && s.unsaved_work() && !s.can_reload(),
+            "{finish}: kept through a blur"
+        );
+        s.set_focused(true);
+        step(&mut s);
+        match finish {
+            "Enter" => press(&mut s, "Enter", "Enter"),
+            "click" => click_at(&mut s, 700.0, 500.0, 2000.0),
+            "Escape" => press(&mut s, "Escape", "Escape"),
+            // The conflict banner's explicit discard: the server's canvas, in place.
+            _ => s.reload(&canvas(&two_pages_data(), "beta22")).unwrap(),
         }
-        y += 6.0;
+        step(&mut s);
+        step(&mut s);
+        assert!(s.ui.pages.renaming.is_none(), "{finish}: the field closed");
+        assert!(!s.field_has_keyboard(), "{finish}");
+        if matches!(finish, "Escape" | "discard") {
+            // Enter now has no field to finish: the draft never comes back.
+            s.key_down("Enter", "Enter", false);
+            s.key_up("Enter", "Enter");
+            step(&mut s);
+            step(&mut s);
+            assert_eq!(s.ed.page_name(), "Beta", "{finish}: dropped");
+            assert!(
+                !s.dirty() && !s.unsaved_work() && s.can_reload(),
+                "{finish}"
+            );
+            continue;
+        }
+        let name = s.ed.page_name().to_string();
+        assert!(name != "Beta" && name.contains('q'), "{finish}: {name}");
+        assert!(s.dirty() && !s.can_reload(), "{finish}: a change to save");
+        let snap = s.save_snapshot().expect("the rename is saved");
+        let (_, list, sent) = parse_save(&snap);
+        assert_eq!(list[1], ("beta22".to_string(), name.clone()), "{finish}");
+        assert!(sent.is_empty(), "{finish}: a name is the page list's");
+        s.save_succeeded();
+        assert!(!s.dirty() && s.can_reload(), "{finish}: saved");
     }
 }
 
 #[test]
-fn page_actions_are_disabled_and_change_nothing() {
-    // The control: the same presses with page actions available do change pages.
-    let mut open = state();
-    open.ui.pages_locked = false;
-    step(&mut open);
-    let before = page_state(&open);
-    press_the_pages_panel(&mut open);
-    assert!(
-        open.ed.pages.len() > 1 || open.ui.pages.renaming.is_some() || page_state(&open) != before,
-        "the presses reach the pages panel's controls"
+fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page() {
+    let mut s = state();
+    // The only page: upstream's Delete is disabled, so it stays.
+    let d = menu_item(&mut s, "Page 1", "Delete", 100.0);
+    click(&mut s, d, 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.pages.len(), 1, "the last page stays");
+    assert!(!s.dirty());
+    // Duplicate: a copy after it, shown.
+    let d = menu_item(&mut s, "Page 1", "Duplicate", 300.0);
+    click(&mut s, d, 400.0);
+    step(&mut s);
+    step(&mut s);
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Page 1", "Page 1 copy"]);
+    assert_eq!(s.ed.page_name(), "Page 1 copy");
+    assert_eq!(s.ed.page_doc(1).nodes.len(), 1, "with the page's content");
+    // Delete the copy from its menu.
+    let d = menu_item(&mut s, "Page 1 copy", "Delete", 500.0);
+    click(&mut s, d, 600.0);
+    step(&mut s);
+    step(&mut s);
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Page 1"]);
+    // The header's + (Add page): pressed where it is, right of the "Pages" title.
+    let left = s.canvas_rect().min.x as f64;
+    let (title_x, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+    let mut x = left - 4.0;
+    let mut t = 1000.0;
+    while s.ed.pages.len() == 1 && x > title_x {
+        click(&mut s, (x, title_y), t);
+        step(&mut s);
+        x -= 4.0;
+        t += 500.0;
+    }
+    step(&mut s);
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Page 1", "Page 2"], "added after the active page");
+    assert_eq!(s.ed.page_name(), "Page 2");
+    // Drag Page 2's row onto Page 1's: reordered.
+    let (from, to) = (page_row(&mut s, "Page 2"), page_row(&mut s, "Page 1"));
+    s.pointer_move(from.0, from.1, t);
+    s.pointer_down(from.0, from.1, Button::Primary, t);
+    step(&mut s);
+    for k in 1..=2 {
+        let y = from.1 + (to.1 - from.1) * k as f64 / 2.0;
+        s.pointer_move(from.0, y, t + k as f64 * 20.0);
+        step(&mut s);
+    }
+    s.pointer_up(to.0, to.1, Button::Primary, t + 100.0);
+    step(&mut s);
+    step(&mut s);
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Page 2", "Page 1"], "reordered");
+    assert_eq!(s.ed.page_name(), "Page 2", "the shown page stays");
+    // One save: the new list and active page, and the new page's content (never saved).
+    let new = s.ed.active_page_id().to_string();
+    let snap = s.save_snapshot().expect("the page changes");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, new);
+    assert_eq!(
+        list,
+        [
+            (new.clone(), "Page 2".to_string()),
+            ("p".to_string(), "Page 1".to_string())
+        ]
     );
-    // This host: page actions are off, so exactly nothing changes.
+    let ids: Vec<&str> = sent.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, [new.as_str()], "only the new page's content");
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn a_saved_canvas_reopens_with_every_page_its_order_names_active_page_and_content() {
+    let mut s = two_pages();
+    // Upstream's page operations, as the pages panel and inspector run them.
+    let added = s.ed.add_page();
+    s.ed.rename_page(added, "Gamma");
+    let n = s.ed.edit("Add", |tx| {
+        let id = tx.alloc_id();
+        let r = crate::geom::Rect::new(7.0, 8.0, 9.0, 10.0);
+        tx.insert(Node::new(id, NodeKind::Ellipse, r), None, None)
+    });
+    s.ed.duplicate_page(0);
+    s.ed.move_page(0, 3);
+    s.ed.rename_page(0, "Alpha again");
+    let snap = s.save_snapshot().expect("the page changes");
+    s.save_succeeded();
+    assert!(!s.dirty());
+    let (active, list, _) = parse_save(&snap);
+    // What the server has now is exactly what the editor holds: reopened, nothing is lost.
+    let reopened = WebState::open(&canvas(&pages_now(&s), &active), false, W, H).unwrap();
+    let ids = |s: &WebState| -> Vec<(String, String)> {
+        s.ed.pages
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect()
+    };
+    assert_eq!(ids(&reopened), list, "order, ids and names");
+    assert_eq!(ids(&reopened), ids(&s));
+    assert_eq!(reopened.ed.active_page_id(), s.ed.active_page_id());
+    for i in 0..s.ed.pages.len() {
+        assert_eq!(
+            reopened.ed.page_doc(i).nodes,
+            s.ed.page_doc(i).nodes,
+            "page {i}"
+        );
+    }
+    let gamma = reopened
+        .ed
+        .pages
+        .iter()
+        .position(|p| p.name == "Gamma")
+        .unwrap();
+    assert!(reopened.ed.page_doc(gamma).nodes.contains_key(&n));
+    assert!(!reopened.dirty() && reopened.can_reload());
+}
+
+#[test]
+fn an_old_save_answer_never_marks_newer_edits_on_any_page_or_the_list_saved() {
+    let mut s = two_pages();
+    // Beta's rectangle deleted; the save of that is taken.
+    click_at(&mut s, 425.0, 325.0, 0.0);
+    assert!(s.key_down("Delete", "Delete", false));
+    let snap = s.save_snapshot().expect("Beta's change");
+    let (_, _, sent) = parse_save(&snap);
+    assert_eq!(sent.len(), 1);
+    // While it is in flight: a switch to Alpha, an edit there and a new page.
+    s.ed.switch_page(0);
+    let a = s.ed.doc.root[0];
+    ui::inspector::apply(&mut s.ed, "x", &[a], |n| n.rect.x = 5.0);
+    let added = s.ed.add_page();
+    assert!(s.save_snapshot().is_none(), "one save at a time");
+    // The first save's answer: only Beta's content as it was then counts as saved.
+    s.save_succeeded();
+    assert!(s.dirty() && !s.can_reload(), "the newer changes stay");
+    let beta = s.ed.pages.iter().position(|p| p.id == "beta22").unwrap();
+    let dirty = s.ed.dirty_pages();
+    assert!(dirty.contains(&0) && dirty.contains(&added), "{dirty:?}");
+    assert!(!dirty.contains(&beta), "Beta was saved");
+    let snap = s.save_snapshot().expect("the rest");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, s.ed.active_page_id());
+    assert_eq!(list.len(), 3);
+    let ids: Vec<&str> = sent.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["alpha1", s.ed.pages[added].id.as_str()]);
+    assert_eq!(sent[0].1.doc.get(a).unwrap().rect.x, 5.0);
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn an_undo_or_rename_after_a_save_was_taken_stays_to_save() {
     let mut s = state();
     click_at(&mut s, 150.0, 150.0, 0.0);
-    step(&mut s);
-    assert!(s.ui.pages_locked);
-    let before = page_state(&s);
-    press_the_pages_panel(&mut s);
-    assert!(s.ui.pages.renaming.is_none());
-    assert_eq!(
-        page_state(&s),
-        before,
-        "page list, document, history and selection kept"
-    );
+    assert!(s.key_down("Delete", "Delete", false));
+    let snap = s.save_snapshot().unwrap();
+    assert!(sent_page(&snap).doc.nodes.is_empty());
+    // Undone and the page renamed before the answer: the page differs from what was saved.
+    s.run(Action::Undo);
+    s.ed.rename_page(0, "Renamed");
+    s.save_succeeded();
+    assert!(s.dirty(), "the undo and the rename are newer than the save");
+    let snap = s.save_snapshot().expect("saved next");
+    let (_, list, _) = parse_save(&snap);
+    assert_eq!(list, [("p".to_string(), "Renamed".to_string())]);
+    assert_eq!(sent_page(&snap).doc.nodes.len(), 1, "the undone state");
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn a_refused_save_keeps_every_page_change_and_only_an_explicit_discard_drops_it() {
+    let mut s = two_pages();
+    click_at(&mut s, 425.0, 325.0, 0.0);
+    assert!(s.key_down("Delete", "Delete", false));
+    s.ed.switch_page(0);
+    s.ed.rename_page(0, "First");
+    s.ed.add_page();
+    let snap = s.save_snapshot().unwrap();
+    // Refused (a conflict, or no answer): everything stays unsaved and is sent again as it was.
+    s.save_failed();
+    assert!(s.dirty() && !s.can_reload() && s.unsaved_work());
+    assert_eq!(s.save_snapshot().as_deref(), Some(snap.as_str()));
+    s.save_failed();
+    assert_eq!(s.ed.pages.len(), 3);
+    // The explicit discard loads the server's canvas in place: every local change goes.
+    s.reload(&canvas(&two_pages_data(), "beta22")).unwrap();
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Alpha", "Beta"]);
+    assert_eq!(s.ed.page_name(), "Beta");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "Beta's rectangle is back");
+    assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
+}
+
+#[test]
+fn a_clean_reload_takes_the_whole_canvas_and_keeps_each_page_s_view() {
+    let mut s = two_pages();
+    s.ed.camera.pan = v2(-30.0, 20.0);
+    // The rectangle's centre (425, 325), where the panned camera shows it.
+    click_at(&mut s, 425.0 + 30.0, 325.0 - 20.0, 0.0);
+    assert_eq!(s.ed.selection.len(), 1);
+    let b = s.ed.selection[0];
+    // Elsewhere, Beta's rectangle was moved and a page added (an agent).
+    let mut pages = two_pages_data();
+    pages[1].doc.nodes.get_mut(&b).unwrap().rect.x = 420.0;
+    pages.push(page(
+        "gamma3",
+        "Gamma",
+        crate::geom::Rect::new(0.0, 0.0, 10.0, 10.0),
+    ));
+    assert!(s.can_reload());
+    s.reload(&canvas(&pages, "beta22")).unwrap();
+    assert_eq!(s.ed.pages.len(), 3);
+    assert_eq!(s.ed.page_name(), "Beta");
+    assert_eq!(s.ed.camera.pan, v2(-30.0, 20.0), "Beta's camera kept");
+    assert_eq!(s.ed.selection, vec![b], "and its selection");
+    assert_eq!(s.ed.doc.get(b).unwrap().rect.x, 420.0);
+    assert!(!s.dirty() && s.can_reload());
+    // A change of the active page made elsewhere shows rather than hides.
+    s.reload(&canvas(&pages, "gamma3")).unwrap();
+    assert_eq!(s.ed.page_name(), "Gamma");
+    assert!(s.ed.selection.is_empty());
     assert!(!s.dirty());
-    // Next/previous page from the keyboard: one page, so the active page stays.
-    s.key_down("PageDown", "PageDown", false);
-    s.key_down("PageUp", "PageUp", false);
-    step(&mut s);
-    assert_eq!(page_state(&s), before);
 }
 
 /// What the owner did in a real browser, at one point of the inspector: click, select all,
@@ -873,50 +1275,30 @@ fn inspector_edge(s: &WebState) -> f64 {
 }
 
 #[test]
-fn the_inspector_page_name_is_read_only_where_pages_are() {
-    // The control: where page changes can be stored (the native default), the inspector's page
-    // name field (nothing selected) takes that input and renames the page.
+fn the_inspector_page_name_renames_the_page_and_saves_it_with_the_page_list() {
+    // The inspector's page name field (nothing selected), found where it is painted: the
+    // owner's click, select all, "X" and Enter rename the page, as upstream does.
     let x = inspector_edge(&state());
     let mut found = None;
     let mut y = 40.0;
     while found.is_none() && y < H - 40.0 {
-        let mut open = state();
-        open.ui.pages_locked = false;
-        step(&mut open);
-        type_page_name(&mut open, (x, y));
-        if open.ed.page_name() == "X" {
-            found = Some(y);
+        let mut s = state();
+        type_page_name(&mut s, (x, y));
+        if s.ed.page_name() == "X" {
+            found = Some(s);
         }
         y += 8.0;
     }
-    let y = found.expect("the field renames the page where pages can change");
-    // This host: the same click and keys at the same place change nothing about the page.
-    let mut s = state();
-    assert!(s.ui.pages_locked);
-    let page = |s: &WebState| {
-        (
-            s.ed.pages
-                .iter()
-                .map(|p| (p.id.clone(), p.name.clone()))
-                .collect::<Vec<_>>(),
-            s.ed.active_page,
-            page_to_json(&s.ed.page_data(s.ed.active_page)),
-            s.ed.history.undo_len(),
-        )
-    };
-    let before = page(&s);
-    click(&mut s, (x, y), 5000.0);
-    step(&mut s);
-    assert!(
-        !s.field_has_keyboard(),
-        "the page name field is disabled, so it takes no keyboard"
-    );
-    type_page_name(&mut s, (x, y));
-    assert_eq!(s.ed.page_name(), "Page 1");
-    assert!(!s.ed.meta_dirty, "no page change is pending");
-    assert_eq!(page(&s), before, "page list, page file and history kept");
-    assert!(!s.dirty(), "nothing changed, so nothing is shown as saved");
-    assert!(s.save_snapshot().is_none());
+    let mut s = found.expect("the field renames the page");
+    assert!(!s.field_has_keyboard(), "Enter finished the field");
+    assert!(s.ed.meta_dirty && s.dirty() && !s.can_reload());
+    let snap = s.save_snapshot().expect("the new name is saved");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, "p");
+    assert_eq!(list, [("p".to_string(), "X".to_string())]);
+    assert!(sent.is_empty(), "the page's content is unchanged");
+    s.save_succeeded();
+    assert!(!s.dirty() && s.can_reload() && !s.unsaved_work());
 }
 
 // ---- keys
@@ -1127,9 +1509,11 @@ fn laser_expiry_after_a_long_gap_still_draws() {
 
 // ---- saving and reloading (unchanged rules)
 
-/// The page with the rectangle moved to x and a second rectangle, as another writer saved it.
+/// The canvas with the first page's rectangle moved to x and a second rectangle added, as
+/// another writer saved it.
 fn changed_elsewhere(s: &WebState, x: f64) -> String {
-    let mut page = s.ed.page_data(0);
+    let mut pages = pages_now(s);
+    let page = &mut pages[0];
     let id = *page.doc.nodes.keys().next().unwrap();
     page.doc.nodes.get_mut(&id).unwrap().rect.x = x;
     let n = page.doc.alloc_id();
@@ -1142,7 +1526,7 @@ fn changed_elsewhere(s: &WebState, x: f64) -> String {
         ),
     );
     page.doc.root.push(n);
-    page_to_json(&page)
+    canvas(&pages, s.ed.active_page_id())
 }
 
 #[test]
@@ -1205,7 +1589,7 @@ fn saves_follow_document_changes_only() {
     assert_eq!(s.save_snapshot().as_deref(), Some(snap.as_str()));
     s.save_succeeded();
     assert!(!s.dirty());
-    let saved = page_from_json(&snap).unwrap();
+    let saved = sent_page(&snap);
     let n = saved.doc.nodes.values().next().unwrap();
     assert!(n.rect.x > 100.0 && n.rect.y > 100.0, "moved: {:?}", n.rect);
 }

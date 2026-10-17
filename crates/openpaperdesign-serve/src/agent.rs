@@ -510,34 +510,8 @@ impl BoundHost {
         plain(&self.project.dir.join(PAGES_DIR), Kind::Dir)?;
         // Write only to safe names (listed pages come from the checked manifest, new ones get
         // upstream's random hex ids) and never through a link.
-        if let Some(bad) = ed.pages.iter().find(|p| !valid_page_id(&p.id)) {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save a page with unsafe id {:?}",
-                bad.id
-            )));
-        }
-        let mut folded = std::collections::HashSet::new();
-        if let Some(dup) = ed
-            .pages
-            .iter()
-            .find(|p| !folded.insert(p.id.to_ascii_lowercase()))
-        {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save: page id {:?} differs from another only in case",
-                dup.id
-            )));
-        }
-        let mut prefixes = std::collections::HashSet::new();
-        if let Some(dup) = ed
-            .pages
-            .iter()
-            .find(|p| !prefixes.insert(page_prefix(&p.id)))
-        {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save: page id {:?} shares its first six characters with another",
-                dup.id
-            )));
-        }
+        let ids: Vec<&str> = ed.pages.iter().map(|p| p.id.as_str()).collect();
+        crate::check_page_ids(&ids).map_err(crate::commit::CommitError::Failed)?;
         crate::refuse_if_broken(&self.broken)?;
         // One commit for the whole call (see `crate::commit`): new images, then every changed
         // page, then the manifest; on any error every file is as it was.

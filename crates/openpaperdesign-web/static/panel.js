@@ -12,18 +12,18 @@
 //   anything else stops the transfer with the exact reason. The glue's own init then compiles
 //   the bytes. Whether the host allows that (its content security policy) and gives the view
 //   WebGL2 or WebGPU is up to the host: a refusal is shown as it came.
-// - Page calls name the view's binding, then the page id and mount number its first read
-//   returned. The server compares the binding and mount before it reads or writes anything
-//   and checks the page id is a page of the canvas; keeping to that one page is this
-//   editor's own rule (the server doesn't tie a mount to a page). Saves are
-//   revision-checked exactly as the browser's; a save whose answer never came is treated as
-//   unknown (it is retried, and a conflict shows if it was written meanwhile), never as saved.
+// - The canvas travels whole, as in the browser editor: every page, the page list and the
+//   active page (`openpaperdesign_app_canvas`), under one canvas revision. Calls name the
+//   view's binding, then the mount number its first read returned. The server compares the
+//   binding and mount before it reads or writes anything. Saves are revision-checked exactly as
+//   the browser's; a save whose answer never came is treated as unknown (it is retried, and a
+//   conflict shows if it was written meanwhile), never as saved.
 
 const OPD_PANEL = Object.freeze({
   ASSET: 'openpaperdesign_app_editor_asset',
-  PAGE: 'openpaperdesign_app_page',
-  REVISION: 'openpaperdesign_app_page_revision',
-  SAVE: 'openpaperdesign_app_page_save',
+  CANVAS: 'openpaperdesign_app_canvas',
+  REVISION: 'openpaperdesign_app_canvas_revision',
+  SAVE: 'openpaperdesign_app_canvas_save',
   READY: 'openpaperdesign_app_ready',
   RELEASE: 'openpaperdesign_app_page_release',
   ASSET_NAME: 'openpaperdesign_web_bg.wasm',
@@ -166,6 +166,17 @@ export function opdCreatePanel(opts) {
       h.released = true;
       await call(P.RELEASE, { binding, mount: h.mount }, 5000).catch(() => {});
     };
+    // A canvas answer for this view: its binding, a revision, the active page and at least one
+    // page, each with its id, name and page file as text.
+    const readable = (v) => Boolean(v) && v.binding === binding && typeof v.revision === 'string'
+      && typeof v.active_page === 'string' && Array.isArray(v.pages) && v.pages.length > 0
+      && v.pages.every((p) => p && typeof p.id === 'string' && typeof p.name === 'string'
+        && typeof p.text === 'string');
+    // What the editor opens (its pages and active page, as text) and the revision it is at.
+    const canvasPage = (v) => ({
+      text: JSON.stringify({ active_page: v.active_page, pages: v.pages }),
+      revision: v.revision,
+    });
     h.started = (async () => {
       say('Loading the editor…');
       try {
@@ -175,30 +186,24 @@ export function opdCreatePanel(opts) {
         throw e;
       }
       if (!live()) return 'left';
-      say('Opening the page…');
-      const first = await call(P.PAGE, { binding });
+      say('Opening the canvas…');
+      const first = await call(P.CANVAS, { binding });
       if (first.ok && Number.isInteger(first.ok.mount)) h.mount = first.ok.mount;
       if (!live()) { await release(); return 'left'; }
       if (!first.ok) throw new Error(describe(first));
       const v = first.ok;
-      if (v.binding !== binding || !v.page || typeof v.page.id !== 'string' || typeof v.page.name !== 'string'
-        || typeof v.text !== 'string' || typeof v.revision !== 'string' || !Number.isInteger(v.mount) || v.mount < 1) {
+      if (!readable(v) || !Number.isInteger(v.mount) || v.mount < 1) {
         await release();
-        throw new Error('Codex answered with another canvas or page than the one shown here, so it wasn\'t opened.');
+        throw new Error('Codex answered with another canvas than the one shown here, so it wasn\'t opened.');
       }
-      const pageId = v.page.id;
-      const pageName = v.page.name;
-      // Every later call names exactly this binding, page and mount.
-      const ids = { binding, page_id: pageId, mount: v.mount };
+      const active = v.pages.find((p) => p.id === v.active_page) || v.pages[0];
+      // Every later call names exactly this binding and mount.
+      const ids = { binding, mount: v.mount };
       const fetchPage = async () => {
-        const r = await call(P.PAGE, ids);
+        const r = await call(P.CANVAS, ids);
         if (!r.ok) throw new Error(describe(r));
-        const p = r.ok;
-        if (p.binding !== binding || !p.page || p.page.id !== pageId || typeof p.text !== 'string'
-          || typeof p.revision !== 'string') {
-          throw new Error('Codex answered with another page than this one.');
-        }
-        return { text: p.text, revision: p.revision };
+        if (!readable(r.ok)) throw new Error('Codex answered with another canvas than this one.');
+        return canvasPage(r.ok);
       };
       const put = async (snapshot, revision) => {
         const args = Object.assign({}, ids, { if_match: revision, text: snapshot });
@@ -208,7 +213,7 @@ export function opdCreatePanel(opts) {
         const r = await call(P.SAVE, args, 130000);
         if (r.ok) {
           const s = r.ok;
-          if (s.saved !== true || s.binding !== binding || s.page_id !== pageId || typeof s.revision !== 'string') {
+          if (s.saved !== true || s.binding !== binding || typeof s.revision !== 'string') {
             throw new Error('unreadable save answer');
           }
           return { ok: true, status: 200, revision: s.revision };
@@ -222,8 +227,8 @@ export function opdCreatePanel(opts) {
       };
       const revision = async () => {
         const r = await call(P.REVISION, ids);
-        if (!r.ok || r.ok.page_id !== pageId || typeof r.ok.revision !== 'string') {
-          throw new Error(r.ok ? 'Codex answered for another page.' : describe(r));
+        if (!r.ok || r.ok.binding !== binding || typeof r.ok.revision !== 'string') {
+          throw new Error(r.ok ? 'Codex answered for another canvas.' : describe(r));
         }
         return r.ok.revision;
       };
@@ -237,18 +242,18 @@ export function opdCreatePanel(opts) {
         onHome,
         boot: (canvas, page, webgl) => {
           const r = canvas.getBoundingClientRect();
-          return engine.start(canvas, page.text, pageId, pageName, seed[0], seed[1], mac, webgl,
+          return engine.start(canvas, page.text, seed[0], seed[1], mac, webgl,
             r.width, r.height, env.devicePixelRatio());
         },
         transport: { fetchPage, put, revision },
-        firstPage: { text: v.text, revision: v.revision },
+        firstPage: canvasPage(v),
         forceWebgl: false,
         onReady: () => {
           if (!live()) return;
           // The server learns it too (as the browser editor's /api/ready); this view's own
           // Ready came from its own renderer, not from that.
           call(P.READY, { binding, mount: v.mount }).catch(() => {});
-          if (onReady) onReady({ pageId, pageName });
+          if (onReady) onReady({ pageId: active.id, pageName: active.name });
         },
         log: (msg) => console.error(msg),
         env,

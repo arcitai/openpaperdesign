@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.44 · Updated: 2026-10-17
+Revision: 0.46 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -28,17 +28,15 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     newly activated project drops stale entries for its page ids. `Server::retire` first
     closes admission and drains the current writer/rollback, then releases every page id
     the host held. Queued and retained old handles cannot execute or save after retirement.
-  - `src/ui/mod.rs`, `src/ui/pages.rs`, `src/ui/inspector.rs`: `UiState::pages_locked`
-    (default `false`, so the native app is unchanged). A host that can't store page-list
-    changes (the browser editor, which saves one page) sets it. The pages panel then shows the
-    pages with its add, rename, duplicate, delete, reorder and switch controls disabled, and
-    the inspector's page name field (nothing selected) is disabled too, instead of a copied UI.
-    Upstreamable as a host capability flag.
-  - `src/ui/mod.rs` `layer_row`: the inline layer rename checks `lost_focus` before asking for
-    focus again (and asks only while it lacks focus). With egui 0.36, `request_focus` takes
-    focus back at once, so the old order hid Enter and click-away and the rename never
-    committed, natively too. A plain upstream bug fix. `ui/pages.rs` page rename has the same
-    order; it is not changed here (pages are locked in the browser).
+  - `src/ui/mod.rs` `layer_row` and `src/ui/pages.rs` `page_row`: the inline layer and page
+    renames check `lost_focus` before asking for focus again (and ask only while they lack
+    focus). With egui 0.36, `request_focus` takes focus back at once, so the old order hid
+    Enter and click-away and the rename never committed, natively too. A plain upstream bug
+    fix, the same two lines in both places. (The earlier `UiState::pages_locked` host flag is
+    gone: the browser editor now stores every page action, so it had no caller left.)
+  - `src/editor/pages.rs`: `Editor::page_gen` is `pub` (visibility only). The browser host
+    records each sent page's history generation, so a save's late answer marks only what it
+    sent as saved, never a newer edit (upstream saves synchronously and has no such seam).
   - `src/ui/palette.rs`: `PaletteUi::search_id`, the search field's actual widget id, recorded
     each frame the palette is drawn (no behaviour change). The browser host needs it to exempt
     only that ephemeral search from its unfinished-input guard; the id is otherwise automatic
@@ -159,7 +157,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-4.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-5.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -175,7 +173,9 @@ resource registration uses it) and the URI tests. No earlier URI is served or al
 `home.html`; `home-2` added the in-panel editor; `home-3` (2026-10-17) is the browser-first
 home, where New/Open/Import/Open current canvas open the web editor link and the panel is
 optional; `home-4` (2026-10-17) hosts upstream's workspace UI in the editor (no tool buttons of
-the view's own).
+the view's own); `home-5` (2026-10-17) is the whole-canvas pages protocol: its renderer starts on
+the whole canvas and its in-panel editor reads and saves through `_app_canvas*`. A view a host
+already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -240,8 +240,9 @@ the only live copy) and `locks/<id>.lock`; ids are 16 hex digits made by the ser
 data. Listing creates and locks nothing and is bounded (entries and manifest bytes). In that
 process only the home, its resource, `openpaperdesign_status` (library report), the read-only
 inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export}`
-and in-panel editor tools (`_app_editor_asset`, `_app_page`, `_app_page_revision`,
-`_app_page_save`, `_app_ready`, `_app_page_release`), plus the agent's library controls and
+and in-panel editor tools (`_app_editor_asset`, `_app_canvas`, `_app_canvas_revision`,
+`_app_canvas_save`, the per-page `_app_page`, `_app_page_revision`, `_app_page_save`,
+`_app_ready`, `_app_page_release`), plus the agent's library controls and
 binding-guarded upstream design tools (below),
 are answered, with strict argument keys and types; every project route (including the
 `_ui_*` actions, the picker and the upstream design tools) is refused without admission or
@@ -312,18 +313,19 @@ The launcher inlines one fixed module into the view's one `<script type="module"
 `</script`, `<script`, `<!--` or an import; no eval, URL import, outbound domain, CSP, CORS or
 framing change. The renderer comes only from the packaged wasm, in sequential 256 KiB parts
 (integer `part`, identity/size/count/length checked, 16 MiB cap) and goes to the glue's own
-`__wbg_init({module_or_path: bytes})`. Page calls name the view's `binding`, then the `page_id`
-and `mount` of the first read (the manifest's active page, else its first). Binding and mount
+`__wbg_init({module_or_path: bytes})`. The view loads and saves the whole canvas
+(`_app_canvas*`, as the browser's `/api/canvas`, below); its calls name the view's `binding`,
+then the `mount` of the first read. The per-page tools stay for older views (`page_id` only
+checked as a manifest page; a mount isn't tied to a page). Binding and mount
 are compared under the state lock, which is released before the writer fence (never
-reversed); `page_id` is only checked as a manifest page (a mount isn't tied to a page; the view
-keeps to its own). They use the same `Server::{page, page_revision, save_page, mark_ready}` as
-HTTP: one transaction, structured 409/rollback/`Broken`, bounded queue. A save carries its
+reversed). They use the same `Server::{canvas, canvas_revision, save_canvas_while, page,
+page_revision, save_page_while, mark_ready}` as HTTP: one transaction, structured
+409/rollback/`Broken`, bounded queue. A save carries its
 mount's lifetime flag, checked again under the writer fence; a release clears it under the
 state lock, then waits for the fence before it is acknowledged, so a queued save of that mount
 never runs and a started one finishes first (the binding stays). A cancelled save never starts:
 cancellation is observed before and during admission and before the fence is taken. A started
-save always finishes, and retirement waits. A save writes only its page and the manifest's
-`modified`. Panel page messages are capped at 4 MiB as sent: a read as the whole tool result in
+save always finishes, and retirement waits. Panel messages are capped at 4 MiB as sent: a read as the whole tool result in
 its JSON-RPC response, a save as its whole `tools/call` request, each escaping counted, plus a
 fixed 16 KiB host allowance (not a known host limit), separately from the 64 MiB page limit;
 larger pages stay browser-only, untouched, and no mount is registered for them. `panel: true` on create/open/import/
@@ -379,11 +381,37 @@ Home/New/Open go to the host's own navigation (the panel's drained Back, or a st
 a browser tab); SVG/PDF export is upstream's in-memory export offered as a download; PNG
 export/copy (GPU read-back), Duplicate project and placing images from files are refused
 with a visible reason. Copy/cut/paste use the page's clipboard events through upstream's
-`clipboard::Provider`; no OS clipboard. The page saves one page, so page-list actions are
-disabled (`pages_locked`) rather than reverted; multi-page editing is an open gap. The
+`clipboard::Provider`; no OS clipboard. The
 Library tab is session-only (never the native library file). IME composition, copying out of
 egui text fields outside a copy event, DOM accessibility of the egui UI and image fills stay
 unsupported. Bundle changes need a new exact production qualification.
+
+Pages in the web editor (owner direction 2026-10-17, `state.rs`, `Server::{canvas,
+save_canvas_within}`): the editor holds the whole canvas through upstream `Editor::open_pages`
+(every page with its own history, selection and camera), and upstream's pages panel and
+inspector add, rename, duplicate, reorder, delete (never the last page) and switch pages with
+upstream's own operations. The transport is a bounded envelope around upstream's page files,
+never a new format: `GET /api/canvas` (and the panel's `_app_canvas`) returns every listed page,
+the active page and one canvas revision (a hash of the manifest's exact bytes and every listed
+page's revision), read under the writer fence; `PUT /api/canvas` (`_app_canvas_save`) sends
+`{active_page, pages: [{id, name, text?}]}` with that revision in `If-Match`. It is checked
+completely before the fence (shape, at most 1000 pages, ids by the shared `check_page_ids`,
+active page listed, each page file parsed and validated by upstream and naming its own id),
+then against the canvas under the fence: any change since (any page, the list or the active
+page) is a 409 with nothing written (conservative, no merge); a page new to the list must
+carry its content (no listed id reaches an unlisted file), and a changed name must be a page
+name. One `commit_fenced` writes the sent pages and the manifest (server-owned identity, name,
+format, version and creation time; the sent list and active page); rollback and `Broken` as
+for every save. A page left out of the list keeps its file, unreferenced and unreadable by id,
+as the agent's saves leave it; nothing is erased. The per-page API stays as it was. Dirty is
+upstream's own bookkeeping (`dirty_pages`, `meta_dirty`) plus the document stamp; a save
+records each sent page's history generation (`Editor::page_gen`) and the list and active page
+it sent, and its answer marks exactly those saved, never a newer edit, undo or page action. A
+refused save keeps everything. A reload (only when `can_reload`, or the explicit discard)
+replaces the whole canvas, shows the server's active page, keeps each remaining page's camera
+and the shown page's selection, and closes rename fields (layer and page). The agent's host
+reloads when the manifest changes (its revisions include the manifest's), so its default page
+follows the remembered active page, and its own saves keep the manifest's active page.
 
 ## Model profile
 
