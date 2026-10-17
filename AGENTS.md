@@ -4,7 +4,7 @@ Revision: 0.16 · Updated: 2026-10-13
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
-built-in browser or an MCP App panel ([issue #1](https://github.com/onlinesourdough/openpaperdesign/issues/1)).
+built-in browser or an MCP App panel ([issue #1](https://github.com/arcitai/openpaperdesign/issues/1)).
 It is not affiliated with or endorsed by Paper (paper.design). Do not suggest that it is.
 
 ## Upstream and credits
@@ -37,8 +37,8 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
 - Stage explicit paths only. Never use `git add -A` or `git add .`, because sandboxed sessions
   can show untracked placeholder dotfiles (`.bashrc`, `.gitconfig`, `.claude/`, ...) at the
   repo root that must not be committed.
-- Every GitHub write (issues, PRs, comments) targets `onlinesourdough/openpaperdesign`
-  explicitly (`gh ... --repo onlinesourdough/openpaperdesign`), never the upstream repo.
+- Every GitHub write (issues, PRs, comments) targets `arcitai/openpaperdesign`
+  explicitly (`gh ... --repo arcitai/openpaperdesign`), never the upstream repo.
 - The tests regenerate the tracked screenshots in `docs/screenshots/`. Restore them
   (`git checkout -- docs/screenshots`) unless a change is meant to update them.
 - Commits use Conventional Commits and keep the actual contributors' co-author trailers.

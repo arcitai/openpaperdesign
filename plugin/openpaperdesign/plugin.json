@@ -3,10 +3,10 @@
   "name": "openpaperdesign",
   "version": "0.1.0",
   "description": "Edit a design project in your workspace with an agent and in an editable canvas in the in-app browser (paper-rs, local only).",
-  "author": { "name": "onlinesourdough", "url": "https://github.com/onlinesourdough" },
+  "author": { "name": "Arc’IT AI", "url": "https://github.com/arcitai" },
   "license": "MIT OR Apache-2.0",
-  "repository": "https://github.com/onlinesourdough/openpaperdesign",
-  "homepage": "https://github.com/onlinesourdough/openpaperdesign",
+  "repository": "https://github.com/arcitai/openpaperdesign",
+  "homepage": "https://github.com/arcitai/openpaperdesign",
   "keywords": ["design", "canvas", "whiteboard", "mcp", "paper-rs"],
   "extensions": {
     "com.openai": {
@@ -14,7 +14,7 @@
         "displayName": "openpaperdesign",
         "shortDescription": "Agent + human design canvas",
         "longDescription": "Binds one paper-rs design project in the workspace, lets the agent edit it over MCP, and opens the editable canvas in the in-app browser on a loopback URL. Local only: no cloud, no telemetry. Not affiliated with Paper (paper.design).",
-        "developerName": "onlinesourdough",
+        "developerName": "Arc’IT AI",
         "category": "Design"
       },
       "onboardingSkill": "./skills/setup"
