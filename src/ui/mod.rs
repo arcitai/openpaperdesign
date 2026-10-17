@@ -44,6 +44,10 @@ pub struct UiState {
     pub layer_drag: Option<(NodeId, Option<LayerDrop>)>,
     /// Row rects of the last layers-panel frame (for drop targeting).
     pub layer_rows: Vec<(NodeId, egui::Rect, usize)>,
+    /// The host can't store page-list changes, so the pages panel shows the pages without
+    /// letting them be added, renamed, duplicated, deleted, reordered or switched. `false`
+    /// (the default, and the native app) keeps every page action.
+    pub pages_locked: bool,
 }
 
 /// Where a dragged layer lands relative to a row.
@@ -617,13 +621,16 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
             name_rect.shrink2(egui::vec2(0.0, 2.0)),
             egui::TextEdit::singleline(name),
         );
-        r.request_focus();
+        // Check the loss first: `request_focus` takes focus back at once, so calling it before
+        // `lost_focus` would hide Enter or a click elsewhere and the rename would never commit.
         if r.lost_focus() {
             let new = name.trim().to_string();
             st.renaming = None;
             if !new.is_empty() && new != n.name {
                 ed.edit("Rename", |tx| tx.node_mut(id).unwrap().name = new);
             }
+        } else if !r.has_focus() {
+            r.request_focus();
         }
     } else {
         let font = if n.is_frame() {

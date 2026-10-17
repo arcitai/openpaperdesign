@@ -1,6 +1,7 @@
-//! Browser glue: the JS-facing API. A `<canvas>` is rendered by upstream
-//! `render::gpu::CanvasRenderer`; everything else (input, redraw decisions, saving) lives in
-//! [`crate::state::WebState`], which is plain Rust and tested on the host.
+//! Browser glue: the JS-facing API. A `<canvas>` shows upstream's whole workspace, painted by
+//! upstream `render::frame::Painter` (the egui UI and the canvas renderer on one wgpu device,
+//! as in the native window); everything else (input, layout, requests, redraw decisions,
+//! saving) lives in [`crate::state::WebState`], which is plain Rust and tested on the host.
 //!
 //! Time comes from the page (`performance.now()` / `event.timeStamp`), never from
 //! `std::time`, which panics on wasm32-unknown-unknown. Saving is pulled by the page:
@@ -8,11 +9,8 @@
 //! check decides whether it lands.
 
 use crate::editor::Button;
-use crate::editor::shortcuts::Action;
-use crate::geom::V2;
 use crate::health::{self, Acquired, Health, Step};
-use crate::render::gpu::CanvasRenderer;
-use crate::render::scene::{self, SceneCache};
+use crate::render::frame::Painter;
 use crate::state::WebState;
 use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
@@ -26,18 +24,40 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    renderer: CanvasRenderer,
-    scale: f32,
+    painter: Painter,
 }
 
 #[wasm_bindgen]
 pub struct WebEditor {
     state: WebState,
-    cache: SceneCache,
     gpu: Gpu,
     backend: String,
     /// Presented frames and the first terminal GPU problem (shared with wgpu's callbacks).
     health: Arc<Mutex<Health>>,
+}
+
+/// An export for the page to offer as a download.
+#[wasm_bindgen]
+pub struct WebDownload {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl WebDownload {
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn mime(&self) -> String {
+        self.mime.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
 }
 
 fn install_panic_hook() {
@@ -123,8 +143,9 @@ pub async fn start(
         }
         sink.lock().unwrap().fail(msg);
     });
-    // Shader, pipelines, surface setup and the first frame must validate before the page may
-    // say it is ready (browser WebGPU validates WGSL more strictly than native wgpu).
+    // Shaders (the canvas's and egui's), pipelines, surface setup and the first frame must
+    // validate before the page may say it is ready (browser WebGPU validates WGSL more strictly
+    // than native wgpu).
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let caps = surface.get_capabilities(&adapter);
     // Like the native app: blend in gamma space, so prefer a non-sRGB target.
@@ -151,19 +172,17 @@ pub async fn start(
         view_formats: vec![],
         color_space: Default::default(),
     };
-    let renderer = CanvasRenderer::new(&device, format);
+    let painter = Painter::new(&device, format);
     let gpu = Gpu {
         surface,
         device,
         queue,
         config,
-        renderer,
-        scale: 1.0,
+        painter,
     };
 
     let mut w = WebEditor {
         state,
-        cache: SceneCache::default(),
         gpu,
         backend,
         health,
@@ -216,13 +235,12 @@ impl WebEditor {
         let max = g.device.limits().max_texture_dimension_2d;
         let w = ((css_width * dpr).round() as u32).clamp(1, max);
         let h = ((css_height * dpr).round() as u32).clamp(1, max);
-        g.scale = dpr as f32;
         if (g.config.width, g.config.height) != (w, h) {
             g.config.width = w;
             g.config.height = h;
             g.surface.configure(&g.device, &g.config);
         }
-        self.state.resize(css_width, css_height);
+        self.state.resize(css_width, css_height, dpr);
     }
 
     /// Advance animations and draw if anything changed. Call once per animation frame.
@@ -241,7 +259,8 @@ impl WebEditor {
             C::Lost => (None, Acquired::Lost),
             C::Validation => (None, Acquired::Validation),
         };
-        // Skipped or failed frames leave the redraw pending (no `drawn()`).
+        // Skipped or failed frames leave the redraw (and egui's input) pending: no layout and
+        // no `drawn()`.
         let reconfigure_after = match (health::step(acquired), tex) {
             (Step::Draw { reconfigure_after }, Some(t)) => {
                 self.draw(t);
@@ -262,22 +281,19 @@ impl WebEditor {
     }
 
     fn draw(&mut self, tex: wgpu::SurfaceTexture) {
+        let layout = self.state.layout();
         let g = &mut self.gpu;
         let view = tex.texture.create_view(&Default::default());
-        let frame = scene::canvas(&self.state.ed, &mut self.cache, V2::ZERO, true);
-        let bg = scene::CANVAS_BG.to_f32(1.0);
-        let mut enc = g.device.create_command_encoder(&Default::default());
-        g.renderer.render(
+        g.painter.paint(
             &g.device,
             &g.queue,
-            &mut enc,
             &view,
             [g.config.width, g.config.height],
-            g.scale,
-            &frame,
-            [bg[0] as f64, bg[1] as f64, bg[2] as f64, 1.0],
+            &self.state.ctx,
+            layout,
+            &self.state.ed,
+            !self.state.ui.show_grid_off,
         );
-        g.queue.submit([enc.finish()]);
         g.queue.present(tex);
         self.state.drawn();
         self.health.lock().unwrap().presented();
@@ -287,6 +303,12 @@ impl WebEditor {
         self.state.modifiers(shift, ctrl, alt, meta);
     }
 
+    /// The canvas element gained or lost keyboard focus.
+    pub fn focus(&mut self, focused: bool) {
+        self.state.set_focused(focused);
+    }
+
+    /// Positions are CSS px in the canvas element.
     pub fn pointer_down(&mut self, x: f64, y: f64, dom_button: u8, time_ms: f64) {
         if let Some(b) = button(dom_button) {
             self.state.pointer_down(x, y, b, time_ms);
@@ -303,12 +325,16 @@ impl WebEditor {
         }
     }
 
+    pub fn pointer_leave(&mut self) {
+        self.state.pointer_leave();
+    }
+
     /// DOM wheel delta in CSS px (positive y = scroll down).
     pub fn wheel(&mut self, dx: f64, dy: f64, x: f64, y: f64) {
         self.state.wheel(dx, dy, x, y);
     }
 
-    /// Returns whether the editor took the key (the page then prevents the browser default).
+    /// Returns whether the workspace took the key (the page then prevents the browser default).
     pub fn key_down(&mut self, key: &str, code: &str, repeat: bool) -> bool {
         self.state.key_down(key, code, repeat)
     }
@@ -317,25 +343,42 @@ impl WebEditor {
         self.state.key_up(key, code);
     }
 
-    /// Toolbar: "select", "hand", "rect", "ellipse".
-    pub fn set_tool(&mut self, name: &str) {
-        self.state.set_tool(name);
+    /// A `paste` event's plain text.
+    pub fn paste(&mut self, text: &str) {
+        self.state.paste(text);
+    }
+
+    /// A `copy` or `cut` event: the text for its clipboard data, if the editor copied any.
+    pub fn copy(&mut self, cut: bool) -> Option<String> {
+        self.state.copy(cut)
+    }
+
+    /// Text to write to the clipboard outside a copy event (best effort, by the page).
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.state.take_clipboard_text()
+    }
+
+    /// The CSS cursor to show.
+    pub fn cursor(&self) -> String {
+        self.state.cursor().to_string()
+    }
+
+    /// The next host request ("save" or "home"), if any.
+    pub fn take_request(&mut self) -> Option<String> {
+        self.state.take_request().map(|r| r.name().to_string())
+    }
+
+    /// The next export to offer as a download, if any.
+    pub fn take_download(&mut self) -> Option<WebDownload> {
+        self.state.take_download().map(|d| WebDownload {
+            name: d.name,
+            mime: d.mime.to_string(),
+            bytes: d.bytes,
+        })
     }
 
     pub fn tool(&self) -> String {
         self.state.tool()
-    }
-
-    pub fn undo(&mut self) {
-        self.state.run(Action::Undo);
-    }
-
-    pub fn redo(&mut self) {
-        self.state.run(Action::Redo);
-    }
-
-    pub fn delete(&mut self) {
-        self.state.run(Action::Delete);
     }
 
     pub fn selection_len(&self) -> usize {
@@ -353,6 +396,17 @@ impl WebEditor {
     /// Top-level nodes as JSON (see [`WebState::root_nodes`]).
     pub fn root_nodes(&self) -> String {
         self.state.root_nodes()
+    }
+
+    /// The canvas rectangle inside the workspace, `[x, y, w, h]` in CSS px (for checks).
+    pub fn canvas_rect(&self) -> Vec<f64> {
+        let c = self.state.canvas_rect();
+        vec![
+            c.min.x as f64,
+            c.min.y as f64,
+            c.width() as f64,
+            c.height() as f64,
+        ]
     }
 
     pub fn dirty(&self) -> bool {

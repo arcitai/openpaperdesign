@@ -144,7 +144,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             ui.add_space(2.0);
             let ids = ed.top_selection();
             if ids.is_empty() {
-                nothing_selected(ui, ed);
+                nothing_selected(ui, ed, st.pages_locked);
                 separator(ui);
                 export_section(ui, ed, st);
                 return;
@@ -445,7 +445,9 @@ fn export_section(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     });
 }
 
-fn nothing_selected(ui: &mut Ui, ed: &mut Editor) {
+/// `pages_locked`: the host can't store page changes (`UiState::pages_locked`), so the page
+/// name is shown but not editable.
+fn nothing_selected(ui: &mut Ui, ed: &mut Editor, pages_locked: bool) {
     ui.label(title_text("New shapes"));
     let mut sketch = ed.sketch.is_some();
     if ui.checkbox(&mut sketch, "Hand-drawn style").changed() {
@@ -483,7 +485,11 @@ fn nothing_selected(ui: &mut Ui, ed: &mut Editor) {
     separator(ui);
     ui.label(title_text("Page"));
     let mut name = ed.page_name().to_string();
-    if ui.text_edit_singleline(&mut name).changed() {
+    if ui
+        .add_enabled(!pages_locked, egui::TextEdit::singleline(&mut name))
+        .on_disabled_hover_text(super::pages::LOCKED)
+        .changed()
+    {
         let i = ed.active_page;
         ed.rename_page(i, &name);
     }

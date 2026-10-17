@@ -1261,10 +1261,10 @@ test('panel: "Edit in this view" mounts the optional in-panel editor on the show
   assert.equal(h.o.binding, B1, 'the editor edits exactly the binding this result named');
   assert.equal(h.o.refs.canvas, v.els['ed-canvas']);
   assert.equal(h.o.refs.conflict, v.els['ed-conflict']);
-  // Copied into this realm (the view's arrays have the VM context's prototypes).
-  assert.deepEqual(Array.from(h.o.refs.tools, ([b, t]) => [b, t]), [[v.els['ed-select'], 'select'], [v.els['ed-hand'], 'hand'],
-    [v.els['ed-rect'], 'rect'], [v.els['ed-ellipse'], 'ellipse']]);
-  assert.deepEqual(Array.from(h.o.refs.actions, ([, a]) => a), ['undo', 'redo', 'delete']);
+  // Upstream's own workspace draws its tools in the canvas: no toolbar of the view's own.
+  assert.equal(h.o.refs.tools, undefined, 'no parallel tool buttons');
+  assert.equal(h.o.refs.actions, undefined);
+  assert.ok(!/id="ed-(select|hand|rect|ellipse|undo|redo|delete)"/.test(html), 'and none in the markup');
   assert.equal(v.els['ed-status'].textContent, 'Loading the editor…');
   assert.equal(v.els['ed-title'].textContent, 'Landing');
   // The factory got the view's own request function: its calls go to the host, as the view's.
@@ -1272,6 +1272,12 @@ test('panel: "Edit in this view" mounts the optional in-panel editor on the show
   assert.deepEqual(v.last('tools/call').params, { name: 'openpaperdesign_app_page', arguments: { binding: B1 } });
   h.o.onStatus('Ready');
   assert.equal(v.els['ed-status'].textContent, 'Ready');
+  // The workspace's "All projects" (upstream Home/New/Open) is this view's Back: it drains first.
+  h.o.onHome();
+  await flush();
+  assert.deepEqual(fake.log.slice(2), ['drain', 'dispose'], 'saved what was left, then let go');
+  assert.equal(v.els.home.hidden, false);
+  assert.equal(libCalls(v, 'openpaperdesign_app_close'), 0, 'Home closes nothing');
   panelOnly(v);
 });
 

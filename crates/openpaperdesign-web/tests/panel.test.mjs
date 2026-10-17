@@ -168,11 +168,17 @@ function fakeEngine() {
   const eng = { inits: [], editors: [] };
   eng.init = async (bytes) => { eng.inits.push(bytes); };
   eng.start = async (canvas, text, pageId, pageName) => {
+    // The real editor's page-facing API (web.rs); the workspace itself draws in the canvas.
     const ed = { canvas, text, pageId, pageName, calls: [], pending: undefined, isReady: false, freed: false, canReload: true,
+      requests: [], downloads: [], clip: undefined,
       backend() { return 'mock (test)'; }, frame() {}, gpu_error() { return undefined; }, ready() { return this.isReady; },
-      tool() { return 'select'; }, set_tool(t) { this.calls.push('tool:' + t); }, resize() {}, modifiers() {},
-      pointer_down() { this.calls.push('down'); }, pointer_move() {}, pointer_up() { this.calls.push('up'); }, wheel() {},
-      key_down(k) { this.calls.push('key:' + k); return true; }, key_up() {}, undo() { this.calls.push('undo'); }, redo() {}, delete() {},
+      tool() { return 'select'; }, resize() {}, modifiers() {}, focus(f) { this.calls.push('focus:' + f); },
+      pointer_down() { this.calls.push('down'); }, pointer_move() {}, pointer_up() { this.calls.push('up'); }, pointer_leave() {}, wheel() {},
+      key_down(k) { this.calls.push('key:' + k); return true; }, key_up() {},
+      copy() { return undefined; }, paste(t) { this.calls.push('paste:' + t); },
+      cursor() { return 'default'; }, take_request() { return this.requests.shift(); },
+      take_download() { return this.downloads.shift(); },
+      take_clipboard_text() { const c = this.clip; this.clip = undefined; return c; },
       save_snapshot() { const s = this.pending; this.pending = undefined; return s; },
       save_succeeded() { this.calls.push('saved'); }, save_failed() { this.calls.push('save_failed'); },
       dirty() { return this.pending !== undefined; }, can_reload() { return this.canReload && this.pending === undefined; },
@@ -193,8 +199,6 @@ function setup(srv = fakeServer()) {
     status: (t, error) => shown.status.push(error ? 'ERR ' + t : t),
     renderer: (t, error) => shown.renderer.push(error ? 'ERR ' + t : t),
     conflict: fakeEl(doc),
-    tools: [['select', fakeEl(doc, 'button')], ['rect', fakeEl(doc, 'button')]].map(([t, b]) => [b, t]),
-    actions: [[fakeEl(doc, 'button'), 'undo']],
   };
   const panel = mod.opdCreatePanel({ rpc: srv.rpc, identity: IDENTITY, engine, env, nav: { platform: 'Linux' } });
   return { srv, env, engine, refs, shown, panel, doc };
@@ -340,7 +344,6 @@ test('leaving waits for the save under way and saves what is left; then everythi
   assert.equal(t.env.intervals.size, 0, 'save and poll timers stopped');
   assert.equal(t.env.frames.length, 0, 'frame loop stopped');
   assert.equal(t.refs.canvas.listeners.length, 0, 'canvas listeners removed');
-  assert.ok(t.refs.tools.every(([b]) => b.listeners.length === 0), 'toolbar listeners removed');
   assert.deepEqual(t.srv.named(T.RELEASE), [{ binding: BINDING, mount: 1 }], 'released once');
   // Nothing more reaches it.
   t.ed.pending = '{"v":3}';
@@ -406,6 +409,37 @@ test('a save is bounded as the whole request it would be (envelope, escaping and
   assert.equal(t.srv.named(T.SAVE).length, 1);
   assert.equal(t.srv.page.text, fits);
   assert.equal(t.shown.status.at(-1), 'Saved');
+});
+
+test('what the workspace asks the page for: Save saves now, Home goes back through the view, nothing is dropped', async () => {
+  const t = setup();
+  let homes = 0;
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {}, onHome: () => { homes += 1; } });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors.at(-1);
+  ed.isReady = true;
+  t.env.frame(16);
+  await flush();
+  // Upstream's Save (⌘S or File > Save Now): the same checked page save, at once.
+  ed.pending = '{"page":1,"saved":"now"}';
+  ed.requests.push('save');
+  t.env.frame(32);
+  await flush();
+  assert.deepEqual(t.srv.named(T.SAVE).map((a) => a.text), ['{"page":1,"saved":"now"}'], 'saved without waiting for the timer');
+  assert.equal(t.shown.status.at(-1), 'Saved');
+  // Upstream's Home (All projects): the view's own Back, which drains first.
+  ed.requests.push('home');
+  t.env.frame(48);
+  assert.equal(homes, 1);
+  // An export the page can't download here is said so, not dropped silently.
+  ed.downloads.push({ name: 'Page 1.svg', mime: 'image/svg+xml', bytes: new Uint8Array([60]) });
+  t.env.frame(64);
+  assert.match(t.shown.status.at(-1), /can't start downloads here/);
+  assert.equal(ed.downloads.length, 0);
+  // Focus is the editor's (egui's text fields need it).
+  t.refs.canvas.fire('focus');
+  assert.ok(ed.calls.includes('focus:true'));
+  await h.dispose();
 });
 
 test('a stale binding or released mount is refused by the server and never applied', async () => {

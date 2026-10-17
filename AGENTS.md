@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.40 · Updated: 2026-10-17
+Revision: 0.41 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -28,6 +28,17 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     newly activated project drops stale entries for its page ids. `Server::retire` first
     closes admission and drains the current writer/rollback, then releases every page id
     the host held. Queued and retained old handles cannot execute or save after retirement.
+  - `src/ui/mod.rs`, `src/ui/pages.rs`, `src/ui/inspector.rs`: `UiState::pages_locked`
+    (default `false`, so the native app is unchanged). A host that can't store page-list
+    changes (the browser editor, which saves one page) sets it. The pages panel then shows the
+    pages with its add, rename, duplicate, delete, reorder and switch controls disabled, and
+    the inspector's page name field (nothing selected) is disabled too, instead of a copied UI.
+    Upstreamable as a host capability flag.
+  - `src/ui/mod.rs` `layer_row`: the inline layer rename checks `lost_focus` before asking for
+    focus again (and asks only while it lacks focus). With egui 0.36, `request_focus` takes
+    focus back at once, so the old order hid Enter and click-away and the rename never
+    committed, natively too. A plain upstream bug fix. `ui/pages.rs` page rename has the same
+    order; it is not changed here (pages are locked in the browser).
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -144,7 +155,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-3.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-4.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -159,7 +170,8 @@ code, presentation or the responses it expects gets a new URI in `HOME_URI` (eve
 resource registration uses it) and the URI tests. No earlier URI is served or aliased. History:
 `home.html`; `home-2` added the in-panel editor; `home-3` (2026-10-17) is the browser-first
 home, where New/Open/Import/Open current canvas open the web editor link and the panel is
-optional.
+optional; `home-4` (2026-10-17) hosts upstream's workspace UI in the editor (no tool buttons of
+the view's own).
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -338,6 +350,25 @@ earlier tab or the panel, so the editor itself shows Ready and Saved. The home o
 routing and lifecycle; the web editor (browser/WASM, upstream engine) owns editing; the server
 owns the document, conflicts and authority. Don't add a second library home or editor.
 Native qualification is pending.
+
+The web editor's workspace (owner decision 2026-10-17, `crates/openpaperdesign-web/src/state.rs`):
+the one web editor (browser page and optional panel alike) hosts upstream's own workspace UI,
+compiled unchanged via `#[path]` (`ui::draw` with layers, inspector, pages, floating tools,
+palette, menus and help; `render::frame::{layout, Painter}` on the editor's wgpu device with
+upstream's `egui-wgpu`). Don't rebuild that UI in DOM, fork it or add eframe/another runtime.
+DOM input goes to egui first; pointer input reaches `Editor` only over the returned canvas
+rectangle and not over a floating egui area or an egui drag (as native `App::over_canvas`);
+keys reach `Editor` only while no egui text field has the keyboard. Every `AppRequest` is
+handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
+Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in
+a browser tab); SVG/PDF export is upstream's in-memory export offered as a download; PNG
+export/copy (GPU read-back), Duplicate project and placing images from files are refused
+with a visible reason. Copy/cut/paste use the page's clipboard events through upstream's
+`clipboard::Provider`; no OS clipboard. The page saves one page, so page-list actions are
+disabled (`pages_locked`) rather than reverted; multi-page editing is an open gap. The
+Library tab is session-only (never the native library file). IME composition, copying out of
+egui text fields outside a copy event, DOM accessibility of the egui UI and image fills stay
+unsupported. Bundle changes need a new exact production qualification.
 
 ## Model profile
 

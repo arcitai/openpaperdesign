@@ -11,10 +11,6 @@
   header { flex: 0 0 40px; box-sizing: border-box; height: 40px; display: flex; flex-wrap: nowrap;
            gap: 6px; align-items: center; padding: 0 10px; background: #fff;
            border-bottom: 1px solid #ddd; overflow: hidden; }
-  header button { flex: 0 0 auto; font: inherit; padding: 4px 10px; border: 1px solid #ccc;
-                  border-radius: 6px; background: #fff; cursor: pointer; }
-  header button[aria-pressed="true"] { background: #2f6fed; border-color: #2f6fed; color: #fff; }
-  header .sep { width: 1px; height: 20px; background: #ddd; margin: 0 4px; }
   .clip { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #title { flex: 0 1 auto; font-weight: 600; margin-right: 8px; }
   #status { flex: 1 1 0; margin-left: 8px; text-align: right; color: #555; }
@@ -32,16 +28,10 @@
 </style>
 </head>
 <body>
+<!-- The canvas shows upstream paper-rs's own workspace (layers, inspector, pages, tools,
+     palette, menus, help); this bar only names the canvas and shows the save status. -->
 <header>
   <span id="title" class="clip">openpaperdesign</span>
-  <button data-tool="select" title="Select (V)">Select</button>
-  <button data-tool="hand" title="Hand (H)">Hand</button>
-  <button data-tool="rect" title="Rectangle (R)">Rectangle</button>
-  <button data-tool="ellipse" title="Ellipse (O)">Ellipse</button>
-  <span class="sep"></span>
-  <button data-action="undo" title="Undo">Undo</button>
-  <button data-action="redo" title="Redo">Redo</button>
-  <button data-action="delete" title="Delete selection">Delete</button>
   <span id="status" class="clip">Loading…</span>
 </header>
 <div id="stage">

@@ -1,6 +1,9 @@
 // The editor mount shared by the browser page (app.js) and the home view's in-panel editor
-// (panel.js): DOM input, the toolbar, the frame loop, saving and polling for one Session, all
-// scoped to that editor's own canvas and buttons, and one disposal that undoes all of it.
+// (panel.js): DOM input, the frame loop, saving and polling for one Session, all scoped to that
+// editor's own canvas, and one disposal that undoes all of it. The canvas shows upstream
+// paper-rs's whole workspace (layers, inspector, pages, tools, palette, menus, help), drawn and
+// laid out by the editor itself; this mount only forwards input to it and does what it asks
+// the page for (save now, go to the canvases, a download, clipboard text).
 // It imports nothing: the session, the page steps, the renderer's boot, the page transport and
 // the browser environment are passed in, so the same code runs as a file (app.js imports it)
 // and inlined in the home view's one module (where the launcher assembles it).
@@ -8,10 +11,11 @@
 export const OPD_SAVE_POLL_MS = 300;
 // How often to look for changes made elsewhere (an agent over MCP, another tab or view).
 export const OPD_REVISION_POLL_MS = 1000;
-// The only toolbar actions an editor button may call.
-const OPD_ACTIONS = ['undo', 'redo', 'delete'];
+// Upstream's Home, New and Open, in a page that has no canvases view of its own.
+const OPD_NO_HOME = 'Open, create or import canvases from the OpenPaperDesign home in Codex. '
+  + 'This canvas stays open here.';
 
-/** The browser environment the mount uses (timers, frames, observers), from a window. */
+/** The browser environment the mount uses (timers, frames, observers, downloads, clipboard). */
 export function opdBrowserEnv(win) {
   return {
     setInterval: (fn, ms) => win.setInterval(fn, ms),
@@ -21,6 +25,30 @@ export function opdBrowserEnv(win) {
     ResizeObserver: win.ResizeObserver,
     AbortController: win.AbortController,
     devicePixelRatio: () => win.devicePixelRatio,
+    // A browser download of `bytes`, if this page may start one; never says a file was saved.
+    download: (name, mime, bytes) => {
+      const doc = win.document;
+      if (typeof win.Blob !== 'function' || !win.URL || !doc || !doc.body) return false;
+      try {
+        const href = win.URL.createObjectURL(new win.Blob([bytes], { type: mime }));
+        const a = doc.createElement('a');
+        a.href = href;
+        a.download = name;
+        a.hidden = true;
+        doc.body.append(a);
+        a.click();
+        a.remove();
+        win.setTimeout(() => win.URL.revokeObjectURL(href), 60000);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    // Best effort, outside a copy event (a menu's Copy): the browser may refuse it.
+    writeClipboard: (text) => {
+      const c = win.navigator && win.navigator.clipboard;
+      return c && typeof c.writeText === 'function' ? c.writeText(text) : Promise.reject(new Error('no clipboard'));
+    },
   };
 }
 
@@ -35,11 +63,13 @@ export function opdIsMac(nav) {
  *   lib: { Session, frameStep, saveStep, discardStep },
  *   canvas,                          the canvas element (inside the editor's own root)
  *   status(text, error), renderer(text, error), conflictBox
- *   tools: [[button, tool]], actions: [[button, action]]
  *   boot(canvas, page, webgl) -> Promise<editor>
  *   transport: { fetchPage(), put(snapshot, revision), revision() }
  *   firstPage: { text, revision }, forceWebgl, state
  *   onReady(session)                 the renderer is Ready (once per mount)
+ *   onHome()                         upstream's Home/New/Open: the host's own way back to its
+ *                                    canvases (which saves and drains first); without it the
+ *                                    status line says where that is
  *   log(message), env                (see opdBrowserEnv)
  * }
  * Returns { session, started, drain(), resume(), dispose() }. `started` settles once the
@@ -81,9 +111,19 @@ export function opdMountEditor(opts) {
     log: opts.log,
   }, opts.state || {});
 
-  // ---- input: only reaches the editor while editing is allowed (see session.js).
+  // ---- input: only reaches the editor while editing is allowed (see session.js). Positions
+  // are CSS px in the canvas element: the editor lays out its own workspace inside it and
+  // decides what is a panel and what is the canvas.
   const mods = (ed, e) => ed.modifiers(e.shiftKey, e.ctrlKey, e.altKey, e.metaKey);
   const local = (c, e) => { const r = rectOf(c); return [e.clientX - r.left, e.clientY - r.top]; };
+  // Clipboard text the editor wrote outside a copy event (a menu's Copy): best effort.
+  const flushClipboard = (ed) => {
+    const t = ed.take_clipboard_text();
+    if (t === undefined || t === null || !env.writeClipboard) return;
+    env.writeClipboard(t).catch(() => {
+      if (!disposed) opts.status('The browser didn\'t allow copying here; use Ctrl/⌘+C on the canvas.');
+    });
+  };
   function wire(c) {
     on(c, 'pointerdown', (e) => {
       e.preventDefault();
@@ -105,6 +145,7 @@ export function opdMountEditor(opts) {
     };
     on(c, 'pointerup', up);
     on(c, 'pointercancel', up);
+    on(c, 'pointerleave', () => session.edit((ed) => ed.pointer_leave()));
     on(c, 'contextmenu', (e) => e.preventDefault());
     on(c, 'wheel', (e) => {
       e.preventDefault();
@@ -114,33 +155,68 @@ export function opdMountEditor(opts) {
         ed.wheel(e.deltaX * k, e.deltaY * k, ...local(c, e));
       });
     }, { passive: false });
-    // The canvas's keys are the editor's: the view around it (where Escape means Back) never
-    // sees them.
+    // The canvas's keys are the workspace's: the view around it (where Escape means Back)
+    // never sees them.
     on(c, 'keydown', (e) => {
       e.stopPropagation();
-      if (session.edit((ed) => { mods(ed, e); return ed.key_down(e.key, e.code, e.repeat); })) {
-        e.preventDefault();
-      }
+      const taken = session.edit((ed) => {
+        mods(ed, e);
+        const t = ed.key_down(e.key, e.code, e.repeat);
+        flushClipboard(ed);
+        return t;
+      });
+      if (taken) e.preventDefault();
     });
     on(c, 'keyup', (e) => {
       e.stopPropagation();
       session.edit((ed) => { mods(ed, e); ed.key_up(e.key, e.code); });
     });
-    on(c, 'blur', () => session.withEditor((ed) => ed.modifiers(false, false, false, false)));
+    on(c, 'focus', () => session.withEditor((ed) => ed.focus(true)));
+    on(c, 'blur', () => session.withEditor((ed) => ed.focus(false)));
+  }
+  // Copy, cut and paste: the page's own clipboard events (fired at the document while the
+  // canvas has focus), the supported way for a page to use the clipboard.
+  const doc = opts.canvas.ownerDocument;
+  if (doc && typeof doc.addEventListener === 'function') {
+    const mine = () => session.canvas && doc.activeElement === session.canvas;
+    const copy = (cut) => (e) => {
+      if (!mine()) return;
+      const t = session.edit((ed) => ed.copy(cut));
+      if (typeof t === 'string' && e.clipboardData) {
+        e.clipboardData.setData('text/plain', t);
+        e.preventDefault();
+      }
+    };
+    on(doc, 'copy', copy(false));
+    on(doc, 'cut', copy(true));
+    on(doc, 'paste', (e) => {
+      if (!mine()) return;
+      const t = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+      if (!t) return;
+      e.preventDefault();
+      session.edit((ed) => ed.paste(t));
+    });
   }
 
-  // ---- toolbar
-  const tools = opts.tools || [];
-  for (const [b, tool] of tools) {
-    on(b, 'click', () => session.edit((ed) => { ed.set_tool(tool); session.canvas.focus(); }));
-  }
-  for (const [b, action] of opts.actions || []) {
-    if (!OPD_ACTIONS.includes(action)) continue;
-    on(b, 'click', () => session.edit((ed) => { ed[action](); session.canvas.focus(); }));
-  }
-  const syncToolbar = () => session.withEditor((ed) => {
-    const t = ed.tool();
-    for (const [b, tool] of tools) b.setAttribute('aria-pressed', String(tool === t));
+  // ---- what the editor asks the page for, after each frame
+  const afterFrame = () => session.withEditor((ed) => {
+    if (session.canvas && session.canvas.style) session.canvas.style.cursor = ed.cursor();
+    for (let r = ed.take_request(); r !== undefined && r !== null; r = ed.take_request()) {
+      if (r === 'save') lib.saveStep(session, ui);
+      else if (r === 'home') {
+        if (opts.onHome) opts.onHome();
+        else opts.status(OPD_NO_HOME);
+      }
+    }
+    for (let d = ed.take_download(); d !== undefined && d !== null; d = ed.take_download()) {
+      const name = d.name;
+      const done = env.download && env.download(name, d.mime, d.bytes);
+      if (typeof d.free === 'function') d.free();
+      opts.status(done
+        ? `Asked the browser to download ${name}; it decides whether and where it is saved.`
+        : 'This page can\'t start downloads here, so nothing was exported.');
+    }
+    flushClipboard(ed);
   });
 
   const showRenderer = () => {
@@ -167,7 +243,7 @@ export function opdMountEditor(opts) {
       opts.log(msg);
     },
     status: (text) => { if (!disposed) opts.status(text); },
-    tick: syncToolbar,
+    tick: afterFrame,
     // The conflict banner. The unsaved state stays on screen until the person discards it;
     // the button reloads the server's version in place.
     conflict: () => {

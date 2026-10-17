@@ -42,8 +42,10 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home is `ui://openpaperdesign/home-3.html` (2026-10-17). The earlier
-  `home-2` view opened canvases in the panel and expected panel results. Hosts may cache a view
+- **View version.** This home is `ui://openpaperdesign/home-4.html` (2026-10-17: its editor
+  hosts upstream's workspace UI and has no tool buttons of its own; `home-3` was the
+  browser-first home with them). The earlier `home-2` view opened canvases in the panel and
+  expected panel results. Hosts may cache a view
   by its resource URI; OpenAI's [Apps UI guidance](https://developers.openai.com/plugins/build/chatgpt-ui)
   (read 2026-10-17) asks for a new URI, everywhere it is referenced, for breaking HTML/JS/CSS
   changes. So a fresh tool listing or resource read gets `home-3` under a cache key no older
@@ -95,19 +97,34 @@ upstream source change in this delta.
 |---|---|
 | Agent catalogue and execution (`mcp::tools`, `mcp::exec`, `mcp::css`/`html`) | Directly, in the serve crate's host (`agent.rs` `BoundHost`: an upstream `Editor` on its own thread). The library adds only the binding envelope. |
 | Document, scene and project structures (`model`, `project`, `project::format`) | Directly: library canvases are standard paper-rs projects. Saves write upstream's page and manifest format. |
-| Editor, tools, pointer/keyboard/undo (`editor`, `history`, `layout`, `text`, …) | In the browser through `#[path]` in `openpaperdesign-web` (`WebState` feeds DOM input to `Editor::{pointer_*, key_*}`), and on the server through the agent host. |
+| Editor, tools, pointer/keyboard/undo (`editor`, `history`, `layout`, `text`, …) | In the browser through `#[path]` in `openpaperdesign-web` (`WebState` feeds DOM input through egui to `Editor`), and on the server through the agent host. |
+| Workspace UI (`ui`: layers, inspector, pages, palette, library, menus, floating tools, help) and its frame (`render::frame::{layout, Painter}`) | Directly, since 2026-10-17: `#[path]` in `openpaperdesign-web`, with upstream's `egui-wgpu` on the editor's own device. One host flag upstream (`UiState::pages_locked`, native default unchanged). |
 | Renderer (`render::{draw, gpu, mesh, rough, scene, tess}`) | Directly, compiled to wasm32 (wgpu WebGPU/WebGL2). |
 | Core `#[path]` crate, web/WASM wrappers | Ours: `openpaperdesign-core`/`-web` compile upstream modules unchanged. Our code is `state`/`web` glue, `health` and `keys`. |
 | Session lifecycle and editor mount (`static/session.js`, `editor.js`, `panel.js`) | Ours: hosting, fallback, save/conflict, disposal. |
 | Library authority, binding, leases, fences, revisions, transport, home view | Ours: `library*.rs`, `launcher*.rs`, `lib.rs` `Server`, `home.html`. |
 
 **Not reused, by inspection.**
-- **The egui/winit app shell** (`app`, `ui`, `render::frame`). This covers panels, the
-  properties and layers UI, the page list and the command palette. The browser editor has a
-  small toolbar (select/hand/rect/ellipse, undo/redo/delete); upstream's keyboard shortcuts
-  reach `Editor` except chrome-only ones (`state::chrome_only`). The gap is a browser-hosted
-  chrome. The smallest adapter is DOM controls calling the same `Editor` actions, as the
-  toolbar does; there is no parity claim.
+- **The winit window** (`app`): the event loop, `egui-winit`, `rfd` dialogs, the native
+  `Session` and the MCP server. Its job in the browser is `WebState` (2026-10-17, replacing
+  the earlier four-tool DOM toolbar):
+  - DOM input goes to egui, and canvas input to `Editor` as `App::over_canvas` does.
+  - Every `AppRequest` is handled explicitly:
+    - Save is the checked page save;
+    - Home, New and Open go to the host's navigation;
+    - SVG and PDF are upstream's in-memory export, as a download;
+    - PNG and Copy as PNG (GPU read-back), Duplicate project and placing images are refused
+      with a reason.
+  - Clipboard goes through the page's copy/cut/paste events.
+
+  Still not done:
+  - **Pages:** page-list actions are disabled (`pages_locked`), because the page saves one
+    page.
+  - **Library tab:** session-only.
+  - **Unsupported in the browser:** IME composition, copying out of egui fields outside a
+    copy event, DOM accessibility of the egui UI, and image fills.
+
+  This is the upstream workspace, not a parity claim.
 - **Native `session`** (clocks, storage, autosave): library saves go through `Server`.
 - **Upstream's HTTP MCP endpoint** (`mcp::server`). It rejects browser `Origin`s and is not an
   editor URL. The browser never talks to it, and no origin rule was relaxed.
@@ -143,7 +160,7 @@ primary and this panel is optional ("Edit in this view").
   discard, WebGPU-to-WebGL fallback) and one shared mount (`static/editor.js`, also used by
   `app.js`). No second renderer, document store, runtime or dependency.
 - **One fixed module.** The home resource was versioned `ui://openpaperdesign/home-2.html` for
-  this module (now `home-3`, the browser-first home above).
+  this module (now `home-4`, the browser-first home above).
   Its one `<script type="module">` starts with an editor slot. An app-library server fills that
   slot with the packaged glue, `session.js`, `page.js`, `editor.js` and `panel.js`, in that
   order, only if no part has an import, `</script`, `<script` or `<!--`. Otherwise the slot
@@ -312,7 +329,7 @@ installed check.
 Not installed or qualified. [Issue #6](https://github.com/onlinesourdough/openpaperdesign/issues/6)
 adds `openpaperdesign_home`, a Codex sidebar (global) entry that is also a chat tab (thread
 entry), and its static MCP App view `ui://openpaperdesign/home.html`
-(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-3.html`, the
+(`text/html;profile=mcp-app`; the current view is `ui://openpaperdesign/home-4.html`, the
 browser-first home at the top of this record). It also adds a read-only native project inventory,
 `openpaperdesign_projects`, and a read-only list of this workspace's canvases,
 `openpaperdesign_canvases`. The server now lists 36 tools and one resource.

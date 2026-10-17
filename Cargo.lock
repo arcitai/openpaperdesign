@@ -2519,6 +2519,7 @@ dependencies = [
  "bytemuck",
  "dirs",
  "egui",
+ "egui-wgpu",
  "fastrand",
  "i_overlay",
  "image",

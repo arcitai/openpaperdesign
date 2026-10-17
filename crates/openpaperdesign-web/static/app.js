@@ -1,5 +1,5 @@
 // Page glue for openpaperdesign-web: loads the active page of the served project and mounts the
-// editor on it (editor.js: DOM input, toolbar, frame loop, saving and polling), with saves
+// editor on it (editor.js: DOM input to upstream's workspace, frame loop, saving and polling), with saves
 // revision-checked over HTTP (If-Match). The editor lifecycle (gating, fallback, saving) is in
 // session.js. The home view's in-panel editor mounts the same editor (panel.js).
 import init, { start } from './openpaperdesign_web.js';
@@ -70,8 +70,6 @@ async function main() {
     status,
     renderer,
     conflictBox: $('conflict'),
-    tools: [...document.querySelectorAll('[data-tool]')].map((b) => [b, b.dataset.tool]),
-    actions: [...document.querySelectorAll('[data-action]')].map((b) => [b, b.dataset.action]),
     boot: (canvas, page, webgl) => {
       const r = canvas.getBoundingClientRect();
       return start(canvas, page.text, meta.id, meta.name, seed[0], seed[1], opdIsMac(navigator), webgl,

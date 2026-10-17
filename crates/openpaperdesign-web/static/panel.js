@@ -152,8 +152,11 @@ export function opdCreatePanel(opts) {
     return loaded;
   }
 
-  /** Open the canvas `binding` in this view's editor (`refs`: its canvas, status, buttons). */
-  function open({ binding, refs, onStatus, onReady }) {
+  /**
+   * Open the canvas `binding` in this view's editor (`refs`: its canvas, status and conflict
+   * banner). `onHome`: the view's own way back (upstream's Home, New and Open ask for it).
+   */
+  function open({ binding, refs, onStatus, onReady, onHome }) {
     const h = { left: false, mounted: null, mount: null, released: false };
     wanting.add(h);
     const live = () => !h.left;
@@ -231,8 +234,7 @@ export function opdCreatePanel(opts) {
         status: refs.status,
         renderer: refs.renderer,
         conflictBox: refs.conflict,
-        tools: refs.tools,
-        actions: refs.actions,
+        onHome,
         boot: (canvas, page, webgl) => {
           const r = canvas.getBoundingClientRect();
           return engine.start(canvas, page.text, pageId, pageName, seed[0], seed[1], mac, webgl,

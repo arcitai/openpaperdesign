@@ -1,19 +1,100 @@
-//! Everything the browser page does with the upstream editor, apart from the GPU surface and
-//! the JS bindings (`web.rs`). It is plain Rust, so it is tested on the host.
+//! Everything the browser page does with the upstream application, apart from the GPU surface
+//! and the JS bindings (`web.rs`). It is plain Rust, so it is tested on the host.
+//!
+//! The page hosts upstream's own workspace: `ui::draw` (layers, inspector, pages, floating
+//! tools, palette, menus, help) laid out by `render::frame::layout`, exactly as the native
+//! app's `App` does with winit. DOM input goes to egui first; pointer input reaches the editor
+//! only over the canvas rectangle that layout returned, and not over a floating egui area,
+//! like `App::over_canvas`; keys reach the editor only while no egui text field has keyboard
+//! focus. What upstream asks the app for (`AppRequest`) is handled here, one case each.
 //!
 //! Redraw rule: the scene is a function of editor state plus time (only the laser trail
-//! animates, see `Editor::animating`). Editor state only changes inside the methods below, so
-//! every method that can change it marks a redraw. `Editor::revision` alone is not enough:
-//! selection, hover, marquee, handles and modifier changes don't bump it.
+//! animates, see `Editor::animating`), and egui asks for its own repaints. Editor state only
+//! changes inside the methods below, so every method that can change it marks a redraw.
+//! `Editor::revision` alone is not enough: selection, hover, marquee, handles and modifier
+//! changes don't bump it.
 
 use crate::editor::shortcuts::{self, Action};
-use crate::editor::{Button, Editor, InputEvent, Key, Tool};
+use crate::editor::{AppRequest, Button, Editor, InputEvent, Key};
 use crate::geom::v2;
+use crate::io::export::{self, Format, Scope, Spec};
 use crate::keys;
+use crate::model::{Color, Document};
 use crate::project::format::{page_from_json, page_to_json};
+use crate::render::frame::{self, Layout};
+use crate::ui::{self, UiState};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+/// What the page itself must do for the editor (see [`WebState::take_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRequest {
+    /// Save now (upstream's Save): the page runs its usual checked save.
+    Save,
+    /// Back to the canvases (upstream's Home, New and Open): the page's own navigation, which
+    /// saves and drains first, or says where that is when it has none.
+    Home,
+}
+
+impl HostRequest {
+    pub fn name(self) -> &'static str {
+        match self {
+            HostRequest::Save => "save",
+            HostRequest::Home => "home",
+        }
+    }
+}
+
+/// An export the page offers as a browser download.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Download {
+    pub name: String,
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// The page's clipboard as upstream sees it (`io::clipboard::Provider`): text the page hands
+/// in from a `paste` event, and text the editor wrote for the page to put on the clipboard
+/// from a `copy`/`cut` event (or, best effort, the async clipboard API). No OS clipboard.
+#[derive(Default)]
+struct ClipboardBuf {
+    /// Text of the `paste` event being handled.
+    incoming: Option<String>,
+    /// Text the editor wrote, not yet given to the page.
+    outgoing: Option<String>,
+    /// The last text the editor wrote (a menu Paste without a paste event uses it).
+    last: Option<String>,
+}
+
+struct WebClipboard(Rc<RefCell<ClipboardBuf>>);
+
+impl crate::io::clipboard::Provider for WebClipboard {
+    fn read_text(&mut self) -> Option<String> {
+        let mut b = self.0.borrow_mut();
+        b.incoming.take().or_else(|| b.last.clone())
+    }
+    fn write_text(&mut self, s: &str) {
+        let mut b = self.0.borrow_mut();
+        b.outgoing = Some(s.to_string());
+        b.last = Some(s.to_string());
+    }
+}
+
+const NO_PNG: &str = "PNG export and Copy as PNG aren't available in this browser editor (they \
+    need a GPU read-back it can't do yet). Export SVG or PDF instead. Nothing was exported.";
+const NO_SAVE_AS: &str =
+    "Duplicating a canvas isn't available in this editor. Nothing was changed.";
+const NO_IMAGE: &str =
+    "Placing images from files isn't available in this editor yet. Nothing was changed.";
+const LIBRARY_SESSION: &str = "Library items stay only while this editor is open; they aren't \
+    saved with the canvas.";
 
 pub struct WebState {
     pub ed: Editor,
+    /// Upstream's workspace state (panels, palette, renaming, export settings...).
+    pub ui: UiState,
+    pub ctx: egui::Context,
     mac: bool,
     /// `doc_stamp` of the content last confirmed written by the server.
     saved_stamp: u64,
@@ -21,36 +102,38 @@ pub struct WebState {
     inflight: Option<u64>,
     /// Something that can change the picture happened since the last draw.
     redraw: bool,
+    /// egui input gathered since the last layout.
+    events: Vec<egui::Event>,
+    mods: egui::Modifiers,
+    focused: bool,
+    /// The canvas element's size in CSS px, and device pixels per CSS px.
+    screen: egui::Vec2,
+    ppp: f32,
+    /// The canvas rectangle of the last layout (CSS px in the element).
+    canvas: egui::Rect,
+    /// A pointer press on the canvas went to the editor; its moves and release follow it.
+    captured: bool,
+    now_ms: f64,
+    /// When egui asked to be laid out again (page clock, ms).
+    repaint_at: Option<f64>,
+    cursor: egui::CursorIcon,
+    clipboard: Rc<RefCell<ClipboardBuf>>,
+    /// Text an egui text field copied (best effort for the page to write).
+    field_copy: Option<String>,
+    requests: VecDeque<HostRequest>,
+    downloads: VecDeque<Download>,
+    library_noted: bool,
 }
 
-/// Shortcuts whose action only asks the app chrome to do something (dialogs, export,
-/// palette, rename, page list...). That chrome doesn't exist in this slice, so these keys
-/// are neither sent to the editor nor consumed: the browser keeps them (⌘R reloads, ⌘S/⌘P
-/// stay the browser's).
-pub fn chrome_only(a: Action) -> bool {
-    matches!(
-        a,
-        Action::New
-            | Action::Open
-            | Action::Save
-            | Action::SaveAs
-            | Action::ExportPng
-            | Action::ExportSvg
-            | Action::ExportPdf
-            | Action::CopyAsPng
-            | Action::CopyAsSvg
-            | Action::PlaceImage
-            | Action::CommandPalette
-            | Action::Rename
-            | Action::ToggleUi
-            | Action::ToggleHelp
-            | Action::ToggleGrid
-            | Action::Home
-    )
+/// Shortcuts the browser keeps: copy, cut and paste arrive as the page's own clipboard events
+/// (the only supported way to reach the clipboard from a page), which then run them. Every
+/// other upstream shortcut is the workspace's.
+pub fn browser_keeps(a: Action) -> bool {
+    matches!(a, Action::Copy | Action::Cut | Action::Paste)
 }
 
 /// Whether upstream `Editor::key_down` acts on `key` in the editor's current state (same
-/// order of checks), minus chrome-only shortcuts. Decided before the key is handled.
+/// order of checks), minus the shortcuts the browser keeps. Decided before the key is handled.
 pub fn editor_takes(ed: &Editor, key: &Key) -> bool {
     let cmd_char = ed.mods.command() && matches!(key, Key::Char(_));
     let select_all = ed.mods.command() && matches!(key, Key::Char('a' | 'A'));
@@ -66,9 +149,46 @@ pub fn editor_takes(ed: &Editor, key: &Key) -> bool {
         return true;
     }
     if let Some(a) = shortcuts::lookup(key, ed.mods) {
-        return !chrome_only(a);
+        return !browser_keeps(a);
     }
     *key == Key::Space
+}
+
+fn egui_button(b: Button) -> egui::PointerButton {
+    match b {
+        Button::Primary => egui::PointerButton::Primary,
+        Button::Middle => egui::PointerButton::Middle,
+        Button::Secondary => egui::PointerButton::Secondary,
+    }
+}
+
+/// The CSS cursor for what egui shows.
+pub fn css_cursor(c: egui::CursorIcon) -> &'static str {
+    use egui::CursorIcon as C;
+    match c {
+        C::PointingHand => "pointer",
+        C::Text | C::VerticalText => "text",
+        C::Crosshair => "crosshair",
+        C::Move | C::AllScroll => "move",
+        C::Grab => "grab",
+        C::Grabbing => "grabbing",
+        C::NotAllowed | C::NoDrop => "not-allowed",
+        C::Wait => "wait",
+        C::Progress => "progress",
+        C::Help => "help",
+        C::ContextMenu => "context-menu",
+        C::Copy => "copy",
+        C::Alias => "alias",
+        C::Cell => "cell",
+        C::ResizeHorizontal | C::ResizeColumn | C::ResizeEast | C::ResizeWest => "ew-resize",
+        C::ResizeVertical | C::ResizeRow | C::ResizeNorth | C::ResizeSouth => "ns-resize",
+        C::ResizeNeSw | C::ResizeNorthEast | C::ResizeSouthWest => "nesw-resize",
+        C::ResizeNwSe | C::ResizeNorthWest | C::ResizeSouthEast => "nwse-resize",
+        C::ZoomIn => "zoom-in",
+        C::ZoomOut => "zoom-out",
+        C::None => "none",
+        _ => "default",
+    }
 }
 
 impl WebState {
@@ -89,28 +209,59 @@ impl WebState {
         let mut ed = Editor::default();
         ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
         ed.open_pages(vec![page], None);
+        let clipboard = Rc::new(RefCell::new(ClipboardBuf::default()));
+        ed.clipboard_io = Some(Box::new(WebClipboard(clipboard.clone())));
+        let ctx = egui::Context::default();
+        ui::setup_style(&ctx);
+        // This page holds one page of the canvas and saves only that page: page-list changes
+        // couldn't be stored, so the pages panel offers none (see `UiState::pages_locked`).
+        let st = UiState {
+            pages_locked: true,
+            ..Default::default()
+        };
         let mut s = WebState {
             saved_stamp: ed.doc_stamp,
             ed,
+            ui: st,
+            ctx,
             mac,
             inflight: None,
             redraw: true,
+            events: Vec::new(),
+            mods: egui::Modifiers::NONE,
+            focused: true,
+            screen: egui::vec2(1.0, 1.0),
+            ppp: 1.0,
+            canvas: egui::Rect::NOTHING,
+            captured: false,
+            now_ms: 0.0,
+            repaint_at: None,
+            cursor: egui::CursorIcon::Default,
+            clipboard,
+            field_copy: None,
+            requests: VecDeque::new(),
+            downloads: VecDeque::new(),
+            library_noted: false,
         };
-        s.resize(css_width, css_height);
+        s.resize(css_width, css_height, 1.0);
         Ok(s)
     }
 
-    pub fn resize(&mut self, css_width: f64, css_height: f64) {
-        self.ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
-        if self.ed.pending_fit && css_width > 1.0 {
-            self.ed.pending_fit = false;
-            self.ed.zoom_to_fit();
-        }
+    /// The canvas element's size in CSS px and the device pixel ratio. The editor's viewport
+    /// is the canvas rectangle inside the workspace, set by the next layout.
+    pub fn resize(&mut self, css_width: f64, css_height: f64, dpr: f64) {
+        self.screen = egui::vec2(css_width.max(1.0) as f32, css_height.max(1.0) as f32);
+        self.ppp = if dpr.is_finite() && dpr > 0.0 {
+            dpr as f32
+        } else {
+            1.0
+        };
         self.redraw = true;
     }
 
-    /// Advance time; returns whether a frame should be drawn now.
+    /// Advance time; returns whether a frame should be laid out and drawn now.
     pub fn tick(&mut self, now_ms: f64) -> bool {
+        self.now_ms = now_ms;
         let trail = self.ed.laser.len();
         self.ed.tick(now_ms);
         // Expired laser points leave the scene: that change needs a frame of its own (after
@@ -118,11 +269,64 @@ impl WebState {
         if self.ed.laser.len() != trail {
             self.redraw = true;
         }
-        // Requests for app chrome (export, open, palette, rename...) have no handler in this
-        // slice; drop them instead of letting them pile up.
-        self.ed.requests.clear();
-        self.ed.ui_events.clear();
-        self.redraw || self.ed.animating(now_ms)
+        let egui_due = self.repaint_at.is_some_and(|t| now_ms >= t);
+        self.redraw || !self.events.is_empty() || egui_due || self.ed.animating(now_ms)
+    }
+
+    fn raw_input(&mut self) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(self.ppp),
+                    focused: Some(self.focused),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            time: Some(self.now_ms / 1000.0),
+            // Modifier changes reach egui as `Event::ModifiersChanged`, in order (`modifiers`).
+            events: std::mem::take(&mut self.events),
+            focused: self.focused,
+            ..Default::default()
+        }
+    }
+
+    /// Lay out the workspace for one frame (upstream `render::frame::layout`) and handle what
+    /// it asked for. The caller paints the returned layout (`Painter::paint`) and then calls
+    /// [`WebState::drawn`].
+    pub fn layout(&mut self) -> Layout {
+        let input = self.raw_input();
+        let mut l = frame::layout(&self.ctx, input, &mut self.ed, &mut self.ui);
+        self.canvas = l.canvas;
+        let platform = std::mem::take(&mut l.output.platform_output);
+        self.cursor = platform.cursor_icon;
+        for c in platform.commands {
+            if let egui::OutputCommand::CopyText(t) = c {
+                self.field_copy = Some(t);
+            }
+        }
+        let delay = l
+            .output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+        self.repaint_at = if delay < std::time::Duration::from_secs(3600) {
+            Some(self.now_ms + delay.as_secs_f64() * 1000.0)
+        } else {
+            None
+        };
+        self.handle_requests();
+        if self.ui.library.dirty {
+            // Nothing persists the library from a page (it is the native app's own file).
+            self.ui.library.dirty = false;
+            if !self.library_noted {
+                self.library_noted = true;
+                self.ed.status = LIBRARY_SESSION.into();
+            }
+        }
+        l
     }
 
     /// The frame for the current state was drawn.
@@ -130,7 +334,75 @@ impl WebState {
         self.redraw = false;
     }
 
+    /// The canvas rectangle of the last layout (CSS px in the canvas element).
+    pub fn canvas_rect(&self) -> egui::Rect {
+        self.canvas
+    }
+
+    /// What the cursor should look like now (a CSS `cursor` value).
+    pub fn cursor(&self) -> &'static str {
+        css_cursor(self.cursor)
+    }
+
+    /// The next thing the page must do for the editor, if any.
+    pub fn take_request(&mut self) -> Option<HostRequest> {
+        self.requests.pop_front()
+    }
+
+    pub fn take_download(&mut self) -> Option<Download> {
+        self.downloads.pop_front()
+    }
+
+    /// Text for the page to put on the clipboard: what the editor wrote (a copy outside a
+    /// `copy` event, e.g. from a menu) or what an egui text field copied.
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        let out = self.clipboard.borrow_mut().outgoing.take();
+        out.or_else(|| self.field_copy.take())
+    }
+
+    fn over_egui(&self, p: egui::Pos2) -> bool {
+        self.ctx
+            .layer_id_at(p)
+            .is_some_and(|l| l.order != egui::Order::Background)
+    }
+
+    /// Like the native `App::over_canvas`: inside the canvas rectangle, not over a floating
+    /// egui area (tools, palette, help, menus, tooltips), and no egui drag under way.
+    fn over_canvas(&self, p: egui::Pos2) -> bool {
+        self.canvas.contains(p) && !self.over_egui(p) && !self.ctx.egui_is_using_pointer()
+    }
+
+    fn to_canvas(&self, p: egui::Pos2) -> crate::geom::V2 {
+        v2(
+            (p.x - self.canvas.min.x) as f64,
+            (p.y - self.canvas.min.y) as f64,
+        )
+    }
+
+    pub fn set_focused(&mut self, focused: bool) {
+        if self.focused != focused {
+            self.focused = focused;
+            self.events.push(egui::Event::WindowFocused(focused));
+        }
+        if !focused {
+            self.modifiers(false, false, false, false);
+        }
+        self.redraw = true;
+    }
+
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {
+        let mods = egui::Modifiers {
+            alt,
+            ctrl,
+            shift,
+            mac_cmd: self.mac && meta,
+            command: if self.mac { meta } else { ctrl },
+        };
+        if mods != self.mods {
+            self.mods = mods;
+            self.events.push(egui::Event::ModifiersChanged(mods));
+            self.redraw = true;
+        }
         let m = keys::modifiers(self.mac, shift, ctrl, alt, meta);
         if m != self.ed.mods {
             self.ed.handle(InputEvent::Modifiers(m));
@@ -138,52 +410,138 @@ impl WebState {
         }
     }
 
+    /// Positions are CSS px in the canvas element (the whole workspace).
     pub fn pointer_down(&mut self, x: f64, y: f64, button: Button, time_ms: f64) {
-        self.ed.handle(InputEvent::PointerDown {
-            pos: v2(x, y),
-            button,
-            pressure: None,
-            time_ms,
+        let p = egui::pos2(x as f32, y as f32);
+        self.events.push(egui::Event::PointerMoved(p));
+        self.events.push(egui::Event::PointerButton {
+            pos: p,
+            button: egui_button(button),
+            pressed: true,
+            modifiers: self.mods,
         });
+        if self.over_canvas(p) {
+            // Clicking the canvas takes keyboard focus away from text fields.
+            self.ctx.memory_mut(|m| {
+                if let Some(f) = m.focused() {
+                    m.surrender_focus(f);
+                }
+            });
+            self.captured = true;
+            self.ed.handle(InputEvent::PointerDown {
+                pos: self.to_canvas(p),
+                button,
+                pressure: None,
+                time_ms,
+            });
+        }
         self.redraw = true;
     }
 
     pub fn pointer_move(&mut self, x: f64, y: f64, time_ms: f64) {
-        self.ed.handle(InputEvent::PointerMove {
-            pos: v2(x, y),
-            pressure: None,
-            time_ms,
-        });
+        let p = egui::pos2(x as f32, y as f32);
+        self.events.push(egui::Event::PointerMoved(p));
+        if self.captured || self.over_canvas(p) {
+            self.ed.handle(InputEvent::PointerMove {
+                pos: self.to_canvas(p),
+                pressure: None,
+                time_ms,
+            });
+        } else {
+            self.ed.hover = None;
+        }
         self.redraw = true;
     }
 
     pub fn pointer_up(&mut self, x: f64, y: f64, button: Button, time_ms: f64) {
-        self.ed.handle(InputEvent::PointerUp {
-            pos: v2(x, y),
-            button,
-            time_ms,
+        let p = egui::pos2(x as f32, y as f32);
+        self.events.push(egui::Event::PointerMoved(p));
+        self.events.push(egui::Event::PointerButton {
+            pos: p,
+            button: egui_button(button),
+            pressed: false,
+            modifiers: self.mods,
         });
+        if self.captured {
+            self.captured = false;
+            self.ed.handle(InputEvent::PointerUp {
+                pos: self.to_canvas(p),
+                button,
+                time_ms,
+            });
+        }
         self.redraw = true;
     }
 
-    /// DOM wheel delta in CSS px (positive y = scroll down). With Ctrl/⌘ held (which is how
-    /// browsers report a trackpad pinch) upstream zooms instead of panning.
+    /// The pointer left the canvas element.
+    pub fn pointer_leave(&mut self) {
+        self.events.push(egui::Event::PointerGone);
+        if !self.captured {
+            self.ed.hover = None;
+        }
+        self.redraw = true;
+    }
+
+    /// DOM wheel delta in CSS px (positive y = scroll down). Over the canvas the editor pans
+    /// or (with Ctrl/⌘, which is how browsers report a trackpad pinch) zooms; over a panel
+    /// egui scrolls it.
     pub fn wheel(&mut self, dx: f64, dy: f64, x: f64, y: f64) {
-        let d = if self.ed.mods.shift && dx == 0.0 {
-            v2(dy, 0.0)
+        let p = egui::pos2(x as f32, y as f32);
+        self.events.push(egui::Event::PointerMoved(p));
+        if self.over_canvas(p) {
+            let d = if self.ed.mods.shift && dx == 0.0 {
+                v2(dy, 0.0)
+            } else {
+                v2(dx, dy)
+            };
+            self.ed.handle(InputEvent::Scroll {
+                delta: d,
+                pos: self.to_canvas(p),
+            });
         } else {
-            v2(dx, dy)
-        };
-        self.ed.handle(InputEvent::Scroll {
-            delta: d,
-            pos: v2(x, y),
-        });
+            self.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-dx as f32, -dy as f32),
+                // A DOM wheel event has no gesture phase (egui: "if unknown, Move").
+                phase: egui::TouchPhase::Move,
+                modifiers: self.mods,
+            });
+        }
         self.redraw = true;
     }
 
-    /// Returns whether the key was taken by the editor (the page then prevents the browser
-    /// default). Keys the editor wouldn't act on are not sent and stay the browser's.
+    /// Whether an egui text field (inspector, rename, palette...) has the keyboard.
+    pub fn field_has_keyboard(&self) -> bool {
+        self.ctx.egui_wants_keyboard_input()
+    }
+
+    /// Returns whether the key was taken (the page then prevents the browser default). While
+    /// an egui text field has the keyboard, keys are its own (copy, cut and paste still come
+    /// as clipboard events); otherwise keys the editor wouldn't act on are not sent and stay
+    /// the browser's.
     pub fn key_down(&mut self, key: &str, code: &str, repeat: bool) -> bool {
+        let named = egui::Key::from_name(key);
+        if let Some(k) = named {
+            self.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat,
+                modifiers: self.mods,
+            });
+        }
+        self.redraw = true;
+        if self.field_has_keyboard() {
+            let clipboard_chord = self.mods.command
+                && matches!(named, Some(egui::Key::C | egui::Key::X | egui::Key::V));
+            if clipboard_chord {
+                return false;
+            }
+            if key.chars().count() == 1 && !self.mods.command && !self.mods.ctrl {
+                self.events.push(egui::Event::Text(key.to_string()));
+            }
+            return true;
+        }
         let editing = self.ed.text_edit.is_some();
         let Some(k) = keys::key(self.ed.mods, editing, key, code) else {
             return false;
@@ -195,27 +553,56 @@ impl WebState {
         if editing && !self.ed.mods.command() && key.chars().count() == 1 {
             self.ed.handle(InputEvent::Text(key.to_string()));
         }
-        self.redraw = true;
         true
     }
 
     pub fn key_up(&mut self, key: &str, code: &str) {
-        if let Some(k) = keys::key(self.ed.mods, self.ed.text_edit.is_some(), key, code) {
-            self.ed.handle(InputEvent::KeyUp { key: k });
-            self.redraw = true;
+        if let Some(k) = egui::Key::from_name(key) {
+            self.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: self.mods,
+            });
         }
+        if !self.field_has_keyboard()
+            && let Some(k) = keys::key(self.ed.mods, self.ed.text_edit.is_some(), key, code)
+        {
+            self.ed.handle(InputEvent::KeyUp { key: k });
+        }
+        self.redraw = true;
     }
 
-    /// Toolbar: "select", "hand", "rect", "ellipse".
-    pub fn set_tool(&mut self, name: &str) {
-        let tool = match name {
-            "select" => Tool::Select,
-            "hand" => Tool::Hand,
-            "rect" => Tool::Rect,
-            "ellipse" => Tool::Ellipse,
-            _ => return,
-        };
-        self.run(Action::Tool(tool));
+    /// A `paste` event's text: into the egui text field that has the keyboard, else the
+    /// editor's Paste (upstream reads it through its clipboard provider).
+    pub fn paste(&mut self, text: &str) {
+        if self.field_has_keyboard() {
+            self.events.push(egui::Event::Paste(text.to_string()));
+        } else {
+            self.clipboard.borrow_mut().incoming = Some(text.to_string());
+            self.run(Action::Paste);
+            self.clipboard.borrow_mut().incoming = None;
+        }
+        self.redraw = true;
+    }
+
+    /// A `copy` (or `cut`) event: the editor copies its selection, and the text it wrote is
+    /// returned for the event's clipboard data. In an egui text field the field handles it
+    /// on the next frame (its text then comes from `take_clipboard_text`).
+    pub fn copy(&mut self, cut: bool) -> Option<String> {
+        self.redraw = true;
+        if self.field_has_keyboard() {
+            self.events.push(if cut {
+                egui::Event::Cut
+            } else {
+                egui::Event::Copy
+            });
+            return None;
+        }
+        self.clipboard.borrow_mut().outgoing = None;
+        self.run(if cut { Action::Cut } else { Action::Copy });
+        self.clipboard.borrow_mut().outgoing.take()
     }
 
     pub fn tool(&self) -> String {
@@ -227,10 +614,120 @@ impl WebState {
         self.redraw = true;
     }
 
+    /// Every `AppRequest`, explicitly: the page's own save and navigation, in-memory SVG and
+    /// PDF exports offered as downloads, and a visible reason for what this editor can't do.
+    fn handle_requests(&mut self) {
+        for req in std::mem::take(&mut self.ed.requests) {
+            match req {
+                AppRequest::Save => self.requests.push_back(HostRequest::Save),
+                AppRequest::Home | AppRequest::New | AppRequest::Open => {
+                    self.requests.push_back(HostRequest::Home)
+                }
+                AppRequest::SaveAs => self.ed.status = NO_SAVE_AS.into(),
+                AppRequest::PlaceImage | AppRequest::ImageFill(..) => {
+                    self.ed.status = NO_IMAGE.into()
+                }
+                AppRequest::CopyAsPng => self.ed.status = NO_PNG.into(),
+                AppRequest::Export(spec) => self.export(spec),
+                AppRequest::ExportFormat(f) => {
+                    let spec = Spec {
+                        format: f,
+                        ..self.ui.export
+                    };
+                    self.export(spec);
+                }
+            }
+            self.redraw = true;
+        }
+    }
+
+    /// Upstream's export for SVG and PDF, in memory (`io::svg::export`, `io::pdf`), as one
+    /// file. PNG needs a GPU read-back and is refused with a reason.
+    fn export(&mut self, spec: Spec) {
+        if spec.format == Format::Png {
+            self.ed.status = NO_PNG.into();
+            return;
+        }
+        let made: Result<Download, String> = {
+            let names: Vec<String> = self.ed.pages.iter().map(|p| p.name.clone()).collect();
+            let pages: Vec<(&str, &Document)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.as_str(), self.ed.page_doc(i)))
+                .collect();
+            let sel = self.ed.top_selection();
+            let items = export::items(&spec, &pages, self.ed.active_page, &sel);
+            let bg = (!spec.transparent).then_some(Color::WHITE);
+            let base = match items.as_slice() {
+                [one] => one.name.clone(),
+                _ => self.ed.page_name().to_string(),
+            };
+            let name = format!(
+                "{}.{}",
+                match crate::project::folder_name(&base) {
+                    s if s.is_empty() => "export".to_string(),
+                    s => s,
+                },
+                spec.format.ext()
+            );
+            if items.is_empty() {
+                Err("Nothing to export.".into())
+            } else if spec.format == Format::Pdf {
+                let mut out = Vec::new();
+                for it in &items {
+                    out.extend(crate::io::pdf::pages_for(
+                        it.doc,
+                        Some(&it.roots),
+                        spec.scope == Scope::Frames,
+                        bg,
+                    ));
+                }
+                if out.is_empty() {
+                    Err("Nothing to export.".into())
+                } else {
+                    Ok(Download {
+                        name,
+                        mime: "application/pdf",
+                        bytes: crate::io::pdf::export(&out),
+                    })
+                }
+            } else if items.len() > 1 {
+                Err(
+                    "SVG export makes one file here: export one frame or the page, or use PDF \
+                     for several. Nothing was exported."
+                        .into(),
+                )
+            } else {
+                crate::io::svg::export(items[0].doc, Some(&items[0].roots), bg)
+                    .map(|s| Download {
+                        name,
+                        mime: "image/svg+xml",
+                        bytes: s.into_bytes(),
+                    })
+                    .ok_or_else(|| "Nothing to export.".to_string())
+            }
+        };
+        match made {
+            Ok(d) => {
+                self.ed.status = format!(
+                    "Exported {} (a download; the browser decides where it goes)",
+                    d.name
+                );
+                self.downloads.push_back(d);
+            }
+            Err(e) => self.ed.status = e,
+        }
+    }
+
     /// Top-level nodes as JSON `[{id, name, kind, children, world: [x,y,w,h], screen: [x,y,w,h]}]`
-    /// (screen = CSS px in the canvas), for status displays and automated checks.
+    /// (screen = CSS px in the canvas element), for status displays and automated checks.
     pub fn root_nodes(&self) -> String {
         let doc = &self.ed.doc;
+        let off = if self.canvas.is_finite() {
+            (self.canvas.min.x as f64, self.canvas.min.y as f64)
+        } else {
+            (0.0, 0.0)
+        };
         let list: Vec<_> = doc
             .root
             .iter()
@@ -248,7 +745,7 @@ impl WebState {
                     "kind": kind,
                     "children": n.children.len(),
                     "world": [w.x, w.y, w.w, w.h],
-                    "screen": [s.x, s.y, s.w, s.h],
+                    "screen": [s.x + off.0, s.y + off.1, s.w, s.h],
                 }))
             })
             .collect();
@@ -322,248 +819,5 @@ impl WebState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::geom::V2;
-    use crate::model::{Document, Node, NodeKind};
-    use crate::project::PageData;
-    use crate::render::scene::{self, SceneCache};
-
-    /// One 200×100 rectangle at world (100, 100); camera at zoom 1, no pan.
-    fn state() -> WebState {
-        let mut doc = Document::default();
-        let id = doc.alloc_id();
-        let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
-        doc.nodes.insert(id, Node::new(id, NodeKind::Rect, rect));
-        doc.root.push(id);
-        let page = PageData {
-            id: "p".into(),
-            name: "Page 1".into(),
-            doc,
-            camera: Some(Default::default()),
-        };
-        let json = page_to_json(&page);
-        let mut s =
-            WebState::open(&json, "p".into(), "Page 1".into(), false, 800.0, 600.0).unwrap();
-        assert!(s.tick(0.0), "first frame draws");
-        s.drawn();
-        s
-    }
-
-    fn overlay_vertices(s: &WebState) -> usize {
-        let f = scene::canvas(&s.ed, &mut SceneCache::default(), V2::ZERO, true);
-        f.over.iter().map(|b| b.mesh.vertices.len()).sum()
-    }
-
-    #[test]
-    fn selection_click_redraws_although_revision_is_unchanged() {
-        let mut s = state();
-        let rev = s.ed.revision;
-        let before = overlay_vertices(&s);
-        assert!(!s.tick(16.0), "idle: nothing to draw");
-        s.pointer_down(150.0, 150.0, Button::Primary, 20.0);
-        s.pointer_up(150.0, 150.0, Button::Primary, 30.0);
-        assert_eq!(s.ed.selection.len(), 1);
-        assert_eq!(
-            s.ed.revision, rev,
-            "upstream revision doesn't track selection"
-        );
-        assert_ne!(
-            overlay_vertices(&s),
-            before,
-            "selection changes the overlay"
-        );
-        assert!(s.tick(40.0), "so the adapter must draw");
-        s.drawn();
-        assert!(!s.tick(56.0));
-    }
-
-    /// Laser points at world (400, 400) .. (420, 410), drawn at t = 0..20 ms, then a frame.
-    fn with_laser_trail() -> WebState {
-        let mut s = state();
-        s.run(Action::Tool(Tool::Laser));
-        s.pointer_down(400.0, 400.0, Button::Primary, 0.0);
-        s.pointer_move(410.0, 405.0, 10.0);
-        s.pointer_up(420.0, 410.0, Button::Primary, 20.0);
-        assert!(!s.ed.laser.is_empty());
-        assert!(s.tick(100.0));
-        s.drawn();
-        assert!(overlay_vertices(&s) > 0, "trail on screen");
-        s
-    }
-
-    #[test]
-    fn laser_expiry_draws_the_clearing_frame() {
-        let mut s = with_laser_trail();
-        let mut t = 100.0;
-        // Animate frame by frame until the trail is gone; the frame that removes it must draw.
-        while !s.ed.laser.is_empty() {
-            t += 16.0;
-            assert!(s.tick(t), "frame at {t} ms while the trail fades");
-            s.drawn();
-            assert!(t < 5000.0);
-        }
-        assert_eq!(overlay_vertices(&s), 0, "nothing left to draw");
-        assert!(!s.tick(t + 16.0), "idle afterwards");
-    }
-
-    #[test]
-    fn laser_expiry_after_a_long_gap_still_draws() {
-        let mut s = with_laser_trail();
-        // E.g. a background tab: the next frame comes long after every point expired.
-        assert!(s.tick(60_000.0), "the stale trail must be cleared");
-        assert!(s.ed.laser.is_empty());
-        assert_eq!(overlay_vertices(&s), 0);
-        // Not drawn (e.g. the surface was unavailable): still pending on the next frame.
-        assert!(s.tick(60_016.0), "pending until a frame is actually drawn");
-        s.drawn();
-        assert!(!s.tick(60_032.0));
-    }
-
-    #[test]
-    fn hover_and_modifier_changes_redraw() {
-        let mut s = state();
-        s.pointer_move(150.0, 150.0, 10.0);
-        assert!(s.ed.hover.is_some());
-        assert!(s.tick(16.0));
-        s.drawn();
-        s.modifiers(false, false, true, false);
-        assert!(s.tick(32.0), "Alt shows distance guides");
-        s.drawn();
-        s.modifiers(false, false, true, false);
-        assert!(!s.tick(48.0), "same modifiers: no change");
-    }
-
-    #[test]
-    fn select_all_is_consumed() {
-        let mut s = state();
-        s.modifiers(false, true, false, false);
-        assert!(s.key_down("a", "KeyA", false), "Ctrl+A");
-        assert_eq!(s.ed.selection.len(), 1);
-        let mut mac = state();
-        mac.mac = true;
-        mac.modifiers(false, false, false, true);
-        assert!(mac.key_down("a", "KeyA", false), "⌘A on a Mac");
-    }
-
-    #[test]
-    fn editing_keys_are_consumed_and_act() {
-        let mut s = state();
-        assert!(s.key_down("r", "KeyR", false));
-        assert_eq!(s.ed.tool, Tool::Rect);
-        assert!(s.key_down("Escape", "Escape", false));
-        assert_eq!(s.ed.tool, Tool::Select);
-        s.pointer_down(150.0, 150.0, Button::Primary, 0.0);
-        s.pointer_up(150.0, 150.0, Button::Primary, 10.0);
-        assert!(s.key_down("Delete", "Delete", false));
-        assert_eq!(s.ed.doc.nodes.len(), 0);
-        s.modifiers(false, true, false, false);
-        assert!(s.key_down("z", "KeyZ", false), "Ctrl+Z");
-        assert_eq!(s.ed.doc.nodes.len(), 1);
-        s.modifiers(true, true, false, false);
-        assert!(s.key_down("Z", "KeyZ", false), "Ctrl+Shift+Z");
-        assert_eq!(s.ed.doc.nodes.len(), 0);
-        s.modifiers(false, false, false, false);
-        assert!(s.key_down(" ", "Space", false), "Space (pan)");
-    }
-
-    #[test]
-    fn chrome_shortcuts_and_unbound_keys_stay_with_the_browser() {
-        let mut s = state();
-        s.modifiers(false, true, false, false);
-        for (k, code) in [("r", "KeyR"), ("s", "KeyS"), ("o", "KeyO"), ("k", "KeyK")] {
-            let a = shortcuts::lookup(&Key::Char(k.chars().next().unwrap()), s.ed.mods);
-            assert!(
-                a.is_some_and(chrome_only),
-                "Ctrl+{k} is a chrome action: {a:?}"
-            );
-            assert!(!s.key_down(k, code, false), "Ctrl+{k} not consumed");
-        }
-        assert!(s.ed.ui_events.is_empty() && s.ed.requests.is_empty());
-        s.modifiers(false, false, false, false);
-        assert!(!s.key_down("F5", "F5", false));
-        assert!(!s.key_down("Shift", "ShiftLeft", false));
-    }
-
-    /// The page with the rectangle moved to x and a second rectangle, as another writer saved it.
-    fn changed_elsewhere(s: &WebState, x: f64) -> String {
-        let mut page = s.ed.page_data(0);
-        let id = *page.doc.nodes.keys().next().unwrap();
-        page.doc.nodes.get_mut(&id).unwrap().rect.x = x;
-        let n = page.doc.alloc_id();
-        page.doc.nodes.insert(
-            n,
-            Node::new(
-                n,
-                NodeKind::Rect,
-                crate::geom::Rect::new(0.0, 0.0, 5.0, 5.0),
-            ),
-        );
-        page.doc.root.push(n);
-        page_to_json(&page)
-    }
-
-    #[test]
-    fn reload_only_when_clean_and_it_keeps_the_view() {
-        let mut s = state();
-        s.ed.camera.pan = v2(-40.0, 10.0);
-        s.pointer_down(150.0 + 40.0, 150.0 - 10.0, Button::Primary, 0.0);
-        s.pointer_up(150.0 + 40.0, 150.0 - 10.0, Button::Primary, 10.0);
-        assert_eq!(s.ed.selection.len(), 1);
-        let selected = s.ed.selection[0];
-        assert!(s.can_reload(), "clean: may reload");
-        let newer = changed_elsewhere(&s, 300.0);
-        s.reload(&newer).unwrap();
-        assert_eq!(s.ed.doc.nodes.len(), 2);
-        assert_eq!(s.ed.doc.nodes[&selected].rect.x, 300.0);
-        assert_eq!(s.ed.camera.pan, v2(-40.0, 10.0), "camera kept");
-        assert_eq!(s.ed.selection, vec![selected], "selection kept");
-        assert!(!s.dirty(), "the reloaded page is the saved state");
-        assert!(s.tick(100.0), "redraws");
-    }
-
-    #[test]
-    fn never_reload_over_unsaved_or_in_flight_edits() {
-        let mut s = state();
-        // Mid-gesture.
-        s.pointer_down(150.0, 150.0, Button::Primary, 0.0);
-        s.pointer_move(170.0, 160.0, 10.0);
-        assert!(!s.can_reload(), "dragging");
-        s.pointer_up(170.0, 160.0, Button::Primary, 20.0);
-        assert!(!s.can_reload(), "unsaved move");
-        let _snap = s.save_snapshot().unwrap();
-        assert!(!s.can_reload(), "save in flight");
-        s.save_succeeded();
-        assert!(s.can_reload(), "saved: clean again");
-        // A selection on its own is not an unsaved change.
-        s.pointer_down(170.0, 160.0, Button::Primary, 30.0);
-        s.pointer_up(170.0, 160.0, Button::Primary, 40.0);
-        assert!(s.can_reload());
-    }
-
-    #[test]
-    fn saves_follow_document_changes_only() {
-        let mut s = state();
-        assert!(s.save_snapshot().is_none(), "freshly opened");
-        s.pointer_down(150.0, 150.0, Button::Primary, 0.0);
-        s.pointer_up(150.0, 150.0, Button::Primary, 10.0);
-        assert!(
-            s.save_snapshot().is_none(),
-            "selection alone isn't a change"
-        );
-        s.pointer_down(150.0, 150.0, Button::Primary, 20.0);
-        s.pointer_move(190.0, 170.0, 30.0);
-        assert!(s.save_snapshot().is_none(), "mid-drag");
-        s.pointer_up(190.0, 170.0, Button::Primary, 40.0);
-        let snap = s.save_snapshot().expect("drag moved the node");
-        assert!(s.save_snapshot().is_none(), "one in flight");
-        s.save_failed();
-        assert!(s.dirty());
-        assert_eq!(s.save_snapshot().as_deref(), Some(snap.as_str()));
-        s.save_succeeded();
-        assert!(!s.dirty());
-        let saved = page_from_json(&snap).unwrap();
-        let n = saved.doc.nodes.values().next().unwrap();
-        assert!(n.rect.x > 100.0 && n.rect.y > 100.0, "moved: {:?}", n.rect);
-    }
-}
+#[path = "state_tests.rs"]
+mod tests;
