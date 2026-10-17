@@ -1875,3 +1875,125 @@ test('R12-F2: a library view treats a delivered editor result as a library one; 
   assert.deepEqual(fields(w), ['Canvas', 'Beta (1 page)', 'Folder', 'acme']);
   onlyAllowed(w);
 });
+
+// ---- R13: leaving the in-panel editor ends its browser opening, with the real panel module ----
+// The exact crates/openpaperdesign-web/static/panel.js lifecycle and transport (read here, so
+// this needs that file); only the engine, the editor mount and the platform check are stand-ins.
+// Nothing renders. Adapted from the R13 reviewer's r13-real-panel-probe.mjs.
+let realPanelModule = null;
+async function realPanelView() {
+  if (!realPanelModule) {
+    const source = readFileSync(new URL('../../openpaperdesign-web/static/panel.js', import.meta.url), 'utf8');
+    realPanelModule = import('data:text/javascript;base64,'
+      + Buffer.from('const opdIsMac = () => false;\n' + source).toString('base64'));
+  }
+  const panel = await realPanelModule;
+  const editor = { nextDrain: 'clean', disposed: false, handle: null };
+  const factory = ({ rpc }) => {
+    const real = panel.opdCreatePanel({
+      rpc, identity: 'r13-fixture', nav: {}, lib: {}, env: {},
+      engine: { init: async () => {}, start: () => {} },
+      mount: () => ({ started: Promise.resolve(), drain: async () => editor.nextDrain,
+        resume: () => {}, dispose: () => { editor.disposed = true; } }),
+    });
+    return { open: (o) => { editor.handle = real.open(o); return editor.handle; } };
+  };
+  const v = mount({ library: true, panel: factory, clock: true });
+  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: {} } });
+  await flush();
+  await answer(v, LIBRARY_LIST, v.last('tools/call'));
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els['edit-here'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('opened'), libAction(v));
+  const asset = v.last('tools/call');
+  assert.equal(asset.params.name, 'openpaperdesign_app_editor_asset');
+  await answer(v, { asset: 'openpaperdesign_web_bg.wasm', identity: 'r13-fixture', bytes: 1,
+    parts: 1, part: 0, offset: 0, part_bytes: 1, data: 'AA==' }, asset);
+  const page = v.last('tools/call');
+  assert.equal(page.params.name, 'openpaperdesign_app_page');
+  await answer(v, { binding: B1, page: { id: 'p1', name: 'Page 1' }, text: '{}', revision: '"r1"', mount: 7 }, page);
+  assert.equal(await editor.handle.started, 'mounted');
+  return { v, editor };
+}
+
+test('R13-F1: once Back, Close, a discard or teardown lets the editor go, its late link or acknowledgement does nothing, while the real release is pending', async () => {
+  // Collected first, so each case fails on its own.
+  const observations = [];
+  for (const departure of ['back', 'close', 'discard', 'teardown']) {
+    for (const stage of ['link', 'acknowledgement']) {
+      const { v, editor } = await realPanelView();
+      const opening = v.els['ed-browser'].onclick();
+      await flush();
+      const fetch = libAction(v);
+      assert.deepEqual(fetch.params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1 } });
+      if (stage === 'acknowledgement') await answer(v, LIB_EDITOR('reopened'), fetch); // its opening is unanswered
+      const sent = v.count('ui/open-link');
+      let leaving = null;
+      if (departure === 'back') leaving = v.els.back.onclick();
+      else if (departure === 'close') leaving = v.els['ed-close'].onclick();
+      else if (departure === 'discard') {
+        editor.nextDrain = 'failed';
+        await v.els.back.onclick();
+        assert.equal(v.els['ed-leave'].hidden, false, 'leaving without saving is offered');
+        leaving = v.els['ed-leave'].onclick();
+      } else v.from({ id: 'td-r13', method: 'ui/resource-teardown', params: {} });
+      await flush();
+      // The mount is gone; the server hasn't answered its release yet.
+      const release = v.last('tools/call');
+      assert.deepEqual(release.params, { name: 'openpaperdesign_app_page_release', arguments: { binding: B1, mount: 7 } }, departure);
+      assert.equal(editor.disposed, true, departure);
+      const note = v.els['ed-note'].textContent;
+      if (stage === 'link') await answer(v, LIB_EDITOR('reopened'), fetch);
+      else await ack(v, 'ui/open-link', { error: { code: -32603, message: 'late failure' } });
+      const o = { departure, stage, extraNavigations: v.count('ui/open-link') - sent, noteChanged: v.els['ed-note'].textContent !== note };
+      if (o.extraNavigations) await ack(v); // settle what shouldn't have been sent
+      await opening;
+      await answer(v, { binding: B1, released: true }, release);
+      if (leaving) await leaving;
+      await flush();
+      o.left = departure === 'close'
+        ? JSON.stringify(libAction(v).params) === JSON.stringify({ name: 'openpaperdesign_app_close', arguments: { binding: B1 } })
+        : departure === 'teardown' ? v.sent.some((m) => m.id === 'td-r13' && m.result) : !v.els.home.hidden;
+      observations.push(o);
+      panelOnly(v);
+    }
+  }
+  assert.equal(observations.length, 8);
+  assert.deepEqual(observations.filter((o) => o.extraNavigations || o.noteChanged || !o.left), []);
+});
+
+test('R13-F1 control: with the real panel, a refused Back keeps the editor and its opening; a retry and a clean Back still work', async () => {
+  const { v, editor } = await realPanelView();
+  const before = v.count('ui/open-link');
+  const opening = v.els['ed-browser'].onclick();
+  await flush();
+  const fetch = libAction(v);
+  editor.nextDrain = 'failed';
+  await v.els.back.onclick();
+  assert.equal(v.els.editor.hidden, false);
+  assert.equal(editor.disposed, false, 'a refused Back lets nothing go');
+  await answer(v, LIB_EDITOR('reopened'), fetch);
+  assert.equal(v.count('ui/open-link'), before + 1, 'the editor stayed, so its opening goes on');
+  await ack(v);
+  await opening;
+  assert.match(v.els['ed-note'].textContent, /doesn't confirm it loaded/);
+  const retry = v.els['ed-browser'].onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('reopened'), libAction(v));
+  await ack(v, 'ui/open-link', { error: { code: -32603, message: 'not opened' } });
+  await retry;
+  assert.equal(v.els['ed-note'].textContent, "Codex didn't open the link (code -32603).");
+  assert.equal(v.count('ui/open-link'), before + 2);
+  editor.nextDrain = 'clean';
+  const back = v.els.back.onclick();
+  await flush();
+  const release = v.last('tools/call');
+  assert.deepEqual(release.params, { name: 'openpaperdesign_app_page_release', arguments: { binding: B1, mount: 7 } });
+  await answer(v, { binding: B1, released: true }, release);
+  await back;
+  assert.equal(v.els.home.hidden, false);
+  panelOnly(v);
+});

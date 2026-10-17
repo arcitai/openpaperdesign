@@ -1148,13 +1148,17 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // A secondary way to edit: the loopback browser editor, for the same binding. Getting its
   // link counts as given (closing or switching then asks first, as before). As with Open canvas,
   // each press is one opening attempt, from asking for the link to Codex's answer: a reply to an
-  // earlier attempt, or one after Back, changes nothing (R12-F1).
+  // earlier attempt, or one after Back, changes nothing (R12-F1). It also belongs to the editor
+  // it was pressed in: once that editor is let go for good (disposePanel, which Back, Close, the
+  // explicit discard and teardown all go through), the attempt is over, even while the panel's
+  // release is still unanswered (R13-F1). A refused Back keeps the editor, and the attempt.
   $('ed-browser').onclick = async () => {
     const binding = panelBinding;
+    const h = panelHandle;
     const g = gen;
-    if (!binding) return;
+    if (!binding || !h) return;
     const attempt = ++linkAttempt;
-    const current = () => g === gen && attempt === linkAttempt;
+    const current = () => g === gen && attempt === linkAttempt && panelHandle === h;
     $('ed-browser').disabled = true;
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
     if (!current()) return; // a newer attempt or view owns the button and the note now
