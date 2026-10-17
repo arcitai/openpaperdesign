@@ -10,8 +10,35 @@ use egui::{Color32, RichText, Ui};
 pub struct PagesUi {
     pub collapsed: bool,
     pub renaming: Option<(usize, String)>,
+    /// The rename field's widget id, as of the last frame it was drawn: lets a host tell
+    /// keyboard focus in this field from focus in another one.
+    pub rename_field: Option<egui::Id>,
     /// Row being dragged, and the index it would drop at.
     drag: Option<(usize, usize)>,
+}
+
+/// Finish the page rename as losing focus does, on the page its row names.
+pub(super) fn commit_rename(ed: &mut Editor, st: &mut UiState) {
+    if let Some((i, name)) = st.pages.renaming.take() {
+        ed.rename_page(i, &name);
+    }
+}
+
+/// Before the shown page or the page list changes (a pages-panel action, a palette command):
+/// unfinished fields are finished first, as a click elsewhere finishes them, on the page and
+/// row they were opened for. The layer rename names a node of the shown page's document only
+/// (another page may have a node with the same id); the page rename names its row by
+/// position. A page drag ends, and any other field's keyboard focus ends, so a field of the
+/// shown page is never continued on the next one.
+pub(super) fn finish_fields(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState) {
+    super::commit_rename(ed, st);
+    commit_rename(ed, st);
+    st.pages.drag = None;
+    ctx.memory_mut(|m| {
+        if let Some(f) = m.focused() {
+            m.surrender_focus(f);
+        }
+    });
 }
 
 const ROW_H: f32 = 24.0;
@@ -27,22 +54,9 @@ enum PageAction {
     Move(usize, usize),
 }
 
-/// Run a page-list action. Unfinished fields are finished first, as a click elsewhere
-/// finishes them, on the page and row they were opened for: the layer rename (it names a node
-/// of the shown page's document only; another page may have a node with the same id) and the
-/// page rename (it names its row by position). Any other field's keyboard focus ends, so a
-/// field of the shown page is never continued on the next one.
+/// Run a page-list action, after finishing open fields (`finish_fields`).
 fn run(ui: &Ui, ed: &mut Editor, st: &mut UiState, action: PageAction) {
-    super::commit_rename(ed, st);
-    if let Some((i, name)) = st.pages.renaming.take() {
-        ed.rename_page(i, &name);
-    }
-    st.pages.drag = None;
-    ui.memory_mut(|m| {
-        if let Some(f) = m.focused() {
-            m.surrender_focus(f);
-        }
-    });
+    finish_fields(ui.ctx(), ed, st);
     match action {
         PageAction::Add => {
             ed.add_page();
@@ -88,6 +102,10 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         });
     });
     if st.pages.collapsed {
+        // The rows (and an open rename field) aren't drawn: the rename is finished as losing
+        // focus finishes it, rather than kept for a row that may name another page later.
+        commit_rename(ed, st);
+        st.pages.drag = None;
         if let Some(a) = action {
             run(ui, ed, st, a);
         }
@@ -166,6 +184,7 @@ fn page_row(
             name_rect.shrink2(egui::vec2(0.0, 2.0)),
             egui::TextEdit::singleline(name),
         );
+        st.pages.rename_field = Some(r.id);
         // Focus is taken only until the field has it: asked for again after Enter or a click
         // elsewhere, it would keep the field focused, so it never lost focus and never renamed.
         if r.lost_focus() {

@@ -18,6 +18,9 @@ use std::collections::HashSet;
 pub struct UiState {
     pub collapsed: HashSet<NodeId>,
     pub renaming: Option<(NodeId, String)>,
+    /// The layer rename field's widget id, as of the last frame it was drawn: lets a host
+    /// tell keyboard focus in this field from focus in another one.
+    pub rename_field: Option<egui::Id>,
     pub show_help: bool,
     pub show_grid_off: bool,
     /// Export settings (inspector Export section).
@@ -104,6 +107,9 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         }
     }
     if st.hide_ui {
+        // No layer or page rows are drawn: an open rename is finished as losing focus does.
+        commit_rename(ed, st);
+        pages::commit_rename(ed, st);
         let canvas = ui.available_rect_before_wrap();
         palette::draw(ui.ctx(), ed, st, canvas);
         return canvas;
@@ -328,6 +334,9 @@ fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     });
     ui.add_space(2.0);
     if st.show_library {
+        // The layer rows (and an open rename field) aren't drawn: finish the rename now, as
+        // losing focus does, while its node is still the shown page's.
+        commit_rename(ed, st);
         library::panel(ui, ed, st);
         return;
     }
@@ -349,6 +358,15 @@ fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             }
             layer_drag(ui, ed, st);
         });
+    // A rename whose row wasn't drawn (inside a collapsed group, or of a node that is gone)
+    // has no field to finish it: finish it now, on this page.
+    if st
+        .renaming
+        .as_ref()
+        .is_some_and(|(id, _)| !st.layer_rows.iter().any(|(r, _, _)| r == id))
+    {
+        commit_rename(ed, st);
+    }
 }
 
 /// Drag-and-drop reordering in the layers tree: above / below a row, or into a frame/group.
@@ -630,6 +648,7 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
             name_rect.shrink2(egui::vec2(0.0, 2.0)),
             egui::TextEdit::singleline(name),
         );
+        st.rename_field = Some(r.id);
         // Check the loss first: `request_focus` takes focus back at once, so calling it before
         // `lost_focus` would hide Enter or a click elsewhere and the rename would never commit.
         if r.lost_focus() {

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.47 · Updated: 2026-10-17
+Revision: 0.48 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -43,6 +43,15 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     page, the page rename (it names its row by position) is committed to its page, and other
     keyboard focus ends, so no draft continues on the next page. `commit_rename` is the layer
     row's existing lost-focus commit, shared. Same `Editor` page operations; upstreamable.
+  - R23 (natively too): that finish is `pages::finish_fields`, also run before every command
+    palette command (Go to page called `switch_page` directly). A rename whose row isn't drawn
+    is finished as losing focus does, on the shown page: the layer rename when the Library tab
+    or hidden UI hides the layer rows, or its row is inside a collapsed group; the page rename
+    when the pages panel is collapsed or the UI hidden. Before, such a draft stayed stored with
+    a document-local id or row position and could later land on another page.
+    `UiState::rename_field` and `PagesUi::rename_field` record each rename field's widget id
+    (no behaviour change), like `PaletteUi::search_id`: the browser host exempts only that
+    focused field, never another field while a rename is merely stored.
   - `src/editor/pages.rs`: `Editor::page_gen` is `pub` (visibility only). The browser host
     records each sent page's history generation, so a save's late answer marks only what it
     sent as saved, never a newer edit (upstream saves synchronously and has no such seam).
@@ -383,7 +392,9 @@ typing queued for a field. It blocks a clean reload or leave (`can_reload`) and 
 page's leave guard (`unsaved_work`); a reload closes the rename field and drops field focus.
 Only the command palette's own search field is exempt, and only while it has the keyboard
 (told by the id the palette reports, `PaletteUi::search_id`): the palette stays open when a
-document field is clicked.
+document field is clicked. An open rename's own field is judged by its draft, told by the ids
+upstream reports (`UiState::rename_field`, `PagesUi::rename_field`); a stored rename never
+exempts another focused field.
 Every `AppRequest` is
 handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
 Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in

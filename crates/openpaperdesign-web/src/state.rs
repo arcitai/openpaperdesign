@@ -820,12 +820,21 @@ impl WebState {
     /// Escape). Told by egui's public text-edit state for the focused widget, not by its text.
     /// Only the palette's own search field is exempt, told by the id upstream's palette reports
     /// for it (`PaletteUi::search_id`): the palette stays open when a document field is
-    /// clicked, and that field keeps its protection.
+    /// clicked, and that field keeps its protection. An open rename's own field is judged by
+    /// its draft instead, told the same way (`UiState::rename_field`, `PagesUi::rename_field`).
     fn field_editing(&self) -> bool {
         let Some(id) = self.ctx.memory(|m| m.focused()) else {
             return false;
         };
         if self.ui.palette.open && self.ui.palette.search_id == Some(id) {
+            return false;
+        }
+        // An open rename's own field (layer or page): its draft is judged by its text
+        // (`ui_edit_pending`). Only that field, told by the id upstream reports for it; a stored
+        // rename never exempts another focused field.
+        let layer = self.ui.renaming.is_some() && self.ui.rename_field == Some(id);
+        let page = self.ui.pages.renaming.is_some() && self.ui.pages.rename_field == Some(id);
+        if layer || page {
             return false;
         }
         egui::widgets::text_edit::TextEditState::load(&self.ctx, id).is_some()
@@ -858,10 +867,9 @@ impl WebState {
             .as_ref()
             .map(|(i, text)| changed(text, self.ed.pages.get(*i).map(|p| p.name.as_str())));
         let renaming = layer.is_some() || page.is_some();
-        let draft = match (layer, page) {
-            (None, None) => self.field_editing(),
-            (l, p) => l.unwrap_or(false) || p.unwrap_or(false),
-        };
+        // A stored rename speaks only for its own field: another focused field is judged on
+        // its own (`field_editing` exempts exactly the rename's field).
+        let draft = layer.unwrap_or(false) || page.unwrap_or(false) || self.field_editing();
         let typing = (renaming || self.field_has_keyboard())
             && self.events.iter().any(|e| {
                 matches!(

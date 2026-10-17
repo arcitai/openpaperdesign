@@ -1521,6 +1521,246 @@ fn r77_a_page_rename_draft_is_finished_on_its_own_page_before_another_row_is_del
     assert!(s.ui.pages.renaming.is_none());
 }
 
+// ---- R23: a rename whose row is hidden, palette page commands, and the field guard. The
+// first five tests are the independent R23 review's probes (r23-probes.rs and
+// r23-draft-guard-probes.rs), adopted with their fixtures, input and final assertions. One
+// intermediate assertion of the guard probe is adjusted, see there.
+
+fn r23_hidden_rename_setup() -> (WebState, crate::model::NodeId, String, String) {
+    let mut s = two_pages();
+    click_page(&mut s, "Alpha", 100.0);
+    let id = open_rename(&mut s);
+    let beta = s.ed.page_doc(1).get(id).unwrap().name.clone();
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    let draft = s.ui.renaming.as_ref().unwrap().1.clone();
+    let left = s.canvas_rect().min.x;
+    let p = painted_at(&mut s, "Library", |r| r.max.x <= left);
+    click(&mut s, p, 2000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.show_library, "actual Library tab hides the layer rows");
+    eprintln!(
+        "R23 after Library: rename={:?} focus={:?}",
+        s.ui.renaming,
+        s.ctx.memory(|m| m.focused())
+    );
+    (s, id, draft, beta)
+}
+
+fn r23_go_beta_from_palette(s: &mut WebState) {
+    open_palette(s);
+    s.paste("Go to page: Beta");
+    step(s);
+    step(s);
+    assert_eq!(s.ui.palette.query, "Go to page: Beta");
+    assert!(paints(s, "Go to page: Beta"));
+    press(s, "Enter", "Enter");
+    step(s);
+    step(s);
+    assert_eq!(
+        s.ed.active_page_id(),
+        "beta22",
+        "actual palette page command switched"
+    );
+}
+
+fn r23_finish_visible_layer_field(s: &mut WebState) {
+    let left = s.canvas_rect().min.x;
+    let p = painted_at(s, "Layers", |r| r.max.x <= left);
+    click(s, p, 4000.0);
+    step(s);
+    step(s);
+    assert!(!s.ui.show_library);
+    if s.ui.renaming.is_some() {
+        press(s, "Enter", "Enter");
+        step(s);
+        step(s);
+    }
+}
+
+#[test]
+fn r23_hidden_layer_draft_survives_palette_page_switch_on_its_origin() {
+    let (mut s, id, draft, beta) = r23_hidden_rename_setup();
+    r23_go_beta_from_palette(&mut s);
+    r23_finish_visible_layer_field(&mut s);
+    eprintln!(
+        "R23 palette hidden rename: Alpha={:?} Beta={:?} draft={:?}",
+        s.ed.page_doc(0).get(id).map(|n| &n.name),
+        s.ed.page_doc(1).get(id).map(|n| &n.name),
+        s.ui.renaming
+    );
+    assert_eq!(
+        s.ed.page_doc(1).get(id).unwrap().name,
+        beta,
+        "a hidden Alpha draft must not edit Beta"
+    );
+    assert_eq!(
+        s.ed.page_doc(0).get(id).unwrap().name,
+        draft,
+        "a local switch finishes the rename on Alpha"
+    );
+}
+
+#[test]
+fn r23_hidden_layer_draft_pages_panel_switch_is_a_positive_control() {
+    let (mut s, id, draft, beta) = r23_hidden_rename_setup();
+    click_page(&mut s, "Beta", 3000.0);
+    r23_finish_visible_layer_field(&mut s);
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta);
+    assert_eq!(s.ed.page_doc(0).get(id).unwrap().name, draft);
+}
+
+#[test]
+fn r23_visible_layer_rename_finishes_before_palette_switch_control() {
+    let mut s = two_pages();
+    click_page(&mut s, "Alpha", 100.0);
+    let id = open_rename(&mut s);
+    let beta = s.ed.page_doc(1).get(id).unwrap().name.clone();
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    let draft = s.ui.renaming.as_ref().unwrap().1.clone();
+    // Click the canvas as ordinary click-away, then use the actual palette command.
+    click_at(&mut s, 700.0, 500.0, 2000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.renaming.is_none());
+    r23_go_beta_from_palette(&mut s);
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta);
+    assert_eq!(s.ed.page_doc(0).get(id).unwrap().name, draft);
+}
+
+fn r23_library_tab(s: &mut WebState) {
+    let left = s.canvas_rect().min.x;
+    let p = painted_at(s, "Library", |r| r.max.x <= left);
+    click(s, p, 2000.0);
+    step(s);
+    step(s);
+    assert!(s.ui.show_library);
+}
+
+#[test]
+fn r23_hidden_unchanged_layer_rename_does_not_exempt_an_inspector_draft() {
+    let mut s = state();
+    let id = open_rename(&mut s);
+    assert!(s.ui.renaming.is_some(), "unchanged layer rename is open");
+    r23_library_tab(&mut s);
+    // Adjusted from the original probe, which asserted here that the rename "stays in hidden
+    // Library state" (true BEFORE the R23 fix, see r23-before.log). Hiding the layer rows now
+    // finishes the rename as losing focus does (unchanged, so no edit), so no rename is stored
+    // any more. The same input follows, and the final protection assertions are unchanged;
+    // `field_editing` also no longer lets a stored rename exempt another focused field.
+    assert!(
+        s.ui.renaming.is_none(),
+        "hiding the layer rows finishes the rename"
+    );
+    assert!(!s.dirty() && s.can_reload(), "nothing typed yet");
+    let field_id = open_number_field(&mut s, "X  ");
+    assert_eq!(field_id, id);
+    s.paste("-");
+    step(&mut s);
+    step(&mut s);
+    assert!(
+        paints(&mut s, "-"),
+        "the actual inspector paints the incomplete number"
+    );
+    assert_eq!(
+        axis(&s, id, "X  "),
+        100.0,
+        "the document has no number to save"
+    );
+    assert!(s.field_has_keyboard());
+    eprintln!(
+        "R23 hidden rename guard: renaming={:?} dirty={} unsaved={} can_reload={}",
+        s.ui.renaming,
+        s.dirty(),
+        s.unsaved_work(),
+        s.can_reload()
+    );
+    assert!(
+        s.unsaved_work() && !s.can_reload(),
+        "an unrelated hidden unchanged rename must not exempt an actual inspector draft"
+    );
+}
+
+#[test]
+fn r23_library_without_hidden_rename_protects_inspector_draft_control() {
+    let mut s = state();
+    r23_library_tab(&mut s);
+    let id = open_number_field(&mut s, "X  ");
+    s.paste("-");
+    step(&mut s);
+    step(&mut s);
+    assert!(paints(&mut s, "-"));
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(s.unsaved_work() && !s.can_reload());
+}
+
+#[test]
+fn r78_a_hidden_layer_draft_is_finished_on_its_page_and_saves_reopens_and_undoes_there() {
+    let (mut s, id, draft, beta) = r23_hidden_rename_setup();
+    // Hiding the rows finished the draft on Alpha, where it was typed.
+    assert!(s.ui.renaming.is_none());
+    assert_eq!(s.ed.page_doc(0).get(id).unwrap().name, draft);
+    r23_go_beta_from_palette(&mut s);
+    r23_finish_visible_layer_field(&mut s);
+    let snap = s.save_snapshot().expect("Alpha's rename and the switch");
+    let (active, _, sent) = parse_save(&snap);
+    assert_eq!(active, "beta22");
+    let ids: Vec<&str> = sent.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(ids, ["alpha1"], "only Alpha's content changed");
+    assert_eq!(sent[0].1.doc.get(id).unwrap().name, draft);
+    s.save_succeeded();
+    let reopened = WebState::open(&canvas(&pages_now(&s), "beta22"), false, W, H).unwrap();
+    assert_eq!(reopened.ed.page_doc(0).get(id).unwrap().name, draft);
+    assert_eq!(reopened.ed.page_doc(1).get(id).unwrap().name, beta);
+    // Undo on Beta changes nothing of Alpha's; on Alpha it undoes the rename.
+    s.run(Action::Undo);
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta);
+    click_page(&mut s, "Alpha", 5000.0);
+    s.run(Action::Undo);
+    assert_ne!(
+        s.ed.page_doc(0).get(id).unwrap().name,
+        draft,
+        "Alpha's undo"
+    );
+    assert_eq!(s.ed.page_doc(1).get(id).unwrap().name, beta);
+}
+
+#[test]
+fn r78_collapsing_the_pages_panel_finishes_a_page_rename_on_its_page() {
+    let mut s = two_pages();
+    // A double-click on Beta's row opens its rename; type a draft.
+    let p = page_row(&mut s, "Beta");
+    click(&mut s, p, 100.0);
+    step(&mut s);
+    click(&mut s, p, 150.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.pages.renaming.is_some());
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    assert!(!s.can_reload(), "a changed page-rename draft");
+    // One click on the header's collapse chevron: the sidebar's first item, 16 px wide, inside
+    // its 10 px margin, on the "Pages" title's line. (Any other click there would finish the
+    // field by ordinary click-away first, which wouldn't test the collapse.)
+    let left = s.canvas_rect().min.x as f64;
+    let (_, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+    click(&mut s, (18.0, title_y), 3000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.pages.collapsed, "the panel collapsed");
+    assert!(
+        s.ui.pages.renaming.is_none(),
+        "the hidden rename was finished"
+    );
+    let beta = page_index(&s, "beta22");
+    let name = s.ed.pages[beta].name.clone();
+    assert!(name != "Beta" && name.contains('q'), "{name}");
+    assert_eq!(s.ed.pages[page_index(&s, "alpha1")].name, "Alpha");
+    assert!(s.dirty() && s.unsaved_work(), "a page-list change to save");
+}
+
 #[test]
 fn r77_an_inspector_number_draft_never_continues_on_the_next_page() {
     for typed in ["-150", "-"] {

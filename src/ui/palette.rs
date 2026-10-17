@@ -301,6 +301,9 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
         });
     if let Some(c) = chosen {
         st.palette.open = false;
+        // A command may show another page (Go to page, or an action that does): open fields
+        // are finished first on the page they belong to, as for the pages panel's actions.
+        super::pages::finish_fields(ctx, ed, st);
         run(ed, st, c);
     }
 }
