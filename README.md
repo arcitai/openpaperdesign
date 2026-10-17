@@ -7,7 +7,7 @@ workspace. See [standalone plugin setup](docs/openpaperdesign/plugin-b2b.md#inst
 for local-build setup and limits. Installed model editing and browser save/conflict/reopen
 passed on macOS with Codex 0.162.1 at `0078487` (2026-10-13). Distribution is source-only /
 local build, with no packaged installer or public marketplace listing. See
-[repository Releases](https://github.com/onlinesourdough/openpaperdesign/releases) for delivery status.
+[repository Releases](https://github.com/arcitai/openpaperdesign/releases) for delivery status.
 There is no protection against concurrent native or external writers, and no multiplayer
 or cloud service. The upstream README follows unchanged.
 

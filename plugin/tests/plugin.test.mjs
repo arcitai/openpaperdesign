@@ -37,7 +37,7 @@ test('plugin.json has the required fields and its paths exist', () => {
   assert.match(m.name, /^[a-z0-9]+(-[a-z0-9]+)*$/, 'kebab-case');
   assert.match(m.version, /^\d+\.\d+\.\d+$/);
   assert.equal(m.license, 'MIT OR Apache-2.0');
-  assert.equal(m.repository, 'https://github.com/onlinesourdough/openpaperdesign');
+  assert.equal(m.repository, 'https://github.com/arcitai/openpaperdesign');
   assert.ok(m.description && m.author && m.author.name);
   // Discovery is fixed (the skills/ folder and the root mcp.json): the portable manifest
   // must not declare components itself.

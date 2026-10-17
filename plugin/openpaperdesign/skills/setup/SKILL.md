@@ -49,7 +49,7 @@ Standalone use remains `openpaperdesign-mcp --workspace <project-workspace>` (or
 process cwd); it is separate from packaged host mode. `--app-library`, `--codex-context` and
 `--workspace` cannot be combined.
 
-To install, in a checkout of https://github.com/onlinesourdough/openpaperdesign (macOS or
+To install, in a checkout of https://github.com/arcitai/openpaperdesign (macOS or
 Linux; Rust 1.95 with the `wasm32-unknown-unknown` target, and `wasm-bindgen` CLI 0.2.129):
 
 ```sh
