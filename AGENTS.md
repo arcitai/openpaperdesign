@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.41 · Updated: 2026-10-17
+Revision: 0.42 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -358,7 +358,11 @@ palette, menus and help; `render::frame::{layout, Painter}` on the editor's wgpu
 upstream's `egui-wgpu`). Don't rebuild that UI in DOM, fork it or add eframe/another runtime.
 DOM input goes to egui first; pointer input reaches `Editor` only over the returned canvas
 rectangle and not over a floating egui area or an egui drag (as native `App::over_canvas`);
-keys reach `Editor` only while no egui text field has the keyboard. Every `AppRequest` is
+keys reach `Editor` only while no egui text field has the keyboard. egui's own keyboard zoom
+is off in this host (Ctrl/⌘ +/- is the canvas zoom only), so egui paints at the page's device
+pixel ratio and DOM input stays in its CSS px. A changed layer-rename draft or typing queued
+for an egui field is unsaved work: it blocks a clean reload or leave (`can_reload`) and shows
+in the page's leave guard (`unsaved_work`); a reload closes the rename field. Every `AppRequest` is
 handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
 Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in
 a browser tab); SVG/PDF export is upstream's in-memory export offered as a download; PNG

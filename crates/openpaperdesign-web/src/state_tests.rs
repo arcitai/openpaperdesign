@@ -252,6 +252,184 @@ fn a_click_on_the_canvas_commits_the_layers_panel_rename() {
     assert!(snap.contains(&renamed));
 }
 
+/// Selects the rectangle and opens upstream's layer rename field (Ctrl+R), laid out.
+fn open_rename(s: &mut WebState) -> crate::model::NodeId {
+    click_at(s, 150.0, 150.0, 0.0);
+    let id = s.ed.selection[0];
+    s.modifiers(false, true, false, false);
+    assert!(s.key_down("r", "KeyR", false));
+    s.key_up("r", "KeyR");
+    s.modifiers(false, false, false, false);
+    step(s);
+    step(s);
+    assert!(s.field_has_keyboard(), "the rename field has the keyboard");
+    id
+}
+
+fn press(s: &mut WebState, key: &str, code: &str) {
+    assert!(s.key_down(key, code, false));
+    s.key_up(key, code);
+}
+
+/// The page with node `id` renamed to `name`, as an agent saved it.
+fn renamed_elsewhere(s: &WebState, id: crate::model::NodeId, name: &str) -> String {
+    let mut page = s.ed.page_data(0);
+    page.doc.nodes.get_mut(&id).unwrap().name = name.into();
+    page_to_json(&page)
+}
+
+#[test]
+fn an_unfinished_layer_rename_is_unsaved_work_until_it_is_committed_and_saved() {
+    let mut s = state();
+    let id = open_rename(&mut s);
+    let old = s.ed.doc.get(id).unwrap().name.clone();
+    assert!(
+        s.can_reload(),
+        "an open field with nothing typed loses nothing"
+    );
+    assert!(!s.unsaved_work());
+    // Typed, not laid out yet: the typing is queued for the field.
+    press(&mut s, "z", "KeyZ");
+    assert!(!s.can_reload(), "queued typing for the field");
+    assert!(s.unsaved_work());
+    step(&mut s);
+    // Laid out: a draft, not yet in the document.
+    assert_eq!(s.ed.doc.get(id).unwrap().name, old, "still a draft");
+    assert!(!s.dirty(), "the document itself is unchanged");
+    assert!(s.unsaved_work(), "the page's leave guard sees the draft");
+    assert!(!s.can_reload(), "no clean reload (or clean leave) over it");
+    assert!(
+        s.save_snapshot().is_none(),
+        "nothing in the document to save yet"
+    );
+    // The page loses focus (a leave starts, or the panel's Back is clicked): the draft stays.
+    s.set_focused(false);
+    step(&mut s);
+    assert!(s.ui.renaming.is_some());
+    assert!(!s.can_reload(), "a refused leave keeps it unfinished");
+    assert!(s.unsaved_work());
+    s.set_focused(true);
+    step(&mut s);
+    // Enter commits it through upstream's rename; it saves like any other edit.
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    let renamed = s.ed.doc.get(id).unwrap().name.clone();
+    assert!(
+        renamed != old && renamed.contains('z'),
+        "{old} -> {renamed}"
+    );
+    assert!(s.ui.renaming.is_none());
+    assert!(s.dirty() && !s.can_reload(), "a change to save now");
+    let snap = s.save_snapshot().expect("the rename is saved");
+    assert!(snap.contains(&renamed));
+    s.save_succeeded();
+    assert!(s.can_reload(), "clean again after the save");
+    assert!(!s.unsaved_work());
+}
+
+#[test]
+fn an_agent_s_change_never_meets_a_stale_rename_draft() {
+    // A typed draft: the agent's newer page isn't loaded over it. Committed, it saves on the
+    // old revision, which the server refuses (409): a conflict, nothing reloads, and the
+    // banner's explicit discard loads the agent's page and drops the local name.
+    let mut s = state();
+    let id = open_rename(&mut s);
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    let agent = renamed_elsewhere(&s, id, "Agent");
+    assert!(!s.can_reload(), "the poll doesn't replace the page");
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ed.doc.get(id).unwrap().name.contains('q'));
+    let _snap = s.save_snapshot().expect("the local rename");
+    s.save_failed();
+    assert!(
+        s.dirty() && !s.can_reload(),
+        "a conflict keeps the local change"
+    );
+    s.reload(&agent).unwrap();
+    assert_eq!(s.ed.doc.get(id).unwrap().name, "Agent");
+    assert!(!s.unsaved_work());
+    // An open field with nothing typed: a clean reload takes the agent's name, and the field
+    // (for the replaced page) closes, so Enter afterwards can't write the old name back.
+    let mut s = state();
+    let id = open_rename(&mut s);
+    assert!(s.can_reload());
+    let agent = renamed_elsewhere(&s, id, "Agent");
+    s.reload(&agent).unwrap();
+    assert!(
+        s.ui.renaming.is_none(),
+        "the field closed with the old page"
+    );
+    s.key_down("Enter", "Enter", false);
+    s.key_up("Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        s.ed.doc.get(id).unwrap().name,
+        "Agent",
+        "the agent's name stays"
+    );
+    assert!(!s.dirty());
+}
+
+/// The egui pixel scale the next frame is painted at (headless).
+fn painted_scale(s: &mut WebState) -> f32 {
+    let mut l = s.layout();
+    l.output.textures_delta.clear();
+    s.drawn();
+    l.output.pixels_per_point
+}
+
+#[test]
+fn zoom_shortcuts_zoom_the_canvas_and_keep_painting_and_input_in_css_px() {
+    for (mac, dpr) in [(false, 1.0), (false, 2.0), (true, 1.0), (true, 2.0)] {
+        let mut s = state();
+        s.mac = mac;
+        s.resize(W, H, dpr);
+        step(&mut s);
+        step(&mut s);
+        let canvas = s.canvas_rect();
+        assert_eq!(painted_scale(&mut s), dpr as f32);
+        let zoom = s.ed.camera.zoom;
+        // ⌘ on a Mac, Ctrl elsewhere: two "=" (zoom in) and one "-" (zoom out).
+        for (k, code) in [("=", "Equal"), ("=", "Equal"), ("-", "Minus")] {
+            if mac {
+                s.modifiers(false, false, false, true);
+            } else {
+                s.modifiers(false, true, false, false);
+            }
+            press(&mut s, k, code);
+            s.modifiers(false, false, false, false);
+            step(&mut s);
+            step(&mut s);
+        }
+        assert!(
+            s.ed.camera.zoom > zoom,
+            "upstream's canvas zoom (mac {mac})"
+        );
+        let scale = painted_scale(&mut s);
+        assert_eq!(
+            scale, dpr as f32,
+            "egui paints at the page's DPR only (mac {mac}, dpr {dpr})"
+        );
+        assert_eq!(s.canvas_rect(), canvas, "panels keep their CSS size");
+        // A click where the rectangle is painted (device px / DPR = CSS px) selects it.
+        let id = s.ed.doc.root[0];
+        let r =
+            s.ed.camera
+                .world_rect_to_screen(&s.ed.doc.world_rect(id).unwrap());
+        let device = (
+            (canvas.min.x as f64 + r.x + r.w / 2.0) * scale as f64,
+            (canvas.min.y as f64 + r.y + r.h / 2.0) * scale as f64,
+        );
+        click(&mut s, (device.0 / dpr, device.1 / dpr), 900.0);
+        assert_eq!(s.ed.selection, vec![id], "mac {mac}, dpr {dpr}");
+    }
+}
+
 #[test]
 fn inspector_edits_are_coalesced_undoable_changes_of_the_saved_page() {
     let mut s = state();

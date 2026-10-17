@@ -213,6 +213,11 @@ impl WebState {
         ed.clipboard_io = Some(Box::new(WebClipboard(clipboard.clone())));
         let ctx = egui::Context::default();
         ui::setup_style(&ctx);
+        // Ctrl/⌘ with +, = or - is upstream's canvas zoom (`Editor`). egui would also apply it
+        // as its own UI zoom (`Options::zoom_with_keyboard`), scaling what it paints while the
+        // page's input and the canvas rectangle stay in CSS px: positions would no longer match
+        // what is drawn. The UI scale here is the page's device pixel ratio only.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
         // This page holds one page of the canvas and saves only that page: page-list changes
         // couldn't be stored, so the pages panel offers none (see `UiState::pages_locked`).
         let st = UiState {
@@ -757,6 +762,34 @@ impl WebState {
         self.ed.doc_stamp != self.saved_stamp
     }
 
+    /// An upstream UI edit that isn't in the document yet: a changed layer-rename draft
+    /// (upstream commits it on Enter or when the field loses focus), or typing queued for an egui
+    /// text field that the next layout will apply. Nothing can save it yet, and a reload would
+    /// strand it.
+    fn ui_edit_pending(&self) -> bool {
+        let draft = self.ui.renaming.as_ref().is_some_and(|(id, text)| {
+            let text = text.trim();
+            !text.is_empty() && self.ed.doc.get(*id).is_some_and(|n| n.name != text)
+        });
+        let typing = (self.ui.renaming.is_some() || self.field_has_keyboard())
+            && self.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            });
+        draft || typing
+    }
+
+    /// Anything a leave would lose: unsaved content or an unfinished UI edit (for the page's
+    /// leave guard).
+    pub fn unsaved_work(&self) -> bool {
+        self.dirty() || self.ui_edit_pending()
+    }
+
     /// The page file to write now, or `None` when there is nothing to save, a save is
     /// already in flight, or a gesture/text edit still owns the open transaction.
     pub fn save_snapshot(&mut self) -> Option<String> {
@@ -772,19 +805,29 @@ impl WebState {
     }
 
     /// Whether a newer revision from the server may replace the page now: nothing unsaved,
-    /// no save in flight, no gesture or text edit under way. Otherwise nothing is reloaded:
-    /// the local change's save is refused as a conflict (nothing merges).
+    /// no save in flight, no gesture, text edit or unfinished UI edit (a changed rename draft,
+    /// queued typing) under way. Otherwise nothing is reloaded: the local change's save is
+    /// refused as a conflict (nothing merges). Leaving (`Session.drain`) is clean only then too.
     pub fn can_reload(&self) -> bool {
         !self.dirty()
             && self.inflight.is_none()
             && !self.ed.is_busy()
             && self.ed.text_edit.is_none()
+            && !self.ui_edit_pending()
     }
 
     /// Load a newer revision of the same page in place, keeping the view: camera, tool, and
-    /// the selection where those nodes still exist. Undo history starts over.
+    /// the selection where those nodes still exist. Undo history starts over. An open rename
+    /// field closes: it was for the replaced page, so its text (unchanged after a clean reload,
+    /// or deliberately dropped by the conflict banner's discard) never lands on the new one.
     pub fn reload(&mut self, page_json: &str) -> Result<(), String> {
         let mut page = page_from_json(page_json).map_err(|e| e.to_string())?;
+        self.ui.renaming = None;
+        self.ctx.memory_mut(|m| {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        });
         let slot = &self.ed.pages[self.ed.active_page];
         page.id = slot.id.clone();
         page.name = slot.name.clone();

@@ -105,8 +105,9 @@ async function main() {
   window.__opdSession = m.session;
   await m.started;
   window.__opdEditor = m.session.ed;
+  // Unsaved content, or an unfinished edit in the workspace (a layer name being typed).
   window.addEventListener('beforeunload', (e) => {
-    if (m.session.ed && m.session.ed.dirty()) e.preventDefault();
+    if (m.session.ed && m.session.ed.unsaved_work()) e.preventDefault();
   });
 }
 

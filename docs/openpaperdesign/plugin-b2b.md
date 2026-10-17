@@ -48,12 +48,12 @@ once to open it (`ui/open-link`).
   expected panel results. Hosts may cache a view
   by its resource URI; OpenAI's [Apps UI guidance](https://developers.openai.com/plugins/build/chatgpt-ui)
   (read 2026-10-17) asks for a new URI, everywhere it is referenced, for breaking HTML/JS/CSS
-  changes. So a fresh tool listing or resource read gets `home-3` under a cache key no older
+  changes. So a fresh tool listing or resource read gets `home-4` under a cache key no older
   view used, and a read of an earlier URI is refused. That guidance promises no eviction.
   - **What it doesn't do.** It doesn't evict or refresh a view a host already has open, and it
     doesn't stop such a view from making ordinary tool calls. The server doesn't learn which
     view version is calling (`panel: true` is still a supported request).
-  - **Still unproven.** Which `home-3` metadata, resource and visible view a native host
+  - **Still unproven.** Which `home-4` metadata, resource and visible view a native host
     actually uses still has to be shown through its supported lifecycle.
   - **Not a diagnosis.** This is a compatibility rule, not an explanation of what a Mac host
     cached.

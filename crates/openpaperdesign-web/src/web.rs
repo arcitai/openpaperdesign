@@ -413,6 +413,11 @@ impl WebEditor {
         self.state.dirty()
     }
 
+    /// Unsaved content or an unfinished UI edit (see [`WebState::unsaved_work`]).
+    pub fn unsaved_work(&self) -> bool {
+        self.state.unsaved_work()
+    }
+
     pub fn save_snapshot(&mut self) -> Option<String> {
         self.state.save_snapshot()
     }
