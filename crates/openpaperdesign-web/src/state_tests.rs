@@ -552,6 +552,142 @@ fn an_agent_s_change_never_meets_a_stale_number_draft() {
     assert!(!s.dirty() && !s.unsaved_work());
 }
 
+/// Opens upstream's command palette (Ctrl+K); its search field takes the keyboard.
+fn open_palette(s: &mut WebState) {
+    s.modifiers(false, true, false, false);
+    press(s, "k", "KeyK");
+    s.modifiers(false, false, false, false);
+    step(s);
+    step(s);
+    assert!(s.ui.palette.open && s.field_has_keyboard());
+}
+
+/// Selects the rectangle, opens the palette, then clicks the painted inspector X field and
+/// selects its text: the palette stays open, the field has the keyboard. Adapted from the R20
+/// review's probe.
+fn open_x_with_palette_open(s: &mut WebState) -> crate::model::NodeId {
+    click_at(s, 150.0, 150.0, 0.0);
+    step(s);
+    step(s);
+    let id = s.ed.selection[0];
+    open_palette(s);
+    let search = s.ctx.memory(|m| m.focused());
+    assert_eq!(
+        search, s.ui.palette.search_id,
+        "the search has the keyboard"
+    );
+    let text = painted_text(s);
+    let (_, bounds) = text
+        .iter()
+        .find(|(t, _)| t.starts_with("X  "))
+        .unwrap_or_else(|| panic!("X field not painted: {text:?}"));
+    let p = bounds.center();
+    click(s, (p.x as f64, p.y as f64), 1000.0);
+    step(s);
+    step(s);
+    assert!(s.ui.palette.open, "the palette stays open");
+    assert!(s.field_has_keyboard(), "the X field has the keyboard");
+    assert_ne!(s.ctx.memory(|m| m.focused()), search, "not the search");
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+    id
+}
+
+#[test]
+fn a_palette_search_is_ephemeral_and_never_taken_for_a_document_field() {
+    let mut s = state();
+    open_palette(&mut s);
+    s.paste("no matching command qzqz");
+    assert!(!s.can_reload(), "queued typing for the field");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.palette.query, "no matching command qzqz");
+    assert!(s.field_has_keyboard(), "the search still has the keyboard");
+    assert!(!s.dirty() && !s.unsaved_work() && s.can_reload());
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    step(&mut s);
+    assert!(!s.ui.palette.open && !s.unsaved_work() && s.can_reload());
+}
+
+#[test]
+fn an_open_palette_never_exempts_a_number_draft_in_the_inspector() {
+    let mut s = state();
+    let id = open_x_with_palette_open(&mut s);
+    assert!(
+        s.unsaved_work() && !s.can_reload(),
+        "the inspector field, not the search, has the keyboard"
+    );
+    s.paste("-");
+    step(&mut s);
+    assert!(paints(&mut s, "-"), "the field shows the draft");
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(!s.dirty() && s.save_snapshot().is_none());
+    assert!(
+        s.unsaved_work() && !s.can_reload(),
+        "laid out: still guarded"
+    );
+    s.set_focused(false);
+    step(&mut s);
+    assert!(paints(&mut s, "-"));
+    assert!(s.ui.palette.open);
+    assert!(
+        s.unsaved_work() && !s.can_reload(),
+        "after the blur: still guarded"
+    );
+    // So no clean reload can drop it; the explicit discard (the conflict banner) does, once.
+    let agent = renamed_elsewhere(&s, id, "Agent");
+    s.reload(&agent).unwrap();
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.doc.get(id).unwrap().name, "Agent");
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(
+        !paints(&mut s, "-"),
+        "the discarded draft isn't shown again"
+    );
+}
+
+#[test]
+fn a_number_draft_beside_an_open_palette_finishes_like_any_other() {
+    // Completed and finished with Enter: upstream applies it and it saves.
+    let mut s = state();
+    let id = open_x_with_palette_open(&mut s);
+    s.paste("-150");
+    step(&mut s);
+    assert_eq!(axis(&s, id, "X  "), -150.0);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert!(s.dirty());
+    let _snap = s.save_snapshot().expect("the new position is saved");
+    s.save_succeeded();
+    assert!(!s.unsaved_work() && s.can_reload(), "clean after the save");
+    // Cancelled with Escape: upstream drops the draft (and closes the palette); clean again.
+    let mut s = state();
+    let id = open_x_with_palette_open(&mut s);
+    s.paste("-");
+    step(&mut s);
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(!s.dirty() && !s.unsaved_work() && s.can_reload());
+    // Finished by a click on the canvas: focus leaves the field; clean again.
+    let mut s = state();
+    let id = open_x_with_palette_open(&mut s);
+    s.paste("-");
+    step(&mut s);
+    click_at(&mut s, 700.0, 600.0, 2000.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(axis(&s, id, "X  "), 100.0);
+    assert!(!s.field_has_keyboard());
+    assert!(!s.dirty() && !s.unsaved_work() && s.can_reload());
+}
+
 /// The egui pixel scale the next frame is painted at (headless).
 fn painted_scale(s: &mut WebState) -> f32 {
     let mut l = s.layout();

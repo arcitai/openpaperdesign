@@ -767,13 +767,16 @@ impl WebState {
     /// library name... Its text can be an unfinished draft that the document doesn't have yet
     /// (`-` before a negative X; upstream applies a number only once it parses, or drops it on
     /// Escape). Told by egui's public text-edit state for the focused widget, not by its text.
+    /// Only the palette's own search field is exempt, told by the id upstream's palette reports
+    /// for it (`PaletteUi::search_id`): the palette stays open when a document field is
+    /// clicked, and that field keeps its protection.
     fn field_editing(&self) -> bool {
-        if self.ui.palette.open {
-            return false;
-        }
         let Some(id) = self.ctx.memory(|m| m.focused()) else {
             return false;
         };
+        if self.ui.palette.open && self.ui.palette.search_id == Some(id) {
+            return false;
+        }
         egui::widgets::text_edit::TextEditState::load(&self.ctx, id).is_some()
     }
 

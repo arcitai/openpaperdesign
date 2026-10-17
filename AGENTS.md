@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.43 · Updated: 2026-10-17
+Revision: 0.44 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -39,6 +39,10 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     focus back at once, so the old order hid Enter and click-away and the rename never
     committed, natively too. A plain upstream bug fix. `ui/pages.rs` page rename has the same
     order; it is not changed here (pages are locked in the browser).
+  - `src/ui/palette.rs`: `PaletteUi::search_id`, the search field's actual widget id, recorded
+    each frame the palette is drawn (no behaviour change). The browser host needs it to exempt
+    only that ephemeral search from its unfinished-input guard; the id is otherwise automatic
+    and can't be known without guessing. Upstreamable as a read-only host seam.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -362,10 +366,13 @@ keys reach `Editor` only while no egui text field has the keyboard. egui's own k
 is off in this host (Ctrl/⌘ +/- is the canvas zoom only), so egui paints at the page's device
 pixel ratio and DOM input stays in its CSS px. Unfinished UI input is unsaved work: a changed
 layer-rename draft, any other egui text field while it has the keyboard (an inspector number
-field holding `-`, say; told by egui's public `TextEditState` for the focused widget, the
-palette's search excepted, and conservatively busy until upstream finishes or cancels it), and
+field holding `-`, say; told by egui's public `TextEditState` for the focused widget, and
+conservatively busy until upstream finishes or cancels it), and
 typing queued for a field. It blocks a clean reload or leave (`can_reload`) and shows in the
 page's leave guard (`unsaved_work`); a reload closes the rename field and drops field focus.
+Only the command palette's own search field is exempt, and only while it has the keyboard
+(told by the id the palette reports, `PaletteUi::search_id`): the palette stays open when a
+document field is clicked.
 Every `AppRequest` is
 handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
 Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in

@@ -14,6 +14,9 @@ pub struct PaletteUi {
     pub selected: usize,
     /// Focus the text field on the next frame.
     focus: bool,
+    /// The search field's widget id, as of the last frame the palette was drawn: lets a host
+    /// tell keyboard focus in this (ephemeral) search from focus in a document field.
+    pub search_id: Option<egui::Id>,
 }
 
 impl PaletteUi {
@@ -243,6 +246,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY),
                     );
+                    st.palette.search_id = Some(r.id);
                     if st.palette.focus {
                         r.request_focus();
                         st.palette.focus = false;
