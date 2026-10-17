@@ -3,11 +3,13 @@
 //! the home view, with no model turn and no message.
 //!
 //! In an app-library process only these tools, the home, its resource,
-//! `openpaperdesign_status` (this mode's own report) and the read-only Codex project inventory
-//! are answered. Every project route (`bind_project`, `create_project`, `open_editor`, the
-//! workspace canvases list, the `_ui_*` workspace actions, the folder picker and the upstream
-//! design tools) is refused without being admitted and without touching any state, so a call
-//! without workspace context can neither use nor retire anything here. No Workspace is ever
+//! `openpaperdesign_status` (this mode's own report), the read-only Codex project inventory and
+//! the agent's access to the same canvases (`launcher_library_agent.rs`: model-visible library
+//! controls and upstream's design tools, each naming the open canvas's binding) are answered.
+//! Every project route (`bind_project`, `create_project`, `open_editor`, the workspace
+//! canvases list, the `_ui_*` workspace actions and the folder picker) is refused without being
+//! admitted and without touching any state, so a call without workspace context can neither
+//! use nor retire anything here. No Workspace is ever
 //! made for the library, and no argument names a path: only a server-made canvas id, a bounded
 //! name, a `force` flag, a server-made binding identity or a canvas file's bytes reach it.
 //!
@@ -28,6 +30,14 @@
 use super::*;
 use crate::library::payload::MAX_PAYLOAD_BYTES;
 use crate::library::{Lease, LeaseError, MAX_NAME_CHARS, NewDocument, payload, valid_id};
+
+#[path = "launcher_library_agent.rs"]
+mod agent_api;
+pub(super) use agent_api::AGENT_TOOLS;
+#[cfg(test)]
+pub(super) use agent_api::{
+    AGENT_CLOSE, AGENT_CREATE, AGENT_CURRENT, AGENT_EDITOR, AGENT_LIST, AGENT_OPEN,
+};
 
 pub(super) const LIST: &str = "openpaperdesign_app_canvases";
 pub(super) const CREATE: &str = "openpaperdesign_app_create";
@@ -165,15 +175,24 @@ fn expect_binding(state: &LauncherState, binding: Option<&str>) -> Result<(), St
 
 pub(super) const INSTRUCTIONS: &str = "openpaperdesign (app library): the OpenPaperDesign home \
     in the Codex sidebar creates, opens, closes and reopens canvases that OpenPaperDesign keeps \
-    in its own data folder, and edits them in the view itself (or, as a secondary option, in \
-    the loopback browser editor). Those actions are the person's, from the view; they need no \
-    model call. This server has no workspace and no \
-    project editing tools: openpaperdesign_status reports what it serves. Workspace design \
-    projects (design/<name>/ in a repository) need a separately started `openpaperdesign-mcp \
-    --codex-context` server; don't claim this one can bind or edit them.";
+    in its own data folder, and hands each to its loopback web editor (Codex's built-in \
+    browser, or a browser on this computer; editing inside the view is optional). Those \
+    actions are the person's, from the view; they need no model call.\n\n\
+    You can work on the same canvases: openpaperdesign_library_current shows the canvas open \
+    here (id, binding, pages); openpaperdesign_library_canvases, _create, _open and _close pick \
+    one. The paper-rs design tools below edit it; pass the open canvas's `binding` with every \
+    call (a stale one is refused with no effect). Read a page before changing it \
+    (get_tree_summary with nodeId \"root\" and its pageId); changes to an unread or \
+    since-changed page are refused as conflicts. Each successful change is saved at once and \
+    shows in the person's editor when it has no unsaved change of its own. A canvas whose editor may hold unsaved changes \
+    can't be switched or closed from here: ask the person. In this server list_resources and \
+    open_file only name the open canvas; create_file and export aren't offered; images must be \
+    data: URIs. Workspace design projects (design/<name>/ in a repository) need a separately \
+    started `openpaperdesign-mcp --codex-context` server; don't claim this one can bind or edit \
+    them.";
 
-/// The tools of an app-library process: the home, this mode's status, the inventory and the
-/// app-only library actions. No project or upstream design tool.
+/// The tools of an app-library process: the home, this mode's status, the inventory, the
+/// app-only library actions, and the agent's library controls and design tools.
 pub(super) fn listed_tools() -> Vec<Tool> {
     let none = json!({"type": "object", "properties": {}, "additionalProperties": false});
     let mut out = vec![
@@ -194,7 +213,7 @@ pub(super) fn listed_tools() -> Vec<Tool> {
             "name": "openpaperdesign_status",
             "description": "Report what this OpenPaperDesign server serves: the app library \
                 (its folder and the canvas open in this window), and that it has no workspace \
-                or project editing tools.",
+                or workspace project tools.",
             "inputSchema": none,
         }),
     ];
@@ -205,6 +224,7 @@ pub(super) fn listed_tools() -> Vec<Tool> {
             .map(|t| serde_json::to_value(t).expect("tool serializes")),
     );
     out.extend(tools());
+    out.extend(agent_api::agent_tools());
     out.into_iter()
         .map(|t| serde_json::from_value(t).expect("valid tool"))
         .collect()
@@ -362,10 +382,13 @@ impl Launcher {
                         Ok(_) => "built in".to_string(),
                         Err(why) => format!("not available: {why}"),
                     },
+                    "binding": state.bound.as_ref().and_then(|b| b.binding.clone()),
+                    "agent_tools": "openpaperdesign_library_* and the paper-rs design tools, \
+                        each naming the open canvas's binding",
                     "workspace": null,
                     "workspace_usable": false,
                     "workspace_problem": "This server runs the app library and has no workspace \
-                        or project tools; workspace projects need a separately started \
+                        or workspace project tools; workspace projects need a separately started \
                         openpaperdesign-mcp --codex-context server.",
                 }))
             }
@@ -380,6 +403,11 @@ impl Launcher {
                 self.app(lib, n, Value::Object(args.unwrap_or_default()))
                     .await
             }
+            n if AGENT_TOOLS.contains(&n) => {
+                self.agent_library(lib, n, Value::Object(args.unwrap_or_default()))
+                    .await
+            }
+            n if agent_api::is_design_tool(n) => self.agent_design(n, args).await,
             _ => Err(LIBRARY_ONLY.into()),
         }
     }

@@ -11,11 +11,111 @@ cloud, no telemetry. Not affiliated with Paper (paper.design).
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
 surface), plugin publishing, other hosts. The later sidebar home is described in the next section.
 
+## Agents on library canvases, and what is upstream's (issues #6/#10): source candidate, 2026-10-17
+
+Not built, tested, installed or qualified by its writer. The owner's target (2026-10-17): keep
+the Home-first plugin. The home owns the overview, the native project inventory and the canvas
+library with New/Open. A created or chosen canvas goes to one localhost web editor, in Codex's
+built-in browser or an ordinary browser on this computer. The person uses it directly
+(New/Open/edit/Saved/Close/reopen with no agent message), and supported MCP agents edit the same
+canvas. The MCP App panel and the native paper-rs app are optional.
+
+**Home to web editor, as implemented.** The home's New, Open, Import and "Open current canvas"
+call the library actions without `panel`. The server returns the canvas and its same-binding
+loopback editor link, and the home checks it against the loopback pattern before asking Codex
+once to open it (`ui/open-link`).
+- **What it shows.** The home shows the canvas, Close and Export. Under Details it shows the
+  port, never the link or its token. A link given makes Close and Switch ask the person first.
+- **Readiness.** Asking for the link is never treated as a load. The home reports "loaded"
+  only from the editor's own report (`POST /api/ready`), polled through
+  `_app_editor {binding}`.
+- **Stale and wrong results.** An answer for another canvas, or a link that isn't loopback,
+  opens nothing. A late reply after Back opens nothing either.
+- **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
+  view" when the build has it.
+- **Who owns what.** Routing and lifecycle are the home's. Editing belongs to the web editor
+  (browser/WASM hosting of upstream's engine). The document, revisions, conflicts and authority
+  belong to the server.
+
+A future upstream plugin could replace the thin home/routing/lifecycle adapter, but only once
+its actual contracts are verified; compatibility is not assumed.
+
+**Agent contract, as implemented.**
+- **Library controls (model-visible), on the existing library operations:**
+  - `openpaperdesign_library_canvases`: the list.
+  - `_current`: the open canvas's id, name, binding, pages, active page and editor state.
+  - `_create {name}` and `_open {id}`.
+  - `_close {binding}`.
+  - `_editor {binding}`: the loopback editor link, for Codex's built-in browser; it counts as
+    a link given.
+
+  None of them takes `force` or `replace`. While a panel is mounted or a link was given, the
+  agent can't switch or close the canvas, and must ask the person. A canvas another process
+  holds is refused as busy.
+- **Design operations: upstream's own.** These are `agent::offered_tools`, the paper-rs
+  catalogue minus `export`, `export_combined_pdf` and `create_file`, with their own names,
+  descriptions and schemas. Each also requires `binding`. The adapter compares the binding
+  under the state lock, removes it, and calls `Server::call_tool`, the path workspace mode
+  uses. Reads count per page, session and revision, and only when delivered. Nothing
+  `create`/`open`/`current` returns counts as a read, and a caller-supplied session field is
+  refused. Successful changes are saved as one commit, with rollback and the `Broken` fence.
+- **Same canvas as the person.** The panel and the browser editor poll revisions. A clean view
+  picks up agent commits; a stale save is a 409 that overwrites nothing. A stale agent change
+  is refused as a conflict.
+- **What was missing before.** Library mode offered no model tools besides the home, status and
+  inventory. The library actions were app-only, and every upstream design tool was refused.
+
+**Reuse map (upstream paper-rs).** The pinned baseline is upstream `0b1b91da` (from the
+2026-10-12 feasibility record). Verified there, not a claim about upstream's latest; no new
+upstream source change in this delta.
+
+| Upstream part | How it's used |
+|---|---|
+| Agent catalogue and execution (`mcp::tools`, `mcp::exec`, `mcp::css`/`html`) | Directly, in the serve crate's host (`agent.rs` `BoundHost`: an upstream `Editor` on its own thread). The library adds only the binding envelope. |
+| Document, scene and project structures (`model`, `project`, `project::format`) | Directly: library canvases are standard paper-rs projects. Saves write upstream's page and manifest format. |
+| Editor, tools, pointer/keyboard/undo (`editor`, `history`, `layout`, `text`, …) | In the browser through `#[path]` in `openpaperdesign-web` (`WebState` feeds DOM input to `Editor::{pointer_*, key_*}`), and on the server through the agent host. |
+| Renderer (`render::{draw, gpu, mesh, rough, scene, tess}`) | Directly, compiled to wasm32 (wgpu WebGPU/WebGL2). |
+| Core `#[path]` crate, web/WASM wrappers | Ours: `openpaperdesign-core`/`-web` compile upstream modules unchanged. Our code is `state`/`web` glue, `health` and `keys`. |
+| Session lifecycle and editor mount (`static/session.js`, `editor.js`, `panel.js`) | Ours: hosting, fallback, save/conflict, disposal. |
+| Library authority, binding, leases, fences, revisions, transport, home view | Ours: `library*.rs`, `launcher*.rs`, `lib.rs` `Server`, `home.html`. |
+
+**Not reused, by inspection.**
+- **The egui/winit app shell** (`app`, `ui`, `render::frame`). This covers panels, the
+  properties and layers UI, the page list and the command palette. The browser editor has a
+  small toolbar (select/hand/rect/ellipse, undo/redo/delete); upstream's keyboard shortcuts
+  reach `Editor` except chrome-only ones (`state::chrome_only`). The gap is a browser-hosted
+  chrome. The smallest adapter is DOM controls calling the same `Editor` actions, as the
+  toolbar does; there is no parity claim.
+- **Native `session`** (clocks, storage, autosave): library saves go through `Server`.
+- **Upstream's HTTP MCP endpoint** (`mcp::server`). It rejects browser `Origin`s and is not an
+  editor URL. The browser never talks to it, and no origin rule was relaxed.
+
+**Native alternative, for comparison only.**
+- Upstream `app.rs` runs MCP calls through the running native app's `Editor` on its event loop.
+  Its `Session` owns loading, autosave and close, and `paper-rs-mcp` relays stdio to it.
+- That route could reuse the egui/winit UI, `Editor`, renderer, `Session` and MCP unchanged,
+  with little setup, as a separate window. It would still need its own Mac GUI, agent and
+  persistence proof, and one explicit owner of its project session.
+- It does not follow our library's advisory lease, transaction or revision boundary (native
+  `Session`/`Project::open` don't). It must never open an active `PLUGIN_DATA` canvas
+  concurrently, and isn't interchangeable with this path.
+- The browser route stays the target. Native is a lower-code standalone alternative only if a
+  separate-window experience is later chosen and qualified.
+
+**Unproven.** None of this is proven yet:
+- an actual Codex catalogue listing these tools;
+- Codex opening the editor link from the home (an earlier Mac run saw no destination for an
+  open-link request);
+- a native agent edit appearing in the person's browser editor or panel;
+- Mac persistence of edits made this way.
+
 ## In-panel editor (issue #6): source candidate, 2026-10-16
 
 Not built, tested, installed or qualified by its writer. On the Mac, the host received the
 library's app-origin calls, but `ui/open-link` showed no editor destination, so the basic flow
-now edits in the home view itself. The browser editor link stays a secondary action.
+then edited in the home view itself, with the browser editor link as a secondary action.
+Superseded on 2026-10-17 by the owner's Home-first decision (section above): the web editor is
+primary and this panel is optional ("Edit in this view").
 
 - **Same editor.** The view runs the existing Rust/WASM renderer, `Session` (save, conflict,
   discard, WebGPU-to-WebGL fallback) and one shared mount (`static/editor.js`, also used by

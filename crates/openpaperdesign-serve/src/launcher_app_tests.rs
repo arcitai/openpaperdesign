@@ -304,12 +304,37 @@ async fn library_mode_has_no_project_routes_and_takes_no_paths() {
                 json!({"root": elsewhere, "project": "design/X"}),
             ),
             ("openpaperdesign_choose_folder", json!({})),
-            ("get_tree_summary", json!({"nodeId": "root"})),
         ] {
             let e = call_meta(&lib.c, tool, args, meta.clone())
                 .await
                 .unwrap_err();
             assert!(e.contains("runs the app library"), "{tool}: {e}");
+        }
+        // Upstream design tools work only on the open library canvas the call names, never
+        // on a path or a workspace, whatever the metadata says.
+        let e = call_meta(
+            &lib.c,
+            "get_tree_summary",
+            json!({"nodeId": "root"}),
+            meta.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("Name the canvas you mean"), "{e}");
+        let e = call_meta(
+            &lib.c,
+            "open_file",
+            json!({"fileId": elsewhere, "binding": "0123456789abcdef.1"}),
+            meta.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("isn't the canvas open"), "{e}");
+        for refused in ["export", "create_file", "export_combined_pdf"] {
+            let e = call_meta(&lib.c, refused, json!({}), meta.clone())
+                .await
+                .unwrap_err();
+            assert!(e.contains("runs the app library"), "{refused}: {e}");
         }
         for (tool, args, want) in [
             (app::OPEN, json!({"id": "../../elsewhere"}), "canvas id"),
@@ -2201,4 +2226,359 @@ async fn panel_requests_are_refused_before_any_effect_when_the_build_has_no_pane
     }
     assert_eq!(canvases(), count);
     bound_server(&lib.l).await.retire().await;
+}
+
+// ---- the agent on the library canvas (`launcher_library_agent.rs`): model-visible library
+// controls and upstream's own design tools, on the canvas the person's view shows. The engine
+// here is upstream paper-rs (`exec::call` on the server's host); only the unit-test bundle is
+// a stand-in, and nothing renders.
+
+/// Every text block of a tool result, joined.
+fn out_text(r: ToolResult) -> String {
+    r.unwrap()
+        .into_iter()
+        .filter_map(|o| match o {
+            Out::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The saved node named `name` on `page` of the canvas in `dir` (upstream's page file format),
+/// with its tool id (`<first six characters of the page id>:<n>`).
+fn saved_node(dir: &Path, page: &str, name: &str) -> (String, paper_rs::model::Node) {
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let text = std::fs::read_to_string(path).unwrap();
+    let data = paper_rs::project::format::page_from_json(&text).unwrap();
+    let node = data
+        .doc
+        .nodes
+        .values()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("no saved node {name}"))
+        .clone();
+    (format!("{}:{}", &page[..6], node.id.0), node)
+}
+
+/// The catalogue a model sees from an app-library process: the library controls (no app-only
+/// visibility), and every upstream design tool the adapter offers, under its own name,
+/// description and schema, with `binding` required on top. Export, file creation and the
+/// project routes aren't there; the view's own tools stay app-only. A workspace process's
+/// catalogue is unchanged, and it refuses the library controls without any state change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_catalogue_shows_library_controls_and_binding_guarded_upstream_tools() {
+    let lib = library().await;
+    let tools: Vec<Value> = lib
+        .c
+        .peer
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).cloned();
+    for n in app::AGENT_TOOLS {
+        let t = tool(n).unwrap_or_else(|| panic!("{n} is listed"));
+        assert!(
+            t["_meta"]["ui"]["visibility"].is_null(),
+            "{n} is model-visible"
+        );
+    }
+    for upstream in crate::agent::offered_tools() {
+        let name = upstream.name.to_string();
+        let original = serde_json::to_value(upstream).unwrap();
+        let t = tool(&name).unwrap_or_else(|| panic!("{name} is listed"));
+        let schema = &t["inputSchema"];
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("binding")),
+            "{name}"
+        );
+        assert!(schema["properties"]["binding"].is_object(), "{name}");
+        for (k, v) in original["inputSchema"]["properties"].as_object().unwrap() {
+            assert_eq!(
+                &schema["properties"][k], v,
+                "{name}.{k}: upstream's own schema"
+            );
+        }
+        let desc = original["description"].as_str().unwrap();
+        assert!(
+            t["description"].as_str().unwrap().starts_with(desc),
+            "{name}"
+        );
+    }
+    for gone in [
+        "export",
+        "export_combined_pdf",
+        "create_file",
+        "bind_project",
+        "create_project",
+        "open_editor",
+    ] {
+        assert!(tool(gone).is_none(), "{gone} isn't offered here");
+    }
+    for n in app::TOOLS {
+        assert_eq!(
+            tool(n).unwrap()["_meta"]["ui"]["visibility"],
+            json!(["app"]),
+            "{n}"
+        );
+    }
+    // A workspace process.
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    let ws: Vec<Value> = c
+        .peer
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    assert!(
+        ws.iter()
+            .all(|t| !app::AGENT_TOOLS.contains(&t["name"].as_str().unwrap()))
+    );
+    let summary = ws.iter().find(|t| t["name"] == "get_tree_summary").unwrap();
+    assert!(summary["inputSchema"]["properties"]["binding"].is_null());
+    for n in app::AGENT_TOOLS {
+        let e = call(&c, n, json!({})).await.unwrap_err();
+        assert!(e.contains("wasn't started for the app library"), "{n}: {e}");
+    }
+    let st = l.state.lock().await;
+    assert!(st.bound.is_none() && st.workspace.is_none() && st.invalidated.is_none());
+    drop(st);
+    task.abort();
+}
+
+/// The agent's whole path on an app-owned canvas, with upstream's own commands: create it
+/// (no link, no token), see it as the open canvas, read the page, draw a rectangle, move and
+/// recolour it, read the results back, close, and reopen it in a fresh process with the
+/// drawing there. A change before the page is read, a missing or stale binding and a forged
+/// session field are refused with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_creates_reads_draws_moves_recolours_and_a_fresh_process_reopens_it() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::AGENT_CREATE, json!({"name": "Agent board"})).await);
+    assert!(created.get("url").is_none(), "no link or token: {created}");
+    let b = binding(&created);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["active_page"], json!(page));
+    let dir = lib.root.join("library/v1/canvases").join(&id);
+    let current = value(call(&lib.c, app::AGENT_CURRENT, json!({})).await);
+    assert_eq!(binding(&current), b);
+    assert_eq!(current["canvas"]["id"], json!(id));
+    let shape = json!({"binding": b, "pageId": page, "type": "rectangle", "name": "Agent box",
+        "x": 10, "y": 20, "width": 80, "height": 40, "styles": {"backgroundColor": "#ff0000"}});
+    // Neither a library result nor the current view counts as reading the page.
+    let before = files(&dir, &page);
+    let e = call(&lib.c, "create_shape", shape.clone())
+        .await
+        .unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    let mut unbound = shape.clone();
+    unbound.as_object_mut().unwrap().remove("binding");
+    let e = call(&lib.c, "create_shape", unbound).await.unwrap_err();
+    assert!(e.contains("Name the canvas you mean"), "{e}");
+    let stale = json!({"binding": "0123456789abcdef.99999", "nodeId": "root"});
+    let e = call(&lib.c, "get_tree_summary", stale).await.unwrap_err();
+    assert!(e.contains("isn't the canvas open"), "{e}");
+    let forged = json!({"binding": b, "nodeId": "root", "_openpaperdesignSession": 1});
+    let e = call(&lib.c, "get_tree_summary", forged).await.unwrap_err();
+    assert!(e.contains("unexpected argument"), "{e}");
+    assert_eq!(files(&dir, &page), before);
+    // Read the page, then draw.
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read).await);
+    call(&lib.c, "create_shape", shape).await.unwrap();
+    let (nid, node) = saved_node(&dir, &page, "Agent box");
+    assert_eq!(
+        (node.rect.x, node.rect.y, node.rect.w, node.rect.h),
+        (10.0, 20.0, 80.0, 40.0)
+    );
+    // Move it and recolour it (its own committed change counts as read).
+    let moved = json!({"binding": b, "updates": [{"nodeIds": [nid],
+        "styles": {"left": "120px", "top": "60px"}}]});
+    call(&lib.c, "update_styles", moved).await.unwrap();
+    let (_, node) = saved_node(&dir, &page, "Agent box");
+    assert_eq!((node.rect.x, node.rect.y), (120.0, 60.0));
+    let before_fill = files(&dir, &page);
+    let fill = json!({"binding": b, "updates": [{"nodeIds": [nid],
+        "styles": {"backgroundColor": "#00ff00"}}]});
+    call(&lib.c, "update_styles", fill).await.unwrap();
+    assert_ne!(files(&dir, &page).0, before_fill.0, "the fill was saved");
+    // Read the results back through upstream's readers.
+    let ask = json!({"binding": b, "nodeId": nid});
+    let info = out_text(call(&lib.c, "get_node_info", ask).await);
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["worldX"].as_f64(), Some(120.0), "{info}");
+    assert_eq!(info["worldY"].as_f64(), Some(60.0), "{info}");
+    let ask = json!({"binding": b, "nodeIds": [nid]});
+    let styles = out_text(call(&lib.c, "get_computed_styles", ask).await);
+    let styles = styles.to_ascii_lowercase();
+    assert!(
+        styles.contains("#00ff00") || styles.contains("rgb(0, 255, 0)"),
+        "{styles}"
+    );
+    // Close (no editor holds anything), then a fresh process reopens it.
+    let closed = value(call(&lib.c, app::AGENT_CLOSE, json!({"binding": b})).await);
+    assert_eq!(closed["action"], "closed");
+    let late = json!({"binding": b, "nodeId": "root", "pageId": page});
+    let e = call(&lib.c, "get_tree_summary", late).await.unwrap_err();
+    assert!(e.contains("No canvas is open"), "{e}");
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::AGENT_OPEN, json!({"id": id})).await);
+    let b2 = binding(&reopened);
+    assert_ne!(b2, b, "a new binding");
+    let read = json!({"binding": b2, "nodeId": "root", "pageId": page});
+    let tree = out_text(call(&c2, "get_tree_summary", read).await);
+    assert!(tree.contains("Agent box"), "{tree}");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// The agent and the person on one canvas: the person's panel (and then a browser tab from the
+/// agent's link) and the agent's tools share the binding, its server and its revisions. A clean
+/// panel sees the agent's commit; a panel save based on the old revision is a conflict and
+/// overwrites nothing; after the person saves, the agent's stale change is refused. The agent
+/// can't switch or close the canvas while the person's editor is mounted or a link was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_and_person_share_the_canvas_with_strict_conflicts_and_no_forced_switch() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Shared", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let current = value(call(&lib.c, app::AGENT_CURRENT, json!({})).await);
+    assert_eq!(binding(&current), b, "the canvas the person's panel shows");
+    assert_eq!(current["editors"]["panel_editors"], 1);
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    let shape = |name: &str| json!({"binding": b, "pageId": page, "type": "rectangle", "name": name, "x": 1, "y": 1, "width": 9, "height": 9});
+    call(&lib.c, "create_shape", shape("From the agent"))
+        .await
+        .unwrap();
+    let agent_bytes = files(&dir, &page);
+    // The clean panel's poll and re-read see the commit.
+    let ids = json!({"binding": b, "page_id": page, "mount": mount});
+    let polled = value(call(&lib.c, app::REVISION, ids.clone()).await);
+    assert_ne!(polled["revision"], json!(rev));
+    assert_eq!(polled["revision"], json!(crate::etag(&agent_bytes.0)));
+    let reread = value(call(&lib.c, app::PAGE, ids).await);
+    let reread_text = reread["text"].as_str().unwrap().to_string();
+    assert!(reread_text.contains("From the agent"));
+    // A dirty panel's save on the old revision: a conflict, nothing overwritten.
+    let stale = json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev,
+        "text": edited(&text)});
+    let e = call(&lib.c, app::SAVE, stale).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 409, "{e}");
+    assert_eq!(files(&dir, &page), agent_bytes, "the agent's bytes stay");
+    // The person saves on the current revision; the agent's next change is then stale.
+    let human = json!({"binding": b, "page_id": page, "mount": mount,
+        "if_match": polled["revision"], "text": edited(&reread_text)});
+    value(call(&lib.c, app::SAVE, human).await);
+    let human_bytes = files(&dir, &page);
+    let e = call(&lib.c, "create_shape", shape("Stale"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), human_bytes, "the person's bytes stay");
+    // No switch or close from the agent while the person's editor is mounted.
+    for (tool, args) in [
+        (app::AGENT_CREATE, json!({"name": "Other"})),
+        (app::AGENT_CLOSE, json!({"binding": b})),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(e.contains("can't be switched or closed"), "{tool}: {e}");
+        let st = lib.l.state.lock().await;
+        assert_eq!(
+            st.bound.as_ref().unwrap().binding.as_deref(),
+            Some(b.as_str())
+        );
+    }
+    let e = call(
+        &lib.c,
+        app::AGENT_OPEN,
+        json!({"id": "0123456789abcdef", "force": true}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("unexpected argument"),
+        "no confirmation from the agent: {e}"
+    );
+    // The browser editor link, for Codex's built-in browser: the same binding's loopback
+    // editor, whose save and the agent's tools share one revision check.
+    let link = value(call(&lib.c, app::AGENT_EDITOR, json!({"binding": b})).await);
+    assert_eq!(binding(&link), b);
+    let (port, token) = url(&link);
+    assert!(
+        lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .unwrap()
+            .editor_opened
+    );
+    browser_edit(port, &token).await;
+    let e = call(&lib.c, "create_shape", shape("Before reading"))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("conflict"),
+        "the browser's save made the agent's read stale: {e}"
+    );
+    out_text(call(&lib.c, "get_tree_summary", read).await);
+    let before = page_nodes(port, &token, &page).await;
+    call(&lib.c, "create_shape", shape("After reading"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page_nodes(port, &token, &page).await,
+        before + 1,
+        "the browser reads it"
+    );
+    // After the service ends, nothing more is done through the binding.
+    lib.l.shutdown().await;
+    let e = call(&lib.c, "create_shape", shape("Late"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+}
+
+/// Ownership across processes stays the lease's: an agent can't open a canvas another process
+/// holds (a truthful busy refusal, no transfer), and the other process's canvas is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_open_of_a_canvas_another_process_holds_is_busy() {
+    let a = library().await;
+    let (lb, b, task_b) = launch(&a.root).await;
+    let created = value(call(&a.c, app::AGENT_CREATE, json!({"name": "Held"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let e = call(&b, app::AGENT_OPEN, json!({"id": id}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("another OpenPaperDesign window"), "{e}");
+    assert!(lb.state.lock().await.bound.is_none());
+    let listed = value(call(&b, app::AGENT_LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["id"], json!(id));
+    // In the process that holds it, opening it again is a no-op on the same binding.
+    let again = value(call(&a.c, app::AGENT_OPEN, json!({"id": id})).await);
+    assert_eq!(binding(&again), binding(&created));
+    bound_server(&a.l).await.retire().await;
+    task_b.abort();
 }

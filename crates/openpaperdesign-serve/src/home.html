@@ -22,14 +22,14 @@
   chosen for import travels only as its text; an export is offered as a browser download, which
   Codex never confirms. The server fills the view's mode slot; nothing else differs per server.
 
-  An app-library server also fills the view's editor slot (the first line of its one module)
-  with the in-panel editor, when its build has one: the packaged renderer glue, session.js,
-  page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that order. Then a
-  created or opened canvas is edited right here, with the same renderer and save rules as the
-  browser editor, through the app's own page tools; the browser editor link is a secondary
-  action. Without it, the slot stays `null`: the view still lists canvases, but refuses to
-  create, import or open one (nothing is sent), and the server refuses a request for the
-  view's editor that its build can't serve. The link never replaces the in-panel editor.
+  A created, imported or opened library canvas is handed to its one loopback web editor: the
+  result's own link (the same binding's server, checked against the loopback pattern) is asked
+  to open once, in Codex's browser; the editor's own readiness report, not the request, says it
+  loaded. An app-library server also fills the view's editor slot (the first line of its one
+  module) with the optional in-panel editor, when its build has one: the packaged renderer glue,
+  session.js, page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that
+  order. It is offered as "Edit in this view" for the canvas a result shows, with the same
+  renderer and save rules; without it, the slot stays `null` and nothing else changes.
 -->
 <style>
   @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
@@ -226,6 +226,7 @@
     <ul id="result-list"></ul>
     <div class="actions" id="result-actions">
       <button id="canvas" class="btn btn-primary" type="button" hidden>Open canvas</button>
+      <button id="edit-here" class="btn" type="button" hidden>Edit in this view</button>
       <button id="reopen" class="btn" type="button" hidden>Open in editor</button>
       <button id="force" class="btn" type="button" hidden>Switch anyway</button>
       <button id="close" class="btn" type="button" hidden>Close canvas</button>
@@ -377,7 +378,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // Row buttons that run an action, owned by the list that rendered them. Rebuilding one list
   // (say, the hidden home when a late inventory reply arrives) never replaces another's.
   const rowActions = { projects: [], 'pick-list': [], 'result-list': [] };
-  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), $('close'), $('export'),
+  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), $('close'), $('export'), $('edit-here'),
     ...Object.values(rowActions).flat()];
   function setBusy(busy) {
     sending = busy;
@@ -821,25 +822,13 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
 
   // A confirmed switch names the binding the person confirmed replacing (`replace`); the
   // server refuses it if another view changed the open canvas meanwhile. Every primary action
-  // asks for this view's own editor (`panel`): the server checks it has one before it creates,
-  // imports or opens anything, and its result carries no browser link.
+  // hands the canvas to its one loopback web editor: the result's own link, opened once.
   const switchArgs = (args, replace) => {
     if (replace) Object.assign(args, { force: true, replace });
-    args.panel = true;
     return args;
   };
 
-  // A build without the in-panel editor module: the primary actions are refused right here,
-  // with nothing sent. The browser editor link is never a silent substitute for them.
-  function panelMissing() {
-    if (PANEL) return false;
-    refuse('Can\'t edit canvases here',
-      'This OpenPaperDesign build has no in-panel editor, so canvases can\'t be created, imported or opened in this view. Nothing was sent or changed. Rebuild OpenPaperDesign with its editor (./scripts/build-web.sh), then reinstall it.');
-    return true;
-  }
-
   async function openLibrary(id, name, replace) {
-    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_open', switchArgs({ id }, replace), 'Opening ' + name);
     if (!r) return;
     if (r.ok) return showEditor(r.ok, false, id);
@@ -855,7 +844,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   }
 
   async function createLibrary(name, replace) {
-    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_create', switchArgs({ name }, replace), 'Creating "' + name + '"');
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
@@ -864,12 +852,24 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   }
 
   async function reopenLibrary() {
-    if (panelMissing()) return;
-    const r = await act('openpaperdesign_app_editor', { panel: true }, 'Opening the current canvas');
+    const r = await act('openpaperdesign_app_editor', {}, 'Opening the current canvas');
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
     refused(r);
   }
+
+  // The optional in-panel editor, only where this build has it, for the canvas this result
+  // shows (its binding): the same renderer and save rules as the web editor.
+  async function editHere() {
+    const binding = editorBinding;
+    const canvas = editorCanvas;
+    if (!PANEL || !binding) return;
+    const r = await act('openpaperdesign_app_editor', { binding, panel: true }, 'Opening it in this view');
+    if (!r) return;
+    if (r.ok) return showEditor(r.ok, false, canvas);
+    refused(r);
+  }
+  $('edit-here').onclick = editHere;
 
   // Close the canvas this view showed: its binding goes with the request, and with a later
   // confirmation, so the server never closes a canvas another view opened since.
@@ -937,7 +937,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // Import: the person's chosen file travels only as its text; its name or location means
   // nothing to the server.
   function chooseImport() {
-    if (panelMissing()) return;
     const input = $('import-file');
     if (!input || typeof input.click !== 'function') {
       notice('This view can\'t open files here. Nothing was imported.');
@@ -971,7 +970,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     importCanvas(text, null);
   };
   async function importCanvas(text, replace) {
-    if (panelMissing()) return;
     const r = await act('openpaperdesign_app_import', switchArgs({ payload: text }, replace), 'Importing the canvas file', 120000);
     if (!r) return;
     if (r.ok) return showEditor(r.ok);
@@ -979,7 +977,31 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     refused(r, (shownFor) => shownFor && importCanvas(text, shownFor));
   }
 
+  // After the link was handed to Codex: whether the editor itself reported its page loaded.
+  // An acknowledgement of the link is never treated as a load.
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function watchLoad(g, id, binding) {
+    if (!binding) return;
+    for (let i = 0; i < 30; i++) {
+      await later(2000);
+      if (g !== gen) return;
+      // Only this view's binding: another view's canvas never counts as this one loading.
+      const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
+      if (g !== gen) return;
+      let v = null;
+      if (!r.timeout && !r.error && r.result && !r.result.isError) {
+        try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
+      }
+      if (!v || !v.canvas || v.canvas.id !== id || v.binding !== binding) return;
+      if (v.editor_loaded === true) {
+        const n = Number.isInteger(v.browser_saves) ? v.browser_saves : 0;
+        const s = 'The editor loaded this canvas.' + (n ? ' Saved from the editor ' + n + (n === 1 ? ' time.' : ' times.') : '');
+        $('canvas-state').textContent = s;
+        announce(s, g);
+        return;
+      }
+    }
+  }
 
   // ---- the in-panel editor (an app-library view whose build has it) ----
   // The canvas is edited right here: the renderer and its save rules are the browser editor's,
@@ -1213,6 +1235,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('result-list').textContent = '';
     $('canvas').hidden = true;
     $('canvas').disabled = false;
+    $('edit-here').hidden = true;
     $('reopen').hidden = true;
     $('force').hidden = true;
     $('close').hidden = true;
@@ -1242,7 +1265,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // An editor result, from a direct action or a delivered open_editor result: identity from
   // this same result, never an earlier one. A direct action then asks Codex to open it.
   function showEditor(v, delivered, expected) {
-    // A library canvas for this view's own editor: no link is involved, so none is checked.
+    // A library canvas for the optional in-panel editor (asked for explicitly): no link.
     if (v && v.storage === 'app-library' && v.panel === true) {
       if (expected && !(v.canvas && v.canvas.id === expected)) {
         refuse('Canvas', 'Codex answered for another canvas than the one asked for, so it won\'t be opened.');
@@ -1250,11 +1273,13 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       }
       return openPanel(v);
     }
-    // Any other library canvas result is not this view's to open: the browser link is only
-    // ever the editor's explicit secondary action, never the way a canvas opens here.
-    if (v && v.storage === 'app-library') {
-      refuse('Canvas', 'Codex answered without this view\'s own editor, so nothing was opened here.');
-      return;
+    // A library canvas built without the browser editor has no link to open.
+    if (v && v.storage === 'app-library' && v.browser_editor !== 'built in') {
+      if (expected && !(v.canvas && v.canvas.id === expected)) {
+        refuse('Canvas', 'Codex answered for another canvas than the one asked for, so it won\'t be opened.');
+        return;
+      }
+      return showLibraryEditor(v, true, (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas');
     }
     if (typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
       refuse('Canvas', 'The editor link isn\'t a local OpenPaperDesign link, so it won\'t be opened.');
@@ -1265,6 +1290,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       return;
     }
     const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
+    if (v.storage === 'app-library') return showLibraryEditor(v, delivered, name);
     reset(name);
     editorUrl = v.url;
     $('result-state').textContent = {
@@ -1278,6 +1304,51 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (typeof v.workspace === 'string') meta('Folder path', v.workspace);
     meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
     $('canvas').hidden = false;
+    $('result-title').focus();
+    announce(name + '. ' + $('result-state').textContent);
+    if (!delivered && v.action) openLink();
+  }
+
+  // A library canvas: created, imported, opened or reopened in this window, from this result,
+  // and handed to its one loopback web editor (the result's own link, opened once). The
+  // in-panel editor is offered only where this build has it, and only when asked for.
+  function showLibraryEditor(v, delivered, name) {
+    const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
+    reset(name);
+    if (!id) {
+      refuse('Canvas', 'Codex sent an answer OpenPaperDesign can\'t read. Nothing is shown as done.');
+      return;
+    }
+    editorCanvas = id;
+    editorBinding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
+    field('Canvas', name + ' (' + pages(v.canvas.pages) + ')');
+    field('Stored in', 'OpenPaperDesign library');
+    meta('Canvas id', id);
+    if (typeof v.location === 'string') meta('Location', v.location);
+    // Close and Export act only on this result's own binding.
+    $('close').hidden = !editorBinding;
+    $('export').hidden = !editorBinding;
+    if (v.browser_editor !== 'built in') {
+      $('result-state').textContent = {
+        created: 'Created and saved in your library.',
+        imported: 'Imported as a new canvas in your library.',
+      }[v.action] || 'Open in this window.';
+      $('canvas-state').textContent = 'This OpenPaperDesign command was built without the browser editor, so the canvas can\'t be shown here.';
+      $('result-title').focus();
+      announce(name + '. ' + $('result-state').textContent);
+      return;
+    }
+    editorUrl = v.url;
+    meta('Address', 'local, port ' + EDITOR_URL.exec(v.url)[1]); // never the link or its token
+    $('result-state').textContent = {
+      created: 'Created and saved in your library. Opening the editor…',
+      imported: 'Imported as a new canvas in your library. Opening the editor…',
+      opened: 'Opening the editor…',
+      'already-open': 'Already open in this window. Opening the editor…',
+      reopened: 'Opening the editor…',
+    }[v.action] || 'The canvas is ready to open.';
+    $('canvas').hidden = false;
+    $('edit-here').hidden = !(PANEL && editorBinding);
     $('result-title').focus();
     announce(name + '. ' + $('result-state').textContent);
     if (!delivered && v.action) openLink();
@@ -1371,6 +1442,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     else state = 'Codex was asked to open the canvas. That doesn\'t confirm it loaded; if nothing opens, press Open canvas again.';
     $('canvas-state').textContent = state;
     announce(state, g);
+    if (LIBRARY && editorCanvas && !r.timeout && !r.error) watchLoad(g, editorCanvas, editorBinding);
   }
   $('canvas').onclick = openLink;
 

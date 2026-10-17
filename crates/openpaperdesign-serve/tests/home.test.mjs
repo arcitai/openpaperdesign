@@ -58,7 +58,7 @@ const buttons = (e) => all(e).filter((n) => n.tag === 'button');
 const IDS = ['back', 'title', 'menu-button', 'menu', 'm-new', 'm-current', 'm-folder', 'm-import', 'm-refresh', 'live', 'notice',
   'import-file', 'home', 'inventory', 'projects', 'pick', 'pick-title', 'pick-list', 'new-form', 'new-title', 'name', 'where-field', 'where',
   'create', 'cancel-new', 'folder-help', 'folder-title', 'folder-refresh', 'folder-done', 'result', 'result-title',
-  'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'reopen', 'force', 'close', 'export', 'canvas-state',
+  'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'edit-here', 'reopen', 'force', 'close', 'export', 'canvas-state',
   'result-details', 'result-meta', 'result-detail', 'app', 'editor', 'ed-title', 'ed-status', 'ed-select', 'ed-hand', 'ed-rect',
   'ed-ellipse', 'ed-undo', 'ed-redo', 'ed-delete', 'ed-stage', 'ed-canvas', 'ed-conflict', 'ed-close', 'ed-leave', 'ed-export', 'ed-full',
   'ed-browser', 'ed-note', 'ed-details', 'ed-meta', 'ed-renderer'];
@@ -70,7 +70,7 @@ const panelScript = libScript.replace(PANEL_SLOT, 'const opdCreatePanel = __opdT
 function mount({ library = false, panel = null } = {}) {
   const document = { activeElement: null };
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
-  for (const id of ['back', 'menu', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'reopen', 'force', 'close', 'export',
+  for (const id of ['back', 'menu', 'pick', 'new-form', 'folder-help', 'result', 'canvas', 'edit-here', 'reopen', 'force', 'close', 'export',
     'm-import', 'import-file', 'result-details', 'result-meta', 'result-detail', 'editor', 'ed-leave', 'ed-full']) {
     els[id].hidden = true;
   }
@@ -903,7 +903,7 @@ const libOnly = (v) => {
 const libAction = (v) => [...v.sent].reverse().find((m) => m.method === 'tools/call' && m.params.name !== LIB_LIST);
 const libCalls = (v, name) => v.sent.filter((m) => m.method === 'tools/call' && m.params.name === name).length;
 
-test('library: the app\'s canvases are listed and one opens directly in this view\'s editor, with no link or message', async () => {
+test('library: the app\'s canvases are listed; Open hands the canvas to its one web editor link, with no message', async () => {
   assert.notEqual(libScript, script, 'the mode slot is filled');
   const v = await libraryView();
   assert.deepEqual(rows(v).map((r) => [r.name, r.hint]), [['Landing', '2 pages'], ['Notes', '1 page · open here']],
@@ -912,27 +912,37 @@ test('library: the app\'s canvases are listed and one opens directly in this vie
   assert.equal(v.els['m-import'].hidden, false);
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, panel: true } },
-    'the primary action asks for this view\'s own editor');
-  await answer(v, PANEL_EDITOR('opened'), libAction(v));
-  assert.equal(v.count('ui/open-link'), 0, 'opening never goes through a link');
-  assert.equal(v.els.editor.hidden, false);
-  assert.equal(v.fake.handles.length, 1);
-  assert.equal(v.fake.handles[0].o.binding, B1);
-  const shown = ['ed-meta', 'ed-status', 'ed-title', 'notice', 'live'].flatMap((id) => texts(v.els[id])).join('\n');
-  assert.ok(shown.includes(ID1) && !shown.includes(TOKEN), 'the canvas id under Details, never a token');
-  assert.equal(libCalls(v, 'openpaperdesign_app_editor'), 0, 'no link is asked for');
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } },
+    'the primary action asks for nothing but the canvas');
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 1, 'exactly one opening request');
+  assert.equal(v.last('ui/open-link').params.url, URL_OK, 'the result\'s own same-binding loopback link');
+  assert.equal(v.els['result-state'].textContent, 'Opening the editor…');
+  assert.ok(!v.els.close.hidden && !v.els.export.hidden && !v.els.canvas.hidden);
+  assert.equal(v.els['edit-here'].hidden, false, 'the optional in-panel editor is offered (this build has it)');
+  assert.equal(v.fake.handles.length, 0, 'but never opened unasked');
+  const shown = ['result-fields', 'result-meta', 'result-state', 'notice', 'live'].flatMap((id) => texts(v.els[id])).join('\n');
+  assert.ok(shown.includes(ID1) && !shown.includes(TOKEN), 'the canvas id under Details, never the token');
+  await ack(v);
+  assert.match(v.els['canvas-state'].textContent, /doesn't confirm it loaded/, 'an acknowledgement is not a load');
+  assert.equal(libCalls(v, 'openpaperdesign_app_editor'), 0, 'no load is claimed without the editor\'s own report');
   libOnly(v);
 });
 
-test('library: an answer for another canvas, or after Back, opens nothing', async () => {
+test('library: an answer for another canvas, a link that isn\'t loopback, or a reply after Back opens nothing', async () => {
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened', ID2), libAction(v));
+  await answer(v, LIB_EDITOR('opened', ID2), libAction(v));
   assert.equal(v.count('ui/open-link'), 0);
-  assert.equal(v.fake.handles.length, 0, 'no editor for another canvas');
   assert.match(v.els['result-state'].textContent, /another canvas/);
+  v.els.back.onclick();
+  await flush();
+  row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened', ID1, { url: 'https://example.com/#token=' + TOKEN }), libAction(v));
+  assert.equal(v.count('ui/open-link'), 0);
+  assert.match(v.els['result-state'].textContent, /isn't a local OpenPaperDesign link/);
   v.els.back.onclick();
   await flush();
   row(v, 'Landing', '2 pages').open.onclick();
@@ -940,10 +950,9 @@ test('library: an answer for another canvas, or after Back, opens nothing', asyn
   const pending = libAction(v);
   v.els.back.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened'), pending);
-  assert.equal(v.fake.handles.length, 0, 'a late reply belongs to the view it started in');
-  assert.equal(v.count('ui/open-link'), 0);
-  // A library result without this view's editor (no `panel`) is never opened through its link.
+  await answer(v, LIB_EDITOR('opened'), pending);
+  assert.equal(v.count('ui/open-link'), 0, 'a late reply belongs to the view it started in');
+  // A delivered result is shown, never opened by itself.
   v.from(result(LIB_EDITOR('opened')));
   assert.equal(v.count('ui/open-link'), 0);
   assert.equal(v.fake.handles.length, 0);
@@ -956,10 +965,11 @@ test('library: New creates directly with a name only; an unanswered create is ne
   assert.equal(v.els['where-field'].hidden, true, 'library canvases have no destination choice');
   v.els.name.value = 'Pitch';
   await submitNew(v);
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch', panel: true } });
-  await answer(v, PANEL_EDITOR('created'), libAction(v));
-  assert.equal(v.els['ed-status'].textContent, 'Created and saved in your library. Loading the editor…');
-  assert.equal(v.count('ui/open-link'), 0);
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch' } });
+  await answer(v, LIB_EDITOR('created'), libAction(v));
+  assert.equal(v.els['result-state'].textContent, 'Created and saved in your library. Opening the editor…');
+  assert.equal(v.count('ui/open-link'), 1);
+  assert.equal(v.last('ui/open-link').params.url, URL_OK);
   const w = await libraryView();
   w.els['m-new'].onclick();
   w.els.name.value = 'Pitch';
@@ -977,10 +987,9 @@ test('library: Close names this view\'s binding, asks the person first when the 
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened'), libAction(v));
-  v.els['ed-close'].onclick();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.close.onclick();
   await flush();
-  assert.deepEqual(v.fake.log.slice(-2), ['drain', 'dispose'], 'the editor is drained and let go first');
   assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } },
     'close names the binding this view showed');
   await answer(v, { refused: 'The editor of this canvas was opened. ... then close again with force: true.' }, libAction(v));
@@ -1001,17 +1010,13 @@ test('library: export and import move only bytes, and say plainly what this view
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened'), libAction(v));
-  v.els['ed-export'].onclick();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.export.onclick();
   await flush();
   assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_export', arguments: { binding: B1 } });
   await answer(v, { action: 'exported', binding: B1, canvas: { id: ID1, name: 'Landing' }, content: 'canvas-only',
     file_name: 'Landing.opdcanvas.json', bytes: 38, payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
   assert.match(v.els.notice.textContent, /can't download files here, so no file was saved/, 'no claimed download');
-  assert.equal(v.els.editor.hidden, false, 'the editor stays open');
-  // Import is from the list (the menu isn't shown in the editor).
-  v.els.back.onclick();
-  await flush();
   v.els['m-import'].onclick();
   assert.match(v.els.notice.textContent, /can't open files here\. Nothing was imported/);
   let picked = 0;
@@ -1024,11 +1029,11 @@ test('library: export and import move only bytes, and say plainly what this view
   v.els['import-file'].files = [{ size: 9, name: '/Users/someone/secret.json', text: async () => 'FILE-TEXT' }];
   await v.els['import-file'].onchange();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'FILE-TEXT', panel: true } },
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'FILE-TEXT' } },
     'only the text, never the file name or a path');
-  await answer(v, PANEL_EDITOR('imported', ID2), libAction(v));
-  assert.equal(v.els['ed-status'].textContent, 'Imported as a new canvas in your library. Loading the editor…');
-  assert.equal(v.count('ui/open-link'), 0);
+  await answer(v, LIB_EDITOR('imported', ID2), libAction(v));
+  assert.equal(v.els['result-state'].textContent, 'Imported as a new canvas in your library. Opening the editor…');
+  assert.equal(v.count('ui/open-link'), 2, 'one opening request per opened canvas');
   libOnly(v);
 });
 
@@ -1036,10 +1041,11 @@ test('library: without a built editor nothing is opened, and the canvas is still
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened', ID1, { browser_editor: 'not built' }), libAction(v));
+  await answer(v, LIB_EDITOR('opened', ID1, { browser_editor: 'not built' }), libAction(v));
   assert.equal(v.count('ui/open-link'), 0);
   assert.equal(v.fake.handles.length, 0);
   assert.equal(v.els.canvas.hidden, true);
+  assert.equal(v.els['edit-here'].hidden, true);
   assert.match(v.els['canvas-state'].textContent, /built without the browser editor/);
 });
 
@@ -1047,13 +1053,13 @@ test('library: a switch confirmation names exactly the binding the refusal showe
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, panel: true } }, 'no force at first');
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } }, 'no force at first');
   await answer(v, { refused: SWITCH_REFUSAL(B2) }, libAction(v));
   assert.equal(v.els['result-title'].textContent, 'Switch canvases?');
   assert.equal(v.els.force.hidden, false);
   v.els.force.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, force: true, replace: B2, panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, force: true, replace: B2 } });
   // The server finds another view changed the open canvas meanwhile: refused, shown as such.
   await answer(v, { refused: 'The canvas this view shows isn\'t the one open in this OpenPaperDesign window any more: another view changed it. Nothing was done, and the open canvas is unchanged.' }, libAction(v));
   assert.equal(v.count('ui/open-link'), 0);
@@ -1067,7 +1073,7 @@ test('library: a switch confirmation names exactly the binding the refusal showe
   await answer(v, { refused: SWITCH_REFUSAL(B1) }, libAction(v));
   v.els.force.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch', force: true, replace: B1, panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch', force: true, replace: B1 } });
   libOnly(v);
 });
 
@@ -1075,14 +1081,13 @@ test('library: an export answer for another binding is never offered as a downlo
   const v = await libraryView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  await answer(v, PANEL_EDITOR('opened'), libAction(v));
-  v.els['ed-export'].onclick();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els.export.onclick();
   await flush();
   await answer(v, { action: 'exported', binding: B2, canvas: { id: ID2, name: 'Notes' }, content: 'canvas-only',
     file_name: 'Notes.opdcanvas.json', bytes: 38, payload: '{"format":"openpaperdesign-canvas"}' }, libAction(v));
-  assert.match(v.els['ed-note'].textContent, /another canvas than the one shown here, so nothing was downloaded/);
+  assert.match(v.els['result-state'].textContent, /another canvas than the one shown here, so nothing was downloaded/);
   assert.doesNotMatch(v.els.notice.textContent, /download/);
-  assert.equal(v.els.editor.hidden, false, 'shown in the editor, which stays open');
   libOnly(v);
 });
 
@@ -1124,7 +1129,7 @@ test('library: a file read that outlives its view or its selection sends nothing
   await choose(Promise.resolve('NEW-TEXT'));
   await flush();
   assert.equal(imports(), 1);
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'NEW-TEXT', panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'NEW-TEXT' } });
   c.resolve('OLD-TEXT');
   await readC;
   await flush();
@@ -1211,23 +1216,35 @@ async function relist(v) {
   v.from({ id: call.id, result: toolText(LIBRARY_LIST) });
   await flush();
 }
+// Open a canvas (the primary hand-off to its web editor link), then choose the optional
+// in-panel editor for the same binding.
 async function openInPanel(v) {
   row(v, 'Landing', '2 pages').open.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  v.els['edit-here'].onclick();
   await flush();
   await answer(v, PANEL_EDITOR('opened'), libAction(v));
 }
 
-test('panel: opening edits right in the view, with no link, no open-link and no message', async () => {
+test('panel: "Edit in this view" mounts the optional in-panel editor on the shown binding, with no message', async () => {
   const { v, fake } = await panelView();
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1, panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } });
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 1, 'the primary hand-off');
+  assert.deepEqual(fake.log, ['create'], 'no in-panel editor unasked');
+  v.els['edit-here'].onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1, panel: true } },
+    'asked for the binding this result showed');
   await answer(v, PANEL_EDITOR('opened'), libAction(v));
   assert.equal(v.els.editor.hidden, false);
   assert.equal(v.els.result.hidden, true);
   assert.equal(v.els['menu-button'].hidden, true, 'Back and Close are the only ways out');
   assert.equal(v.els.app.getAttribute('data-view'), 'editor');
-  assert.equal(v.count('ui/open-link'), 0, 'the basic flow needs no link');
+  assert.equal(v.count('ui/open-link'), 1, 'the in-panel editor itself opens no link');
   assert.deepEqual(fake.log, ['create', 'open ' + B1]);
   const h = fake.handles[0];
   assert.equal(h.o.binding, B1, 'the editor edits exactly the binding this result named');
@@ -1247,27 +1264,29 @@ test('panel: opening edits right in the view, with no link, no open-link and no 
   panelOnly(v);
 });
 
-test('panel: New, Import and Open current canvas ask for the view\'s editor too', async () => {
+test('panel: New, Import and Open current canvas stay web-editor-first even when the module is there', async () => {
   const { v, fake } = await panelView();
   v.els['m-new'].onclick();
   v.els.name.value = 'Pitch';
   await submitNew(v);
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch', panel: true } });
-  await answer(v, PANEL_EDITOR('created'), libAction(v));
-  assert.match(v.els['ed-status'].textContent, /^Created and saved in your library\. Loading the editor…$/);
-  assert.equal(fake.handles.length, 1);
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch' } });
+  await answer(v, LIB_EDITOR('created'), libAction(v));
+  assert.equal(v.els['result-state'].textContent, 'Created and saved in your library. Opening the editor…');
+  assert.equal(v.count('ui/open-link'), 1);
+  assert.equal(fake.handles.length, 0, 'no in-panel editor unasked');
   v.els.back.onclick();
   await flush();
   v.els['import-file'].files = [{ size: 9, name: 'canvas.json', text: async () => 'FILE-TEXT' }];
   await v.els['import-file'].onchange();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'FILE-TEXT', panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_import', arguments: { payload: 'FILE-TEXT' } });
   await answer(v, { refused: 'nope' }, libAction(v));
+  assert.equal(v.count('ui/open-link'), 1, 'a refusal opens nothing');
   v.els.back.onclick();
   await flush();
   v.els['m-current'].onclick();
   await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { panel: true } });
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: {} });
   panelOnly(v);
 });
 
@@ -1360,7 +1379,7 @@ test('panel: a model result or cancellation never replaces an editor', async () 
   v.from({ method: 'ui/notifications/tool-cancelled', params: {} });
   await flush();
   assert.equal(v.els.editor.hidden, false);
-  assert.equal(v.count('ui/open-link'), 0);
+  assert.equal(v.count('ui/open-link'), 1, 'only the primary hand-off, before the panel');
 });
 
 test('panel: a start failure is shown as it came; Back still leaves', async () => {
@@ -1393,7 +1412,7 @@ test('panel: the browser editor is a secondary action, for the same binding and 
   v.els['ed-browser'].onclick();
   await flush();
   await answer(v, LIB_EDITOR('reopened', ID1, { url: 'https://example.com/#token=' + TOKEN }), libAction(v));
-  assert.equal(v.count('ui/open-link'), 1);
+  assert.equal(v.count('ui/open-link'), 2, 'the primary hand-off and this one');
   assert.match(v.els['ed-note'].textContent, /nothing was opened/);
   panelOnly(v);
 });
@@ -1418,43 +1437,26 @@ test('panel: Full screen only when the host offers it', async () => {
   panelOnly(v);
 });
 
-test('library: without the editor module, the canvases are listed but nothing is created, imported or opened, and nothing is sent', async () => {
+test('library: without the in-panel module, New and Open still hand off to the web editor, and no in-panel choice is shown', async () => {
   assert.ok(libScript.includes('const opdCreatePanel = null;'), 'the slot as a build without the module leaves it');
   const v = await libraryView(LIBRARY_LIST, { panel: false });
-  assert.deepEqual(rows(v).map((r) => [r.name, r.hint]), [['Landing', '2 pages'], ['Notes', '1 page · open here']],
-    'the list still works');
-  const sent = v.sent.length;
-  const missing = () => {
-    assert.equal(v.els['result-title'].textContent, 'Can\'t edit canvases here');
-    assert.match(v.els['result-state'].textContent, /no in-panel editor.*Nothing was sent or changed/);
-    assert.equal(v.els['result-state'].className, 'bad');
-  };
+  assert.deepEqual(rows(v).map((r) => [r.name, r.hint]), [['Landing', '2 pages'], ['Notes', '1 page · open here']]);
   row(v, 'Landing', '2 pages').open.onclick();
   await flush();
-  missing();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_open', arguments: { id: ID1 } });
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 1);
+  assert.equal(v.last('ui/open-link').params.url, URL_OK);
+  assert.equal(v.els['edit-here'].hidden, true, 'no in-panel choice without the module');
+  v.els['edit-here'].onclick();
+  await flush();
+  assert.equal(libCalls(v, 'openpaperdesign_app_editor'), 0, 'and nothing is asked for');
   v.els.back.onclick();
   v.els['m-new'].onclick();
   v.els.name.value = 'Pitch';
   await submitNew(v);
-  missing();
-  let picked = 0;
-  v.els['import-file'].click = () => { picked += 1; };
-  v.els['m-import'].onclick();
-  missing();
-  assert.equal(picked, 0, 'no file picker either');
-  v.els['import-file'].files = [{ size: 9, name: 'canvas.json', text: async () => 'FILE-TEXT' }];
-  await v.els['import-file'].onchange();
-  await flush();
-  missing();
-  v.els['m-current'].onclick();
-  await flush();
-  missing();
-  // The only thing sent since the list is the list again (Back to it).
-  const since = v.sent.slice(sent);
-  assert.ok(since.every((m) => m.method === 'tools/call' && m.params.name === LIB_LIST), JSON.stringify(since));
-  for (const t of ['openpaperdesign_app_open', 'openpaperdesign_app_create', 'openpaperdesign_app_import', 'openpaperdesign_app_editor']) {
-    assert.equal(libCalls(v, t), 0, t);
-  }
-  assert.equal(v.count('ui/open-link'), 0, 'never the link instead');
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_create', arguments: { name: 'Pitch' } });
+  await answer(v, LIB_EDITOR('created'), libAction(v));
+  assert.equal(v.count('ui/open-link'), 2);
   libOnly(v);
 });

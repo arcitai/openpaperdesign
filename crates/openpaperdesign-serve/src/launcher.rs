@@ -1297,7 +1297,7 @@ impl ServerHandler for Launcher {
                     Implementation::new("openpaperdesign", VERSION)
                         .with_icons(serde_json::from_value(icons()).expect("valid icons")),
                 )
-                .with_instructions(app::INSTRUCTIONS.to_string());
+                .with_instructions(format!("{}\n\n{}", app::INSTRUCTIONS, tools::INSTRUCTIONS));
         }
         // Safe to advertise in standalone mode too; only --codex-context consumes it.
         capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
@@ -1385,7 +1385,9 @@ impl ServerHandler for Launcher {
                 .await;
             return Ok(to_result(r).into());
         }
-        if app::TOOLS.contains(&request.name.as_ref()) {
+        if app::TOOLS.contains(&request.name.as_ref())
+            || app::AGENT_TOOLS.contains(&request.name.as_ref())
+        {
             // Refused without reading or changing any state (no admission, no retirement).
             return Ok(to_result(Err(app::NOT_LIBRARY.to_string())).into());
         }

@@ -237,6 +237,108 @@ async fn two_processes_share_the_library_one_canvas_at_a_time() {
     c.cancel().await.unwrap();
 }
 
+/// An agent's path through the real executable (its own build, with whatever bundle it
+/// embeds, not the unit tests' stand-in): the catalogue lists the library controls and
+/// upstream's design tools with `binding` required; the agent creates a canvas, reads its page,
+/// draws a rectangle with upstream's `create_shape`, and the saved page file (upstream's
+/// format) has it; a fresh process reopens the canvas and reads the drawing back. No request
+/// carries metadata. This is a synthetic host, not a Codex catalogue or a Mac receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
+    let t = tmp();
+    let (root, home) = (t.0.join("data"), t.0.join("home"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let a = library(&root, &home).await;
+    let tools = a.list_all_tools().await.unwrap();
+    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+    for n in [
+        "openpaperdesign_library_canvases",
+        "openpaperdesign_library_current",
+        "openpaperdesign_library_create",
+        "openpaperdesign_library_open",
+        "openpaperdesign_library_close",
+        "openpaperdesign_library_editor",
+        "get_basic_info",
+        "get_tree_summary",
+        "create_shape",
+        "update_styles",
+        "write_html",
+    ] {
+        assert!(names.iter().any(|x| x == n), "{n} is listed");
+    }
+    for refused in ["export", "create_file", "bind_project"] {
+        assert!(
+            !names.iter().any(|x| x == refused),
+            "{refused} isn't listed"
+        );
+    }
+    let shape_tool = tools.iter().find(|t| t.name == "create_shape").unwrap();
+    let schema = Value::Object((*shape_tool.input_schema).clone());
+    assert!(
+        schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("binding"))
+    );
+    let created = call(
+        &a,
+        "openpaperdesign_library_create",
+        json!({"name": "Agent"}),
+    )
+    .await
+    .unwrap();
+    assert!(created.get("url").is_none());
+    let b = created["binding"].as_str().unwrap().to_string();
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    call(&a, "get_tree_summary", read).await.unwrap();
+    let shape = json!({"binding": b, "pageId": page, "type": "rectangle", "name": "Real box",
+        "x": 30, "y": 40, "width": 50, "height": 25});
+    call(&a, "create_shape", shape).await.unwrap();
+    let file = root
+        .join("library/v1/canvases")
+        .join(&id)
+        .join("pages")
+        .join(format!("{page}.json"));
+    let text = std::fs::read_to_string(&file).unwrap();
+    let data = paper_rs::project::format::page_from_json(&text).unwrap();
+    let node = data
+        .doc
+        .nodes
+        .values()
+        .find(|n| n.name == "Real box")
+        .unwrap();
+    assert_eq!((node.rect.x, node.rect.y), (30.0, 40.0));
+    let status = call(&a, "openpaperdesign_status", json!({})).await.unwrap();
+    assert_eq!(status["binding"], json!(b));
+    call(&a, "openpaperdesign_library_close", json!({"binding": b}))
+        .await
+        .unwrap();
+    a.cancel().await.unwrap();
+    let c = library(&root, &home).await;
+    let mut reopened = None;
+    for _ in 0..100 {
+        match call(&c, "openpaperdesign_library_open", json!({"id": id})).await {
+            Ok(v) => {
+                reopened = Some(v);
+                break;
+            }
+            Err(e) if e.contains("another OpenPaperDesign window") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let reopened = reopened.expect("the canvas is free again");
+    let b2 = reopened["binding"].as_str().unwrap();
+    let read = json!({"binding": b2, "nodeId": "root", "pageId": page});
+    let tree = call(&c, "get_tree_summary", read).await.unwrap();
+    assert!(tree.to_string().contains("Real box"), "{tree}");
+    c.cancel().await.unwrap();
+}
+
 /// Launch refusals: conflicting flags, an unexpanded placeholder, a relative or dotted path,
 /// a missing folder, a link, the package root and the package cache. Each exits non-zero
 /// before serving anything and creates nothing.

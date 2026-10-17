@@ -1,13 +1,14 @@
 ---
 name: openpaperdesign
-description: Explain and support the OpenPaperDesign canvas library in the Codex sidebar, and, with a separately started workspace server, bind and edit a design project in this workspace over MCP.
+description: Work on OpenPaperDesign canvases with the person (the app library in the Codex sidebar, edited with the paper-rs design tools), and, with a separately started workspace server, bind and edit a design project in this workspace over MCP.
 metadata:
   version: "0.1.0"
 ---
 
 # openpaperdesign editor
 
-Contract updated 2026-10-16: the packaged plugin serves the app library.
+Contract updated 2026-10-17: you can edit the person's library canvases (source candidate;
+until it is qualified in Codex, check the tools are actually listed before relying on them).
 
 An editable design canvas (paper-rs). The packaged plugin starts
 `openpaperdesign-mcp --app-library ${PLUGIN_DATA}`: an app-library server.
@@ -15,19 +16,37 @@ An editable design canvas (paper-rs). The packaged plugin starts
 **The app library (packaged).** The person uses the OpenPaperDesign home in the Codex sidebar.
 Its New, open, close, import and export actions call the server directly; they send you no
 message and need no turn from you. Canvases live in OpenPaperDesign's own data folder
-(`library/v1/canvases/<id>/`, one standard paper-rs project each) and open in the loopback
-browser editor, where the person edits and saves them.
+(`library/v1/canvases/<id>/`, one standard paper-rs project each). The home hands a created or
+opened canvas to its loopback web editor (Codex's built-in browser, or a browser on this
+computer); editing inside the view is optional. Asking Codex to open the link isn't a load:
+don't say the editor loaded or saved unless the home or status shows it.
 
-- This server has no workspace and no project or design tools. `openpaperdesign_status`
-  reports `mode: app-library`, the library folder and the open canvas. Don't claim you can
-  bind, read or edit a library canvas, or a project, through it.
+You can work on the same canvas:
+
+1. **Find it.** `openpaperdesign_library_current` gives the open canvas: id, name, `binding`,
+   pages. `openpaperdesign_library_canvases` lists the library; `_create {name}` and
+   `_open {id}` pick one. Ask if several could be meant.
+2. **Read, then change.** Pass the open canvas's `binding` with every design tool
+   (`get_basic_info`, `get_tree_summary`, `create_shape`, `write_html`, `update_styles`, …);
+   a stale one is refused with no effect. Read a page (`get_tree_summary`, `nodeId` `"root"`,
+   its `pageId`) before your first change to it; a library result isn't a read. Each successful
+   change is saved at once and shows in the person's view.
+3. **Respect their editor.** If the person has an unsaved change, their save is refused as a
+   conflict and nothing is overwritten; a change of yours to a page they saved since is refused
+   too: read it again. While their editor is open you can't switch or close the canvas: ask.
+   `_editor {binding}` gives the browser link for Codex's built-in browser; never write its
+   token into files.
+
+- `openpaperdesign_status` reports `mode: app-library`, the library folder and the open canvas.
+  This server has no workspace: don't claim it can bind or edit a repository project.
+- A canvas open in another Codex window is busy; it isn't taken over.
 - A library canvas is app-owned until the person exports it. Export gives a canvas file:
   the canvas as last saved, without design direction (`DESIGN.md`) or tokens. Unsaved edits
   in a browser tab aren't in it. Import makes a new canvas from such a file and never
   overwrites one.
-- A canvas open in another Codex chat or panel is busy: close it there first. Closing stops
-  its editor; anything still unsaved in that tab is lost, so the view asks first.
 - A new blank canvas applies no design system and creates no `DESIGN.md`, tokens or assets.
+- In this server `list_resources`/`open_file` only name the open canvas; `create_file` and
+  export aren't offered; images must be `data:` URIs.
 
 **Workspace projects (separate server).** Editing `design/<name>/` in a repository with the
 tools below needs a server started for it: `openpaperdesign-mcp --codex-context` (Codex's

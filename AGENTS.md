@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.36 · Updated: 2026-10-16
+Revision: 0.37 · Updated: 2026-10-17
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -220,10 +220,11 @@ data. Listing creates and locks nothing and is bounded (entries and manifest byt
 process only the home, its resource, `openpaperdesign_status` (library report), the read-only
 inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export}`
 and in-panel editor tools (`_app_editor_asset`, `_app_page`, `_app_page_revision`,
-`_app_page_save`, `_app_ready`, `_app_page_release`)
+`_app_page_save`, `_app_ready`, `_app_page_release`), plus the agent's library controls and
+binding-guarded upstream design tools (below),
 are answered, with strict argument keys and types; every project route (including the
 `_ui_*` actions, the picker and the upstream design tools) is refused without admission or
-state change, and a workspace process refuses the `_app_*` names the same way. One binding per
+state change, and a workspace process refuses the `_app_*` and `_library_*` names the same way. One binding per
 process (the page-id layout registry forbids a second slot). Each canvas needs a permanent
 per-id lease: nonblocking `File::try_lock` on a regular single-link lock file, taken before
 `Project::open` (its stale-temp cleanup) or any write, rechecked (handle and path identity, link
@@ -264,11 +265,26 @@ generation and selection that started it; a superseded read sends nothing and sh
 Every image of an imported or exported canvas file is fully decoded with the `image` crate
 (declared in `openpaperdesign-serve` with the root's exact requirement), never through
 `assets::register`, before anything is published; hash, signature, base64 and exact-set checks
-stay. The browser canvas still doesn't draw image fills. Library mode defers stdio page tools:
-canvases are edited in the editor.
+stay. The browser canvas still doesn't draw image fills.
+
+Agents on library canvases (owner direction 2026-10-17, `launcher_library_agent.rs`): the
+model sees `openpaperdesign_library_{canvases,current,create,open,close,editor}` and
+upstream's offered design tools under their own names, descriptions and schemas, each with a
+required `binding` (the open canvas meant). The binding is compared under the state lock after
+the canvas/library/lease re-check, removed, and the call goes to `Server::call_tool` with this
+process's session, exactly as in workspace mode: same policy, per-page read-before-write
+acknowledgements, one commit with rollback/`Broken`, lifecycle fence for queued and late calls.
+A caller-supplied session field is refused. A stale or missing binding is refused with no
+effect. The model library controls take no `force`/`replace`: a canvas with a mounted panel or a
+given link is never switched or closed by the agent. Only `_library_editor` hands out the
+loopback link (a link given); no other agent result carries the URL or token. Cross-process
+ownership stays the lease's (busy is refused, never transferred). The panel and browser editor
+see agent commits through their revision polls; their stale saves are 409 conflicts. Never add
+a parallel editing API, drawing DSL or document format here: reuse upstream's commands and
+renderer, and keep the adapter to binding, authority, transport and hosting.
 
 In-panel editor (owner direction 2026-10-16, `static/{editor,panel}.js`, `launcher_app.rs`):
-the library home edits a canvas in its own MCP App view with the same Rust/WASM renderer,
+the library home can edit a canvas in its own MCP App view with the same Rust/WASM renderer,
 `Session` and editor mount as the browser page (`editor.js`, import-free, shared by `app.js`).
 The launcher inlines one fixed module into the view's one `<script type="module">` (glue,
 `session.js`, `page.js`, `editor.js`, `panel.js`, in that order) and refuses to embed text with
@@ -294,11 +310,22 @@ editor returns no link and gives none; mounted panels and a given link both make
 need `force`. Back and Close drain (wait for the save in flight, save what is left, require
 `can_reload`); conflict, failed/unanswered save or an edit under way keep the editor until an
 explicit discard. Teardown uses the same drain, but an abrupt host removal or crash saves
-nothing. Ready is the mount's own renderer's; Saved only a matching commit answer. The browser
-link stays a secondary action, never a fallback: the view always asks for `panel`, refuses
-New/Import/Open itself without the module, and the server refuses `panel` requests its build
-can't serve before any lock, file, lease, switch or mount. Host CSP for WebAssembly, WebGL2/WebGPU, message limits, input
-and focus in the native panel are unproven: native qualification is pending.
+nothing. Ready is the mount's own renderer's; Saved only a matching commit answer. The panel is
+optional (owner decision 2026-10-17): the home offers it only as "Edit in this view" for a
+shown canvas when its build has the module, and the server refuses `panel` requests its build
+can't serve before any lock, file, lease, switch or mount. Host CSP for WebAssembly,
+WebGL2/WebGPU, message limits, input and focus in the native panel are unproven.
+
+Home and the web editor (owner decision 2026-10-17): the home stays the entry (overview, native
+project inventory, library list, New/Open/Import/Close/Export). Its primary New/Open/Import and
+"Open current canvas" hand the canvas to its one loopback web editor: the result's own
+same-binding link, checked against the loopback pattern and asked to open once (`ui/open-link`)
+in Codex's browser; an ordinary browser on this computer can use the same link. That counts as a
+link given, so Close/Switch then ask first. The request is never a load: only the editor's own
+report (`POST /api/ready`, polled through `_app_editor {binding}`) says it loaded. The home owns
+routing and lifecycle; the web editor (browser/WASM, upstream engine) owns editing; the server
+owns the document, conflicts and authority. Don't add a second library home or editor.
+Native qualification is pending.
 
 ## Model profile
 
