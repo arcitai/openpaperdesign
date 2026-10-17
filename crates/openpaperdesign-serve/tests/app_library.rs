@@ -343,8 +343,9 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 /// listed resource name the current versioned URI (`home-3`, the browser-first view). Reading
 /// it returns this source tree's unchanged view frame with its slots filled (checked here for
 /// shape only), with the view's MIME type, and changes nothing. Earlier, other,
-/// query and file URIs are refused, so a host that caches views by URI never pairs an older
-/// view with this server. A synthetic host, not a receipt of what a Codex host cached.
+/// query and file URIs are refused, so a fresh read can't get an older view. This says nothing
+/// about a view a host already has open (it isn't evicted or refreshed). A synthetic host, not a
+/// receipt of what a Codex host cached or shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() {
     use rmcp::model::ReadResourceRequestParams;

@@ -684,8 +684,8 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
         );
         for other in [
             "ui://openpaperdesign/home-3.html?x",
-            // Earlier view URIs are no longer served: a host's cached older view is never
-            // paired with this server.
+            // Earlier view URIs are no longer served, so a fresh read can't get an older view.
+            // A view a host already has open isn't evicted or refreshed by this.
             "ui://openpaperdesign/home-2.html",
             "ui://openpaperdesign/home.html",
             "ui://openpaperdesign/other.html",

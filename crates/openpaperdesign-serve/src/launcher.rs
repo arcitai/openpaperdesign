@@ -81,8 +81,10 @@ const PROJECTS_TOOL: &str = "openpaperdesign_projects";
 const INVENTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 /// One inventory child process at a time per session.
 static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Versioned: a view whose code changed incompatibly gets a new URI, so a host never pairs a
-/// cached older view with this server (hosts may cache a view by its URI). `home-2` added the
+/// Versioned: a view whose code changed incompatibly gets a new URI. Hosts may cache a view by
+/// its URI, so a fresh tool listing or resource read gets this view under a key no older view
+/// used, and a read of an earlier URI is refused. That neither evicts nor refreshes a view a host
+/// already has open, nor tells this server which view version is calling it. `home-2` added the
 /// in-panel editor module; `home-3` makes the home browser-first: New, Open, Import and Open
 /// current canvas ask for the loopback web editor link and open it, and the in-panel editor is
 /// only the optional "Edit in this view". No earlier URI is served.
