@@ -54,11 +54,14 @@ export function opdQuietStatus(text, error) {
 }
 
 /**
- * The status shown for one editor, with the one thing it remembers (R25-F2): a save failure, a
- * conflict or a terminal error stays shown until it is resolved: an acknowledged save
- * ("Saved"), the conflict's explicit reload, or a new editor (a new display). The next tick's
- * "Saving…" of a retry, Ready or "Updated…" never hides it, and no timer does. A newer problem
- * or note replaces its text. `show(text, error)` returns what the visible note shows:
+ * The status shown for one editor, with the one thing it remembers (R25-F2, R26-F2): a save
+ * failure, a conflict or a terminal error stays shown, with its severity, until it is resolved:
+ * an acknowledged save ("Saved") or the conflict's explicit reload resolve a failure or
+ * conflict; nothing resolves a terminal error but a new editor (a new display). Meanwhile
+ * every other status (the retry's "Saving…", Ready, "Updated…", loading, or an informational
+ * note such as a refused clipboard copy) is only in the host's live region: the problem stays
+ * on screen, and no timer hides it. A newer failure or conflict replaces an older one; neither
+ * replaces a terminal error. `show(text, error)` returns what the visible note shows:
  * `{ kind, text, latched }` (`kind` 'quiet' hides it; `latched`: the earlier problem, still
  * unresolved, shown instead of this status).
  */
@@ -68,14 +71,13 @@ export function opdStatusDisplay() {
     show(text, error) {
       const s = String(text);
       const kind = opdStatusKind(s, error);
-      if (OPD_RESOLVED.has(s) && (!outstanding || outstanding.kind !== 'error')) outstanding = null;
-      if (kind === 'failure' || kind === 'conflict' || kind === 'error') {
-        outstanding = { kind, text: s, latched: false };
-        return outstanding;
+      const terminal = Boolean(outstanding) && outstanding.kind === 'error';
+      if (OPD_RESOLVED.has(s) && !terminal) outstanding = null;
+      if (kind === 'error' || ((kind === 'failure' || kind === 'conflict') && !terminal)) {
+        outstanding = { kind, text: s };
+        return { kind, text: s, latched: false };
       }
-      if (outstanding && (kind === 'quiet' || kind === 'loading')) {
-        return { kind: outstanding.kind, text: outstanding.text, latched: true };
-      }
+      if (outstanding) return { kind: outstanding.kind, text: outstanding.text, latched: true };
       return { kind, text: s, latched: false };
     },
     get outstanding() { return outstanding ? outstanding.kind : null; },
@@ -86,7 +88,8 @@ export function opdStatusDisplay() {
  * A host's visible status note (the browser page's), by `opdStatusDisplay`: every status goes
  * to `live` (a status live region); `note` shows what the display says, with its kind as its
  * class (`loading`, `failure`, `conflict`, `error`, `note`), and only a plain note with no
- * problem outstanding goes after six seconds. `timers`: { setTimeout, clearTimeout }. Returns
+ * problem outstanding goes after six seconds; each status first cancels the last note's timer,
+ * so a stale timer never hides a later problem. `timers`: { setTimeout, clearTimeout }. Returns
  * `status(text, error)`.
  */
 export function opdStatusNote(live, note, timers) {
@@ -103,7 +106,7 @@ export function opdStatusNote(live, note, timers) {
     note.textContent = shown.text;
     note.className = shown.kind;
     note.hidden = false;
-    // A note over an unresolved problem doesn't time out: that would hide the problem too.
+    // Only a plain note goes after a while (an unresolved problem is never a plain note here).
     if (shown.kind === 'note' && !display.outstanding) {
       timer = timers.setTimeout(() => { note.hidden = true; }, 6000);
     }

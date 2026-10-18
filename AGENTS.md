@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.50 · Updated: 2026-10-18
+Revision: 0.51 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -402,12 +402,17 @@ status goes to a status live region for assistive technology and diagnostics; ho
 Saving…) show nothing, loading on the way to Ready shows as a small temporary note that the
 next state replaces, and failures, conflicts, refusals and notes show as one note over the
 workspace. A save failure ("Save failed; retrying", unreachable), a conflict or a terminal
-error stays shown through the retry's "Saving…", Ready and every timer until it is resolved
-(an acknowledged Saved, the conflict's reload, or a new editor): `opdStatusDisplay` per editor
-in the view, `opdStatusNote` on the page (R25-F2). A departure (Home, the explicit discard,
-teardown) captures its view generation, editor handle and binding once and, after every await
-(drain, the mount's release, Close), acts only while it still owns the view: a newer result,
-Home or editor is never closed, hidden or let go by it (R25-F1). Home drains, disposes (releasing the mount), then closes exactly that
+error stays shown, with its severity, through the retry's "Saving…", Ready, informational
+notes (a refused copy, say; they reach the live region only) and every timer until it is
+resolved (an acknowledged Saved or the conflict's reload for a failure or conflict; only a new
+editor for a terminal error, which nothing recoverable replaces): `opdStatusDisplay` per editor
+in the view, `opdStatusNote` on the page (R25-F2, R26-F2). That Saved or reload also ends a
+refused leave's hold and its Leave without saving (R26-F3). A departure (Home, the explicit
+discard, teardown) captures its view generation, editor handle and binding once and, after
+every await (drain, the mount's release, Close), acts only while it still owns the view: a
+newer result, Home or editor is never closed, hidden or let go by it (R25-F1). Departure
+admission is per editor: only the editor being drained refuses a second departure, and that
+mark goes with its departure or its disposal (R26-F1). Home drains, disposes (releasing the mount), then closes exactly that
 binding, not forced; a refused, failed or unanswered close is said on the library and never
 shown as closed, and a close answer after a newer result belongs to nothing. A start failure
 offers a visible Back to files. Without the module, the library falls back to the old link

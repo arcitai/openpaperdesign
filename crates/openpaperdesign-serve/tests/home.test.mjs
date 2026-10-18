@@ -2507,3 +2507,243 @@ test('R25: a teardown whose release is delayed past a newer editor lets only its
   assert.equal(closes(v).length, 0, 'a teardown closes nothing');
   panelOnly(v);
 });
+
+// ---- R26: departure admission belongs to its editor; the reload resolves a refused leave ----
+// The first three cases are the R26 review's probes (home-probes.mjs), with their fixtures and
+// assertions; `mountReplacement` is theirs.
+
+/** Home, then New file, mounting a second real editor (binding B2, mount 8). */
+async function mountReplacement(v, editor) {
+  v.from(result({ surface: 'home' }));
+  await flush();
+  await relist(v);
+  v.els['new-file'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('created', ID2), libAction(v));
+  const read = v.last('tools/call');
+  assert.equal(read.params.name, 'openpaperdesign_app_canvas');
+  await answer(v, { binding: B2, canvas: { name: 'New document' }, revision: '"new"', active_page: 'p2', pages: [{ id: 'p2', name: 'Page 1', text: '{}' }], mount: 8 }, read);
+  assert.equal(await editor.handle.started, 'mounted');
+  return editor.handle;
+}
+
+test('R26 control: teardown drain timeout and release permit the replacement editor to run its own Home', async () => {
+  const { v, editor } = await realPanelView();
+  const first = editor.handle;
+  let finish;
+  first.mounted.drain = () => new Promise((r) => { finish = r; });
+  v.from({ id: 'td-timeout-control', method: 'ui/resource-teardown', params: {} });
+  await flush();
+  v.tick(8000);
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  const h = await mountReplacement(v, editor);
+  editor.nextDrain = 'busy';
+  await answer(v, { binding: B1, released: true }, release);
+  await flush();
+  const before = v.els['ed-alert-text'].textContent;
+  editor.mountOpts.onHome();
+  await flush();
+  assert.equal(h.left, false);
+  assert.notEqual(v.els['ed-alert-text'].textContent, before);
+  assert.match(v.els['ed-alert-text'].textContent, /edit is still under way/);
+  finish('stale');
+  await flush();
+});
+
+test('R26: a Home drain superseded by timed-out teardown must not block the replacement editor Home', async () => {
+  const { v, editor } = await realPanelView();
+  const first = editor.handle;
+  let finish;
+  const pending = new Promise((r) => { finish = r; });
+  // Real Session/saveStep/drain/dispose, with only the editor and delayed transport as stand-ins.
+  const oldSession = new Session({ put: () => pending, log: () => {} });
+  oldSession.ed = { dirty: () => true, save_snapshot: () => 'old work', save_succeeded: () => {}, save_failed: () => {}, can_reload: () => false, free: () => {} };
+  oldSession.state.ready = true;
+  oldSession.wasReady = true;
+  const save = saveStep(oldSession, { status: editor.opts.onStatus, conflict: () => {} });
+  first.mounted.drain = () => oldSession.drain();
+  first.mounted.dispose = () => { oldSession.dispose(); editor.disposed = true; };
+  const back = v.els.back.onclick();
+  await flush();
+  v.from({ id: 'td-timeout-after-back', method: 'ui/resource-teardown', params: {} });
+  await flush();
+  v.tick(8000);
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  const h = await mountReplacement(v, editor);
+  editor.nextDrain = 'busy';
+  await answer(v, { binding: B1, released: true }, release);
+  await flush();
+  editor.mountOpts.onHome();
+  await flush();
+  const blocked = v.els['ed-alert-text'].textContent;
+  // Added: the old editor's save is still unanswered, its session disposed, the teardown
+  // answered, and the replacement still shown and not let go.
+  assert.equal(oldSession.disposed, true);
+  assert.equal(oldSession.state.saving, true, 'the old save reply is still pending');
+  assert.ok(v.sent.some((m) => m.id === 'td-timeout-after-back' && m.result), 'the teardown was answered');
+  assert.equal(v.els.editor.hidden, false);
+  assert.equal(h.left, false);
+  // Settle only our original Session/save-answer stand-in; the old continuation closes nothing.
+  finish({ ok: true, status: 200, revision: '"old-confirmed"' });
+  await save;
+  await back;
+  await flush();
+  editor.mountOpts.onHome();
+  await flush();
+  assert.match(v.els['ed-alert-text'].textContent, /edit is still under way/, 'control: same current Home works once the old drain finishes');
+  assert.equal(closes(v).length, 0);
+  assert.match(blocked, /edit is still under way/, 'the replacement own Home should not be blocked by the superseded departure');
+  // Added: the old continuation left the replacement as it was, and its own Home still goes.
+  assert.equal(h.left, false);
+  editor.nextDrain = 'clean';
+  editor.mountOpts.onHome();
+  await flush();
+  const own = v.last('tools/call');
+  assert.deepEqual(own.params, { name: 'openpaperdesign_app_page_release', arguments: { binding: B2, mount: 8 } });
+  await answer(v, { binding: B2, released: true }, own);
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B2 } }, 'unforced, exactly its own binding');
+  panelOnly(v);
+});
+
+test('R26: an old drain resolving while the replacement\'s own departure is in flight clears only its own state', async () => {
+  const { v, editor } = await realPanelView();
+  const first = editor.handle;
+  // One pending drain, whoever asks (Home, then the teardown).
+  let finishOld;
+  const oldDrain = new Promise((r) => { finishOld = r; });
+  first.mounted.drain = () => oldDrain;
+  const back = v.els.back.onclick();
+  await flush();
+  // The host's teardown times out the old drain and lets that editor go; a new file mounts.
+  v.from({ id: 'td-r26-own', method: 'ui/resource-teardown', params: {} });
+  await flush();
+  v.tick(8000);
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  const h = await mountReplacement(v, editor);
+  await answer(v, { binding: B1, released: true }, release);
+  await flush();
+  // The replacement's own Home starts and waits on its own drain.
+  let finishNew;
+  const newDrain = new Promise((r) => { finishNew = r; });
+  h.mounted.drain = () => newDrain;
+  editor.mountOpts.onHome();
+  await flush();
+  // The old drain resolves now: it must neither end the replacement's departure nor admit a
+  // second one for it.
+  finishOld('clean');
+  await back;
+  await flush();
+  editor.mountOpts.onHome();
+  await flush();
+  assert.equal(h.left, false, 'still draining: a second Home for the same editor waits');
+  assert.equal(closes(v).length, 0);
+  // Its own drain finishes clean: its release, then exactly its binding.
+  finishNew('clean');
+  await flush();
+  const own = v.last('tools/call');
+  assert.deepEqual(own.params, { name: 'openpaperdesign_app_page_release', arguments: { binding: B2, mount: 8 } });
+  await answer(v, { binding: B2, released: true }, own);
+  await flush();
+  assert.deepEqual(closes(v).map((m) => m.params.arguments), [{ binding: B2 }]);
+  panelOnly(v);
+});
+
+test('R26: a real pending Session conflict drain retains the editor, and successful reload resolves departure feedback', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const h = v.fake.handles[0];
+  const session = new Session({ put: async () => ({ ok: false, status: 409 }), fetchPage: async () => ({ text: 'disk', revision: '"disk"' }), log: () => {} });
+  let pending = 'local edit';
+  let loaded = null;
+  let banner = false;
+  session.ed = {
+    dirty: () => pending !== undefined,
+    save_snapshot: () => pending,
+    save_failed: () => {},
+    save_succeeded: () => { pending = undefined; },
+    can_reload: () => pending === undefined,
+    reload: (t) => { loaded = t; pending = undefined; },
+  };
+  session.state.ready = true;
+  session.wasReady = true;
+  h.drain = () => session.drain();
+  h.resume = () => session.resume();
+  const ui = { status: h.o.onStatus, conflict: () => { banner = true; }, hideConflict: () => { banner = false; } };
+  await saveStep(session, ui);
+  assert.equal(session.state.conflict, true);
+  await v.els.back.onclick();
+  assert.equal(v.els.editor.hidden, false);
+  assert.equal(v.els['ed-leave'].hidden, false);
+  assert.match(v.els['ed-alert-text'].textContent, /last change isn't saved/);
+  assert.equal(await discardStep(session, ui), 'discarded');
+  assert.equal(session.state.conflict, false);
+  assert.equal(loaded, 'disk');
+  assert.equal(banner, false);
+  assert.equal(session.ed.can_reload(), true);
+  assert.equal(session.closing, false);
+  // Added: the reload is said, at once and without a Saved.
+  assert.equal(v.els['ed-alert-text'].textContent, 'Reloaded the version on disk');
+  assert.equal(v.els['ed-leave'].hidden, true, 'no Leave without saving for a clean editor');
+  v.tick(6000);
+  await flush();
+  assert.equal(v.els['ed-leave'].hidden, true, 'successful actual reload resolves the need to leave without saving');
+  assert.equal(v.els['ed-alert'].hidden, true, 'a resolved reload note may time out');
+  // Added: and a later Home of the now clean editor goes.
+  assert.equal(await session.drain(), 'clean');
+  session.resume();
+  h.nextDrain = 'clean';
+  h.drain = async () => 'clean';
+  v.els.back.onclick();
+  await flush();
+  await closedHome(v);
+  assert.equal(v.els.home.hidden, false);
+});
+
+test('R26 control: a terminal error keeps its Leave without saving through an informational note', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onStatus('Renderer error: device lost', true);
+  h.nextDrain = 'error';
+  v.els.back.onclick();
+  await flush();
+  assert.equal(v.els['ed-leave'].hidden, false);
+  assert.match(v.els['ed-alert-text'].textContent, /renderer stopped/);
+  // A note (a refused copy) and a healthy status change nothing on screen.
+  h.o.onStatus('The browser didn\'t allow copying here; use Ctrl/⌘+C on the canvas.');
+  h.o.onStatus('Ready');
+  assert.equal(v.els['ed-leave'].hidden, false, 'the discard stays offered');
+  assert.equal(v.els['ed-alert'].hidden, false);
+  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
+  assert.equal(v.els['ed-status'].textContent, 'Ready', 'the live region has every status');
+});
+
+test('R26-F2 (embedded): an informational note during an unanswered retry keeps the save failure shown', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const h = v.fake.handles[0];
+  const { session, ui } = realSave(h.o.onStatus, async () => ({ ok: false, status: 500, revision: null }));
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed; retrying');
+  let finish;
+  session.deps.put = () => new Promise((resolve) => { finish = resolve; });
+  const retry = saveStep(session, ui);
+  // What the mount says when the browser refuses a copy (editor.js flushClipboard).
+  h.o.onStatus('The browser didn\'t allow copying here; use Ctrl/⌘+C on the canvas.');
+  assert.match(v.els['ed-status'].textContent, /didn't allow copying/, 'said in the live region');
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed; retrying', 'the failure stays on screen');
+  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
+  v.runAllTimers();
+  await flush();
+  assert.equal(v.els['ed-alert'].hidden, false, 'no timer hides it');
+  finish({ ok: true, status: 200, revision: '"next"' });
+  await retry;
+  assert.equal(v.els['ed-alert'].hidden, true, 'the acknowledged save resolves it');
+});

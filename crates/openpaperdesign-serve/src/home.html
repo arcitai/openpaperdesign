@@ -1217,7 +1217,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   let display = null;
   let panelHandle = null; // the editor mounted in the editor view, if any
   let panelBinding = null; // the binding it edits
-  let leaving = false;
+  // The editor a departure is draining (R26-F1): a second departure of that same editor waits
+  // for it, any other editor's doesn't. Cleared by that departure only, or when that editor is
+  // let go (a teardown that timed out, say), so a newer editor never inherits it.
+  let leavingFrom = null;
   // A refused leave's note (and its Leave without saving) stays until the editor reports Saved
   // or the person tries again; a passing healthy status doesn't hide it, a newer problem
   // replaces its text.
@@ -1250,9 +1253,16 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   const edStatus = (text, error) => {
     $('ed-status').textContent = text;
     $('ed-status').className = error ? 'sr-only bad' : 'sr-only';
-    if (text === 'Saved') stayReason = false;
     const shown = display ? display.show(text, Boolean(error))
       : { kind: error ? 'error' : 'note', text: String(text), latched: false };
+    // An acknowledged save or the conflict's reload of the version on disk (R26-F3) leaves
+    // nothing to leave without saving: a refused leave's hold and its button go. Never over a
+    // terminal error.
+    if ((text === 'Saved' || text === 'Reloaded the version on disk') && !error
+      && !(display && display.outstanding === 'error')) {
+      stayReason = false;
+      $('ed-leave').hidden = true;
+    }
     if (shown.kind === 'quiet' || (shown.kind === 'loading' && stayReason)) {
       if (!stayReason) hideAlert();
       return;
@@ -1353,8 +1363,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function leaveEditor(d) {
     const h = d.h;
     if (!h) return false;
-    if (leaving) return false;
-    leaving = true;
+    if (leavingFrom === h) return false;
+    leavingFrom = h;
     stayReason = false;
     setEditorBusy(true);
     edStatus('Saving…');
@@ -1364,7 +1374,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     } catch {
       r = 'failed';
     }
-    leaving = false;
+    // Only this departure's own mark (a newer editor's departure may be under way by now).
+    if (leavingFrom === h) leavingFrom = null;
     if (panelHandle !== h || !owns(d)) return false;
     if (r !== 'clean') {
       h.resume();
@@ -1391,6 +1402,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function disposePanel(h) {
     if (!h) return;
     if (panelHandle === h) panelHandle = null;
+    // A departure still waiting for this editor's drain no longer holds the view.
+    if (leavingFrom === h) leavingFrom = null;
     await h.dispose();
   }
 
@@ -1404,7 +1417,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   }
   // Leaving without saving: the explicit discard of what a refused leave kept.
   $('ed-leave').onclick = async () => {
-    if (leaving || !panelHandle) return;
+    if (!panelHandle || leavingFrom === panelHandle) return;
     const d = departure();
     await disposePanel(d.h);
     if (owns(d)) closeAndGoHome(d);

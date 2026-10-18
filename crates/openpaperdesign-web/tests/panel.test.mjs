@@ -512,3 +512,101 @@ test('an answer for another binding, or without pages, is never opened', async (
     assert.deepEqual(srv.named(T.RELEASE), [{ binding: BINDING, mount: 1 }], 'its mount is released');
   }
 });
+
+// ---- R26-F2: an informational note never replaces an unresolved problem ----
+// The actual shared mount, Session and page steps produce the statuses (the mount's frame loop
+// reports the terminal error; its clipboard flush reports a refused copy; the save tick reports
+// the failed save), into the browser page's `opdStatusNote`. Graphics, DOM and transport are
+// stand-ins. These are the R26 review's probes (panel-probes.mjs), with their fixtures and
+// assertions; `noteEditor` is theirs.
+
+async function noteEditor() {
+  const t = setup();
+  const live = { textContent: '' };
+  const note = { textContent: '', className: '', hidden: true };
+  const noteTimers = new Map();
+  let id = 0;
+  t.refs.status = mod.opdStatusNote(live, note, {
+    setTimeout: (fn, ms) => { noteTimers.set(++id, { fn, ms }); return id; },
+    clearTimeout: (n) => noteTimers.delete(n),
+  });
+  await readyEditor(t);
+  return { ...t, live, note, noteTimers };
+}
+
+test('R26 control: an ordinary note timer cannot hide the subsequent failure or terminal error', async () => {
+  const t = await noteEditor();
+  let reject;
+  t.env.writeClipboard = () => new Promise((_, j) => { reject = j; });
+  t.ed.clip = 'upstream clipboard text';
+  t.refs.canvas.fire('keydown', { key: 'c', code: 'KeyC', repeat: false });
+  reject(new Error('clipboard permission refused'));
+  await flush();
+  const staleTimers = [...t.noteTimers.values()];
+  assert.equal(t.note.className, 'note');
+  t.ed.gpu_error = () => 'device lost';
+  t.env.frame(32);
+  assert.equal(t.note.className, 'error');
+  for (const { fn } of staleTimers) { if (t.noteTimers.size) fn(); }
+  assert.equal(t.note.className, 'error');
+  assert.equal(t.note.hidden, false);
+  await t.h.dispose();
+});
+
+test('R26: a late real clipboard rejection must not replace an unresolved terminal renderer error', async () => {
+  const t = await noteEditor();
+  let reject;
+  t.env.writeClipboard = () => new Promise((_, j) => { reject = j; });
+  t.ed.clip = 'upstream clipboard text';
+  t.refs.canvas.fire('keydown', { key: 'c', code: 'KeyC', repeat: false });
+  t.ed.gpu_error = () => 'device lost';
+  t.env.frame(32);
+  assert.equal(t.h.mounted.session.state.error, 'Renderer error: device lost');
+  assert.equal(t.note.className, 'error');
+  reject(new Error('clipboard permission refused'));
+  await flush();
+  // Added: the refused copy is still said, in the live region.
+  assert.match(t.live.textContent, /didn't allow copying/);
+  await t.h.dispose();
+  assert.equal(t.note.className, 'error', 'the unresolved terminal error must stay visible');
+  assert.match(t.note.textContent, /Renderer error/);
+  assert.equal(t.note.hidden, false);
+  assert.equal(t.noteTimers.size, 0, 'and nothing will hide it');
+});
+
+test('R26: a late real clipboard rejection must not mask a save failure during its unanswered retry', async () => {
+  const t = await noteEditor();
+  t.ed.save_failed = () => { t.ed.pending = '{"mine":1}'; };
+  t.srv.override[T.SAVE] = () => no(500, 'disk write failed');
+  t.ed.pending = '{"mine":1}';
+  t.env.every(300);
+  await flush();
+  assert.equal(t.note.className, 'failure');
+  assert.equal(t.note.textContent, 'Save failed; retrying');
+  let reject;
+  let release;
+  t.env.writeClipboard = () => new Promise((_, j) => { reject = j; });
+  t.ed.clip = 'upstream clipboard text';
+  t.refs.canvas.fire('keydown', { key: 'c', code: 'KeyC', repeat: false });
+  t.srv.holds[T.SAVE] = new Promise((r) => { release = r; });
+  delete t.srv.override[T.SAVE];
+  t.env.every(300);
+  await flush();
+  assert.equal(t.h.mounted.session.state.saving, true);
+  assert.equal(t.note.className, 'failure');
+  reject(new Error('clipboard permission refused'));
+  await flush();
+  t.env.every(300);
+  await flush();
+  const during = { ...t.note };
+  // Added: the refused copy reached the live region; no timer will hide the failure.
+  assert.match(t.live.textContent, /didn't allow copying|Saving…/);
+  assert.equal(t.noteTimers.size, 0);
+  delete t.srv.holds[T.SAVE];
+  release();
+  await flush();
+  assert.equal(t.note.hidden, true, 'the genuine later successful save resolves the latch');
+  await t.h.dispose();
+  assert.equal(during.className, 'failure', 'the unsaved failure must remain visible until recovery');
+  assert.match(during.textContent, /Save failed/);
+});
