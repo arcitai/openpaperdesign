@@ -191,8 +191,9 @@ export function opdIsMac(nav) {
  *   canvas,                          the canvas element (inside the editor's own root)
  *   status(text, error), renderer(text, error), conflictBox
  *   boot(canvas, page, webgl, systemDark, appearance) -> Promise<editor>
- *                                    the OS appearance now (true, false or null) and the kept
- *                                    preference ('system', 'light' or 'dark')
+ *                                    the OS appearance now (true or false; false, the Light
+ *                                    fallback, when nothing says) and the kept preference
+ *                                    ('system', 'light' or 'dark')
  *   appearance                       the kept preference to start with (default 'system')
  *   hostTheme()                      the host's theme, the OS fallback (see opdSystemDark)
  *   onAppearance(appearance)         the person chose another one (Menu ▸ Appearance): keep it
@@ -229,8 +230,9 @@ export function opdMountEditor(opts) {
     boot: async (canvas, page, webgl) => {
       const ed = await opts.boot(canvas, page, webgl, systemDark(), appearance);
       if (!disposed) {
-        const d = systemDark();
-        if (d !== null) ed.set_system_dark(d);
+        // Always the OS appearance as of now, the Light fallback included: a dark signal lost
+        // while it booted must not stay.
+        ed.set_system_dark(systemDark());
         ed.set_appearance(appearance);
       }
       return ed;
@@ -348,14 +350,17 @@ export function opdMountEditor(opts) {
   // in System (opdSystemDark: the browser's colour-scheme, else the host's theme). The
   // browser's changes are followed live; only the editor shown now is told (not one being
   // replaced by a fallback, which boots in the current appearance). The listener goes with the
-  // mount. Nothing here reaches the canvas, its saves or its binding.
+  // mount. Nothing here reaches the canvas, its saves or its binding. With no signal at all (no
+  // browser colour-scheme and no host theme) the OS appearance is the documented Light fallback
+  // (as Home resolves it), delivered like any other: at startup, after boot and when a fallback
+  // signal goes away, so an earlier Dark never stays.
   let appearance = opdAppearance(opts.appearance);
   const media = env.colorScheme ? env.colorScheme() : null;
-  const systemDark = () => opdSystemDark(media, opts.hostTheme ? opts.hostTheme() : null);
+  const systemDark = () => opdSystemDark(media, opts.hostTheme ? opts.hostTheme() : null) === true;
   const system = () => {
     if (disposed) return;
     const d = systemDark();
-    if (d !== null) session.withEditor((ed) => ed.set_system_dark(d));
+    session.withEditor((ed) => ed.set_system_dark(d));
   };
   if (media && typeof media.addEventListener === 'function') on(media, 'change', system);
 

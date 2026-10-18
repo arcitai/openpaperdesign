@@ -641,7 +641,166 @@ test('without a browser signal the host\'s theme stands in, and changes with it'
   host = undefined;
   const n = ed.systems.length;
   h.hostThemeChanged();
-  assert.equal(ed.systems.length, n, 'no signal at all: nothing is claimed');
+  assert.equal(ed.systems.length, n + 1, 'the loss of the signal is delivered');
+  assert.equal(ed.systems.at(-1), false, 'no signal at all: the documented Light fallback (as Home resolves it)');
+  await h.dispose();
+});
+
+// ---- R31: the documented no-signal Light fallback reaches the editor (live and after boot),
+// and a kept preference the view learns late (`setAppearance`) reaches the right editor
+// without being reported as a new choice or touching the canvas. From the R31 review's probes
+// (theme-r31-residual/panel-review-probes.mjs), with their assertions. ----
+
+const r31NoWrite = (t, chosen) => {
+  assert.equal(t.srv.named(T.SAVE).length, 0, 'no canvas save');
+  assert.equal(t.srv.saved, undefined);
+  assert.deepEqual(chosen, [], 'a kept read is not reported as a new menu choice');
+};
+
+test('R31 no-signal: losing a dark host fallback resolves the mounted editor to Light', async () => {
+  const t = setup();
+  let host = 'dark';
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', hostTheme: () => host });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors[0];
+  assert.equal(ed.startSystem, true);
+  assert.deepEqual(ed.systems, [true]);
+  host = null;
+  h.hostThemeChanged();
+  assert.equal(ed.systems.at(-1), false, 'the old Dark system signal is reset to the Light fallback');
+  assert.equal(mod.opdResolveDark(ed.pref, ed.systems.at(-1)), false);
+  await h.dispose();
+  const n = ed.systems.length;
+  h.hostThemeChanged();
+  assert.equal(ed.systems.length, n, 'nothing reaches the disposed editor');
+});
+
+test('R31 no-signal boot: a dark fallback lost while engine boot is pending is reconciled on completion', async () => {
+  const t = setup();
+  let host = 'dark';
+  const boot = t.engine.start;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  t.engine.start = async (...args) => { const ed = await boot(...args); await gate; return ed; };
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', hostTheme: () => host });
+  await flush();
+  assert.equal(t.engine.editors[0].startSystem, true);
+  host = null;
+  h.hostThemeChanged();
+  release();
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors[0];
+  assert.equal(ed.systems.at(-1), false, 'post-boot reconciliation resets the no-longer-current Dark');
+  await h.dispose();
+});
+
+test('R31 no-signal: the browser\'s OS signal still comes first and an explicit mode is untouched', async () => {
+  const t = setup();
+  const media = scheme(t, true);
+  let host = 'light';
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'dark', hostTheme: () => host });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors[0];
+  assert.equal(ed.startSystem, true, 'the OS, not the host');
+  host = null;
+  h.hostThemeChanged();
+  assert.equal(ed.systems.at(-1), true, 'losing the host signal changes nothing while the OS says');
+  media.matches = false;
+  media.fire('change');
+  assert.equal(ed.systems.at(-1), false);
+  assert.equal(ed.pref, 'dark', 'the explicit Dark preference is the editor\'s own');
+  assert.equal(mod.opdResolveDark(ed.pref, ed.systems.at(-1)), true);
+  await h.dispose();
+});
+
+test('R31 setter: a preference learned during renderer transfer is the first editor appearance', async () => {
+  const t = setup();
+  let release;
+  t.srv.holds[T.ASSET] = new Promise((r) => { release = r; });
+  const chosen = [];
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', onAppearance: (a) => chosen.push(a) });
+  await flush();
+  assert.equal(h.mounted, null);
+  h.setAppearance('dark');
+  release();
+  assert.equal(await h.started, 'mounted');
+  assert.equal(t.engine.editors[0].startAppearance, 'dark');
+  assert.equal(t.engine.editors[0].pref, 'dark');
+  r31NoWrite(t, chosen);
+  await h.dispose();
+});
+
+test('R31 setter: a preference learned during engine boot reaches that editor after boot, without reporting it', async () => {
+  const t = setup();
+  const chosen = [];
+  const boot = t.engine.start;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  t.engine.start = async (...args) => { const ed = await boot(...args); await gate; return ed; };
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', onAppearance: (a) => chosen.push(a) });
+  await flush();
+  assert.ok(h.mounted);
+  assert.equal(t.engine.editors[0].startAppearance, 'system');
+  h.setAppearance('dark');
+  release();
+  assert.equal(await h.started, 'mounted');
+  assert.equal(t.engine.editors[0].pref, 'dark');
+  assert.deepEqual(t.engine.editors[0].kept, ['dark']);
+  r31NoWrite(t, chosen);
+  await h.dispose();
+});
+
+test('R31 setter: a mounted update keeps a draft, the session and its revision; disposal stops later updates', async () => {
+  const t = setup();
+  const chosen = [];
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', onAppearance: (a) => chosen.push(a) });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors[0];
+  ed.isReady = true;
+  t.env.frame(16);
+  ed.pending = '{"unfinished":"draft"}';
+  ed.canReload = false;
+  const snapshot = () => ({ text: ed.text, pending: ed.pending, revision: h.mounted.session.state.revision,
+    saves: h.mounted.session.state.saves });
+  const before = snapshot();
+  h.setAppearance('dark');
+  assert.equal(ed.pref, 'dark');
+  assert.deepEqual(snapshot(), before);
+  assert.equal(ed.canReload, false);
+  assert.equal(h.mounted.session.closing, false);
+  r31NoWrite(t, chosen);
+  await h.dispose();
+  const calls = ed.kept.length;
+  h.setAppearance('light');
+  h.mounted.setAppearance('light');
+  assert.equal(ed.kept.length, calls);
+  assert.equal(ed.freed, true);
+});
+
+test('R31 setter: a preference learned while a fallback is pending reaches only its replacement', async () => {
+  const t = setup();
+  const chosen = [];
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, appearance: 'system', onAppearance: (a) => chosen.push(a) });
+  assert.equal(await h.started, 'mounted');
+  const first = t.engine.editors[0];
+  const before = first.kept.length;
+  let release;
+  t.srv.holds[T.CANVAS] = new Promise((r) => { release = r; });
+  first.gpu_error = () => 'WebGPU device lost';
+  t.env.frame(16);
+  await flush();
+  assert.equal(h.mounted.session.state.switching, true);
+  h.setAppearance('dark');
+  assert.equal(first.kept.length, before, 'not sent to the editor being replaced');
+  delete t.srv.holds[T.CANVAS];
+  release();
+  await flush();
+  const next = t.engine.editors.at(-1);
+  assert.notEqual(next, first);
+  assert.equal(next.webgl, true);
+  assert.equal(next.startAppearance, 'dark');
+  assert.equal(next.pref, 'dark');
+  r31NoWrite(t, chosen);
   await h.dispose();
 });
 

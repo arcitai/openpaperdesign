@@ -463,10 +463,12 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   if (scheme && typeof scheme.addEventListener === 'function') scheme.addEventListener('change', applyTheme);
   // The mounted editor learns of a host theme change (set where the editor is mounted).
   let hostThemeChanged = () => {};
-  // Freshness of the preference (R30). Every menu choice is numbered. A library list's kept
-  // preference applies only if no choice was made since that read began, no keep is under way,
-  // and the latest choice wasn't refused (this view's own choice then stays). Otherwise the
-  // list itself is still shown.
+  // Freshness of the preference (R30, R31). Every menu choice is numbered. A library list's kept
+  // preference applies only if its read overlapped no unresolved choice: when the read began, no
+  // keep was under way and the latest choice wasn't refused, and when it came back, no choice
+  // had been made since, no keep was under way and none was refused. A read begun while a keep
+  // was unanswered may hold the value from before that keep, whatever the order of the answers.
+  // Otherwise this view's own choice stays, and the list itself is still shown.
   let appearanceChoice = 0;
   let keepsInFlight = 0;
   let choiceUnkept = false;
@@ -493,9 +495,11 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       edStatus('Appearance applied here, but it couldn\'t be kept for next time.');
     }
   }
-  // The kept preference a library list reported, read when choice `readAt` was the latest.
-  function listedAppearance(value, readAt) {
-    if (readAt !== appearanceChoice || keepsInFlight > 0 || choiceUnkept) return;
+  // Whether a library read beginning now could carry a current kept preference: its start.
+  const appearanceReadStart = () => ({ choice: appearanceChoice, settled: keepsInFlight === 0 && !choiceUnkept });
+  // The kept preference a library list reported, from a read that began at `start`.
+  function listedAppearance(value, start) {
+    if (!start.settled || start.choice !== appearanceChoice || keepsInFlight > 0 || choiceUnkept) return;
     const next = opdAppearanceName(value);
     if (next === appearance) return;
     appearance = next;
@@ -1049,7 +1053,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('inventory').className = 'muted';
     $('inventory').hidden = false;
     $('inventory').textContent = 'Reading your files…';
-    const readAt = appearanceChoice;
+    const readAt = appearanceReadStart();
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_canvases', arguments: {} });
     if (run !== libraryRun) return; // a newer refresh owns the list
     let v = null;

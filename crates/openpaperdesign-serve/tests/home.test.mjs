@@ -1686,6 +1686,41 @@ test('R30-F1: a list read while a keep is under way, or after a refused choice, 
   panelOnly(v);
 });
 
+test('R31-F1: a Home read begun during a pending keep cannot undo that keep\'s later acknowledgement', async () => {
+  // From the R31 review's probe (theme-r31-residual/home-review-probes.mjs): read before the
+  // write, answered after its acknowledgement. No backend ordering is assumed.
+  const { v, fake } = await appearanceView('system', { theme: 'light' }, osScheme(false));
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onStatus('Ready');
+  h.o.onAppearance('dark');
+  await flush();
+  const keep = libAction(v);
+  assert.equal(keep.params.name, APPEARANCE_TOOL);
+  // The person goes Home while the preference keep is unanswered.
+  h.o.onHome();
+  await flush();
+  await closedHome(v);
+  const list = v.last('tools/call');
+  assert.equal(list.params.name, LIB_LIST);
+  // The keep is acknowledged; then the read that began before it comes back with the old value.
+  await answer(v, { appearance: 'dark' }, keep);
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  await answer(v, { ...LIBRARY_LIST, appearance: 'system' }, list);
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'a read admitted during an unanswered keep must not overwrite its acknowledged choice');
+  assert.deepEqual(rows(v).map((r) => r.name), ['Landing', 'Notes'], 'its rows are still shown');
+  // The next editor starts in the acknowledged choice, and a read begun after it settled is
+  // authoritative again (control).
+  await openInPanel(v);
+  assert.equal(fake.handles[1].o.appearance, 'dark');
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, appearance: 'light' }, v.last('tools/call'));
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'changed elsewhere since: a settled read applies');
+  assert.deepEqual(fake.handles[1].kept, ['light'], 'and reaches the shown editor');
+  panelOnly(v);
+});
+
 test('R30-F2: System without any OS or host signal is Light, also after an explicit Dark and when a fallback signal goes', async () => {
   const { v, fake } = await appearanceView('dark', {});
   assert.equal(v.rootAttrs['data-theme'], 'dark');
