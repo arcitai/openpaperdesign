@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-18: the one-app source candidate (unqualified). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-19: the one-app source candidate's `home-9` view (unqualified). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -23,7 +23,8 @@ surface Codex grants, Home and the full workspace alike.
   files this app keeps itself, not part of a Codex project"). App-library files have no
   native-project grouping or association, so the home shows, implies and grants none; the
   workspace view keeps its genuine project selection. New file (created at once as
-  "Untitled"), search by name (Escape clears), a list/grid toggle (memory only), and each file
+  "Untitled"), search by name (Escape clears), a grid/list toggle (Grid first; since `home-9`
+  an explicitly chosen List is kept by the library's view record), and each file
   with its name, pages and last edit, opened directly or from its menu (Open, Rename…,
   Export…; arrows, Home/End and Escape). No "Open in new chat" (unsupported).
 - **Rename and export by id.** `openpaperdesign_app_rename {id, name}` changes the manifest's
@@ -53,12 +54,15 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-8.html` (2026-10-18 source candidate: one
-  System/Light/Dark appearance across the view, the editor's chrome and its canvas display,
-  kept by the library through `openpaperdesign_app_appearance`); `home-7` (the quieter
-  workspace whose editor first followed the view's light or dark theme), `home-6` (the first
-  one-app view) and earlier are refused. No eviction of a view a host already has open is
-  promised.
+- **View version.** `ui://openpaperdesign/home-9.html` (2026-10-19 source candidate,
+  unqualified: the quiet Home, Grid first with a kept List, equal cards, About & notices in
+  More instead of a footer, and the canvas background, all kept by the library as one view
+  record through `openpaperdesign_app_view {home_layout?, background?}`, reported by the list
+  as `view`). `home-8` (2026-10-18: one System/Light/Dark appearance across the view, the
+  editor's chrome and its canvas display, kept through `openpaperdesign_app_appearance`, which
+  is unchanged), `home-7` (the quieter workspace whose editor first followed the view's light
+  or dark theme), `home-6` (the first one-app view) and earlier are refused. No eviction of a
+  view a host already has open is promised.
 - **Appearance.** Menu ▸ Appearance in the editor: System (the OS appearance, followed live;
   the host's theme only where the browser can't report it), Light or Dark. The home keeps the
   choice in the library's own folder (`library/v1/appearance`; the list reports it), never in
@@ -98,7 +102,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` and `home-7`, now `home-8`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-8`, now `home-9`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

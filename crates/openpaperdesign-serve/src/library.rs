@@ -60,6 +60,37 @@ pub(crate) const MAX_NAME_CHARS: usize = 60;
 /// [`Library::appearance`]): one of [`APPEARANCES`], nothing else.
 const APPEARANCE_FILE: &str = "appearance";
 pub(crate) const APPEARANCES: [&str; 3] = ["system", "light", "dark"];
+/// The views' other kept view preferences (`<root>/library/v1/view`, see [`Library::view`]):
+/// one small JSON record with two keys, the home's file layout and the editor's canvas
+/// background. Its own file, so the appearance's stays exactly as it is.
+const VIEW_FILE: &str = "view";
+const MAX_VIEW_BYTES: u64 = 256;
+pub(crate) const HOME_LAYOUTS: [&str; 2] = ["grid", "list"];
+pub(crate) const BACKGROUNDS: [&str; 3] = ["none", "dots", "lines"];
+
+/// The kept view preferences (DESIGN.md): the home lists files as a grid (the fresh default)
+/// or a list, and the editor's canvas has no background pattern (the fresh default), dots or
+/// lines. View preferences only: never part of a canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewPrefs {
+    pub home_layout: &'static str,
+    pub background: &'static str,
+}
+
+impl Default for ViewPrefs {
+    fn default() -> Self {
+        ViewPrefs {
+            home_layout: HOME_LAYOUTS[0],
+            background: BACKGROUNDS[0],
+        }
+    }
+}
+
+impl ViewPrefs {
+    pub fn to_json(self) -> Value {
+        json!({"home_layout": self.home_layout, "background": self.background})
+    }
+}
 
 /// A canvas id: exactly 16 lowercase hex digits (made by [`new_id`]).
 pub(crate) fn valid_id(s: &str) -> bool {
@@ -433,6 +464,111 @@ impl Library {
         }
         sync_dir(&dir)?;
         Ok(v)
+    }
+
+    /// The view preferences the library keeps for its views (see [`ViewPrefs`]). Read-only and
+    /// bounded: a missing, unreadable, linked, oversized or malformed record is the defaults,
+    /// and a missing or unknown key is that key's default. Nothing is created.
+    pub fn view(&self) -> ViewPrefs {
+        let mut out = ViewPrefs::default();
+        if self.check().is_err() {
+            return out;
+        }
+        let path = self.version_dir().join(VIEW_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.len() <= MAX_VIEW_BYTES => {}
+            _ => return out,
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return out;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            return out;
+        };
+        let pick = |key: &str, from: &[&'static str]| {
+            let got = v.get(key).and_then(Value::as_str)?;
+            from.iter().copied().find(|c| *c == got)
+        };
+        if let Some(l) = pick("home_layout", &HOME_LAYOUTS) {
+            out.home_layout = l;
+        }
+        if let Some(b) = pick("background", &BACKGROUNDS) {
+            out.background = b;
+        }
+        out
+    }
+
+    /// Keep `home_layout` and/or `background` (each one of its known values; at least one),
+    /// with the other key as it is kept now: the whole record is written to a new file beside
+    /// it, made durable and renamed over the old one, so a reader sees the old or the new
+    /// record, never part of one. Touches no canvas, lease or binding. Two processes keeping
+    /// different keys at the same moment can race (the later record wins whole); each record is
+    /// still a complete, valid one.
+    pub fn set_view(
+        &self,
+        home_layout: Option<&str>,
+        background: Option<&str>,
+    ) -> Result<ViewPrefs, String> {
+        let known = |v: Option<&str>, from: &[&'static str], what: &str| match v {
+            None => Ok(None),
+            Some(v) => from
+                .iter()
+                .copied()
+                .find(|c| *c == v)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "A {what} of {} is required. Nothing was changed.",
+                        from.join(", ")
+                    )
+                }),
+        };
+        let layout = known(home_layout, &HOME_LAYOUTS, "home layout")?;
+        let pattern = known(background, &BACKGROUNDS, "background")?;
+        if layout.is_none() && pattern.is_none() {
+            return Err(
+                "A home_layout or a background to keep is required. Nothing was changed.".into(),
+            );
+        }
+        let mut next = self.view();
+        if let Some(l) = layout {
+            next.home_layout = l;
+        }
+        if let Some(b) = pattern {
+            next.background = b;
+        }
+        self.ensure_hierarchy()?;
+        let dir = self.version_dir();
+        let path = dir.join(VIEW_FILE);
+        if let Ok(m) = std::fs::symlink_metadata(&path)
+            && !m.is_file()
+        {
+            return Err(
+                "The kept view preferences aren't a plain file, so they weren't replaced. \
+                 Nothing was changed."
+                    .into(),
+            );
+        }
+        let tmp = dir.join(format!(".{VIEW_FILE}.{}.tmp", new_id()?));
+        let bytes = next.to_json().to_string();
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(bytes.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "The view preferences couldn't be kept ({e}). Nothing else was changed."
+            ));
+        }
+        sync_dir(&dir)?;
+        Ok(next)
     }
 
     /// A canvas's manifest, read only from a real folder on the library's file system with a

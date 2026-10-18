@@ -604,7 +604,7 @@ pub fn menus() -> Vec<(&'static str, Vec<MenuEntry>)> {
                 I("Previous Page", A::PrevPage),
                 S,
                 I("Snapping", A::ToggleSnapping),
-                I("Dot Grid", A::ToggleGrid),
+                I("Background On/Off", A::ToggleGrid),
                 I("Collapse / Restore Panels", A::TogglePanels),
                 I("Show/Hide UI", A::ToggleUi),
                 I("Keyboard Shortcuts", A::ToggleHelp),

@@ -347,6 +347,76 @@ async fn the_kept_appearance_survives_a_new_process_and_touches_no_canvas() {
     task2.abort();
 }
 
+/// The views' other preferences (revision 2, slices 4 and 5): the home's layout and the canvas
+/// background, one small record with two keys beside the appearance's own file. The list
+/// reports Grid and no background until either is kept (and listing creates nothing); keeping
+/// one key keeps the other as it is; a kept record survives a new process; unknown values,
+/// unknown or missing keys are refused with nothing written; damaged contents read as the
+/// defaults; the appearance is untouched. No canvas, lease or binding is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kept_view_preferences_survive_a_new_process_and_touch_no_canvas() {
+    let lib = library().await;
+    let file = lib.root.join("library/v1/view");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    let fresh = json!({"home_layout": "grid", "background": "none"});
+    assert_eq!(listed["view"], fresh, "the fresh defaults");
+    assert!(
+        !lib.root.join("library").exists(),
+        "listing creates nothing"
+    );
+    for bad in [
+        json!({}),
+        json!({"home_layout": "cards"}),
+        json!({"background": "grid"}),
+        json!({"background": true}),
+        json!({"home_layout": "list", "appearance": "dark"}),
+        json!({"background": "dots", "id": "0123456789abcdef"}),
+    ] {
+        assert!(call(&lib.c, app::VIEW, bad.clone()).await.is_err(), "{bad}");
+    }
+    assert!(!file.exists(), "a refusal writes nothing");
+    let kept = value(call(&lib.c, app::VIEW, json!({"home_layout": "list"})).await);
+    let list = json!({"home_layout": "list", "background": "none"});
+    assert_eq!(kept["view"], list);
+    let kept = value(call(&lib.c, app::VIEW, json!({"background": "lines"})).await);
+    let both = json!({"home_layout": "list", "background": "lines"});
+    assert_eq!(kept["view"], both, "one key keeps the other");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["view"],
+        both
+    );
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "system",
+        "the appearance is its own preference"
+    );
+    assert!(!lib.root.join("library/v1/appearance").exists());
+    // A new process (a reopened view) on the same root.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    assert_eq!(value(call(&c2, app::LIST, json!({})).await)["view"], both);
+    // Damaged or unknown contents read as the defaults, key by key.
+    std::fs::write(&file, r#"{"home_layout": "cards", "background": "dots"}"#).unwrap();
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    let dots = json!({"home_layout": "grid", "background": "dots"});
+    assert_eq!(listed["view"], dots);
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["view"],
+        fresh
+    );
+    // No canvas, lease or binding came of any of it.
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"], json!([]));
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
 /// Library mode refuses every project route without admission, whatever the arguments or
 /// metadata say, and a workspace process refuses library actions without retiring anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2668,8 +2738,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-8.html",
-        "versioned for the System/Light/Dark appearance view code"
+        HOME_URI, "ui://openpaperdesign/home-9.html",
+        "versioned for the kept Grid/List and background view record and the quiet Home"
     );
 }
 

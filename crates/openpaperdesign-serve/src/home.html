@@ -18,8 +18,11 @@
 
   Served by an app-library server (`--app-library`), the view is one OpenPaperDesign app: a
   file library (the canvases OpenPaperDesign keeps in its own data folder: New file, search, a
-  list or grid of named files with their last edit, and a per-file menu with Open, Rename and
-  Export) and, for the file it opens, upstream paper-rs's whole workspace filling the view.
+  grid of equal cards or a list of named files with their last edit, and a per-file menu with
+  Open, Rename and Export; the layout and the editor's canvas background are view preferences
+  the library keeps, `openpaperdesign_app_view`) and, for the file it opens, upstream
+  paper-rs's whole workspace filling the view. The licences and notices are in the menu's
+  About & notices.
   Every action is an `openpaperdesign_app_*` call, without any chat message. These files belong
   to the app's library, not to a Codex project: the library says so, and nothing groups them by
   project. A file chosen for import travels only as its text; an export is offered as a browser
@@ -142,10 +145,7 @@
   summary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--opd-ring); }
   .fields { margin-top: 8px; font-size: 13px; }
   .hint { margin-top: 12px; font-size: 12px; color: var(--opd-muted); }
-  footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: auto; padding-top: 32px; }
-  .wordmark { font: 400 16px/1.2 "Geist Pixel", monospace; color: var(--opd-text); }
-  .about { margin: 0; text-align: right; }
-  .about p { max-width: 320px; margin: 6px 0 0; }
+  .notices p { max-width: 460px; color: var(--opd-muted); font-size: 13px; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
   /* The file library: where its files live, then search, layout and New file. */
@@ -162,8 +162,14 @@
   .files.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
   .files.grid .row { position: relative; align-items: stretch; margin: 0; border: 1px solid var(--opd-line); border-radius: 12px; }
   .files.grid .row:hover { border-color: var(--opd-line-strong); }
-  .files.grid .row-main { flex-direction: column; align-items: flex-start; min-height: 112px; padding: 12px; }
-  .files.grid .row-text { flex-direction: column; gap: 2px; }
+  /* Equal cards whatever the name: the glyph area, two reserved title lines (a longer name is
+     clamped; its full name is the button's accessible name and tooltip) and one line each for
+     pages and the last edit. */
+  .files.grid .row-main { flex-direction: column; align-items: flex-start; height: 132px; min-height: 0; padding: 12px; overflow: hidden; }
+  .files.grid .row-text { flex-direction: column; flex-wrap: nowrap; gap: 2px; width: 100%; }
+  .files.grid .row-name { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+    min-height: 2.8em; line-height: 1.4; padding-right: 22px; }
+  .files.grid .row-hint, .files.grid .row-time { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .files.grid .more { position: absolute; top: 6px; right: 2px; }
   .files.grid .file-menu { right: 0; }
 
@@ -176,7 +182,7 @@
     margin: 0; overflow: hidden; clip-path: inset(50%); }
   main[data-view="editor"] > header:focus-within { position: fixed; z-index: 20; top: 8px; left: 8px; margin: 0;
     padding: 4px 10px 4px 4px; border-radius: 10px; background: var(--opd-bg); box-shadow: 0 4px 16px rgb(0 0 0 / .12); }
-  main[data-view="editor"] > .notice, main[data-view="editor"] > footer { display: none; }
+  main[data-view="editor"] > .notice { display: none; }
   .ed-stage { position: fixed; inset: 0; overflow: hidden; }
   .ed-stage canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
   .ed-stage canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--opd-ring); }
@@ -213,6 +219,7 @@
         <button id="m-import" class="item" type="button" role="menuitem" tabindex="-1" hidden>Import a canvas file…</button>
         <div class="sep" role="separator"></div>
         <button id="m-refresh" class="item" type="button" role="menuitem" tabindex="-1">Refresh projects</button>
+        <button id="m-about" class="item" type="button" role="menuitem" tabindex="-1">About &amp; notices</button>
       </div>
     </div>
   </header>
@@ -223,7 +230,7 @@
   <section id="home" aria-labelledby="h-projects">
     <h2 id="h-projects" class="sr-only">Projects</h2>
     <div id="lib-bar" class="lib-bar" hidden>
-      <p id="lib-context" class="lib-context">OpenPaperDesign library: files this app keeps itself, not part of a Codex project.</p>
+      <p id="lib-context" class="lib-context">New files are kept in the OpenPaperDesign library, this app's own data folder, not in a Codex project.</p>
       <div class="lib-tools">
         <input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off">
         <div class="seg" role="group" aria-label="Layout">
@@ -235,13 +242,13 @@
     </div>
     <p id="inventory" class="muted">Looking up your Codex projects…</p>
     <ul id="projects" aria-labelledby="h-projects"></ul>
-    <p id="no-match" class="muted" hidden>No files match your search.</p>
+    <p id="no-match" class="muted" hidden>No files match your search. Escape in the search field shows them all.</p>
   </section>
 
   <form id="rename-form" aria-labelledby="rename-title" hidden>
     <h2 id="rename-title" tabindex="-1">Rename</h2>
     <label for="rename-name">Name</label>
-    <input id="rename-name" type="text" maxlength="60" autocomplete="off">
+    <input id="rename-name" type="text" maxlength="120" autocomplete="off">
     <div class="actions">
       <button id="rename-save" class="btn btn-primary" type="submit">Rename</button>
       <button id="rename-cancel" class="btn" type="button">Cancel</button>
@@ -266,6 +273,15 @@
       <button id="cancel-new" class="btn" type="button">Cancel</button>
     </div>
   </form>
+
+  <section id="notices" class="notices" aria-labelledby="notices-title" hidden>
+    <h2 id="notices-title" tabindex="-1">About &amp; notices</h2>
+    <p>OpenPaperDesign is a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL Open Font License 1.1. Geist Pixel Square font: SIL Open Font License 1.1. Not affiliated with or endorsed by Paper.</p>
+    <p>The full licence texts and third-party notices ship with every distribution of OpenPaperDesign (LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY.md, NOTICE.md, OFL.txt).</p>
+    <div class="actions">
+      <button id="notices-done" class="btn" type="button">Done</button>
+    </div>
+  </section>
 
   <section id="folder-help" aria-labelledby="folder-title" hidden>
     <h2 id="folder-title" tabindex="-1">Add a folder</h2>
@@ -307,8 +323,6 @@
     </div>
   </section>
 
-  <footer><span class="wordmark">onlinesourdough</span><details id="about" class="about"><summary>About</summary>
-    <p>OpenPaperDesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL OFL 1.1. Not affiliated with Paper.</p></details></footer>
 </main>
 <script type="module">
 const opdCreatePanel = null; // __OPD_PANEL_MODULE__
@@ -354,7 +368,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // links) from appearing under a newer view.
   let gen = 0;
   let view = 'home';
-  const VIEWS = ['home', 'pick', 'new-form', 'rename-form', 'folder-help', 'result', 'editor'];
+  const VIEWS = ['home', 'pick', 'new-form', 'rename-form', 'folder-help', 'notices', 'result', 'editor'];
   let sending = false;
   let editorUrl = null; // memory only, for the Open canvas button
   let editorRoot = null; // the admitted workspace of the shown status/editor result, for reopening
@@ -396,7 +410,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   $('back').onclick = () => (view === 'editor' ? editorBack() : goHome());
   // Escape leaves a secondary view the same way as Back.
   const escapeHome = (e) => { if (e && e.key === 'Escape') { if (e.preventDefault) e.preventDefault(); goHome(); } };
-  for (const v of ['pick', 'new-form', 'rename-form', 'folder-help', 'result']) $(v).onkeydown = escapeHome;
+  for (const v of ['pick', 'new-form', 'rename-form', 'folder-help', 'notices', 'result']) $(v).onkeydown = escapeHome;
 
   // ---- host presentation (MCP Apps HostContext.theme / styles.variables) ----
   // Presentation only: never a workspace, folder or permission. Only standard variable names
@@ -508,9 +522,85 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (panelHandle && panelHandle.setAppearance) panelHandle.setAppearance(appearance);
   }
 
+  // ---- view preferences (DESIGN.md): the home's file layout and the canvas background ----
+  // One small record the app library keeps beside the appearance (its list reports it as
+  // `view`, `openpaperdesign_app_view` keeps one key of it), with the appearance's freshness
+  // rule for each key on its own: every choice is numbered, and a list's kept value applies only
+  // if its read overlapped no unresolved choice of that key (no keep under way and no refused
+  // choice when it began or when it came back, and no choice made since). Without a library
+  // (the workspace view), a choice lives in this view only. Presentation only: no canvas is
+  // read, saved or changed.
+  function viewPref(key, values, apply) {
+    const p = { value: values[0], choice: 0, inFlight: 0, unkept: false };
+    const valid = (v) => (values.includes(v) ? v : values[0]);
+    // A new choice (`from`: the editor it came from, for the background): applied at once,
+    // then kept. Resolves to whether it was kept (null: not this choice's any more, or no
+    // library to keep it).
+    p.choose = async (next) => {
+      const choice = ++p.choice;
+      p.value = valid(next);
+      apply(p.value, false);
+      if (!LIBRARY) return null;
+      p.inFlight += 1;
+      let r;
+      try {
+        r = await rpc('tools/call', { name: 'openpaperdesign_app_view', arguments: { [key]: p.value } }, 15000);
+      } finally {
+        p.inFlight -= 1;
+      }
+      if (choice !== p.choice) return null;
+      const kept = !r.timeout && !r.error && r.result && !r.result.isError;
+      p.unkept = !kept;
+      return kept;
+    };
+    p.readStart = () => ({ choice: p.choice, settled: p.inFlight === 0 && !p.unkept });
+    p.listed = (value, start) => {
+      if (!start.settled || start.choice !== p.choice || p.inFlight > 0 || p.unkept) return;
+      const next = valid(value);
+      if (next === p.value) return;
+      p.value = next;
+      apply(next, true);
+    };
+    return p;
+  }
+  // Grid is the fresh home layout; List once it was chosen (and kept).
+  const homeLayout = viewPref('home_layout', ['grid', 'list'], (v) => setLayout(v));
+  // No background is the fresh one. A kept one learned late reaches the editor shown now.
+  const canvasBackground = viewPref('background', ['none', 'dots', 'lines'], (v, listed) => {
+    if (listed && panelHandle && panelHandle.setBackground) panelHandle.setBackground(v);
+  });
+  // A background choice from the editor `from`: kept like the appearance; its refusal is said
+  // only while it is the latest choice and that editor is still the one shown.
+  async function keepBackground(next, from) {
+    const kept = await canvasBackground.choose(next);
+    if (kept === false && view === 'editor' && from && panelHandle === from) {
+      edStatus('Background applied here, but it couldn\'t be kept for next time.');
+    }
+  }
+
   // ---- direct actions ----
 
   const cleanName = (s) => String(s).replace(/[\u0000-\u001f\u007f"`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
+  // A library file's name follows the server's own rule (launcher_app.rs `canvas_name`): 1 to 60
+  // characters after trimming, counted as Unicode scalar values (Rust `char`s, not UTF-16
+  // units), with no control characters (Unicode Cc). Quotes, backticks and repeated inner spaces
+  // are ordinary characters of a name, and it is shown and sent exactly as saved or typed;
+  // `cleanName` stays the workspace view's label rule.
+  const MAX_NAME_CHARS = 60;
+  const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+  // A listed name as shown, tooltip and accessible name: exactly the saved one. Only an answer
+  // that breaks the rule (which a valid library never sends) is bounded: its controls become
+  // spaces and it is cut to 60 whole characters, never through a surrogate pair.
+  const libraryName = (s) => Array.from(String(s).replace(CONTROL_CHARS, ' ').trim()).slice(0, MAX_NAME_CHARS).join('');
+  // What the person typed as a file name: `{ name }` to send (trimmed, otherwise exactly as
+  // typed), or `{ why }` when it isn't a name the server takes; nothing is changed then.
+  function libraryNameInput(s) {
+    const name = String(s).trim();
+    if (!name) return { why: 'Name the file first.' };
+    if (new RegExp(CONTROL_CHARS.source).test(name)) return { why: 'A file name can\'t contain control characters. Nothing was renamed.' };
+    if (Array.from(name).length > MAX_NAME_CHARS) return { why: 'A file name can have at most 60 characters. Nothing was renamed.' };
+    return { name };
+  }
   // Row buttons that run an action, owned by the list that rendered them. Rebuilding one list
   // (say, the hidden home when a late inventory reply arrives) never replaces another's.
   const rowActions = { projects: [], 'pick-list': [], 'result-list': [] };
@@ -596,7 +686,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('lib-bar').hidden = false;
     $('inventory').textContent = 'Reading your files…';
   }
-  const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-import'), $('m-refresh')]
+  const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-import'), $('m-refresh'), $('m-about')]
     .filter((b) => !b.hidden);
   function openMenu() {
     $('menu').hidden = false;
@@ -634,6 +724,14 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   $('m-refresh').onclick = () => { closeMenu(true); if (LIBRARY) loadLibrary(); else loadProjects(); };
   $('folder-refresh').onclick = () => { goHome(); loadProjects(); };
   $('folder-done').onclick = goHome;
+  // About & notices: the licences and notices, in the menu instead of a footer. Reads nothing.
+  $('m-about').onclick = () => {
+    closeMenu(false);
+    show('notices');
+    $('notices-title').focus();
+    announce('About & notices');
+  };
+  $('notices-done').onclick = goHome;
 
   // The host's folder picker. Its answer is only the folder to try: opening it still needs
   // this view's call to be admitted for exactly that folder.
@@ -980,6 +1078,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     const when = edited(c.modified);
     if (when) text.append(node('span', when, 'row-time'));
     open.append(glyph('file'), text);
+    // A long name is clamped in the grid: its full name stays the button's tooltip and part of
+    // its accessible name, for pointer and keyboard alike.
+    open.title = name;
+    open.setAttribute('aria-label', [name, pages(c.pages) + (c.open ? ', open here' : ''), when].filter(Boolean).join(', '));
     open.onclick = () => openLibrary(c.id, name, false);
     open.disabled = sending;
     rowActions.projects.push(open);
@@ -1036,15 +1138,16 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
   };
 
-  // List or grid, for this view only (nothing is stored).
+  // Grid (the fresh default) or list. A choice shows at once and the library keeps it (see
+  // viewPref); a later list read brings back what was kept, also from another view.
   function setLayout(next) {
     if (LIBRARY) $('projects').className = next === 'grid' ? 'files grid' : 'files';
     $('layout-list').setAttribute('aria-pressed', next === 'list' ? 'true' : 'false');
     $('layout-grid').setAttribute('aria-pressed', next === 'grid' ? 'true' : 'false');
   }
-  $('layout-list').onclick = () => setLayout('list');
-  $('layout-grid').onclick = () => setLayout('grid');
-  setLayout('list');
+  $('layout-list').onclick = () => { homeLayout.choose('list'); };
+  $('layout-grid').onclick = () => { homeLayout.choose('grid'); };
+  setLayout(homeLayout.value);
 
   let libraryRun = 0;
   async function loadLibrary() {
@@ -1054,6 +1157,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('inventory').hidden = false;
     $('inventory').textContent = 'Reading your files…';
     const readAt = appearanceReadStart();
+    const layoutAt = homeLayout.readStart();
+    const backgroundAt = canvasBackground.readStart();
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_canvases', arguments: {} });
     if (run !== libraryRun) return; // a newer refresh owns the list
     let v = null;
@@ -1065,6 +1170,11 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, 'appearance')) {
       listedAppearance(v.appearance, readAt);
     }
+    // The other view preferences the same way, key by key (an older server reports none).
+    if (v && typeof v === 'object' && v.view && typeof v.view === 'object') {
+      homeLayout.listed(v.view.home_layout, layoutAt);
+      canvasBackground.listed(v.view.background, backgroundAt);
+    }
     const list = $('projects');
     list.textContent = '';
     rowActions.projects = [];
@@ -1075,7 +1185,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       text = 'Couldn\'t read your files' + errorCode(r.error) + '. Refresh from the More menu to try again.';
     } else {
       const shown = v.canvases.filter((c) => c && typeof c.id === 'string' && CANVAS_ID.test(c.id));
-      shown.forEach((c, i) => list.append(fileRow(i, c, cleanName(c.name || '') || 'Untitled')));
+      shown.forEach((c, i) => list.append(fileRow(i, c, libraryName(c.name || '') || 'Untitled')));
       if (!shown.length) {
         // A cut-off read proves nothing about absence.
         text = v.complete === false
@@ -1156,12 +1266,13 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (e && e.preventDefault) e.preventDefault();
     const target = renaming;
     if (!target) return;
-    const name = cleanName($('rename-name').value);
-    if (!name) {
-      notice('Name the file first.');
+    const typed = libraryNameInput($('rename-name').value);
+    if (typed.why) {
+      notice(typed.why);
       $('rename-name').focus();
       return;
     }
+    const name = typed.name;
     if (name === target.name) return goHome();
     renameFile(target, name);
   };
@@ -1442,6 +1553,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       appearance,
       hostTheme: () => hostContext.theme,
       onAppearance: (a) => { if (panelHandle === h) keepAppearance(a, h); },
+      // The canvas background the library kept (a view preference), and a new choice from the
+      // editor's menus, kept the same way.
+      background: canvasBackground.value,
+      onBackground: (b) => { if (panelHandle === h) keepBackground(b, h); },
     });
     panelHandle = h;
     h.started.catch((e) => {

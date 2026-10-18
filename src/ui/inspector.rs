@@ -117,6 +117,40 @@ pub fn uniform<T: PartialEq>(nodes: &[Node], f: impl Fn(&Node) -> T) -> Option<T
     rest.iter().all(|n| f(n) == v).then_some(v)
 }
 
+/// Every distinct style the characters of a text layer have, as upstream's
+/// `TextStyle::char_style` resolves them for the layout: one per run between its ranges' edges,
+/// or the layer's own style when it has no text.
+fn char_styles(n: &Node) -> Vec<crate::model::CharStyle> {
+    let len = n.kind.text().map_or(0, |t| t.chars().count());
+    let size = n.kind.font_size().unwrap_or(16.0);
+    let color = n
+        .style
+        .fills
+        .last()
+        .map_or(Color::INK, |p| p.preview_color());
+    let mut starts: Vec<usize> = std::iter::once(0)
+        .chain(n.text_style.spans.iter().flat_map(|s| [s.start, s.end]))
+        .filter(|i| *i == 0 || *i < len)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+        .into_iter()
+        .map(|i| n.text_style.char_style(i, size, color))
+        .collect()
+}
+
+/// The value every character of every selected text layer has ([`char_styles`]), or `None`
+/// when any differ (Mixed).
+fn shared_char<T: PartialEq>(
+    styles: &[Vec<crate::model::CharStyle>],
+    f: impl Fn(&crate::model::CharStyle) -> T,
+) -> Option<T> {
+    let mut all = styles.iter().flatten();
+    let v = f(all.next()?);
+    all.all(|s| f(s) == v).then_some(v)
+}
+
 /// The placeholder of a field whose values differ across the selection: it says Mixed and
 /// edits nothing (a number field can't show Mixed).
 const MIXED: &str = "Mixed";
@@ -932,21 +966,24 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
                     }
                     None => mixed(ui, "Radius  ", 92.0),
                 },
-                Some(true) if ids.len() == 1 => {
-                    let rr = first.style.corner_radii();
-                    for (i, p) in ["TL", "TR", "BR", "BL"].iter().enumerate() {
-                        if let Some(v) =
-                            num_field(ui, ed, &format!("{p} "), rr[i], 0.5, 0.0..=1e4, 46.0)
-                        {
-                            apply(ed, "radius", ids, |n| {
-                                let mut r = n.style.corner_radii();
-                                r[i] = v;
-                                n.style.radii = Some(r);
-                            });
+                // Independent corners (on some or all of the layers): the corners every layer
+                // has, compared corner by corner; Mixed only when they really differ.
+                _ => match uniform(nodes, |n| n.style.corner_radii()) {
+                    Some(rr) => {
+                        for (i, p) in ["TL", "TR", "BR", "BL"].iter().enumerate() {
+                            if let Some(v) =
+                                num_field(ui, ed, &format!("{p} "), rr[i], 0.5, 0.0..=1e4, 46.0)
+                            {
+                                apply(ed, "radius", ids, |n| {
+                                    let mut r = n.style.corner_radii();
+                                    r[i] = v;
+                                    n.style.radii = Some(r);
+                                });
+                            }
                         }
                     }
-                }
-                _ => mixed(ui, "Radius  ", 92.0),
+                    None => mixed(ui, "Radius  ", 92.0),
+                },
             }
             if ids.len() == 1
                 && matches!(first.kind, NodeKind::Rect | NodeKind::Frame { .. })
@@ -1191,13 +1228,9 @@ fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
         }
     });
     let cs = ed.current_char_style();
-    // (size, colour, bold, italic) as one layer shows them, or as the selection shares them.
-    let fill = |n: &Node| {
-        n.style
-            .fills
-            .last()
-            .map_or(Color::INK, |p| p.preview_color())
-    };
+    // (size, colour, bold, italic) as one layer shows them, or as every character of the
+    // selected layers has them, their text ranges included (the same styles the layout draws):
+    // equal base sizes with a range of another size are Mixed, never a shared size.
     let (size, color, bold, italic) = if one {
         let font_size = first.kind.font_size().unwrap_or(16.0);
         (
@@ -1207,18 +1240,20 @@ fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
             Some(cs.is_some_and(|c| c.italic)),
         )
     } else {
+        let styles: Vec<_> = nodes.iter().map(char_styles).collect();
         (
-            uniform(nodes, |n| n.kind.font_size().unwrap_or(16.0)),
-            uniform(nodes, fill),
-            uniform(nodes, |n| n.text_style.bold),
-            uniform(nodes, |n| n.text_style.italic),
+            shared_char(&styles, |c| c.size),
+            shared_char(&styles, |c| c.color),
+            shared_char(&styles, |c| c.bold),
+            shared_char(&styles, |c| c.italic),
         )
     };
     ui.horizontal(|ui| {
+        // Typing a size or dragging it (or the colour) is one undo step per interaction.
         match size {
             Some(size) => {
                 if let Some(v) = num_field(ui, ed, "Size ", size, 0.5, 1.0..=1000.0, 80.0) {
-                    ed.style_text("font size", |s| s.size = Some(v));
+                    ed.style_text_coalesced("font size", |s| s.size = Some(v));
                 }
             }
             None => mixed(ui, "Size ", 80.0),
@@ -1226,7 +1261,7 @@ fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
         match color {
             Some(c) => {
                 if let Some(nc) = color_button(ui, ed, c) {
-                    ed.style_text("color", |s| s.color = Some(nc));
+                    ed.style_text_coalesced("color", |s| s.color = Some(nc));
                 }
             }
             None => mixed(ui, "", 44.0),
@@ -1255,6 +1290,12 @@ fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
         hint(
             ui,
             "Bold or italic differ across the selection: set them per layer.",
+        );
+    }
+    if !one && (size.is_none() || color.is_none()) {
+        hint(
+            ui,
+            "Size or colour differs within or across these layers: set it per layer or range.",
         );
     }
     let align = uniform(nodes, |n| match n.kind {

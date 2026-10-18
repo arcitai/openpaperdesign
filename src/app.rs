@@ -117,8 +117,13 @@ impl App {
         p - v2(self.canvas.min.x as f64, self.canvas.min.y as f64)
     }
 
+    /// Inside the canvas rectangle and not over floating egui UI there (`ui::over_floating_ui`,
+    /// as the browser host judges it: the canvas's own menu counts only while it is open).
+    /// Within the canvas rectangle egui's background layer is the canvas, as
+    /// `Context::is_pointer_over_egui` also has it.
     fn over_canvas(&self, p: V2) -> bool {
-        self.canvas.contains(egui::pos2(p.x as f32, p.y as f32)) && !self.ctx.is_pointer_over_egui()
+        let at = egui::pos2(p.x as f32, p.y as f32);
+        self.canvas.contains(at) && !ui::over_floating_ui(&self.ctx, &self.st, at)
     }
 
     /// Before leaving a scratch (project-less) document. Projects autosave, so they never ask.
@@ -665,7 +670,7 @@ impl App {
             &self.ctx,
             l,
             &self.ed,
-            !self.st.show_grid_off,
+            self.st.background,
         );
         g.window.pre_present_notify();
         g.queue.present(frame);
@@ -732,7 +737,10 @@ impl App {
                 }
             };
             set(&m.snapping, self.ed.snapping);
-            set(&m.grid, !self.st.show_grid_off);
+            set(
+                &m.grid,
+                self.st.background != crate::render::scene::Background::None,
+            );
             set(&m.help, self.st.show_help);
         }
     }
@@ -747,7 +755,7 @@ impl App {
                     event_loop.exit();
                 }
             }
-            MenuCmd::ToggleGrid => self.st.show_grid_off = !self.st.show_grid_off,
+            MenuCmd::ToggleGrid => self.st.toggle_background(),
             MenuCmd::ToggleHelp => self.st.show_help = !self.st.show_help,
             // Menu key equivalents never reach egui, so while a text field is focused, hand
             // the standard editing commands to it instead of the canvas.
@@ -1000,11 +1008,15 @@ impl ApplicationHandler<UserEvent> for App {
                     .input(|i| i.pointer.latest_pos())
                     .map(|p| v2(p.x as f64, p.y as f64));
                 let Some(p) = p else { return };
+                // While a tool flyout or the canvas's menu is open the press only closes it; a
+                // press on a panel's resize handle (into the canvas) only resizes the panel.
+                let theirs = self.st.captures_input()
+                    || self
+                        .st
+                        .chrome
+                        .on_panel_edge(egui::pos2(p.x as f32, p.y as f32));
                 match state {
-                    // While a tool flyout is open the press only closes it.
-                    ElementState::Pressed
-                        if self.over_canvas(p) && !self.st.rail.captures_input() =>
-                    {
+                    ElementState::Pressed if self.over_canvas(p) && !theirs => {
                         // Clicking the canvas takes keyboard focus away from text fields.
                         self.ctx.memory_mut(|m| {
                             if let Some(f) = m.focused() {
@@ -1083,8 +1095,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let p = v2(t.location.x / scale, t.location.y / scale);
                 let pressure = t.force.map(|f| f.normalized());
                 let pos = self.to_canvas(p);
+                let edge = self
+                    .st
+                    .chrome
+                    .on_panel_edge(egui::pos2(p.x as f32, p.y as f32));
                 match t.phase {
-                    TouchPhase::Started if self.over_canvas(p) => {
+                    TouchPhase::Started if self.over_canvas(p) && !edge => {
                         self.captured = true;
                         self.ed.handle(InputEvent::PointerDown {
                             pos,
@@ -1114,7 +1130,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // A text field's keys are its own; an open tool flyout takes Escape (egui has
                 // the event and closes it; the tool stays as it is); a rail control with egui's
                 // keyboard focus takes Enter and Space (egui chooses it).
-                let flyout_escape = self.st.rail.captures_input()
+                let flyout_escape = self.st.captures_input()
                     && matches!(event.logical_key, WKey::Named(NamedKey::Escape));
                 let rail = match event.logical_key {
                     WKey::Named(NamedKey::Enter) => Some(egui::Key::Enter),

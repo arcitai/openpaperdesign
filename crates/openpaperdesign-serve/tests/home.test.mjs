@@ -36,8 +36,8 @@ const TOOLS = new Set([INVENTORY, 'openpaperdesign_choose_folder', 'openpaperdes
 const LIB_LIST = 'openpaperdesign_app_canvases';
 const LIB_TOOLS = new Set([LIB_LIST, 'openpaperdesign_app_create', 'openpaperdesign_app_open', 'openpaperdesign_app_editor',
   'openpaperdesign_app_close', 'openpaperdesign_app_import', 'openpaperdesign_app_export', 'openpaperdesign_app_rename',
-  // The kept appearance (a view preference; no canvas).
-  'openpaperdesign_app_appearance']);
+  // The kept appearance and the other view preferences (home layout, canvas background; no canvas).
+  'openpaperdesign_app_appearance', 'openpaperdesign_app_view']);
 
 // Fictional fixtures. Two local projects share a name; Acme has two folders.
 const ACME = { source: 'codex-app-server', host: 'this computer', id: 'prj_fixture_acme', name: 'Acme site', position: 0, recencyAt: null, roots: [{ path: '/w/acme' }, { path: '/w/acme-docs' }] };
@@ -63,6 +63,7 @@ const texts = (e) => all(e).filter((n) => n.tag !== 'svg' && n.tag !== 'path').m
 const buttons = (e) => all(e).filter((n) => n.tag === 'button');
 
 const IDS = ['back', 'title', 'menu-button', 'menu-icon', 'menu-label', 'menu', 'm-new', 'm-current', 'm-folder', 'm-import', 'm-refresh',
+  'm-about', 'notices', 'notices-title', 'notices-done',
   'live', 'notice', 'import-file', 'home', 'h-projects', 'lib-bar', 'lib-context', 'search', 'layout-list', 'layout-grid', 'new-file',
   'inventory', 'projects', 'no-match', 'rename-form', 'rename-title', 'rename-name', 'rename-save', 'rename-cancel',
   'pick', 'pick-title', 'pick-list', 'new-form', 'new-title', 'name', 'where-field', 'where',
@@ -100,7 +101,7 @@ function mount({ library = false, panel = null, clock = false, media = null } = 
   const runAllTimers = () => { for (const t of timers.splice(0)) t.fn(); };
   const document = { activeElement: null };
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
-  for (const id of ['back', 'menu', 'pick', 'new-form', 'rename-form', 'folder-help', 'result', 'canvas', 'reopen', 'force', 'close', 'export',
+  for (const id of ['back', 'menu', 'pick', 'new-form', 'rename-form', 'folder-help', 'notices', 'result', 'canvas', 'reopen', 'force', 'close', 'export',
     'm-import', 'import-file', 'result-details', 'result-meta', 'result-detail', 'editor', 'ed-renderer', 'ed-alert', 'ed-leave', 'ed-home',
     'lib-bar', 'no-match']) {
     els[id].hidden = true;
@@ -671,11 +672,14 @@ test('the New menu opens on its labelled button, moves with arrows and closes on
   key('ArrowDown');
   assert.equal(v.document.activeElement, v.els['m-current']);
   key('End');
+  assert.equal(v.document.activeElement, v.els['m-about'], 'About & notices is the last item');
+  key('ArrowUp');
   assert.equal(v.document.activeElement, v.els['m-refresh']);
+  key('ArrowDown');
   key('ArrowDown');
   assert.equal(v.document.activeElement, v.els['m-new'], 'wraps around');
   key('ArrowUp');
-  assert.equal(v.document.activeElement, v.els['m-refresh']);
+  assert.equal(v.document.activeElement, v.els['m-about']);
   key('Home');
   assert.equal(v.document.activeElement, v.els['m-new']);
   key('Escape');
@@ -895,15 +899,18 @@ test('the view sends no chat message, calls only its own tools, stores nothing a
   const style = html.slice(0, html.indexOf('</style>'));
   assert.deepEqual(style.match(/url\([^)]*\)/g), ['url("data:font/woff2;base64,__OPD_WORDMARK_FONT__")'], 'the only url() is the served font slot');
   assert.ok(!/https?:\/\/(?!127\.0\.0\.1)/.test(style), 'no external stylesheet or font');
-  assert.match(style, /\.wordmark \{ font: 400 16px\/1\.2 "Geist Pixel", monospace;/);
-  // The wordmark, and the notices behind an unobtrusive About.
-  assert.match(html, /<footer><span class="wordmark">onlinesourdough<\/span><details id="about" class="about"><summary>About<\/summary>\s*<p>OpenPaperDesign: a fork of paper-rs \(MIT OR Apache-2\.0\)\. Inter font: SIL OFL 1\.1\. Not affiliated with Paper\.<\/p><\/details><\/footer>/);
+  // Revision 2: no promotional footer or wordmark; the notices are the menu's About & notices.
+  assert.ok(!html.includes('<footer') && !html.includes('onlinesourdough'), 'no footer or wordmark');
+  assert.match(html, /<button id="m-about" class="item" type="button" role="menuitem" tabindex="-1">About &amp; notices<\/button>/);
+  assert.match(html, /<section id="notices" class="notices" aria-labelledby="notices-title" hidden>/);
+  assert.match(html, /OpenPaperDesign is a fork of paper-rs \(MIT OR Apache-2\.0\)\. Inter font: SIL Open Font License 1\.1\./);
+  assert.match(html, /Not affiliated with or endorsed by Paper\./);
   assert.match(html, /aria-label="Back to projects"/);
   assert.equal(html.split('__OPD_MODE__').length, 2, 'exactly one mode slot');
   // The editor fills the view: no fixed-height stage, frame, header, footer or button row.
   assert.ok(!style.includes('calc(100vh - 210px)'), 'no boxed stage');
   assert.match(style, /\.ed-stage \{ position: fixed; inset: 0; overflow: hidden; \}/);
-  assert.match(style, /main\[data-view="editor"\] > \.notice, main\[data-view="editor"\] > footer \{ display: none; \}/);
+  assert.match(style, /main\[data-view="editor"\] > \.notice \{ display: none; \}/);
   for (const id of GONE) assert.ok(!html.includes(`id="${id}"`), id);
   for (const text of ['Edit in this view', 'Open in browser', 'Full screen', 'Close canvas</button>']) {
     assert.ok(!html.slice(html.indexOf('<section id="editor"')).includes(text), text);
@@ -1208,16 +1215,18 @@ test('library home: the app\'s own context is said plainly, with no project; New
   const v = await libraryView();
   assert.equal(v.els['lib-bar'].hidden, false);
   assert.equal(v.els['h-projects'].textContent, 'Files');
-  // The markup's line, unchanged by the script: the library's files belong to no Codex project.
-  assert.match(html, /id="lib-context" class="lib-context">OpenPaperDesign library: files this app keeps itself, not part of a Codex project\.</);
+  // The markup's line, unchanged by the script: where New puts files (the app's own library,
+  // which belongs to no Codex project).
+  assert.match(html, /id="lib-context" class="lib-context">New files are kept in the OpenPaperDesign library, this app's own data folder, not in a Codex project\.</);
   assert.equal(v.els['menu-label'].textContent, 'More');
   assert.equal(v.els['menu-icon'].getAttribute('hidden'), '');
-  assert.deepEqual(['m-new', 'm-current', 'm-folder', 'm-import', 'm-refresh'].filter((id) => !v.els[id].hidden), ['m-current', 'm-import', 'm-refresh']);
+  assert.deepEqual(['m-new', 'm-current', 'm-folder', 'm-import', 'm-refresh', 'm-about'].filter((id) => !v.els[id].hidden),
+    ['m-current', 'm-import', 'm-refresh', 'm-about']);
   assert.equal(v.els['m-current'].textContent, 'Open current file');
   // No project grouping or folder: no project words or paths in the list.
   const listed = texts(v.els.projects).join('\n');
   assert.doesNotMatch(listed, /project|\/data\/|Folder/i);
-  assert.equal(v.els.projects.className, 'files');
+  assert.equal(v.els.projects.className, 'files grid', 'a fresh library shows its files as a grid');
   assert.equal(v.els['new-file'].disabled, false);
   libOnly(v);
 });
@@ -1270,17 +1279,156 @@ test('library home: search narrows by name, says when nothing matches, and Escap
   assert.deepEqual(actions(v).filter((a) => a.name !== LIB_LIST), [], 'searching runs nothing');
 });
 
-test('library home: list and grid are a pressed toggle; nothing is stored', async () => {
+const VIEW_TOOL = 'openpaperdesign_app_view';
+
+test('library home: Grid first; a List choice shows at once and is kept as a validated preference only', async () => {
   const v = await libraryView();
-  assert.equal(v.els['layout-list'].getAttribute('aria-pressed'), 'true');
-  v.els['layout-grid'].onclick();
-  assert.equal(v.els.projects.className, 'files grid');
-  assert.equal(v.els['layout-grid'].getAttribute('aria-pressed'), 'true');
+  assert.equal(v.els['layout-grid'].getAttribute('aria-pressed'), 'true', 'a fresh view: Grid');
   assert.equal(v.els['layout-list'].getAttribute('aria-pressed'), 'false');
-  // The grid shows the same files and keeps working.
-  assert.deepEqual(rows(v).map((r) => r.name), ['Landing', 'Notes']);
+  assert.equal(v.els.projects.className, 'files grid');
   v.els['layout-list'].onclick();
-  assert.equal(v.els.projects.className, 'files');
+  await flush();
+  assert.equal(v.els.projects.className, 'files', 'shown at once');
+  assert.equal(v.els['layout-list'].getAttribute('aria-pressed'), 'true');
+  const keep = libAction(v);
+  assert.deepEqual(keep.params, { name: VIEW_TOOL, arguments: { home_layout: 'list' } }, 'only the one key, validated');
+  await answer(v, { view: { home_layout: 'list', background: 'none' } }, keep);
+  // The list shows the same files and keeps working.
+  assert.deepEqual(rows(v).map((r) => r.name), ['Landing', 'Notes']);
+  // A later list read (here: refresh) brings back what is kept.
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'list', background: 'none' } }, v.last('tools/call'));
+  assert.equal(v.els.projects.className, 'files', 'the kept List stays');
+  // Reopened: a new view whose list reports the kept List starts in it.
+  const w = await libraryView({ ...LIBRARY_LIST, view: { home_layout: 'list', background: 'none' } });
+  assert.equal(w.els.projects.className, 'files');
+  assert.equal(w.els['layout-list'].getAttribute('aria-pressed'), 'true');
+  assert.equal(libCalls(w, VIEW_TOOL), 0, 'learning the kept layout keeps nothing');
+  // An unknown kept value is the fresh Grid.
+  const x = await libraryView({ ...LIBRARY_LIST, view: { home_layout: 'cards' } });
+  assert.equal(x.els.projects.className, 'files grid');
+  libOnly(v);
+  libOnly(w);
+});
+
+test('library home: a layout read begun during a pending keep, or after a refused one, never undoes this view\'s choice', async () => {
+  const v = await libraryView();
+  v.els['layout-list'].onclick();
+  await flush();
+  const keep = libAction(v);
+  // A refresh that begins while the keep is unanswered and comes back after its acknowledgement
+  // (the R31 order), with the old Grid.
+  v.els['m-refresh'].onclick();
+  await flush();
+  const list = v.last('tools/call');
+  assert.equal(list.params.name, LIB_LIST);
+  await answer(v, { view: { home_layout: 'list', background: 'none' } }, keep);
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'grid', background: 'none' } }, list);
+  assert.equal(v.els.projects.className, 'files', 'the acknowledged List stays');
+  assert.deepEqual(rows(v).map((r) => r.name), ['Landing', 'Notes'], 'the list itself is shown');
+  // A refused keep: the choice still applies here, and a later read doesn't replace it.
+  v.els['layout-grid'].onclick();
+  await flush();
+  await answer(v, { refused: 'The view preferences couldn\'t be kept.' }, libAction(v));
+  assert.equal(v.els.projects.className, 'files grid');
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'list', background: 'none' } }, v.last('tools/call'));
+  assert.equal(v.els.projects.className, 'files grid', 'the refused choice stays this view\'s');
+  // A later kept choice makes the list authoritative again (control).
+  v.els['layout-grid'].onclick();
+  await flush();
+  await answer(v, { view: { home_layout: 'grid', background: 'none' } }, libAction(v));
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'list', background: 'none' } }, v.last('tools/call'));
+  assert.equal(v.els.projects.className, 'files', 'changed elsewhere since: a settled read applies');
+  libOnly(v);
+});
+
+test('library home: cards carry the full name for pointer and keyboard; About & notices is in the menu, not a footer', async () => {
+  // The longest legal name (file names are 1–60 characters): long enough for the card to clamp.
+  const long = 'Quarterly onboarding flows, pricing and launch plan for 2026';
+  assert.equal(long.length, 60);
+  // Control: a host answer past that limit is bounded by the list's own normalization, never
+  // shown unbounded.
+  const over = 'A rather long file name that a grid card clamps to two lines of text';
+  const v = await libraryView({ ...LIBRARY_LIST, canvases: [
+    { id: ID1, name: long, pages: 2, modified: MAR_4_2025 },
+    { id: ID2, name: over, pages: 2, modified: MAR_4_2025 },
+  ] });
+  const r = rows(v).find((x) => x.name.startsWith('Quarterly'));
+  assert.equal(r.name, long, 'the whole name is in the card');
+  assert.equal(r.open.title, long, 'and its tooltip');
+  assert.equal(r.open.getAttribute('aria-label'), long + ', 2 pages, Edited 2025-03-04', 'and its accessible name');
+  const bounded = rows(v).find((x) => x.name.startsWith('A rather long'));
+  assert.equal(bounded.name, over.slice(0, 60), 'an overlong answer is bounded to 60 characters');
+  assert.equal(bounded.open.title, over.slice(0, 60), 'its tooltip too');
+  assert.equal(bounded.open.getAttribute('aria-label'), over.slice(0, 60) + ', 2 pages, Edited 2025-03-04');
+  // Equal cards: a fixed card height with reserved title and meta lines (CSS).
+  const style = html.slice(0, html.indexOf('</style>'));
+  assert.match(style, /\.files\.grid \.row-main \{[^}]*height: 132px;/);
+  assert.match(style, /\.files\.grid \.row-name \{[^}]*-webkit-line-clamp: 2;[^}]*min-height: 2\.8em;/);
+  // The notices: from the menu, then back.
+  v.els['menu-button'].onclick();
+  v.els['m-about'].onclick();
+  assert.equal(v.els.notices.hidden, false);
+  assert.equal(v.els.home.hidden, true);
+  assert.equal(v.document.activeElement, v.els['notices-title']);
+  assert.equal(v.els.menu.hidden, true);
+  v.els.notices.onkeydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(v.els.home.hidden, false, 'Escape goes back');
+  v.els['m-about'].onclick();
+  v.els['notices-done'].onclick();
+  assert.equal(v.els.home.hidden, false, 'and Done');
+  // Back home reads the list again, as always; the notices themselves call nothing.
+  assert.deepEqual(actions(v).filter((a) => a.name !== LIB_LIST), [], 'reading the notices calls nothing');
+  libOnly(v);
+});
+
+// The lead's same-file identity probes (2026-10-19), kept: a library name is the server's
+// canonical one (1 to 60 Unicode scalar values, no control characters), shown exactly.
+test('lead_unicode: a valid sixty-scalar library filename retains its full visible and accessible identity', async () => {
+  const name = 'A'.repeat(59) + '😀';
+  assert.equal(Array.from(name).length, 60, 'valid server-side scalar length');
+  const v = await libraryView({ ...LIBRARY_LIST, canvases: [{ id: ID1, name, pages: 2, modified: MAR_4_2025 }] });
+  const r = rows(v)[0];
+  assert.equal(r.name, name, 'the canonical filename must not be cut in the middle of a surrogate pair');
+  assert.equal(r.open.title, name);
+  assert.equal(r.open.getAttribute('aria-label'), name + ', 2 pages, Edited 2025-03-04');
+  // Its Rename form holds that same name; keeping it renames nothing.
+  r.more.onclick();
+  fileMenuOf(r).children[1].onclick();
+  assert.equal(v.els['rename-name'].value, name);
+  v.els['rename-form'].onsubmit({ preventDefault() {} });
+  await flush();
+  assert.equal(libCalls(v, 'openpaperdesign_app_rename'), 0, 'the same name, exactly');
+  assert.equal(v.els.home.hidden, false);
+  libOnly(v);
+});
+
+test('lead_unicode: quotes and repeated internal spaces are ordinary characters of a valid saved filename', async () => {
+  const name = 'A  file "quoted"';
+  const v = await libraryView({ ...LIBRARY_LIST, canvases: [{ id: ID1, name, pages: 2, modified: MAR_4_2025 }] });
+  assert.equal(rows(v)[0].name, name, 'Home must show the same saved filename as the editor');
+  assert.equal(rows(v)[0].open.title, name);
+  libOnly(v);
+});
+
+test('library home: a listed name that breaks the rule is still bounded, and the rename field fits every legal name', async () => {
+  // Only a faulty or hostile answer carries these: controls become spaces, and an overlong name
+  // is cut to 60 whole characters (a pair is never split).
+  const v = await libraryView({ ...LIBRARY_LIST, canvases: [
+    { id: ID1, name: 'Bell\u0007and\u0085next', pages: 1, modified: MAR_4_2025 },
+    { id: ID2, name: 'B'.repeat(59) + '😀😀', pages: 1, modified: MAR_4_2025 },
+  ] });
+  const names = rows(v).map((r) => r.name);
+  assert.ok(names.includes('Bell and next'), names.join('|'));
+  assert.ok(names.includes('B'.repeat(59) + '😀'), names.join('|'));
+  // The browser's maxlength counts UTF-16 units: 120 holds any 60 characters (the script checks
+  // the server's own count before sending).
+  assert.match(html, /<input id="rename-name" type="text" maxlength="120" autocomplete="off">/);
   libOnly(v);
 });
 
@@ -1346,14 +1494,26 @@ test('library home: Rename changes the name only, by id; the list is read again'
   assert.equal(v.document.activeElement, v.els['rename-name']);
   assert.deepEqual(v.sent.slice(baseline), [], 'opening the form sends nothing');
   assert.equal(libCalls(v, 'openpaperdesign_app_rename'), 0, 'no rename before it is confirmed');
-  v.els['rename-name'].value = '  Launch "plan"\u0007 ';
-  v.els['rename-form'].onsubmit({ preventDefault() {} });
-  await flush();
-  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_rename', arguments: { id: ID1, name: 'Launch plan' } });
+  const submit = async (typed) => {
+    v.els['rename-name'].value = typed;
+    v.els['rename-form'].onsubmit({ preventDefault() {} });
+    await flush();
+  };
+  // A name the server wouldn't take (its rule: 1 to 60 characters after trimming, no control
+  // characters) is said, never rewritten into another name, and nothing is sent.
+  await submit('  Launch "plan"\u0007 ');
+  assert.equal(v.els.notice.textContent, 'A file name can\'t contain control characters. Nothing was renamed.');
+  await submit('A'.repeat(60) + '😀');
+  assert.equal(v.els.notice.textContent, 'A file name can have at most 60 characters. Nothing was renamed.');
+  assert.equal(libCalls(v, 'openpaperdesign_app_rename'), 0, 'neither was sent');
+  assert.equal(v.els['rename-form'].hidden, false, 'the form stays for a correction');
+  // Trimmed, otherwise exactly as typed: quotes and repeated inner spaces are the name's own.
+  await submit('  Launch  "plan" ');
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_rename', arguments: { id: ID1, name: 'Launch  "plan"' } });
   assert.ok(v.els['rename-save'].disabled, 'busy while it runs');
-  await answer(v, { action: 'renamed', canvas: { id: ID1, name: 'Launch plan' } }, libAction(v));
+  await answer(v, { action: 'renamed', canvas: { id: ID1, name: 'Launch  "plan"' } }, libAction(v));
   assert.equal(v.els.home.hidden, false);
-  assert.equal(v.els.notice.textContent, 'Renamed to "Launch plan".');
+  assert.equal(v.els.notice.textContent, 'Renamed to "Launch  "plan"".');
   assert.equal(v.last('tools/call').params.name, LIB_LIST, 'the list shows the name it has now');
   libOnly(v);
 });
@@ -1469,6 +1629,9 @@ function fakePanel() {
           // A kept preference the view learned late (panel.js `setAppearance`), recorded.
           kept: [],
           setAppearance: (a) => { h.kept.push(a); },
+          // The same for the canvas background (panel.js `setBackground`).
+          keptBackground: [],
+          setBackground: (b) => { h.keptBackground.push(b); },
         };
         h.started.catch(() => {});
         h.finish = () => settle.resolve('mounted');
@@ -1829,6 +1992,77 @@ test('panel: the editor gets the kept appearance; a menu choice shows at once an
   await answer(v, { refused: 'An appearance of system, light or dark is required. Nothing was changed.' }, libAction(v));
   assert.match(v.els['ed-alert-text'].textContent, /couldn't be kept/);
   assert.equal(v.rootAttrs['data-theme'], 'light', 'System with the host\'s light (no browser signal here)');
+  panelOnly(v);
+});
+
+test('panel: the editor gets the kept background; a choice is kept as one validated key, and a late kept one reaches the shown editor', async () => {
+  // None until one is kept.
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  assert.equal(h.o.background, 'none', 'a fresh view: no background');
+  h.o.onStatus('Ready');
+  // The editor's menus (the canvas's own menu, Menu ▸ Background, View, the palette): kept.
+  h.o.onBackground('lines');
+  await flush();
+  const keep = libAction(v);
+  assert.deepEqual(keep.params, { name: VIEW_TOOL, arguments: { background: 'lines' } });
+  await answer(v, { view: { home_layout: 'grid', background: 'lines' } }, keep);
+  assert.equal(v.els['ed-alert'].hidden, true, 'kept: nothing to say');
+  // Anything else goes as none, never as it came; a refusal for the shown editor is said.
+  h.o.onBackground('stripes');
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: VIEW_TOOL, arguments: { background: 'none' } });
+  await answer(v, { refused: 'A background of none, dots, lines is required. Nothing was changed.' }, libAction(v));
+  assert.equal(v.els['ed-alert-text'].textContent, 'Background applied here, but it couldn\'t be kept for next time.');
+  assert.equal(libCalls(v, 'openpaperdesign_app_appearance'), 0, 'the appearance is its own preference');
+  // The next editor starts in the latest choice.
+  h.o.onHome();
+  await flush();
+  await closedHome(v);
+  await relist(v);
+  await openInPanel(v);
+  assert.equal(fake.handles[1].o.background, 'none');
+  // A kept value learned only after New mounted reaches that editor, as no new choice.
+  const wf = fakePanel();
+  const w = mount({ library: true, panel: wf });
+  w.from({ id: w.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: {} } });
+  await flush();
+  const initial = w.last('tools/call');
+  w.els['new-file'].onclick();
+  await flush();
+  await answer(w, PANEL_EDITOR('created'), libAction(w));
+  assert.equal(w.els.editor.hidden, false, 'mounted before the list came back');
+  assert.equal(wf.handles[0].o.background, 'none', 'opened before the kept background was known');
+  await answer(w, { ...LIBRARY_LIST, view: { home_layout: 'list', background: 'dots' } }, initial);
+  assert.deepEqual(wf.handles[0].keptBackground, ['dots'], 'the mounted editor takes the kept Dots');
+  assert.equal(libCalls(w, VIEW_TOOL), 0, 'learning the kept background keeps nothing');
+  panelOnly(v);
+  panelOnly(w);
+});
+
+test('panel: a background read begun during a pending keep cannot undo that keep\'s later acknowledgement', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onStatus('Ready');
+  h.o.onBackground('dots');
+  await flush();
+  const keep = libAction(v);
+  h.o.onHome();
+  await flush();
+  await closedHome(v);
+  const list = v.last('tools/call');
+  assert.equal(list.params.name, LIB_LIST);
+  await answer(v, { view: { home_layout: 'grid', background: 'dots' } }, keep);
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'grid', background: 'none' } }, list);
+  await openInPanel(v);
+  assert.equal(fake.handles[1].o.background, 'dots', 'the acknowledged choice, not the older read');
+  // A read begun after it settled is authoritative again (control), and reaches the shown editor.
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, view: { home_layout: 'grid', background: 'lines' } }, v.last('tools/call'));
+  assert.deepEqual(fake.handles[1].keptBackground, ['lines']);
   panelOnly(v);
 });
 

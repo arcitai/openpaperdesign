@@ -156,13 +156,16 @@ export function opdCreatePanel(opts) {
    * Open the canvas `binding` in this view's editor (`refs`: its canvas, status and conflict
    * banner). `onHome`: the view's own way back (upstream's Home, New and Open ask for it).
    * Appearance (see opdMountEditor): `appearance` the view's kept preference, `hostTheme()` the
-   * host's theme, `onAppearance(appearance)` a new choice from the editor's menu.
+   * host's theme, `onAppearance(appearance)` a new choice from the editor's menu. The canvas
+   * background the same way: `background` and `onBackground(background)`.
    */
-  function open({ binding, refs, onStatus, onReady, onHome, appearance, hostTheme, onAppearance }) {
+  function open({ binding, refs, onStatus, onReady, onHome, appearance, hostTheme, onAppearance,
+    background, onBackground }) {
     const h = { left: false, mounted: null, mount: null, released: false };
-    // The kept preference, as the view knows it now (it can learn it late, `setAppearance`):
-    // the editor is mounted with the latest one.
+    // The kept preferences, as the view knows them now (it can learn them late,
+    // `setAppearance`, `setBackground`): the editor is mounted with the latest ones.
     let kept = appearance;
+    let keptBackground = background;
     wanting.add(h);
     const live = () => !h.left;
     const say = (text, error) => { if (live() && onStatus) onStatus(text, Boolean(error)); };
@@ -258,6 +261,8 @@ export function opdCreatePanel(opts) {
         appearance: kept,
         hostTheme,
         onAppearance: (a) => { if (live() && onAppearance) onAppearance(a); },
+        background: keptBackground,
+        onBackground: (b) => { if (live() && onBackground) onBackground(b); },
         transport: { fetchPage, put, revision },
         firstPage: canvasPage(v),
         forceWebgl: false,
@@ -285,6 +290,11 @@ export function opdCreatePanel(opts) {
       if (h.left) return;
       kept = a;
       if (h.mounted) h.mounted.setAppearance(a);
+    };
+    h.setBackground = (b) => {
+      if (h.left) return;
+      keptBackground = b;
+      if (h.mounted && h.mounted.setBackground) h.mounted.setBackground(b);
     };
     // For good: the mount is undone and the server told this editor is gone. Saves nothing.
     h.dispose = async () => {

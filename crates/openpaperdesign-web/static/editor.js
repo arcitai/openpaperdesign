@@ -133,6 +133,14 @@ export function opdSystemDark(media, hostTheme) {
   return null;
 }
 
+/** The canvas backgrounds (DESIGN.md): a plain surface by default, or dots, or lines. */
+export const OPD_BACKGROUNDS = Object.freeze(['none', 'dots', 'lines']);
+
+/** A kept canvas background, or 'none' for anything that isn't one (a missing or bad value). */
+export function opdBackground(value) {
+  return OPD_BACKGROUNDS.includes(value) ? value : 'none';
+}
+
 /** Whether `appearance` shows dark with the OS appearance `systemDark` (see opdSystemDark). */
 export function opdResolveDark(appearance, systemDark) {
   const a = opdAppearance(appearance);
@@ -197,6 +205,10 @@ export function opdIsMac(nav) {
  *   appearance                       the kept preference to start with (default 'system')
  *   hostTheme()                      the host's theme, the OS fallback (see opdSystemDark)
  *   onAppearance(appearance)         the person chose another one (Menu ▸ Appearance): keep it
+ *   background                       the kept canvas background ('none', 'dots' or 'lines';
+ *                                    default 'none'), given to each editor once it booted
+ *   onBackground(background)         the person chose another one (the canvas's menu, Menu ▸
+ *                                    Background, View, the palette or the grid shortcut)
  *   transport: { fetchPage(), put(snapshot, revision), revision() }
  *   firstPage: { text, revision }, forceWebgl, state
  *   onReady(session)                 the renderer is Ready (once per mount)
@@ -206,7 +218,8 @@ export function opdIsMac(nav) {
  *   log(message), env                (see opdBrowserEnv)
  * }
  * Returns { session, started, drain(), resume(), dispose(), hostThemeChanged(), setAppearance(a),
- * appearance }. `setAppearance`: a kept preference the host learned late (not a new choice).
+ * appearance, setBackground(b), background }. `setAppearance` and `setBackground`: a kept
+ * preference the host learned late (not a new choice).
  * `started` settles once the renderer has booted (or failed); Ready comes later, from the frame
  * loop. `hostThemeChanged()`: the host's theme changed (it matters only where the browser can't
  * report the OS appearance).
@@ -234,6 +247,8 @@ export function opdMountEditor(opts) {
         // while it booted must not stay.
         ed.set_system_dark(systemDark());
         ed.set_appearance(appearance);
+        // The kept background, from the next frame (an older renderer without it shows none).
+        if (typeof ed.set_background === 'function') ed.set_background(background);
       }
       return ed;
     },
@@ -355,6 +370,8 @@ export function opdMountEditor(opts) {
   // (as Home resolves it), delivered like any other: at startup, after boot and when a fallback
   // signal goes away, so an earlier Dark never stays.
   let appearance = opdAppearance(opts.appearance);
+  // The canvas background: a view preference like the appearance, never the canvas's content.
+  let background = opdBackground(opts.background);
   const media = env.colorScheme ? env.colorScheme() : null;
   const systemDark = () => opdSystemDark(media, opts.hostTheme ? opts.hostTheme() : null) === true;
   const system = () => {
@@ -376,6 +393,10 @@ export function opdMountEditor(opts) {
         // Menu ▸ Appearance: a view preference, kept by the host where it can keep one.
         appearance = opdAppearance(ed.appearance());
         if (opts.onAppearance) opts.onAppearance(appearance);
+      } else if (r === 'background') {
+        // A background choice: a view preference, kept by the host where it can keep one.
+        background = opdBackground(typeof ed.background === 'function' ? ed.background() : 'none');
+        if (opts.onBackground) opts.onBackground(background);
       }
     }
     for (let d = ed.take_download(); d !== undefined && d !== null; d = ed.take_download()) {
@@ -502,6 +523,13 @@ export function opdMountEditor(opts) {
       session.withEditor((ed) => ed.set_appearance(appearance));
     },
     get appearance() { return appearance; },
+    // The host learned the kept background only now (a late read), as `setAppearance`.
+    setBackground(b) {
+      if (disposed) return;
+      background = opdBackground(b);
+      session.withEditor((ed) => { if (typeof ed.set_background === 'function') ed.set_background(background); });
+    },
+    get background() { return background; },
     get disposed() { return disposed; },
   };
 }

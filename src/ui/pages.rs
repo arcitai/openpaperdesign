@@ -45,8 +45,9 @@ const ROW_H: f32 = 24.0;
 
 /// A page-list action chosen while the panel draws. It runs once, after the rows (`run`): a
 /// deleted, added or moved page would shift the rows still to draw, and a page's open fields
-/// must be finished on that page before another one is shown.
-enum PageAction {
+/// must be finished on that page before another one is shown. The header's page identity
+/// offers the shown page's own actions too (`run_action`).
+pub(super) enum PageAction {
     Add,
     Switch(usize),
     Duplicate(usize),
@@ -56,7 +57,17 @@ enum PageAction {
 
 /// Run a page-list action, after finishing open fields (`finish_fields`).
 fn run(ui: &Ui, ed: &mut Editor, st: &mut UiState, action: PageAction) {
-    finish_fields(ui.ctx(), ed, st);
+    run_action(ui.ctx(), ed, st, action);
+}
+
+/// [`run`], from anywhere in the chrome (the header's page actions).
+pub(super) fn run_action(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    st: &mut UiState,
+    action: PageAction,
+) {
+    finish_fields(ctx, ed, st);
     match action {
         PageAction::Add => {
             ed.add_page();

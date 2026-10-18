@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 6 · 2026-10-18 · The one canonical visual and interaction direction for the OPD app
+Revision: 8 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -45,7 +45,16 @@ The principles:
      holding every upstream menu and Appearance; native macOS keeps its menu bar instead) and
      the Layers toggle (pages and layers);
    - centre: the file's real name over its page and save state, centred on the surface and
-     truncated, never overlapped;
+     truncated, never overlapped (revision 2 slice 6, built):
+     - in the web editor (browser page and Home's in-view editor) the name is an inline rename:
+       a click opens it, Enter or a click elsewhere keeps it, Escape drops it. Until then it is
+       an unfinished draft, so a clean reload or leave waits for it;
+     - a kept name is the file's name in the library and Home. It is saved in the same canvas
+       save as the drawing (one commit, one acknowledgement). A rename made elsewhere while
+       this editor has unsaved changes is a conflict, as for any change;
+     - native windows have no such save, so their title stays a label;
+     - the page line opens the shown page's own actions: Rename page… (the pages list's own
+       rename field), Duplicate page, Add page and Delete page.
    - right: the Design toggle.
 
    Undo/redo, help and every other command stay in the menu, the command palette and their
@@ -87,23 +96,56 @@ The principles:
    - **A creation tool:** only that tool's defaults, titled "For new …"; they never edit the
      selection.
    - **A selection:** the sections every selected layer has. A value they share is shown and
-     editable for all, as one coalesced undo step. A value that differs shows Mixed and is
-     never the first layer's value. A widget that can't show Mixed is left out, with a short
-     reason.
+     editable for all. One interaction with a field (typing a value key by key, or dragging
+     it) is one undo step, sealed when the field is released or loses focus; a later
+     interaction is its own step. A value that differs shows Mixed and is never the first
+     layer's value; Mixed always means the values differ. A widget that can't show Mixed is
+     left out, with a short reason.
+     - Typography is what the characters have, text ranges included (the styles the layout
+       draws): equal base sizes with a range of another size are Mixed, with a word on why,
+       never a shared size.
+     - Independent corners are compared corner by corner: equal corners show as the four
+       corner fields for every selected layer.
    - **Folded by default:** Sketch (the optional hand-drawn style, with a plain explanation;
      clean geometry unless turned on, and existing sketchy drawings keep it) and Export.
 7. **Quiet surfaces, clear state.** Panels and header share one colour, separated by hairlines.
    Fields are softly filled.
 8. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
-   neatness (see the status rules in AGENTS.md). A transient status sits right of the zoom,
-   never over it or the rail.
+   neatness (see the status rules in AGENTS.md). The status line sits at the canvas's lower
+   edge, right of each control laid out there that reaches the canvas's lower half: the zoom,
+   and on a short canvas the rail, which then runs down the left side. It never covers them,
+   at any height, and is never hidden or shortened to make room.
 9. **Light and dark are one design** (see Appearance below): Home, the chrome, the rail and
    zoom, menus, the inspector and the canvas itself share one resolved appearance.
+10. **A plain canvas by default** (revision 2 slice 4, built). The background is None, Dots
+    or Lines.
+    - **Where to choose it:**
+      - the canvas's own menu: a secondary click, without a drag, on blank canvas, never over
+        an object, a panel or a popup. It holds Background, Zoom to Fit and
+        Collapse / Restore Panels;
+      - Menu ▸ Background, and the palette's "Background: …";
+      - the grid shortcut (Ctrl/⌘+Shift+') and View ▸ Background On/Off, which toggle None
+        against the last pattern.
+    - **The menu takes its own input:** while it is open, Escape and presses close it and
+      never reach the canvas. Hand, Space and middle-button panning are unchanged.
+    - **A view preference, never the drawing.** Switching changes nothing in the document,
+      its undo or its saves, and nothing in snapping or exports.
+    - **Where it is kept:** the app library keeps it with Home's layout; the standalone
+      browser page and native windows keep it for that window only.
+    - **Lines** use the dot grid's zoom-adaptive spacing, as 1 px lines.
+11. **A quiet Home** (revision 2 slice 5, built).
+    - **Layout.** Files show as a grid of equal cards by default, and a list once List is
+      chosen; the library keeps that choice.
+    - **Cards.** Each card has its glyph, two reserved title lines (a longer name is clamped;
+      its full name is the card's tooltip and accessible name) and one line each for pages
+      and the last edit.
+    - **No footer or wordmark.** The licences and notices are the More menu's About & notices
+      (the editor's `···` menu has the same).
+    - **Storage cue:** "New files are kept in the OpenPaperDesign library, this app's own
+      data folder, not in a Codex project." No project association is shown or implied.
+    - **Search** says when nothing matches and how to clear it.
 
 Still open from the revision 2 plan (not built yet, and not to be described as built):
-- None / Dots / Lines backgrounds and the blank-canvas menu;
-- the Home grid default, equal cards, footer and storage cue, and view preferences;
-- file rename through the fenced canvas save, and page rename from the centred identity;
 - the diagram workflow and connector labels;
 - the project Design system source;
 - the guide and value editor and Apply.
@@ -118,7 +160,9 @@ Still open from the revision 2 plan (not built yet, and not to be described as b
 - **Light and Dark** override the OS.
 - **Where it is kept.** It is a view preference, never part of a canvas:
   - the app library keeps it in its own data folder (`library/v1/appearance`), so it survives
-    closing and reopening the view;
+    closing and reopening the view. Home's layout and the canvas background are kept beside
+    it, in one small record of two keys (`library/v1/view`). Each key follows the same
+    freshness rule: a list read that overlapped an unresolved choice never replaces it;
   - the standalone browser page keeps it only while it is open (its origin changes per launch);
   - nothing is stored in the browser;
   - native macOS has no egui Menu, so it stays System and follows the OS.
@@ -171,6 +215,10 @@ Rules that apply to every tier:
   Docked ↔ sheet is the same panel, so its fields keep focus.
 - **One canvas rectangle** (what the panels leave) is used for rendering, clipping and pointer
   input.
+- **A panel's edge is the panel's.** A wide panel's resize handle reaches a few pixels into
+  the canvas. A press egui gives that handle (its own rect widened by egui's interact radius)
+  only resizes the panel: both hosts keep it from the editor, so nothing behind the edge is
+  selected, moved or drawn. Elsewhere the canvas takes presses as before.
 - **Native windows** use the wide tier only, unless a host opts in (`UiState::narrow`).
 
 ### Rail and zoom geometry
@@ -186,7 +234,11 @@ render.
 - **Flyout:** 220 px wide, opening inward at rail.right + 4. Where that leaves less than
   180 px it opens over the rail instead. Its height is clamped to the canvas (it scrolls).
 - **Zoom:** −, the level (a menu with Zoom to Fit, Zoom to Selection and Zoom to 100%) and +,
-  at the canvas's lower left.
+  at the canvas's lower left (beside the rail on a short canvas). It stays inside the canvas:
+  its room is judged from its measured width with the current percentage. Where the whole group
+  has no room (both panels widened, for one), only the level is shown and its menu holds Zoom
+  In and Zoom Out too; where not even that fits, no zoom control is shown and the menu and
+  shortcuts still zoom.
 
 ## Tokens
 
@@ -206,6 +258,7 @@ under the host's MCP Apps style variables.
 | selected | accent tint over surface (≈13% light, 27% dark) | |
 | canvas work surface | #eeeef0 | #18181b |
 | canvas grid dot | #cfcfd6 | #34343a |
+| canvas grid line (Lines) | the grid dot at 60% opacity | the grid dot at 60% opacity |
 
 - **Type:** Inter. 13 body, 11 secondary and section labels (semibold), 13 semibold titles.
 - **Shape:**

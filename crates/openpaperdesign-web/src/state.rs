@@ -39,6 +39,10 @@ pub enum HostRequest {
     /// The person chose another appearance (Menu ▸ Appearance): the page keeps the view
     /// preference ([`WebState::appearance`]) where it can. Nothing about the canvas changed.
     Appearance,
+    /// The person chose another canvas background (the canvas's menu, Menu ▸ Background, View,
+    /// the palette or the grid shortcut): the page keeps the view preference
+    /// ([`WebState::background`]) where it can. Nothing about the canvas changed.
+    Background,
 }
 
 impl HostRequest {
@@ -47,6 +51,7 @@ impl HostRequest {
             HostRequest::Save => "save",
             HostRequest::Home => "home",
             HostRequest::Appearance => "appearance",
+            HostRequest::Background => "background",
         }
     }
 }
@@ -142,6 +147,8 @@ struct Inflight {
     stamp: u64,
     pages: Vec<(String, u64)>,
     meta: Meta,
+    /// The file name it carries, when it renames the file.
+    name: Option<String>,
 }
 
 /// A canvas as the server sent it: its pages, its active page and its file name.
@@ -232,6 +239,12 @@ pub struct WebState {
     system_theme: Option<egui::Theme>,
     /// The appearance the page last knew of, so a change made in the menu is reported once.
     reported_appearance: egui::ThemePreference,
+    /// The background the page last knew of, so a change made in a menu is reported once.
+    reported_background: crate::render::scene::Background,
+    /// The file's name (`canvas.name`) as the server last confirmed it: loaded, reloaded or
+    /// saved. Upstream's top-bar title (`UiState::project_name`) differing from it is a rename
+    /// to save, in the same canvas save as the pages.
+    saved_name: String,
 }
 
 /// Shortcuts the browser keeps: copy, cut and paste arrive as the page's own clipboard events
@@ -325,11 +338,14 @@ impl WebState {
         // page's input and the canvas rectangle stay in CSS px: positions would no longer match
         // what is drawn. The UI scale here is the page's device pixel ratio only.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let name = canvas.name.unwrap_or_default();
         let mut s = WebState {
             saved_stamp: ed.doc_stamp,
             ed,
             ui: UiState {
-                project_name: canvas.name.unwrap_or_default(),
+                project_name: name.clone(),
+                // The title renames the file, saved with the canvas (see `save_snapshot`).
+                file_rename: true,
                 // The granted surface can be a narrow sidebar: below this width upstream's
                 // narrow layout (one side panel at a time, the top bar across) keeps the canvas,
                 // tools, All projects and panels reachable. Wider, the ordinary layout.
@@ -357,6 +373,8 @@ impl WebState {
             library_noted: false,
             system_theme: None,
             reported_appearance: egui::ThemePreference::System,
+            reported_background: Default::default(),
+            saved_name: name,
         };
         s.resize(css_width, css_height, 1.0);
         Ok(s)
@@ -407,6 +425,26 @@ impl WebState {
     /// The person's appearance preference now: `system`, `light` or `dark`.
     pub fn appearance(&self) -> &'static str {
         appearance_name(self.ui.appearance)
+    }
+
+    /// The background the page kept (`none`, `dots` or `lines`): shown from the next frame,
+    /// without being reported back. Anything else is refused and changes nothing. A view
+    /// preference: the document, its save state and undo are untouched.
+    pub fn set_background(&mut self, name: &str) -> bool {
+        let Some(b) = crate::render::scene::Background::from_name(name) else {
+            return false;
+        };
+        self.reported_background = b;
+        if self.ui.background != b {
+            self.ui.set_background(b);
+            self.redraw = true;
+        }
+        true
+    }
+
+    /// The canvas background now: `none`, `dots` or `lines`.
+    pub fn background(&self) -> &'static str {
+        self.ui.background.name()
     }
 
     /// Whether the workspace is shown dark now (the preference resolved with the OS
@@ -480,6 +518,11 @@ impl WebState {
             self.requests.push_back(HostRequest::Appearance);
             self.redraw = true;
         }
+        if self.ui.background != self.reported_background {
+            self.reported_background = self.ui.background;
+            self.requests.push_back(HostRequest::Background);
+            self.redraw = true;
+        }
         if self.ui.library.dirty {
             // Nothing persists the library from a page (it is the native app's own file).
             self.ui.library.dirty = false;
@@ -522,16 +565,13 @@ impl WebState {
         out.or_else(|| self.field_copy.take())
     }
 
-    fn over_egui(&self, p: egui::Pos2) -> bool {
-        self.ctx
-            .layer_id_at(p)
-            .is_some_and(|l| l.order != egui::Order::Background)
-    }
-
-    /// Like the native `App::over_canvas`: inside the canvas rectangle, not over a floating
-    /// egui area (tools, palette, help, menus, tooltips), and no egui drag under way.
+    /// Like the native `App::over_canvas`: inside the canvas rectangle, not over floating egui
+    /// UI (tools, palette, help, menus, tooltips; the shared `ui::over_floating_ui`, which
+    /// doesn't count the canvas's own menu once it is closed), and no egui drag under way.
     fn over_canvas(&self, p: egui::Pos2) -> bool {
-        self.canvas.contains(p) && !self.over_egui(p) && !self.ctx.egui_is_using_pointer()
+        self.canvas.contains(p)
+            && !ui::over_floating_ui(&self.ctx, &self.ui, p)
+            && !self.ctx.egui_is_using_pointer()
     }
 
     fn to_canvas(&self, p: egui::Pos2) -> crate::geom::V2 {
@@ -573,7 +613,9 @@ impl WebState {
     }
 
     /// Positions are CSS px in the canvas element (the whole workspace). While a tool flyout
-    /// is open the press is the flyout's (it closes it), never a drawing on the canvas.
+    /// or the canvas's own menu is open the press is theirs (it closes them), never a drawing
+    /// on the canvas. A press egui gives a panel's resize handle (its edge reaches into the
+    /// canvas) is the handle's alone: the panel resizes and nothing behind it moves.
     pub fn pointer_down(&mut self, x: f64, y: f64, button: Button, time_ms: f64) {
         let p = egui::pos2(x as f32, y as f32);
         self.events.push(egui::Event::PointerMoved(p));
@@ -583,7 +625,8 @@ impl WebState {
             pressed: true,
             modifiers: self.mods,
         });
-        if self.over_canvas(p) && !self.ui.rail.captures_input() {
+        let theirs = self.ui.captures_input() || self.ui.chrome.on_panel_edge(p);
+        if self.over_canvas(p) && !theirs {
             // Clicking the canvas takes keyboard focus away from text fields.
             self.ctx.memory_mut(|m| {
                 if let Some(f) = m.focused() {
@@ -694,8 +737,8 @@ impl WebState {
             });
         }
         self.redraw = true;
-        // An open tool flyout takes Escape (it closes, the tool stays as it is).
-        if named == Some(egui::Key::Escape) && self.ui.rail.captures_input() {
+        // An open tool flyout or canvas menu takes Escape (it closes, the tool stays as it is).
+        if named == Some(egui::Key::Escape) && self.ui.captures_input() {
             return true;
         }
         // A rail control with egui's keyboard focus (a family's button or chevron, or a flyout
@@ -932,7 +975,13 @@ impl WebState {
     /// since the last confirmed snapshot (`doc_stamp`). A save in flight is not a confirmed
     /// one, so it stays dirty until its answer.
     pub fn dirty(&self) -> bool {
-        self.ed.doc_stamp != self.saved_stamp || self.ed.project_dirty()
+        self.ed.doc_stamp != self.saved_stamp || self.ed.project_dirty() || self.name_dirty()
+    }
+
+    /// The file's name was changed here (the title's finished rename) since the server last
+    /// confirmed it: it goes with the next canvas save.
+    fn name_dirty(&self) -> bool {
+        self.ui.project_name != self.saved_name
     }
 
     /// An egui text field has the keyboard, other than the command palette's search: an
@@ -956,7 +1005,8 @@ impl WebState {
         // rename never exempts another focused field.
         let layer = self.ui.renaming.is_some() && self.ui.rename_field == Some(id);
         let page = self.ui.pages.renaming.is_some() && self.ui.pages.rename_field == Some(id);
-        if layer || page {
+        let title = self.ui.file_title_draft.is_some() && self.ui.file_title_field == Some(id);
+        if layer || page || title {
             return false;
         }
         egui::widgets::text_edit::TextEditState::load(&self.ctx, id).is_some()
@@ -988,10 +1038,19 @@ impl WebState {
             .renaming
             .as_ref()
             .map(|(i, text)| changed(text, self.ed.pages.get(*i).map(|p| p.name.as_str())));
-        let renaming = layer.is_some() || page.is_some();
+        // The file title's rename: changed against the name shown before it opened.
+        let title = self
+            .ui
+            .file_title_draft
+            .as_ref()
+            .map(|text| changed(text, Some(self.ui.project_name.as_str())));
+        let renaming = layer.is_some() || page.is_some() || title.is_some();
         // A stored rename speaks only for its own field: another focused field is judged on
         // its own (`field_editing` exempts exactly the rename's field).
-        let draft = layer.unwrap_or(false) || page.unwrap_or(false) || self.field_editing();
+        let draft = layer.unwrap_or(false)
+            || page.unwrap_or(false)
+            || title.unwrap_or(false)
+            || self.field_editing();
         let typing = (renaming || self.field_has_keyboard())
             && self.events.iter().any(|e| {
                 matches!(
@@ -1037,12 +1096,19 @@ impl WebState {
             }
             pages.push(p);
         }
+        // The file's own name, when the title renamed it: in this same save, so the name and
+        // the pages are one commit, one revision and one answer.
+        let name = self.name_dirty().then(|| self.ui.project_name.clone());
         self.inflight = Some(Inflight {
             stamp: self.ed.doc_stamp,
             pages: sent,
             meta: meta(&self.ed),
+            name: name.clone(),
         });
-        let save = serde_json::json!({"active_page": self.ed.active_page_id(), "pages": pages});
+        let mut save = serde_json::json!({"active_page": self.ed.active_page_id(), "pages": pages});
+        if let Some(n) = name {
+            save["name"] = n.into();
+        }
         Some(save.to_string())
     }
 
@@ -1074,9 +1140,15 @@ impl WebState {
             name,
         } = parse_canvas(canvas_json)?;
         if let Some(name) = name {
-            self.ui.project_name = name;
+            self.ui.project_name = name.clone();
+            self.saved_name = name;
+        } else {
+            // No name from the server: whatever is shown counts as its name.
+            self.saved_name = self.ui.project_name.clone();
         }
         self.ui.renaming = None;
+        // The title's rename field was for the replaced canvas too.
+        self.ui.file_title_draft = None;
         let collapsed = self.ui.pages.collapsed;
         self.ui.pages = Default::default();
         self.ui.pages.collapsed = collapsed;
@@ -1141,6 +1213,11 @@ impl WebState {
         }
         if meta(&self.ed) == f.meta {
             self.ed.meta_dirty = false;
+        }
+        // The name it carried is the server's now; a later rename (or one made while it was in
+        // flight) stays to save.
+        if let Some(n) = f.name {
+            self.saved_name = n;
         }
     }
 

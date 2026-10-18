@@ -3250,6 +3250,682 @@ fn rev2_different_kinds_show_only_what_they_share_and_sketch_and_export_are_fold
     assert!(!s.dirty());
 }
 
+// ---- revision 2, slice 4: the canvas background (a view preference) and the canvas's own
+// menu. They drive the real upstream UI through this host's input, as above.
+
+/// A secondary click (pressed and released in place, no drag) at `p`, then two frames (the menu
+/// is a new egui area: its first frame is egui's invisible sizing pass).
+fn secondary_click(s: &mut WebState, (x, y): (f64, f64), t: f64) {
+    s.pointer_move(x, y, t);
+    s.pointer_down(x, y, Button::Secondary, t);
+    s.pointer_up(x, y, Button::Secondary, t + 10.0);
+    step(s);
+    step(s);
+}
+
+/// The requests the page has to answer now.
+fn requests(s: &mut WebState) -> Vec<HostRequest> {
+    std::iter::from_fn(|| s.take_request()).collect()
+}
+
+#[test]
+fn rev2_the_canvas_menu_switches_the_background_as_a_view_preference_only() {
+    let mut s = state();
+    assert_eq!(s.ui.background, scene::Background::None, "a fresh view");
+    assert_eq!(s.background(), "none");
+    let authored = page_to_json(&s.ed.page_data(0));
+    let svg = crate::io::svg::export(&s.ed.doc, None, None);
+    let snapping = s.ed.snapping;
+    // Blank canvas (the rectangle is at world 100..300 × 100..200).
+    let blank = at(&s, 600.0, 450.0);
+    secondary_click(&mut s, blank, 100.0);
+    assert!(s.ui.canvas_menu.is_some(), "the canvas's own menu opened");
+    assert!(s.ed.selection.is_empty(), "nothing selected");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn");
+    for label in [
+        "Background",
+        "None",
+        "Dots",
+        "Lines",
+        "Zoom to Fit",
+        "Collapse Panels",
+    ] {
+        assert!(paints(&mut s, label), "{label}");
+    }
+    click_label(&mut s, "Lines", 200.0);
+    assert_eq!(s.ui.background, scene::Background::Lines);
+    assert!(s.ui.canvas_menu.is_none(), "a choice closes it");
+    assert_eq!(requests(&mut s), [HostRequest::Background]);
+    assert_eq!(s.background(), "lines");
+    // Presentation only: the document, its save state, undo, snapping and exports are untouched.
+    assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
+    assert_eq!(crate::io::svg::export(&s.ed.doc, None, None), svg);
+    assert_eq!(s.ed.snapping, snapping);
+    assert!(!s.ed.is_dirty(), "no undo step");
+    assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
+    // The grid shortcut (Ctrl/⌘+Shift+', the workspace's): None against the last pattern.
+    let grid = |s: &mut WebState| {
+        s.modifiers(true, true, false, false);
+        assert!(s.key_down("\"", "Quote", false), "taken");
+        s.key_up("\"", "Quote");
+        s.modifiers(false, false, false, false);
+        step(s);
+        step(s);
+    };
+    grid(&mut s);
+    assert_eq!(s.ui.background, scene::Background::None);
+    grid(&mut s);
+    assert_eq!(s.ui.background, scene::Background::Lines, "not Dots");
+    let both = [HostRequest::Background, HostRequest::Background];
+    assert_eq!(requests(&mut s), both);
+    // The palette offers the same patterns.
+    open_palette(&mut s);
+    s.paste("Background: Dots");
+    step(&mut s);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.background, scene::Background::Dots);
+    assert_eq!(requests(&mut s), [HostRequest::Background]);
+    // A kept preference from the page applies without being reported back; anything else is
+    // refused and changes nothing.
+    assert!(s.set_background("none"));
+    step(&mut s);
+    assert_eq!(s.ui.background, scene::Background::None);
+    assert!(requests(&mut s).is_empty(), "not reported back");
+    assert!(!s.set_background("grid"));
+    assert_eq!(s.background(), "none");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
+    assert!(!s.dirty());
+}
+
+#[test]
+fn rev2_the_canvas_menu_opens_only_on_a_still_secondary_click_on_blank_canvas_and_never_draws() {
+    let mut s = state();
+    s.run(Action::Tool(Tool::Rect));
+    step(&mut s);
+    let nodes = s.ed.doc.nodes.len();
+    // On the rectangle: no menu (an object keeps its own behaviour).
+    let on_rect = at(&s, 150.0, 150.0);
+    secondary_click(&mut s, on_rect, 100.0);
+    assert!(s.ui.canvas_menu.is_none(), "not over a node");
+    // A secondary drag on blank canvas: no menu.
+    let (x, y) = at(&s, 600.0, 450.0);
+    s.pointer_down(x, y, Button::Secondary, 200.0);
+    s.pointer_move(x + 60.0, y + 40.0, 210.0);
+    s.pointer_up(x + 60.0, y + 40.0, Button::Secondary, 220.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.canvas_menu.is_none(), "a drag isn't a click");
+    // Over a panel: never the canvas's menu.
+    let panel = (s.canvas_rect().max.x as f64 + 40.0, 400.0);
+    secondary_click(&mut s, panel, 300.0);
+    assert!(s.ui.canvas_menu.is_none(), "not over a panel");
+    assert_eq!(s.ed.doc.nodes.len(), nodes, "none of it drew");
+    // On blank canvas it opens; a press elsewhere on the canvas closes it and draws nothing,
+    // though the Rectangle tool is active.
+    let blank = (x, y);
+    secondary_click(&mut s, blank, 400.0);
+    assert!(s.ui.canvas_menu.is_some());
+    let (from, to) = (at(&s, 300.0, 300.0), at(&s, 380.0, 360.0));
+    drag(&mut s, from, to, 500.0);
+    step(&mut s);
+    assert!(s.ui.canvas_menu.is_none(), "an outside press closes it");
+    assert_eq!(s.ed.doc.nodes.len(), nodes, "no click-through");
+    // Escape closes it too, and is the menu's: the tool stays.
+    secondary_click(&mut s, blank, 600.0);
+    assert!(s.ui.canvas_menu.is_some());
+    assert!(s.key_down("Escape", "Escape", false), "taken");
+    s.key_up("Escape", "Escape");
+    step(&mut s);
+    assert!(s.ui.canvas_menu.is_none());
+    assert_eq!(s.ed.tool, Tool::Rect, "not the editor's Escape");
+    // Controls: the next drag draws, and the middle button still pans.
+    drag(&mut s, from, to, 700.0);
+    assert_eq!(s.ed.doc.nodes.len(), nodes + 1);
+    let pan = s.ed.camera.pan;
+    s.pointer_down(x, y, Button::Middle, 800.0);
+    s.pointer_move(x + 50.0, y + 30.0, 810.0);
+    s.pointer_up(x + 50.0, y + 30.0, Button::Middle, 820.0);
+    step(&mut s);
+    assert_ne!(s.ed.camera.pan, pan, "middle-button panning");
+    assert!(s.ui.canvas_menu.is_none());
+}
+
+#[test]
+fn rev2_an_open_canvas_menu_keeps_its_press_and_the_next_press_where_it_was_is_the_canvas_s() {
+    let mut s = state();
+    let blank = at(&s, 600.0, 450.0);
+    let elsewhere = at(&s, 250.0, 450.0);
+    let middle_drag = |s: &mut WebState, (x, y): (f64, f64), t: f64| {
+        s.pointer_down(x, y, Button::Middle, t);
+        s.pointer_move(x + 50.0, y + 30.0, t + 10.0);
+        s.pointer_up(x + 50.0, y + 30.0, Button::Middle, t + 20.0);
+    };
+    secondary_click(&mut s, blank, 100.0);
+    assert!(s.ui.canvas_menu.is_some());
+    let pan = s.ed.camera.pan;
+    // While it is open a press is the menu's: it closes it, and the canvas doesn't pan.
+    middle_drag(&mut s, elsewhere, 200.0);
+    step(&mut s);
+    assert!(s.ui.canvas_menu.is_none(), "the outside press closed it");
+    assert_eq!(s.ed.camera.pan, pan, "no pan from the menu's press");
+    // The very next press, where the frame that closed the menu still drew it (egui counts it
+    // visible for one more frame), is the canvas's.
+    middle_drag(&mut s, blank, 300.0);
+    step(&mut s);
+    assert_ne!(s.ed.camera.pan, pan, "the canvas pans");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn");
+}
+
+// ---- revision 2, slice 6: the file's real name, renamed from the header and saved with the
+// canvas (the same canvas save as the pages), and the shown page's own actions
+
+/// Where text starting with `wanted` is painted in the header (its centre, CSS px).
+fn in_header(s: &mut WebState, wanted: &str) -> (f64, f64) {
+    let top = s.canvas_rect().min.y;
+    let text = painted_text(s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, r)| t.trim().starts_with(wanted) && r.max.y <= top)
+        .unwrap_or_else(|| panic!("{wanted:?} isn't in the header: {text:?}"));
+    centre(*r)
+}
+
+/// Click the header's title (`name`) to open its rename field, select its text and type
+/// `text`, laid out: a draft until it is finished.
+fn rename_title(s: &mut WebState, name: &str, text: &str, t: f64) {
+    let p = in_header(s, name);
+    click(s, p, t);
+    for _ in 0..3 {
+        step(s);
+    }
+    assert!(s.ui.file_title_draft.is_some(), "the field is open");
+    assert!(s.field_has_keyboard(), "with the keyboard");
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+    s.paste(text);
+    step(s);
+}
+
+/// The file name a canvas save carries, if it renames the file.
+fn saved_name(snap: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(snap).unwrap();
+    v.get("name").and_then(|n| n.as_str()).map(str::to_string)
+}
+
+#[test]
+fn rev2_the_title_renames_the_file_on_enter_or_a_click_away_and_escape_drops_it() {
+    // An open field with nothing typed loses nothing.
+    let mut s = state();
+    assert!(s.ui.file_rename, "this host saves the name");
+    let p = in_header(&mut s, "Canvas");
+    click(&mut s, p, 50.0);
+    for _ in 0..3 {
+        step(&mut s);
+    }
+    assert!(s.field_has_keyboard());
+    assert!(s.can_reload() && !s.unsaved_work(), "nothing to lose");
+    for finish in ["Enter", "click", "Escape"] {
+        let mut s = state();
+        rename_title(&mut s, "Canvas", "  Launch plan ", 100.0);
+        assert_eq!(s.ui.project_name, "Canvas", "{finish}: a draft");
+        assert!(!s.dirty(), "{finish}: nothing to save yet");
+        assert!(
+            s.unsaved_work() && !s.can_reload(),
+            "{finish}: the draft is guarded"
+        );
+        assert!(s.save_snapshot().is_none(), "{finish}");
+        match finish {
+            "Enter" => press(&mut s, "Enter", "Enter"),
+            "click" => click_at(&mut s, 700.0, 500.0, 2000.0),
+            _ => press(&mut s, "Escape", "Escape"),
+        }
+        step(&mut s);
+        step(&mut s);
+        assert!(s.ui.file_title_draft.is_none(), "{finish}: closed");
+        assert!(!s.field_has_keyboard(), "{finish}");
+        if finish == "Escape" {
+            assert_eq!(s.ui.project_name, "Canvas", "dropped");
+            assert!(!s.dirty() && !s.unsaved_work() && s.can_reload());
+            continue;
+        }
+        assert_eq!(s.ui.project_name, "Launch plan", "{finish}: trimmed");
+        // The header shows it (panics if not).
+        in_header(&mut s, "Launch plan");
+        assert!(s.dirty() && !s.can_reload(), "{finish}: to save");
+        let snap = s.save_snapshot().expect("the rename is saved");
+        let name = saved_name(&snap);
+        assert_eq!(name.as_deref(), Some("Launch plan"), "{finish}");
+        let (_, list, sent) = parse_save(&snap);
+        assert_eq!(list.len(), 1, "{finish}: the page list as it is");
+        assert!(sent.is_empty(), "{finish}: no page content changed");
+        s.save_succeeded();
+        assert!(!s.dirty() && s.can_reload(), "{finish}: saved");
+        assert!(s.save_snapshot().is_none(), "{finish}: nothing more");
+    }
+}
+
+#[test]
+fn rev2_rename_and_content_share_one_save_and_an_older_answer_keeps_a_later_rename() {
+    let mut s = state();
+    // A drawing change and a rename, both unsaved: one save carries both.
+    s.run(Action::Tool(Tool::Rect));
+    let (from, to) = (at(&s, 400.0, 300.0), at(&s, 480.0, 360.0));
+    drag(&mut s, from, to, 100.0);
+    step(&mut s);
+    rename_title(&mut s, "Canvas", "First", 1000.0);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    let snap = s.save_snapshot().expect("one save");
+    assert_eq!(saved_name(&snap).as_deref(), Some("First"));
+    assert_eq!(sent_page(&snap).doc.nodes.len(), 2, "and the drawing");
+    // Renamed again while that save is in flight.
+    rename_title(&mut s, "First", "Second", 3000.0);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert!(s.save_snapshot().is_none(), "one save at a time");
+    s.save_succeeded();
+    assert!(s.dirty(), "the later rename stays to save");
+    let snap = s.save_snapshot().expect("the later rename");
+    assert_eq!(saved_name(&snap).as_deref(), Some("Second"));
+    assert!(parse_save(&snap).2.is_empty(), "the drawing is saved");
+    // Refused (a conflict: the name was changed elsewhere meanwhile): everything is kept.
+    s.save_failed();
+    assert!(s.dirty() && !s.can_reload(), "the rename is kept");
+    assert_eq!(s.ui.project_name, "Second");
+    assert_eq!(s.ed.doc.nodes.len(), 2);
+    // Only the explicit discard (the conflict banner's reload) takes the server's name.
+    s.reload(&canvas_named(&pages_now(&s), "p", "Renamed elsewhere"))
+        .unwrap();
+    assert_eq!(s.ui.project_name, "Renamed elsewhere");
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn rev2_the_page_line_offers_the_shown_page_s_own_actions() {
+    let mut s = state();
+    let page = in_header(&mut s, "Page 1");
+    click(&mut s, page, 100.0);
+    step(&mut s);
+    step(&mut s);
+    click_label(&mut s, "Duplicate page", 200.0);
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Page 1", "Page 1 copy"]);
+    assert_eq!(s.ed.page_name(), "Page 1 copy");
+    // Rename page… opens the shown page's own rename in the pages list: the same field, the
+    // same Enter, and the same page-list save.
+    let page = in_header(&mut s, "Page 1 copy");
+    click(&mut s, page, 300.0);
+    step(&mut s);
+    step(&mut s);
+    click_label(&mut s, "Rename page…", 400.0);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(1));
+    assert!(s.field_has_keyboard(), "its field has the keyboard");
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ed.page_name().contains('q'), "{}", s.ed.page_name());
+    assert_eq!(s.ed.pages[0].name, "Page 1", "only the shown page");
+    let snap = s.save_snapshot().expect("the page list is saved");
+    assert_eq!(saved_name(&snap), None, "not a file rename");
+}
+
+// ---- revision 2 corrections (R33): a panel edge's press, the typography the characters
+// have, one undo step per field interaction, a short surface's status, the zoom's room and
+// independent corners. Real input with time going on, as a browser delivers it.
+
+/// `n` frames, 16 ms apart.
+fn timed_frames(s: &mut WebState, n: usize) {
+    for _ in 0..n {
+        s.tick(s.now_ms + 16.0);
+        step(s);
+    }
+}
+
+/// A click at `p` a second after the last input (no double click), with its frames.
+fn timed_click(s: &mut WebState, (x, y): (f64, f64)) {
+    s.tick(s.now_ms + 1000.0);
+    s.pointer_move(x, y, s.now_ms);
+    s.pointer_down(x, y, Button::Primary, s.now_ms);
+    timed_frames(s, 1);
+    s.pointer_up(x, y, Button::Primary, s.now_ms);
+    timed_frames(s, 4);
+}
+
+/// A primary drag from `from` to `to` in 20 moves, a frame after each, as a person drags.
+fn timed_drag(s: &mut WebState, from: (f64, f64), to: (f64, f64)) {
+    s.tick(s.now_ms + 1000.0);
+    s.pointer_move(from.0, from.1, s.now_ms);
+    timed_frames(s, 2);
+    s.pointer_down(from.0, from.1, Button::Primary, s.now_ms);
+    timed_frames(s, 1);
+    for i in 1..=20 {
+        let f = i as f64 / 20.0;
+        let x = from.0 + (to.0 - from.0) * f;
+        let y = from.1 + (to.1 - from.1) * f;
+        s.pointer_move(x, y, s.now_ms);
+        timed_frames(s, 1);
+    }
+    s.pointer_up(to.0, to.1, Button::Primary, s.now_ms);
+    timed_frames(s, 5);
+}
+
+#[test]
+fn rev2_a_panel_edge_drag_resizes_the_panel_and_never_moves_the_shape_behind_it() {
+    // R33-F1: Layers and Design open at 1024 × 380, a rectangle reaching behind Design's edge
+    // (its resize handle reaches into the canvas).
+    let open = || {
+        let rect = crate::geom::Rect::new(450.0, 60.0, 200.0, 100.0);
+        let pages = [page("p", "Page 1", rect)];
+        let mut s = WebState::open(&canvas(&pages, "p"), false, 1024.0, 380.0).unwrap();
+        settle(&mut s, 0.0);
+        let layers = s.ui.chrome.layers.unwrap();
+        timed_click(&mut s, centre(layers));
+        assert!(s.ui.narrow.shown().is_some_and(|a| a.layers && a.design));
+        s
+    };
+    // Just inside the canvas, exactly on its edge, and just on the panel's side.
+    for offset in [-1.0, 0.0, 1.0] {
+        let mut s = open();
+        let before = page_to_json(&s.ed.page_data(0));
+        let edge = s.canvas_rect().max.x as f64;
+        let from = (edge + offset, 150.0);
+        timed_drag(&mut s, from, (from.0 - 100.0, 150.0));
+        let after = s.canvas_rect().max.x as f64;
+        assert!(after < edge - 70.0, "{offset}: resized to {after}");
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{offset}: nothing behind the edge moved"
+        );
+        assert!(!s.dirty(), "{offset}: nothing to save");
+    }
+    // Control: a drag that starts on the rectangle, clear of the edge, moves it.
+    let mut s = open();
+    let id = s.ed.doc.root[0];
+    let from = at(&s, 480.0, 110.0);
+    timed_drag(&mut s, from, (from.0 - 50.0, from.1));
+    let x = s.ed.doc.get(id).unwrap().rect.x;
+    assert!(x < 420.0, "the canvas drag moved the rectangle: {x}");
+    assert!(s.dirty());
+}
+
+/// Two text layers "Label" at base size 24, both selected; with `span`, the first one's
+/// whole text is a bold 48 range and the second stays plain.
+fn two_labels(span: bool) -> WebState {
+    let mut doc = Document::default();
+    for (i, (x, y)) in [(100.0, 100.0), (400.0, 300.0)].into_iter().enumerate() {
+        let id = doc.alloc_id();
+        let kind = NodeKind::Text {
+            text: "Label".into(),
+            font_size: 24.0,
+            auto_width: true,
+            align: crate::model::TextAlign::Left,
+        };
+        let mut n = Node::new(id, kind, crate::geom::Rect::new(x, y, 80.0, 30.0));
+        if span && i == 0 {
+            n.text_style.spans.push(crate::model::TextSpan {
+                start: 0,
+                end: 5,
+                size: Some(48.0),
+                bold: Some(true),
+                ..Default::default()
+            });
+        }
+        doc.nodes.insert(id, n);
+        doc.root.push(id);
+    }
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    s.modifiers(false, true, false, false);
+    assert!(s.key_down("a", "KeyA", false));
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.selection.len(), 2);
+    s
+}
+
+/// The Size field's value as the inspector shows it (the number painted after its "Size "
+/// prefix); `None` when there is no number there (Mixed).
+fn size_shown(s: &mut WebState) -> Option<f64> {
+    let text = inspector_text(s);
+    text.windows(2)
+        .find(|p| p[0] == "Size ")
+        .and_then(|p| p[1].parse().ok())
+}
+
+/// The font sizes of the page's layers, in order.
+fn label_sizes(s: &WebState) -> Vec<f64> {
+    let size = |id: &crate::model::NodeId| s.ed.doc.get(*id).unwrap().kind.font_size().unwrap();
+    s.ed.doc.root.iter().map(size).collect()
+}
+
+#[test]
+fn rev2_shared_typography_is_what_the_characters_have_ranges_included() {
+    // R33-F2: equal base sizes, but the first layer's text is a 48 range.
+    let mut s = two_labels(true);
+    let drawn = |s: &WebState, i: usize| {
+        let n = s.ed.doc.get(s.ed.doc.root[i]).unwrap();
+        let base = n.kind.font_size().unwrap();
+        n.text_style.char_style(0, base, Color::INK).size
+    };
+    assert_eq!(
+        (drawn(&s, 0), drawn(&s, 1)),
+        (48.0, 24.0),
+        "the layout draws 48 and 24"
+    );
+    let text = inspector_text(&mut s);
+    assert!(text.iter().any(|t| t == "Size Mixed"), "{text:?}");
+    assert_eq!(size_shown(&mut s), None, "never a shared 24");
+    assert!(
+        text.iter().any(|t| t.starts_with("Size or colour differs")),
+        "and why: {text:?}"
+    );
+    assert!(!s.dirty(), "looking changes nothing");
+    // Control: plain texts of one size share it, as a value to edit.
+    let mut s = two_labels(false);
+    assert_eq!(size_shown(&mut s), Some(24.0));
+    let text = inspector_text(&mut s);
+    assert!(!text.iter().any(|t| t == "Size Mixed"), "{text:?}");
+}
+
+/// Click the inspector's Size field, select its text and type `keys`, then Enter.
+fn type_in_size(s: &mut WebState, keys: &[(&str, &str)]) {
+    let right = s.canvas_rect().max.x;
+    let text = painted_text(s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, r)| t == "Size " && r.min.x >= right)
+        .unwrap_or_else(|| panic!("the Size field: {text:?}"));
+    timed_click(s, centre(*r));
+    assert!(s.field_has_keyboard(), "the Size field is in its text mode");
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    timed_frames(s, 1);
+    for (k, code) in keys {
+        press(s, k, code);
+        timed_frames(s, 1);
+    }
+    press(s, "Enter", "Enter");
+    timed_frames(s, 2);
+}
+
+#[test]
+fn rev2_one_size_interaction_is_one_undo_step_and_a_later_one_is_its_own() {
+    // R33-F3: typed key by key (each valid keystroke changes both layers).
+    let mut s = two_labels(false);
+    type_in_size(&mut s, &[("3", "Digit3"), ("0", "Digit0")]);
+    assert_eq!(label_sizes(&s), [30.0, 30.0], "both layers");
+    s.run(Action::Undo);
+    assert_eq!(label_sizes(&s), [24.0, 24.0], "one undo, the whole of it");
+    s.run(Action::Redo);
+    assert_eq!(label_sizes(&s), [30.0, 30.0], "one redo");
+    // A later interaction is a step of its own.
+    type_in_size(&mut s, &[("4", "Digit4"), ("0", "Digit0")]);
+    assert_eq!(label_sizes(&s), [40.0, 40.0]);
+    s.run(Action::Undo);
+    assert_eq!(label_sizes(&s), [30.0, 30.0], "only the later interaction");
+    // Dragging the value is one step too.
+    let mut s = two_labels(false);
+    let right = s.canvas_rect().max.x;
+    let text = painted_text(&mut s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, r)| t == "Size " && r.min.x >= right)
+        .unwrap_or_else(|| panic!("the Size field: {text:?}"));
+    let from = centre(*r);
+    timed_drag(&mut s, from, (from.0 + 40.0, from.1));
+    let dragged = label_sizes(&s);
+    assert!(
+        dragged[0] > 24.0 && dragged[0] == dragged[1],
+        "both, by the drag: {dragged:?}"
+    );
+    s.run(Action::Undo);
+    assert_eq!(label_sizes(&s), [24.0, 24.0], "one undo for the drag");
+}
+
+#[test]
+fn rev2_a_status_on_a_short_surface_stays_clear_of_the_rail_and_the_zoom() {
+    // R33-F4: the real refusal of Copy as PNG at 320 × 270, where the rail runs down the
+    // canvas's left side and the zoom sits beside it at the top.
+    let mut s = fresh(320.0, 270.0);
+    let before = page_to_json(&s.ed.page_data(0));
+    s.run(Action::CopyAsPng);
+    timed_frames(&mut s, 3);
+    let canvas = s.canvas_rect();
+    assert!(canvas.height() < crate::ui::rail::SHORT_H, "{canvas:?}");
+    let rail = s.ui.rail.rects.rail.unwrap();
+    let zoom = s.ui.chrome.zoom.unwrap();
+    let text = painted_text(&mut s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, _)| t.starts_with("PNG export and Copy as PNG"))
+        .unwrap_or_else(|| panic!("the refusal is shown: {text:?}"));
+    assert!(!overlap(*r, rail), "clear of the rail: {r:?} {rail:?}");
+    assert!(!overlap(*r, zoom), "clear of the zoom: {r:?} {zoom:?}");
+    assert!(canvas.contains_rect(*r), "inside the canvas: {r:?}");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+}
+
+#[test]
+fn rev2_the_zoom_stays_inside_a_canvas_narrowed_by_widened_panels() {
+    // R33-F5: at 1024 × 270 both panels dragged to their widest (420).
+    let mut s = fresh(1024.0, 270.0);
+    let layers = s.ui.chrome.layers.unwrap();
+    timed_click(&mut s, centre(layers));
+    let doc = s.ed.doc.clone();
+    let old = s.canvas_rect();
+    timed_drag(&mut s, (old.min.x as f64, 150.0), (420.0, 150.0));
+    let mid = s.canvas_rect();
+    assert!(mid.min.x > old.min.x + 100.0, "Layers widened: {mid:?}");
+    timed_drag(&mut s, (mid.max.x as f64, 150.0), (604.0, 150.0));
+    let canvas = s.canvas_rect();
+    assert!(canvas.max.x < mid.max.x - 100.0, "Design: {canvas:?}");
+    assert_eq!(s.ed.doc, doc, "resizing the panels drew nothing");
+    let inside = |s: &mut WebState, why: &str| {
+        timed_frames(s, 3);
+        let canvas = s.canvas_rect();
+        let rail = s.ui.rail.rects.rail.unwrap();
+        let zoom = s.ui.chrome.zoom.expect("a zoom control");
+        assert!(canvas.contains_rect(zoom), "{why}: {zoom:?} in {canvas:?}");
+        assert!(!overlap(zoom, rail), "{why}: clear of the rail");
+    };
+    inside(&mut s, "100%");
+    // Beside the rail there is no room for the whole group (R33 measured it 108 px wide):
+    // only the level is shown, and its own menu zooms in and out.
+    assert_eq!((s.ui.chrome.zoom_out, s.ui.chrome.zoom_in), (None, None));
+    let level = s.ui.chrome.zoom_level.unwrap();
+    timed_click(&mut s, centre(level));
+    let (zoom, t) = (s.ed.camera.zoom, s.now_ms);
+    click_label(&mut s, "Zoom In", t);
+    timed_frames(&mut s, 2);
+    assert!(s.ed.camera.zoom > zoom, "the level's Zoom In");
+    // Longer and shorter percentages keep it inside.
+    for _ in 0..12 {
+        s.run(Action::ZoomIn);
+    }
+    inside(&mut s, "zoomed in");
+    for _ in 0..24 {
+        s.run(Action::ZoomOut);
+    }
+    inside(&mut s, "zoomed out");
+    assert_eq!(s.ed.doc, doc, "zooming drew nothing");
+    // The rail's own targets still work beside it.
+    let chevron = s.ui.rail.rects.rows[2].1.unwrap();
+    timed_click(&mut s, centre(chevron));
+    assert_eq!(s.ui.rail.flyout, Some(2));
+}
+
+/// The inspector's text with two rectangles (radius 10) selected, their independent corners
+/// `a` and `b`.
+fn corners_selected(a: Option<[f64; 4]>, b: Option<[f64; 4]>) -> Vec<String> {
+    let mut doc = Document::default();
+    for (radii, (x, y)) in [(a, (100.0, 100.0)), (b, (400.0, 300.0))] {
+        let id = doc.alloc_id();
+        let r = crate::geom::Rect::new(x, y, 200.0, 100.0);
+        let mut n = Node::new(id, NodeKind::Rect, r);
+        n.style.corner_radius = 10.0;
+        n.style.radii = radii;
+        doc.nodes.insert(id, n);
+        doc.root.push(id);
+    }
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    s.modifiers(false, true, false, false);
+    assert!(s.key_down("a", "KeyA", false));
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.selection.len(), 2);
+    inspector_text(&mut s)
+}
+
+/// Whether the corner field with prefix `p` shows 10 in `text`.
+fn corner_shows_ten(text: &[String], p: &str) -> bool {
+    text.windows(2)
+        .any(|w| w[0] == p && w[1].parse::<f64>() == Ok(10.0))
+}
+
+#[test]
+fn rev2_independent_corners_are_mixed_only_when_they_differ() {
+    // R33-F6: every corner of both layers is 10.
+    let text = corners_selected(Some([10.0; 4]), Some([10.0; 4]));
+    assert!(!text.iter().any(|t| t == "Radius  Mixed"), "{text:?}");
+    for p in ["TL ", "TR ", "BR ", "BL "] {
+        assert!(corner_shows_ten(&text, p), "{p}10: {text:?}");
+    }
+    // One with independent corners, one without: the same corners still.
+    let text = corners_selected(Some([10.0; 4]), None);
+    assert!(!text.iter().any(|t| t == "Radius  Mixed"), "{text:?}");
+    // Control: one corner differs, so Mixed.
+    let text = corners_selected(Some([10.0; 4]), Some([10.0, 10.0, 10.0, 4.0]));
+    assert!(text.iter().any(|t| t == "Radius  Mixed"), "{text:?}");
+}
+
 // ---- keys
 
 #[test]

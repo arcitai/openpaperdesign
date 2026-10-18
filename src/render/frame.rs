@@ -54,7 +54,9 @@ impl Painter {
         }
     }
 
-    /// Draw a frame into `target` (`size` physical px).
+    /// Draw a frame into `target` (`size` physical px), with the canvas's background pattern
+    /// (`background`, a view preference: `UiState::background`; `true`/`false` mean the dot
+    /// grid or none).
     #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
@@ -65,7 +67,7 @@ impl Painter {
         ctx: &egui::Context,
         layout: Layout,
         ed: &Editor,
-        show_grid: bool,
+        background: impl Into<scene::Background>,
     ) {
         let ppp = layout.output.pixels_per_point;
         let offset = v2(layout.canvas.min.x as f64, layout.canvas.min.y as f64);
@@ -73,7 +75,7 @@ impl Painter {
         // gets a dark work surface and display-adapted drawing colours (`scene::Display`).
         let display = scene::Display::for_theme(ctx.theme());
         self.cache.set_display(display);
-        let frame = scene::canvas(ed, &mut self.cache, offset, show_grid);
+        let frame = scene::canvas(ed, &mut self.cache, offset, background);
         let mut enc = device.create_command_encoder(&Default::default());
         let bg = if self.transparent {
             [0.0; 4]
@@ -209,7 +211,7 @@ pub fn capture(
         &ctx,
         l,
         ed,
-        !st.show_grid_off,
+        st.background,
     );
     // The canvas size is known now; let the caller frame the camera.
     prepare(ed);
@@ -222,7 +224,7 @@ pub fn capture(
         &ctx,
         l,
         ed,
-        !st.show_grid_off,
+        st.background,
     );
     let l = layout(&ctx, input(), ed, st);
     painter.paint(
@@ -233,7 +235,7 @@ pub fn capture(
         &ctx,
         l,
         ed,
-        !st.show_grid_off,
+        st.background,
     );
     gpu.read(&tex)
 }

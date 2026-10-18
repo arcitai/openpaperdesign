@@ -204,13 +204,62 @@ impl View<'_> {
     }
 }
 
+/// The interactive canvas's background pattern (DESIGN.md): a view preference, never part of
+/// the document, its history, its saves, snapping or any export. A plain surface (`None`) by
+/// default; `Dots` is the zoom-adaptive dot grid; `Lines` the same spacing as thin lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Background {
+    #[default]
+    None,
+    Dots,
+    Lines,
+}
+
+impl Background {
+    pub const ALL: [Background; 3] = [Background::None, Background::Dots, Background::Lines];
+
+    /// The stored name (`none`, `dots` or `lines`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Background::None => "none",
+            Background::Dots => "dots",
+            Background::Lines => "lines",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Background> {
+        Background::ALL.into_iter().find(|b| b.name() == name)
+    }
+
+    /// The label menus show.
+    pub fn label(self) -> &'static str {
+        match self {
+            Background::None => "None",
+            Background::Dots => "Dots",
+            Background::Lines => "Lines",
+        }
+    }
+}
+
+/// The old on/off grid switch: on is the dot grid.
+impl From<bool> for Background {
+    fn from(grid: bool) -> Background {
+        if grid {
+            Background::Dots
+        } else {
+            Background::None
+        }
+    }
+}
+
 /// Dot grid whose spacing adapts to the zoom so it never gets too dense or sparse.
 pub fn grid(mb: &mut MeshBuilder, v: &View) {
     grid_dots(mb, v, GRID_DOT);
 }
 
-fn grid_dots(mb: &mut MeshBuilder, v: &View, dot: Color) {
-    let z = v.camera.zoom;
+/// World spacing of the background pattern at zoom `z`: 20 world px, scaled by fives so it stays
+/// between 14 and 70 screen px apart.
+fn grid_spacing(z: f64) -> f64 {
     let mut spacing = 20.0;
     while spacing * z < 14.0 {
         spacing *= 5.0;
@@ -218,6 +267,34 @@ fn grid_dots(mb: &mut MeshBuilder, v: &View, dot: Color) {
     while spacing * z > 70.0 {
         spacing /= 5.0;
     }
+    spacing
+}
+
+/// Line grid: the dot grid's spacing, as 1 px lines across the canvas.
+fn grid_lines(mb: &mut MeshBuilder, v: &View, line: Color) {
+    let spacing = grid_spacing(v.camera.zoom);
+    let vis = v.camera.visible_world(v.viewport);
+    let c = v.canvas_rect();
+    // Lines cover more of the surface than dots: a lighter stroke keeps the same quiet weight.
+    let [r, g, b, _] = rgba(line);
+    let color = [r, g, b, 0.6];
+    let x0 = (vis.x / spacing).floor() as i64;
+    let x1 = (vis.right() / spacing).ceil() as i64;
+    // Axis-aligned, so each line is a 1 px rectangle (no stroke tessellation per frame).
+    for xi in x0..=x1 {
+        let x = v.to_screen(v2(xi as f64 * spacing, 0.0)).x;
+        mb.rect(Rect::new(x - 0.5, c.y, 1.0, c.h), color);
+    }
+    let y0 = (vis.y / spacing).floor() as i64;
+    let y1 = (vis.bottom() / spacing).ceil() as i64;
+    for yi in y0..=y1 {
+        let y = v.to_screen(v2(0.0, yi as f64 * spacing)).y;
+        mb.rect(Rect::new(c.x, y - 0.5, c.w, 1.0), color);
+    }
+}
+
+fn grid_dots(mb: &mut MeshBuilder, v: &View, dot: Color) {
+    let spacing = grid_spacing(v.camera.zoom);
     let vis = v.camera.visible_world(v.viewport);
     let x0 = (vis.x / spacing).floor() as i64;
     let y0 = (vis.y / spacing).floor() as i64;
@@ -768,9 +845,15 @@ fn fmt_num(x: f64) -> String {
     }
 }
 
-/// Full interactive canvas: background grid, document, overlay, shown with the cache's
-/// [`Display`].
-pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) -> CanvasFrame {
+/// Full interactive canvas: background pattern (`background`; `true`/`false` are the dot grid
+/// or none), document, overlay, shown with the cache's [`Display`]. The pattern is built each
+/// frame in screen space under the cached document items, so switching it touches no cache.
+pub fn canvas(
+    ed: &Editor,
+    cache: &mut SceneCache,
+    offset: V2,
+    background: impl Into<Background>,
+) -> CanvasFrame {
     let v = View {
         doc: &ed.doc,
         camera: ed.camera,
@@ -781,8 +864,10 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
     let mut under = MeshBuilder::default();
     under.set_clip(Some(v.canvas_rect()));
     under.rect(v.canvas_rect(), rgba(display.background()));
-    if show_grid {
-        grid_dots(&mut under, &v, display.grid_dot());
+    match background.into() {
+        Background::None => {}
+        Background::Dots => grid_dots(&mut under, &v, display.grid_dot()),
+        Background::Lines => grid_lines(&mut under, &v, display.grid_dot()),
     }
     let vis = ed.camera.visible_world(ed.viewport);
     let bucket = zoom_bucket(ed.camera.zoom);
@@ -809,6 +894,53 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
         camera: ed.camera,
         offset,
         viewport: v.canvas_rect(),
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    fn under_vertices(ed: &Editor, b: Background) -> usize {
+        let f = canvas(ed, &mut SceneCache::default(), V2::ZERO, b);
+        f.under.iter().map(|b| b.mesh.vertices.len()).sum()
+    }
+
+    #[test]
+    fn none_is_the_plain_surface_and_dots_and_lines_are_underlay_only() {
+        let mut ed = Editor::default();
+        let r = Rect::new(100.0, 100.0, 50.0, 50.0);
+        ed.add_node(Node::new(NodeId(0), NodeKind::Rect, r), None);
+        assert_eq!(
+            Background::default(),
+            Background::None,
+            "a fresh view is plain"
+        );
+        assert_eq!(
+            under_vertices(&ed, Background::None),
+            4,
+            "the surface alone"
+        );
+        let dots = under_vertices(&ed, Background::Dots);
+        let lines = under_vertices(&ed, Background::Lines);
+        assert!(dots > 4 && lines > 4 && dots != lines, "{dots} {lines}");
+        // The old switch: on is the dot grid, off is none.
+        assert_eq!(under_vertices(&ed, Background::from(true)), dots);
+        assert_eq!(Background::from(false), Background::None);
+        // The document's own meshes are the same whatever the pattern.
+        let items = |b: Background| {
+            let f = canvas(&ed, &mut SceneCache::default(), V2::ZERO, b);
+            f.items
+                .iter()
+                .map(|i| (i.id, i.pieces.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(items(Background::None), items(Background::Lines));
+        assert_eq!(items(Background::None), items(Background::Dots));
+        for b in Background::ALL {
+            assert_eq!(Background::from_name(b.name()), Some(b));
+        }
+        assert_eq!(Background::from_name("grid"), None);
     }
 }
 

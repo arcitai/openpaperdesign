@@ -180,6 +180,19 @@ impl Editor {
     /// Apply a style change to the selected text range, or to whole text layers when not
     /// editing (or editing without a selection).
     pub fn style_text(&mut self, field: &str, f: impl Fn(&mut TextSpan)) {
+        self.style_text_with(field, false, f);
+    }
+
+    /// [`Editor::style_text`] from one interaction with an inspector field (typing a value in
+    /// it, dragging it): a whole-layer change coalesces with that field's previous change to the
+    /// same layers into one undo step until the field seals it (released, or its focus gone),
+    /// as the inspector's other fields do. A text range's change is part of its text edit, as
+    /// before.
+    pub fn style_text_coalesced(&mut self, field: &str, f: impl Fn(&mut TextSpan)) {
+        self.style_text_with(field, true, f);
+    }
+
+    fn style_text_with(&mut self, field: &str, coalesce: bool, f: impl Fn(&mut TextSpan)) {
         if let (Some(te), Some((a, b))) = (self.text_edit.clone(), self.text_selection()) {
             {
                 let mut tx = self.tx();
@@ -209,7 +222,11 @@ impl Editor {
             return;
         }
         let editing = self.text_edit.is_some();
-        if !editing {
+        if !editing && coalesce {
+            // The inspector's key: the field and the layers it changes (`inspector::apply`).
+            let key = format!("{field}:{ids:?}");
+            self.begin_coalescing(&format!("Change {field}"), Some(&key));
+        } else if !editing {
             self.begin(&format!("Change {field}"));
         }
         for id in &ids {

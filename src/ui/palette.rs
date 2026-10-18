@@ -35,6 +35,8 @@ pub enum Command {
     Layer(NodeId),
     Library(String),
     ToggleLibrary,
+    /// The canvas's background pattern (a view preference, see `UiState::set_background`).
+    Background(crate::render::scene::Background),
 }
 
 pub struct Entry {
@@ -134,6 +136,17 @@ pub fn entries(ed: &Editor, st: &UiState) -> Vec<Entry> {
         detail: String::new(),
         cmd: Command::ToggleLibrary,
     });
+    for b in crate::render::scene::Background::ALL {
+        out.push(Entry {
+            label: format!("Background: {}", b.label()),
+            detail: if st.background == b {
+                "Shown".into()
+            } else {
+                "View".into()
+            },
+            cmd: Command::Background(b),
+        });
+    }
     for (i, p) in ed.pages.iter().enumerate() {
         out.push(Entry {
             label: format!("Go to page: {}", p.name),
@@ -194,6 +207,7 @@ pub fn run(ed: &mut Editor, st: &mut UiState, cmd: Command) {
             }
         }
         Command::ToggleLibrary => st.show_library = !st.show_library,
+        Command::Background(b) => st.set_background(b),
     }
 }
 

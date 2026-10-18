@@ -298,7 +298,7 @@ impl WebEditor {
             &self.state.ctx,
             layout,
             &self.state.ed,
-            !self.state.ui.show_grid_off,
+            self.state.ui.background,
         );
         g.queue.present(tex);
         self.state.drawn();
@@ -324,6 +324,17 @@ impl WebEditor {
     /// Whether the workspace is shown dark now.
     pub fn dark(&self) -> bool {
         self.state.dark()
+    }
+
+    /// Apply a kept canvas background (`none`, `dots` or `lines`); false (and nothing
+    /// changed) for an unknown one.
+    pub fn set_background(&mut self, name: &str) -> bool {
+        self.state.set_background(name)
+    }
+
+    /// The canvas background now, after a `background` request.
+    pub fn background(&self) -> String {
+        self.state.background().to_string()
     }
 
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {
@@ -390,7 +401,7 @@ impl WebEditor {
         self.state.cursor().to_string()
     }
 
-    /// The next host request ("save", "home" or "appearance"), if any.
+    /// The next host request ("save", "home", "appearance" or "background"), if any.
     pub fn take_request(&mut self) -> Option<String> {
         self.state.take_request().map(|r| r.name().to_string())
     }

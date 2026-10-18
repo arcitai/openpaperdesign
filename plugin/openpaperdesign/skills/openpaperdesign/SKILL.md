@@ -41,6 +41,10 @@ You can work on the same canvas:
 - `openpaperdesign_status` reports `mode: app-library`, the library folder and the open canvas.
   This server has no workspace: don't claim it can bind or edit a repository project.
 - A canvas open in another Codex window is busy; it isn't taken over.
+- The person can rename the file from the editor's title. The name is saved with their next
+  canvas save, so their editor counts as unsaved until then. The canvas background (none,
+  dots or lines) and Home's grid or list are view preferences: never canvas content, and
+  nothing to edit or report as a change.
 - A library canvas is app-owned until the person exports it. Export gives a canvas file:
   the canvas as last saved, without design direction (`DESIGN.md`) or tokens. Unsaved edits
   in a browser tab aren't in it. Import makes a new canvas from such a file and never

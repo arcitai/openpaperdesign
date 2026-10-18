@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.56 · Updated: 2026-10-18
+Revision: 0.59 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -154,6 +154,92 @@ engine architecture is `analysis/DESIGN.md`.
       browser host does (`crates/openpaperdesign-web/src/state.rs`).
     - Same Editor, Session, transactions, save, binding and lease; no renderer change.
       Upstreamable as presentation, except the panel defaults, which are an OPD choice.
+  - Revision 2 workspace, slices 4–6 (same plan; root `DESIGN.md` principles 2, 10 and 11).
+    Native windows change too.
+    - **Background.**
+      - `src/render/scene.rs`: `Background` (None by default, Dots or Lines) and a line grid
+        beside the dot grid, built each frame in the screen-space underlay (no cache).
+        `scene::canvas` and `Painter::paint` take `impl Into<Background>`, so an existing
+        `bool` caller still means dot grid or none.
+      - `src/ui/mod.rs`: `UiState::background` replaces `show_grid_off`, set with
+        `set_background`. `toggle_background` (the grid shortcut, ToggleGrid) toggles None
+        against the last pattern.
+      - The canvas's own menu (`open_canvas_menu`, `canvas_menu`): Background, Zoom to Fit
+        and Collapse / Restore Panels.
+      - `UiState::captures_input` (flyout or canvas menu open) is what both hosts now check
+        before a canvas press or Escape.
+      - Menu ▸ Background and About & notices (`NOTICES`).
+      - `src/ui/palette.rs`: `Command::Background`.
+      - `src/editor/shortcuts.rs`: the View item "Dot Grid" is "Background On/Off".
+      - `src/macos.rs`: its check item starts off, labelled Background.
+      - `src/app.rs`: paints `st.background` and uses `captures_input`. The background is not
+        persisted natively (one window's view).
+      - Reason: plan section 4. The existing grid renderer and shortcut are reused; no
+        second engine, DOM grid or document change.
+    - **Header identity.**
+      - `src/ui/mod.rs`: `UiState::file_rename` (a host opt-in; native off), the title's
+        `file_title_draft`/`file_title_field` and `file_name`.
+      - The page line's page actions (`page_actions`), through `pages::run_action` and
+        `PageAction` (now `pub(super)`, no behaviour change).
+      - Reason: plan section 6. Page rename stays upstream's own page transaction; the file
+        name is saved by the host's canvas save, below.
+  - Revision 2 corrections (independent review R33 of slices 1–3, and the first slice 4–6
+    checks; root `DESIGN.md` revision 8). Native windows change too.
+    - **A panel edge's press** (R33-F1; inherited from before revision 2): a wide panel's
+      resize handle reaches into the canvas, and its first press also reached the editor, so a
+      panel resize dragged the shape behind the edge. `src/ui/mod.rs` records each handle as
+      laid out (`Chrome::panel_edges`: egui's own handle widget, read by its egui 0.36 id and
+      widened by egui's interact radius, within which egui's hit test gives it the press);
+      `Chrome::on_panel_edge` is what both hosts (`src/app.rs`, the browser host's
+      `pointer_down`) check before a canvas press, and the canvas menu doesn't open there.
+      Editor semantics are unchanged.
+    - **Effective typography** (R33-F2), `src/ui/inspector.rs`: several text layers share a
+      size, colour, bold or italic only when every character has it, from upstream
+      `TextStyle::char_style` per run between range edges (`char_styles`, `shared_char`);
+      otherwise Mixed, with a hint. Before, base values were compared, so a 48 range beside a
+      plain 24 showed an editable "shared" 24.
+    - **One undo step per field interaction** (R33-F3), `src/editor/text_edit.rs`:
+      `Editor::style_text_coalesced` is `style_text` with the inspector's coalescing key (field
+      and layers) through the existing `begin_coalescing`, sealed by the field's release or
+      focus loss as before. The inspector's Size and colour use it; ⌘B/⌘I and other callers
+      keep `style_text` (one step per press). A text range's change is unchanged.
+    - **Status and zoom room** (R33-F4, F5), `src/ui/mod.rs`: `status` is placed right of the
+      zoom and rail rects laid out this frame wherever they reach the canvas's lower half (a
+      short canvas's rail did not count before). `zoom_controls` judges its room from its
+      measured width (kept in egui's temp memory) plus the current percentage's text: without
+      room only the level is shown, its menu adding Zoom In/Out; without room for that, none.
+    - **Independent corners** (R33-F6), `src/ui/inspector.rs`: several layers' corners are
+      compared corner by corner (`corner_radii`), so equal ones show the four fields, not
+      Mixed.
+    - **The just-closed canvas menu** (slice 4–6 checks): egui counts an area visible for one
+      frame after its last, so until the next frame a press where the closed menu was found its
+      stale area: a secondary click there didn't reopen it, and a press there (a middle-button
+      pan) never reached the editor. One shared rule, `UiState::takes_pointer` /
+      `ui::over_floating_ui` (any area above the background, except the canvas menu's own
+      layer while it is closed), is now used by `open_canvas_menu`, the browser host's
+      `over_canvas` and the native `App::over_canvas` (which used `is_pointer_over_egui`, the
+      same `layer_id_at` test, at egui's last pointer position). An open menu still takes
+      presses (`captures_input`); every other area still owns its stale frame as before.
+    - **Home shows and sends library names exactly** (lead identity probes, not upstream):
+      `crates/openpaperdesign-serve/src/home.html` used the workspace label rule
+      (`cleanName`: quotes and backticks to spaces, spaces collapsed, cut at 60 UTF-16 units)
+      for library files too, so a legal saved `A  file "quoted"` showed as `A file quoted`
+      and a 60-character name ending in an emoji was cut through its surrogate pair. Library
+      names now follow the server's `canvas_name` rule: `libraryName` shows the saved name
+      exactly (an answer breaking the rule is still bounded: controls to spaces, 60 whole
+      characters), and Rename's `libraryNameInput` trims and refuses, with a reason, a name
+      with control characters or over 60 characters instead of rewriting it. The rename
+      field's `maxlength` is 120 UTF-16 units (any 60 characters fit); storage and the
+      server's bounds are unchanged. `cleanName` stays the workspace view's label rule.
+    - Reason: review findings on the admitted slices; same Editor, transactions, renderer,
+      Session, save, binding and lease. Upstreamable as fixes.
+- Upstream changes in the browser host (not upstream-owned, for reference):
+  - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
+    (`Chrome::on_panel_edge`), as `App` does.
+  - `WebState` reports `HostRequest::Background` and applies a kept one
+    (`set_background`).
+  - It saves a finished title rename in the canvas save (`saved_name`, the in-flight
+    `name`). A draft is guarded as the renames are, and a reload closes it.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -270,7 +356,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-8.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-9.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -295,8 +381,15 @@ exports by `id`; `home-7` (2026-10-18 source candidate) is the quieter workspace
 follows the view's light or dark appearance; `home-8` (2026-10-18 source candidate) is one
 System/Light/Dark appearance across the view, the editor's chrome and its canvas display (the
 renderer's `start` takes the OS appearance and the kept preference; the view keeps a menu
-choice with `openpaperdesign_app_appearance`). A view a host already cached under an earlier
-key is not evicted or refreshed by this.
+choice with `openpaperdesign_app_appearance`); `home-9` (2026-10-19 source candidate, revision
+2 slices 4–6) is the quiet Home:
+- Grid first, equal cards, no footer or wordmark, About & notices in the menu, and the
+  storage cue;
+- the home layout and the editor's canvas background kept with `openpaperdesign_app_view`
+  and reported by the list (`view`);
+- the editor's file rename, sent in its canvas save.
+
+A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -360,7 +453,9 @@ tool argument as a path. Layout `<root>/library/v1/canvases/<id>/` (a standard p
 the only live copy) and `locks/<id>.lock`; ids are 16 hex digits made by the server; names are
 data. Listing creates and locks nothing and is bounded (entries and manifest bytes). In that
 process only the home, its resource, `openpaperdesign_status` (library report), the read-only
-inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export,rename}`
+inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export,rename,appearance,view}`
+(the last two keep view preferences in `library/v1/appearance` and `library/v1/view`: no
+canvas, lease or binding)
 and in-panel editor tools (`_app_editor_asset`, `_app_canvas`, `_app_canvas_revision`,
 `_app_canvas_save`, the per-page `_app_page`, `_app_page_revision`, `_app_page_save`,
 `_app_ready`, `_app_page_release`), plus the agent's library controls and
@@ -471,11 +566,13 @@ limits, input and focus in the native panel are unproven.
 
 One OPD app (owner admission 2026-10-18, superseding the 2026-10-17 web-editor-first home):
 the library view is one application in whatever surface Codex grants it. Home is a calm file
-library: the app-owned context said plainly ("OpenPaperDesign library: files this app keeps
-itself, not part of a Codex project"; app-library files have no native-project grouping or
-association, so none is shown, implied or granted), New file (created at once as "Untitled"),
-search by name (Escape clears), a list/grid toggle (memory only), and named files with pages
-and last edit (relative, else the date), each with a restrained menu: Open, Rename… (a form;
+library: the app-owned context said plainly as the storage cue ("New files are kept in the
+OpenPaperDesign library, this app's own data folder, not in a Codex project"; app-library
+files have no native-project grouping or association, so none is shown, implied or granted),
+New file (created at once as "Untitled"), search by name (Escape clears), a grid of equal
+cards by default or a list (the library keeps the choice, `openpaperdesign_app_view`), no
+footer (the licences and notices are the More menu's About & notices), and named files with
+pages and last edit (relative, else the date), each with a restrained menu: Open, Rename… (a form;
 `_app_rename`) and Export… (`_app_export {id}`), keyboard-operable (arrows, Home/End, Escape
 back to its button). There is no "Open in new chat". Workspace mode keeps its genuine project
 selection unchanged. With the module, New file, Open, Import and Open current file send
@@ -561,9 +658,13 @@ active page listed, each page file parsed and validated by upstream and naming i
 then against the canvas under the fence: any change since (any page, the list or the active
 page) is a 409 with nothing written (conservative, no merge); a page new to the list must
 carry its content (no listed id reaches an unlisted file), and a changed name must be a page
-name. One `commit_fenced` writes the sent pages and the manifest (server-owned identity, name,
-format, version and creation time; the sent list and active page); rollback and `Broken` as
-for every save. A page left out of the list keeps its file, unreferenced and unreadable by id,
+name. An optional `name` (revision 2 slice 6) renames the file in that same commit. It
+follows the app's Rename rules (1–60 characters after trimming, no control characters); an
+editor that doesn't send it keeps the name. One `commit_fenced` writes the sent pages and the
+manifest (server-owned identity, format, version and creation time; the sent list, active
+page and, when sent, name); rollback and `Broken` as for every save. A rename made elsewhere
+(the library's Rename) changes the canvas revision, so a dirty editor's save is a 409, as for
+any other change. A page left out of the list keeps its file, unreferenced and unreadable by id,
 as the agent's saves leave it; nothing is erased. The per-page API stays as it was. Dirty is
 upstream's own bookkeeping (`dirty_pages`, `meta_dirty`) plus the document stamp; a save
 records each sent page's history generation (`Editor::page_gen`) and the list and active page

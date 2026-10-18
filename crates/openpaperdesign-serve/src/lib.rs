@@ -1061,10 +1061,29 @@ fn check_page_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A file name a canvas save may set, by the app library's rename rule: 1 to
+/// `library::MAX_NAME_CHARS` characters after trimming, without control characters. Returns
+/// the trimmed name.
+fn check_canvas_name(name: &str) -> Result<String, String> {
+    let n = name.trim();
+    if n.is_empty()
+        || n.chars().count() > library::MAX_NAME_CHARS
+        || n.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "a file name has 1 to {} characters, without control characters",
+            library::MAX_NAME_CHARS
+        ));
+    }
+    Ok(n.to_string())
+}
+
 /// A canvas save, checked (see [`parse_canvas_save`]).
 struct CanvasSave {
     active: String,
     pages: Vec<SavedPage>,
+    /// The file's new name, when the save renames it (the editor's title).
+    name: Option<String>,
 }
 
 /// One page of a canvas save: its id and name, and its content when it changed.
@@ -1074,12 +1093,14 @@ struct SavedPage {
     page: Option<PageData>,
 }
 
-/// A canvas save as the editors send it: `{active_page, pages: [{id, name, text?}]}`, the
+/// A canvas save as the editors send it: `{active_page, pages: [{id, name, text?}], name?}`, the
 /// whole page list in its new order, with `text` (an upstream page file) for each page whose
-/// content is saved. Only those fields; 1 to `MAX_PAGES` pages; ids checked as one project's
-/// (`check_page_ids`); the active page one of them; each page file parsed and validated by
-/// upstream (`page_from_json`: format, version, node graph) and naming its own id. Checked
-/// completely, with no file touched, before a save takes the writer fence.
+/// content is saved, and the file's new `name` when the editor renamed it (an older editor
+/// never sends it, and its saves keep the name as it is). Only those fields; 1 to `MAX_PAGES`
+/// pages; ids checked as one project's (`check_page_ids`); the active page one of them; each
+/// page file parsed and validated by upstream (`page_from_json`: format, version, node graph)
+/// and naming its own id; a name by `check_canvas_name`. Checked completely, with no file
+/// touched, before a save takes the writer fence.
 fn parse_canvas_save(body: &str) -> Result<CanvasSave, ApiError> {
     use serde_json::Value;
     let bad = |msg: String| {
@@ -1095,12 +1116,17 @@ fn parse_canvas_save(body: &str) -> Result<CanvasSave, ApiError> {
         .ok_or_else(|| bad("the canvas save must be an object".into()))?;
     if let Some(k) = obj
         .keys()
-        .find(|k| !matches!(k.as_str(), "active_page" | "pages"))
+        .find(|k| !matches!(k.as_str(), "active_page" | "pages" | "name"))
     {
         return Err(bad(format!(
             "the canvas save has an unexpected field `{k}`"
         )));
     }
+    let name = match obj.get("name") {
+        None => None,
+        Some(Value::String(n)) => Some(check_canvas_name(n).map_err(bad)?),
+        Some(_) => return Err(bad("the file's `name` must be text".into())),
+    };
     let list = obj
         .get("pages")
         .and_then(Value::as_array)
@@ -1172,6 +1198,7 @@ fn parse_canvas_save(body: &str) -> Result<CanvasSave, ApiError> {
     Ok(CanvasSave {
         active: active.to_string(),
         pages,
+        name,
     })
 }
 
@@ -1531,6 +1558,10 @@ impl Server {
         let mut manifest = f.project.manifest.clone();
         manifest.pages = list;
         manifest.active_page = Some(save.active);
+        // A rename from the editor's title lands in this same commit and revision.
+        if let Some(name) = save.name {
+            manifest.name = name;
+        }
         manifest.modified = now_ms();
         let manifest_bytes = manifest.to_json().into_bytes();
         writes.push(commit::Write {
@@ -2054,6 +2085,77 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("new to the canvas"), "{body}");
         assert_eq!(disk(&p.dir), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The editor's title rename travels in its canvas save (revision 2, slice 6): the file's
+    /// name and a changed page are one commit and one revision; a save without `name` (an older
+    /// editor) keeps the name; an invalid name is refused with nothing written; and a rename
+    /// made elsewhere since the editor loaded the canvas (the library's Rename of the open
+    /// canvas) is a conflict: neither the editor's name nor its content is written.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_canvas_save_renames_the_file_with_its_pages_in_one_commit() {
+        let (root, p, s) = canvas_project("name");
+        let first = p.manifest.pages[0].id.clone();
+        let rev = canvas_rev(&s).await;
+        let save = serde_json::json!({"active_page": first, "name": "  Launch plan ", "pages": [
+            {"id": first, "name": "Page 1", "text": page_text(&first, 2)},
+        ]});
+        let (st, rev, body) = request(&s, "PUT", "/api/canvas", Some(&rev), save.to_string()).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let rev = rev.unwrap();
+        let m = read_manifest_checked(&p.dir).unwrap();
+        assert_eq!(m.name, "Launch plan", "trimmed, as Rename keeps it");
+        assert_eq!(m.id, p.manifest.id, "the identity stays the server's");
+        let written = std::fs::read_to_string(p.page_path(&first)).unwrap();
+        let written = page_from_json(&written).unwrap();
+        assert_eq!(written.doc.nodes.len(), 2, "the page in the same commit");
+        assert_eq!(canvas_rev(&s).await, rev, "one revision for both");
+        let (_, _, body) = request(&s, "GET", "/api/canvas", None, String::new()).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["canvas"]["name"], "Launch plan");
+        // An older editor's save (no `name`) keeps the name as it is.
+        let same = serde_json::json!({"active_page": first, "pages": [
+            {"id": first, "name": "Page 1"},
+        ]});
+        let (st, rev, body) = request(&s, "PUT", "/api/canvas", Some(&rev), same.to_string()).await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let rev = rev.unwrap();
+        assert_eq!(read_manifest_checked(&p.dir).unwrap().name, "Launch plan");
+        // Invalid names, each on the current revision: refused, nothing written.
+        let before = disk(&p.dir);
+        let names = [
+            (serde_json::json!(""), "1 to 60 characters"),
+            (serde_json::json!("   "), "1 to 60 characters"),
+            (serde_json::json!("x".repeat(61)), "1 to 60 characters"),
+            (serde_json::json!("a\u{7}b"), "control characters"),
+            (serde_json::json!(7), "must be text"),
+        ];
+        for (name, why) in names {
+            let save = serde_json::json!({"active_page": first, "name": name, "pages": [
+                {"id": first, "name": "Page 1"},
+            ]});
+            let (st, _, body) =
+                request(&s, "PUT", "/api/canvas", Some(&rev), save.to_string()).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{why}: {body}");
+            assert!(body.contains(why), "{why}: {body}");
+            assert!(body.contains("nothing was written"), "{why}: {body}");
+            assert_eq!(disk(&p.dir), before, "{why}");
+        }
+        // The library renames the open canvas meanwhile (`_app_rename` goes through this same
+        // fence): the editor's rename and change, based on what it loaded, are a conflict.
+        assert!(s.rename_canvas("Renamed in the library").await.is_ok());
+        let before = disk(&p.dir);
+        let mine = serde_json::json!({"active_page": first, "name": "Mine", "pages": [
+            {"id": first, "name": "Page 1", "text": page_text(&first, 3)},
+        ]});
+        let (st, tag, body) = request(&s, "PUT", "/api/canvas", Some(&rev), mine.to_string()).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        let now = canvas_rev(&s).await;
+        assert_eq!(tag.as_deref(), Some(now.as_str()), "the current revision");
+        assert_eq!(disk(&p.dir), before, "nothing of the stale save");
+        let name = read_manifest_checked(&p.dir).unwrap().name;
+        assert_eq!(name, "Renamed in the library");
         let _ = std::fs::remove_dir_all(&root);
     }
 

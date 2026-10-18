@@ -50,6 +50,10 @@ pub(super) const RENAME: &str = "openpaperdesign_app_rename";
 /// The views' appearance preference (System, Light or Dark), kept in the library's own data
 /// folder; the list reports it. A view preference: no canvas, lease or binding is involved.
 pub(super) const APPEARANCE: &str = "openpaperdesign_app_appearance";
+/// The views' other view preferences (the home's layout and the editor's canvas background),
+/// one small record in the library's own data folder; the list reports them. As the
+/// appearance: no canvas, lease or binding is involved.
+pub(super) const VIEW: &str = "openpaperdesign_app_view";
 // The in-panel editor's transport (the home view's own editor, see `panel_call`).
 pub(super) const ASSET: &str = "openpaperdesign_app_editor_asset";
 pub(super) const PAGE: &str = "openpaperdesign_app_page";
@@ -73,7 +77,7 @@ pub(super) const PANEL_TOOLS: [&str; 9] = [
     CANVAS_REVISION,
     CANVAS_SAVE,
 ];
-pub(super) const TOOLS: [&str; 18] = [
+pub(super) const TOOLS: [&str; 19] = [
     LIST,
     CREATE,
     OPEN,
@@ -83,6 +87,7 @@ pub(super) const TOOLS: [&str; 18] = [
     EXPORT,
     RENAME,
     APPEARANCE,
+    VIEW,
     ASSET,
     PAGE,
     REVISION,
@@ -300,6 +305,14 @@ fn tools() -> Vec<Value> {
                 no canvas is read or changed.",
             "inputSchema": doc(json!({"appearance": {"type": "string",
                 "enum": crate::library::APPEARANCES}}), &["appearance"])}),
+        json!({"name": VIEW, "_meta": app,
+            "description": "For the home view: keep the views' other preferences, the home's file \
+                layout (grid or list) and the editor's canvas background (none, dots or lines). \
+                View preferences in the library's own folder: no canvas is read or changed.",
+            "inputSchema": {"type": "object", "properties": {
+                "home_layout": {"type": "string", "enum": crate::library::HOME_LAYOUTS},
+                "background": {"type": "string", "enum": crate::library::BACKGROUNDS}
+            }, "minProperties": 1, "additionalProperties": false}}),
         json!({"name": CREATE, "_meta": app,
             "description": "For the home view: create a new, empty canvas in the app library \
                 and open it in the editor. No design system or direction is applied.",
@@ -493,6 +506,7 @@ impl Launcher {
             EXPORT => (&["binding", "id"], &[]),
             RENAME => (&["id", "name"], &[]),
             APPEARANCE => (&["appearance"], &[]),
+            VIEW => (&["home_layout", "background"], &[]),
             CLOSE => (&["binding"], &["force"]),
             IMPORT => (&["payload", "replace"], &["force", "panel"]),
             _ => (&[], &[]),
@@ -523,7 +537,17 @@ impl Launcher {
                 let mut listed = lib.list(open.as_deref())?;
                 // Read-only too: a missing or unknown preference is System, and nothing is made.
                 listed["appearance"] = json!(lib.appearance());
+                // Likewise the other view preferences (their defaults: grid, no background).
+                listed["view"] = lib.view().to_json();
                 text(listed)
+            }
+            VIEW => {
+                let kept = lib.set_view(get("home_layout"), get("background"))?;
+                text(json!({
+                    "view": kept.to_json(),
+                    "note": "Kept as this library's view preferences. No canvas was read or \
+                        changed.",
+                }))
             }
             APPEARANCE => {
                 let kept = lib.set_appearance(get("appearance").unwrap_or(""))?;
