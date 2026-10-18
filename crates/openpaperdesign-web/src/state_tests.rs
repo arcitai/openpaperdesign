@@ -79,13 +79,43 @@ fn sent_page(snap: &str) -> PageData {
 }
 
 /// One 200×100 rectangle at world (100, 100) on the canvas's one page; camera at zoom 1, no
-/// pan; laid out once.
+/// pan; laid out, with the Layers panel opened as a person opens it (a fresh view starts with
+/// it closed, see the revision 2 workspace tests), so its rows and the pages panel are there.
 fn state() -> WebState {
     let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
     let pages = [page("p", "Page 1", rect)];
     let mut s = WebState::open(&canvas(&pages, "p"), false, W, H).unwrap();
     settle(&mut s, 0.0);
+    open_layers(&mut s);
     s
+}
+
+/// The centre of a laid-out control (CSS px).
+fn centre(r: egui::Rect) -> (f64, f64) {
+    (r.center().x as f64, r.center().y as f64)
+}
+
+/// A click on the header's Layers toggle, then the arrangement settles.
+fn toggle_layers(s: &mut WebState) {
+    let r =
+        s.ui.chrome
+            .layers
+            .expect("the header's Layers toggle is laid out");
+    click(s, centre(r), 1.0);
+    for _ in 0..4 {
+        step(s);
+    }
+}
+
+/// [`toggle_layers`] when the Layers panel isn't shown yet.
+fn open_layers(s: &mut WebState) {
+    if !s.ui.narrow.shown().is_some_and(|a| a.layers) {
+        toggle_layers(s);
+    }
+    assert!(
+        s.ui.narrow.shown().is_some_and(|a| a.layers),
+        "the Layers panel opened"
+    );
 }
 
 /// Two pages: "Alpha" (a 200×100 rectangle at (100, 100)) and "Beta" (a 50×50 one at
@@ -109,6 +139,7 @@ fn two_pages_data() -> Vec<PageData> {
 fn two_pages() -> WebState {
     let mut s = WebState::open(&canvas(&two_pages_data(), "beta22"), false, W, H).unwrap();
     settle(&mut s, 0.0);
+    open_layers(&mut s);
     s
 }
 
@@ -229,12 +260,15 @@ fn panel_presses_never_reach_the_canvas() {
 #[test]
 fn hover_and_modifier_changes_redraw() {
     let mut s = state();
+    // The page's clock goes on from where the fixture left it: egui's time never runs
+    // backwards (it already knows the pointer, from the fixture's click on Layers).
+    let t0 = s.now_ms;
     let (x, y) = at(&s, 150.0, 150.0);
-    s.pointer_move(x, y, 10.0);
+    s.pointer_move(x, y, t0 + 10.0);
     assert!(s.ed.hover.is_some());
-    assert!(s.tick(16.0));
+    assert!(s.tick(t0 + 16.0));
     step(&mut s);
-    let t = settle(&mut s, 32.0);
+    let t = settle(&mut s, t0 + 32.0);
     s.modifiers(false, false, true, false);
     assert!(s.tick(t), "Alt shows distance guides");
     let t = settle(&mut s, t);
@@ -485,6 +519,23 @@ fn painted_text(s: &mut WebState) -> Vec<(String, egui::Rect)> {
 
 fn paints(s: &mut WebState, wanted: &str) -> bool {
     painted_text(s).iter().any(|(t, _)| t.trim() == wanted)
+}
+
+/// One headless frame: whether text `wanted` is painted inside `within` and whole inside the
+/// clip rectangle it is painted with (so it is visible, not scrolled or clipped away).
+fn painted_whole(s: &mut WebState, wanted: &str, within: egui::Rect) -> bool {
+    let mut l = s.layout();
+    let mut whole = false;
+    for clipped in &l.output.shapes {
+        let mut text = Vec::new();
+        shape_text(&clipped.shape, &mut text);
+        whole |= text.iter().any(|(t, r)| {
+            t.trim() == wanted && within.contains_rect(*r) && clipped.clip_rect.contains_rect(*r)
+        });
+    }
+    l.output.textures_delta.clear();
+    s.drawn();
+    whole
 }
 
 /// Selects the rectangle, clicks upstream's inspector number field whose painted text starts
@@ -887,6 +938,24 @@ fn menu_item(s: &mut WebState, name: &str, item: &str, t: f64) -> (f64, f64) {
     painted_at(s, item, |_| true)
 }
 
+/// A double-click at `p`, as egui counts one, then laid out. egui's clock only moves with the
+/// page's frames (`tick`), so clicks without a frame between them happen at one moment, and
+/// egui counts a click within 0.3 s of the last one as a double-click and within 0.6 s of the
+/// one before as a triple-click (which isn't a double-click). The fixture's own click on the
+/// Layers toggle ([`state`], [`two_pages`]) is such an earlier click: the page's clock first
+/// passes that window, as a person's time does between opening the panel and the row; the
+/// second click follows the first 120 ms later.
+fn double_click(s: &mut WebState, p: (f64, f64), t: f64) {
+    let later = s.now_ms + 1000.0;
+    let now = settle(s, later);
+    click(s, p, t);
+    step(s);
+    s.tick(now + 120.0);
+    click(s, p, t + 120.0);
+    step(s);
+    step(s);
+}
+
 #[test]
 fn every_page_opens_on_the_remembered_one_and_a_switch_saves_as_the_page_list() {
     let mut s = two_pages();
@@ -966,11 +1035,7 @@ fn the_pages_panel_renames_on_enter_or_a_click_away_and_escape_or_a_discard_drop
         let mut s = two_pages();
         // A double-click on the row opens upstream's rename field.
         let p = page_row(&mut s, "Beta");
-        click(&mut s, p, 100.0);
-        step(&mut s);
-        click(&mut s, p, 150.0);
-        step(&mut s);
-        step(&mut s);
+        double_click(&mut s, p, 100.0);
         assert!(s.ui.pages.renaming.is_some(), "{finish}: the field is open");
         assert!(s.field_has_keyboard(), "{finish}: with the keyboard");
         assert!(s.can_reload(), "{finish}: nothing typed, nothing to lose");
@@ -1293,22 +1358,23 @@ fn the_file_name_is_upstream_s_top_bar_title_above_the_page_name_and_follows_a_r
 fn upstream_s_all_projects_button_is_the_host_s_way_back() {
     let mut s = state();
     let top = s.canvas_rect().min.y;
-    // The top bar's grid button ("All projects") comes first, left of the one Menu (whose
-    // entries are upstream's menus), above the layers panel.
-    let (menu_x, bar_y) = painted_at(&mut s, "Menu", |r| r.max.y <= top);
-    // The bar starts where the canvas does (the layers panel is left of both).
-    let mut x = s.canvas_rect().min.x as f64 + 2.0;
-    let mut t = 1000.0;
-    let mut asked = None;
-    while asked.is_none() && x < menu_x {
-        click(&mut s, (x, bar_y), t);
-        step(&mut s);
-        asked = s.take_request();
-        x += 4.0;
-        t += 500.0;
-    }
+    // The header spans the whole surface above both panels: its first control, at the left
+    // edge, is All projects; the compact menu ("···") and the Layers toggle follow it.
+    let home = s.ui.chrome.home.expect("All projects is laid out");
+    let menu = s.ui.chrome.menu.expect("the compact menu is laid out");
+    let layers = s.ui.chrome.layers.expect("the Layers toggle is laid out");
+    assert!(home.min.x < 12.0 && home.max.y <= top, "{home:?}");
+    assert!(home.max.x <= menu.min.x && menu.max.x <= layers.min.x);
+    let (menu_x, _) = painted_at(&mut s, "···", |r| r.max.y <= top);
+    assert!((menu_x as f32 - menu.center().x).abs() < 8.0);
+    assert!(
+        s.canvas_rect().min.x >= 180.0,
+        "the layers panel below the header"
+    );
+    click(&mut s, centre(home), 1000.0);
+    step(&mut s);
     assert_eq!(
-        asked,
+        s.take_request(),
         Some(HostRequest::Home),
         "the editor asks its host to go Home"
     );
@@ -1331,21 +1397,91 @@ fn narrow_state() -> WebState {
     s
 }
 
-/// Click the narrow top bar's painted toggle `label` ("Layers", "Design") and let the
+/// Click the header's toggle `label` ("Layers", "Design") where it is laid out and let the
 /// arrangement settle (it changes after one frame without a focused text field).
 fn toggle(s: &mut WebState, label: &str, t: f64) {
-    // The top bar is 34 px tall; the panels below paint "Layers" and "Design" too.
-    let p = painted_at(s, label, |r| r.max.y <= 36.0);
-    click(s, p, t);
+    let r = match label {
+        "Layers" => s.ui.chrome.layers,
+        _ => s.ui.chrome.design,
+    }
+    .unwrap_or_else(|| panic!("the {label} toggle is laid out"));
+    click(s, centre(r), t);
     for _ in 0..4 {
         step(s);
     }
 }
 
+/// The single panel a narrow or medium surface shows now.
+fn shown_panel(s: &WebState) -> NarrowPanel {
+    s.ui.narrow.shown().expect("laid out").panel()
+}
+
+/// Every tool through the rail, as a person reaches it: each family's main button, then each
+/// row of its flyout (opened with the family's own chevron). Each flyout lies inside the
+/// canvas; choosing a row closes it; nothing reaches the canvas. Returns the tools reached.
+fn reach_every_tool(s: &mut WebState, mut t: f64) -> std::collections::BTreeSet<String> {
+    use crate::ui::rail::FAMILIES;
+    let mut reached = std::collections::BTreeSet::new();
+    let canvas = s.canvas_rect();
+    for (fi, (_, tools)) in FAMILIES.iter().enumerate() {
+        let (main, chevron) = s.ui.rail.rects.rows[fi];
+        assert!(
+            canvas.contains_rect(main),
+            "family {fi}: {main:?} in {canvas:?}"
+        );
+        click(s, centre(main), t);
+        step(s);
+        t += 500.0;
+        assert_eq!(
+            crate::ui::rail::family_of(s.ed.tool),
+            fi,
+            "the main button runs its family's member"
+        );
+        reached.insert(format!("{:?}", s.ed.tool));
+        let Some(chevron) = chevron else {
+            assert_eq!(tools.len(), 1, "only a one-tool family has no chevron");
+            continue;
+        };
+        assert!(
+            chevron.min.x >= main.max.x - 0.5 && chevron.width() >= 24.0 - 0.5,
+            "the chevron is its own target, beside the main button: {chevron:?}"
+        );
+        for (k, tool) in tools.iter().enumerate() {
+            click(s, centre(chevron), t);
+            step(s);
+            step(s);
+            t += 500.0;
+            assert_eq!(s.ui.rail.flyout, Some(fi), "the chevron opens the flyout");
+            let fly = s.ui.rail.rects.flyout.expect("the flyout is laid out");
+            assert!(
+                fly.min.x >= canvas.min.x && fly.max.x <= canvas.max.x + 0.5,
+                "inside the canvas: {fly:?} {canvas:?}"
+            );
+            let (row_tool, row) = s.ui.rail.rects.flyout_rows[k];
+            assert_eq!(row_tool, *tool, "the family's tools, in order");
+            assert!(
+                painted_whole(s, tool.label(), row),
+                "{tool:?}: its row's name is painted whole, not scrolled or clipped away"
+            );
+            click(s, centre(row), t);
+            step(s);
+            t += 500.0;
+            assert_eq!(s.ed.tool, *tool, "a whole row chooses its tool");
+            assert_eq!(s.ui.rail.flyout, None, "and closes the flyout");
+            assert_eq!(
+                s.ui.rail.members[fi], *tool,
+                "it is the family's member now"
+            );
+            reached.insert(format!("{tool:?}"));
+        }
+    }
+    reached
+}
+
 #[test]
 fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable() {
     let mut s = narrow_state();
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    assert_eq!(shown_panel(&s), NarrowPanel::Canvas);
     let c = s.canvas_rect();
     assert_eq!(c.min.x, 0.0, "no side panel beside the canvas: {c:?}");
     assert!(
@@ -1360,8 +1496,9 @@ fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable()
         (s.ed.viewport.x, s.ed.viewport.y),
         (c.width() as f64, c.height() as f64)
     );
-    // The top bar carries the file's name and both toggles, inside the surface.
-    for wanted in ["Landing", "Layers", "Design", "Menu"] {
+    // The header carries the file's name, the menu and the Design toggle (text) and the
+    // All projects and Layers toggles (icons), inside the surface and above the canvas.
+    for wanted in ["Landing", "Design", "···"] {
         let painted = painted_text(&mut s);
         let (_, r) = painted
             .iter()
@@ -1372,44 +1509,27 @@ fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable()
             "{wanted}: {r:?}"
         );
     }
-    // All projects (upstream's grid button) at the bar's left edge asks the host to go Home.
-    let bar_y = (c.min.y / 2.0) as f64;
-    let mut asked = None;
-    let (mut x, mut t) = (4.0, 1000.0);
-    while asked.is_none() && x < 60.0 {
-        click(&mut s, (x, bar_y), t);
-        step(&mut s);
-        asked = s.take_request();
-        x += 4.0;
-        t += 500.0;
+    for r in [s.ui.chrome.home, s.ui.chrome.layers, s.ui.chrome.design] {
+        let r = r.expect("laid out");
+        assert!(r.max.x <= NARROW as f32 && r.max.y <= c.min.y, "{r:?}");
     }
-    assert_eq!(asked, Some(HostRequest::Home), "All projects is reachable");
-    // Every tool of the floating palette can be clicked inside the surface (it wraps).
-    let mut reached = std::collections::BTreeSet::new();
-    let mut y = c.max.y as f64 - 130.0;
-    while y < c.max.y as f64 - 4.0 {
-        let mut x = 4.0;
-        while x < NARROW - 4.0 {
-            click(&mut s, (x, y), t);
-            step(&mut s);
-            if s.ed.tool != Tool::Select {
-                reached.insert(format!("{:?}", s.ed.tool));
-                // Back to Select, so the next probe's click on the canvas draws nothing.
-                s.run(Action::Tool(Tool::Select));
-                step(&mut s);
-            }
-            x += 6.0;
-            t += 500.0;
-        }
-        y += 6.0;
-    }
-    let all: std::collections::BTreeSet<String> = Tool::ALL
-        .iter()
-        .filter(|t| **t != Tool::Select)
-        .map(|t| format!("{t:?}"))
-        .collect();
+    // All projects asks the host to go Home.
+    let home = centre(s.ui.chrome.home.unwrap());
+    click(&mut s, home, 1000.0);
+    step(&mut s);
+    assert_eq!(
+        s.take_request(),
+        Some(HostRequest::Home),
+        "All projects is reachable"
+    );
+    // Every tool through the rail: main buttons and the families' flyouts, inside the surface.
+    let reached = reach_every_tool(&mut s, 2000.0);
+    let all: std::collections::BTreeSet<String> =
+        Tool::ALL.iter().map(|t| format!("{t:?}")).collect();
     assert_eq!(reached, all, "every tool is on the surface");
     assert_eq!(s.ed.doc.nodes.len(), 1, "probing the tools drew nothing");
+    s.run(Action::Tool(Tool::Select));
+    let t = 100_000.0;
     // The canvas itself takes input: a drag with the rectangle tool draws where it went.
     s.run(Action::Tool(Tool::Rect));
     let (from, to) = (at(&s, 40.0, 60.0), at(&s, 120.0, 140.0));
@@ -1421,16 +1541,24 @@ fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable()
 }
 
 #[test]
-fn r25_narrow_panels_open_one_at_a_time_and_the_wide_layout_returns_unchanged() {
+fn r25_narrow_panels_open_one_at_a_time_as_sheets_and_the_wide_layout_follows_the_choice() {
     let mut s = narrow_state();
     toggle(&mut s, "Layers", 1000.0);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Layers));
+    assert_eq!(shown_panel(&s), NarrowPanel::Layers);
+    assert_eq!(s.ui.narrow.shown().unwrap().tier, crate::ui::Tier::Sheet);
     assert!(
         paints(&mut s, "Pages") && paints(&mut s, "Page 1"),
         "upstream's pages and layers"
     );
-    assert!(s.canvas_rect().width() < 2.0, "the panel takes the room");
-    // A press over the panel never reaches the canvas.
+    assert!(
+        s.canvas_rect().width() < 2.0,
+        "the sheet takes the room: no canvas sliver"
+    );
+    assert!(
+        s.ui.rail.rects.rail.is_none(),
+        "no rail behind the opaque sheet"
+    );
+    // A press over the sheet never reaches the canvas.
     s.run(Action::Tool(Tool::Rect));
     step(&mut s);
     drag(&mut s, (100.0, 400.0), (180.0, 460.0), 1500.0);
@@ -1438,24 +1566,41 @@ fn r25_narrow_panels_open_one_at_a_time_and_the_wide_layout_returns_unchanged() 
     assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn from the panel");
     press(&mut s, "Escape", "Escape");
     toggle(&mut s, "Design", 2000.0);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    assert_eq!(shown_panel(&s), NarrowPanel::Design);
     assert!(paints(&mut s, "Export"), "upstream's inspector");
     assert!(!paints(&mut s, "Pages"), "one panel at a time");
-    toggle(&mut s, "Design", 3000.0);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    // The sheet's own way back to the canvas.
+    let back =
+        s.ui.chrome
+            .sheet_back
+            .expect("the sheet says how to get back");
+    click(&mut s, centre(back), 3000.0);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(shown_panel(&s), NarrowPanel::Canvas);
     assert!(s.canvas_rect().width() >= NARROW as f32 - 1.0);
-    // Wide: upstream's ordinary layout, as before (both panels beside the canvas).
+    // Wide: the person's choice so far (both closed) is kept; a fresh view's default Design
+    // isn't forced back over it.
     s.resize(W, H, 1.0);
     let t = settle(&mut s, 4000.0);
-    assert_eq!(s.ui.narrow.shown(), None);
+    let a = s.ui.narrow.shown().unwrap();
+    assert_eq!(
+        (a.tier, a.layers, a.design),
+        (crate::ui::Tier::Wide, false, false)
+    );
+    let c = s.canvas_rect();
+    assert!(c.min.x < 1.0 && c.max.x >= W as f32 - 1.0, "{c:?}");
+    // Both opened there sit beside the canvas, as before.
+    toggle(&mut s, "Layers", 5000.0);
+    toggle(&mut s, "Design", 6000.0);
     let c = s.canvas_rect();
     assert!(c.min.x >= 180.0 && c.max.x <= W as f32 - 220.0, "{c:?}");
     assert!(paints(&mut s, "Pages") && paints(&mut s, "Export"));
-    // Narrow again: the canvas, as last chosen.
+    // Narrow again: one panel at a time, the one opened last.
     s.resize(NARROW, TALL, 1.0);
     settle(&mut s, t);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
-    assert_eq!(s.canvas_rect().min.x, 0.0);
+    assert_eq!(shown_panel(&s), NarrowPanel::Design);
     assert!(
         !s.dirty(),
         "arranging the panels changes nothing in the document"
@@ -1470,7 +1615,8 @@ fn r25_the_narrow_layout_waits_for_a_focused_number_field_and_never_drops_its_dr
         step(&mut s);
         let id = s.ed.selection[0];
         toggle(&mut s, "Design", 500.0);
-        assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+        assert_eq!(shown_panel(&s), NarrowPanel::Design);
+        let sheet = s.ui.narrow.shown();
         let text = painted_text(&mut s);
         let (_, bounds) = text
             .iter()
@@ -1496,11 +1642,7 @@ fn r25_the_narrow_layout_waits_for_a_focused_number_field_and_never_drops_its_dr
             for _ in 0..4 {
                 step(&mut s);
             }
-            assert_eq!(
-                s.ui.narrow.shown(),
-                Some(NarrowPanel::Design),
-                "{typed}: waits"
-            );
+            assert_eq!(s.ui.narrow.shown(), sheet, "{typed}: waits");
             assert!(paints(&mut s, typed), "{typed}: the draft is still shown");
             assert!(
                 s.field_has_keyboard() && s.unsaved_work() && !s.can_reload(),
@@ -1513,7 +1655,11 @@ fn r25_the_narrow_layout_waits_for_a_focused_number_field_and_never_drops_its_dr
             step(&mut s);
         }
         assert!(!s.field_has_keyboard(), "{typed}: finished");
-        assert_eq!(s.ui.narrow.shown(), None, "{typed}: wide now");
+        assert_eq!(
+            s.ui.narrow.shown().map(|a| (a.tier, a.design)),
+            Some((crate::ui::Tier::Wide, true)),
+            "{typed}: wide now, with the Design panel the person opened"
+        );
         let want = if typed == "-" { 100.0 } else { -150.0 };
         assert_eq!(
             axis(&s, id, "X  "),
@@ -1537,8 +1683,8 @@ fn r25_a_narrow_rename_opens_the_layers_panel_and_a_toggle_finishes_it_as_click_
         step(&mut s);
     }
     assert_eq!(
-        s.ui.narrow.shown(),
-        Some(NarrowPanel::Layers),
+        shown_panel(&s),
+        NarrowPanel::Layers,
         "Rename shows the rows"
     );
     assert!(
@@ -1557,7 +1703,7 @@ fn r25_a_narrow_rename_opens_the_layers_panel_and_a_toggle_finishes_it_as_click_
         "{old} -> {renamed}"
     );
     assert!(s.ui.renaming.is_none());
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    assert_eq!(shown_panel(&s), NarrowPanel::Design);
     assert!(s.dirty(), "one ordinary edit to save");
 }
 
@@ -1572,11 +1718,15 @@ fn r25_the_narrow_layout_is_opt_in_and_off_by_default() {
     s.ui.narrow = Default::default();
     step(&mut s);
     step(&mut s);
-    assert_eq!(s.ui.narrow.shown(), None, "the ordinary layout, as before");
-    let c = s.canvas_rect();
+    let a = s.ui.narrow.shown().unwrap();
+    assert_eq!(
+        a.tier,
+        crate::ui::Tier::Wide,
+        "the wide tier at every width"
+    );
     assert!(
-        c.min.x >= 180.0,
-        "upstream's side panels as they were: {c:?}"
+        !a.layers && a.design,
+        "a fresh view's wide defaults: Layers closed, Design open"
     );
 }
 
@@ -1589,14 +1739,15 @@ fn a_medium_surface_docks_one_panel_beside_the_canvas_and_keeps_a_draft_across_r
     let pages = [page("p", "Page 1", rect)];
     let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, 800.0, TALL).unwrap();
     settle(&mut s, 0.0);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    assert_eq!(shown_panel(&s), NarrowPanel::Canvas);
     assert!(s.canvas_rect().width() >= 799.0, "the canvas first");
     // The rectangle selected, then Design docked on the right.
     click_at(&mut s, 150.0, 150.0, 0.0);
     step(&mut s);
     let id = s.ed.selection[0];
     toggle(&mut s, "Design", 500.0);
-    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    assert_eq!(shown_panel(&s), NarrowPanel::Design);
+    assert_eq!(s.ui.narrow.shown().unwrap().tier, crate::ui::Tier::Docked);
     let c = s.canvas_rect();
     assert_eq!(c.min.x, 0.0, "{c:?}");
     assert!(
@@ -1630,12 +1781,20 @@ fn a_medium_surface_docks_one_panel_beside_the_canvas_and_keeps_a_draft_across_r
     step(&mut s);
     s.paste("-");
     step(&mut s);
+    // Docked ↔ sheet is the same panel (DESIGN.md): it follows the surface at once, the field
+    // focused, and nothing waits.
     for (w, filled) in [(500.0, true), (800.0, false), (500.0, true)] {
         s.resize(w, TALL, 1.0);
         for _ in 0..4 {
             step(&mut s);
         }
-        assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design), "{w}");
+        assert_eq!(shown_panel(&s), NarrowPanel::Design, "{w}");
+        let tier = if filled {
+            crate::ui::Tier::Sheet
+        } else {
+            crate::ui::Tier::Docked
+        };
+        assert_eq!(s.ui.narrow.shown().unwrap().tier, tier, "{w}");
         assert_eq!(
             s.canvas_rect().width() < 2.0,
             filled,
@@ -1712,7 +1871,7 @@ fn menu_appearance_switches_the_chrome_and_the_canvas_and_is_reported_once() {
     let mut s = state();
     let authored = page_to_json(&s.ed.page_data(0));
     assert_eq!(s.appearance(), "system");
-    click_label(&mut s, "Menu", 100.0);
+    click_label(&mut s, "···", 100.0);
     click_label(&mut s, "Appearance", 200.0);
     click_label(&mut s, "Dark", 300.0);
     assert_eq!(s.appearance(), "dark");
@@ -1735,7 +1894,7 @@ fn menu_appearance_switches_the_chrome_and_the_canvas_and_is_reported_once() {
     assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
     assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
     // Back to System, through the same menu.
-    click_label(&mut s, "Menu", 500.0);
+    click_label(&mut s, "···", 500.0);
     click_label(&mut s, "Appearance", 600.0);
     click_label(&mut s, "System", 700.0);
     assert_eq!(s.appearance(), "system");
@@ -1855,6 +2014,7 @@ fn r22_deleting_the_middle_of_three_pages_keeps_the_editor_running() {
     ));
     let mut s = WebState::open(&canvas(&pages, "beta22"), false, W, H).unwrap();
     settle(&mut s, 0.0);
+    open_layers(&mut s);
     let button = menu_item(&mut s, "Beta", "Delete", 100.0);
     click(&mut s, button, 200.0);
     step(&mut s);
@@ -1939,6 +2099,7 @@ fn r77_menu_deletes_of_any_row_active_or_not_keep_the_right_pages_and_shown_page
         ));
         let mut s = WebState::open(&canvas(&pages, "beta22"), false, W, H).unwrap();
         settle(&mut s, 0.0);
+        open_layers(&mut s);
         if shown != "Beta" {
             click_page(&mut s, shown, 50.0);
         }
@@ -2079,11 +2240,7 @@ fn r77_a_page_rename_draft_is_finished_on_its_own_page_before_another_row_is_del
     let mut s = two_pages();
     // A double-click on Beta's row opens its rename; type a draft.
     let p = page_row(&mut s, "Beta");
-    click(&mut s, p, 100.0);
-    step(&mut s);
-    click(&mut s, p, 150.0);
-    step(&mut s);
-    step(&mut s);
+    double_click(&mut s, p, 100.0);
     assert!(s.ui.pages.renaming.is_some());
     press(&mut s, "q", "KeyQ");
     step(&mut s);
@@ -2309,11 +2466,7 @@ fn r78_collapsing_the_pages_panel_finishes_a_page_rename_on_its_page() {
     let mut s = two_pages();
     // A double-click on Beta's row opens its rename; type a draft.
     let p = page_row(&mut s, "Beta");
-    click(&mut s, p, 100.0);
-    step(&mut s);
-    click(&mut s, p, 150.0);
-    step(&mut s);
-    step(&mut s);
+    double_click(&mut s, p, 100.0);
     assert!(s.ui.pages.renaming.is_some());
     press(&mut s, "q", "KeyQ");
     step(&mut s);
@@ -2418,6 +2571,683 @@ fn the_inspector_page_name_renames_the_page_and_saves_it_with_the_page_list() {
     assert!(sent.is_empty(), "the page's content is unchanged");
     s.save_succeeded();
     assert!(!s.dirty() && s.can_reload() && !s.unsaved_work());
+}
+
+// ---- revision 2, slice 1: the header's safe area, panel states, Collapse panels and zoom.
+// These drive the real upstream UI (`ui::draw`) through this host's input; geometry asserts
+// read what it laid out (`UiState::chrome`, `rail.rects`), not a copy of its constants.
+
+/// A fresh view of the one-rectangle canvas on a `w` × `h` surface, laid out (no panel opened).
+fn fresh(w: f64, h: f64) -> WebState {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages = [page("p", "Page 1", rect)];
+    let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, w, h).unwrap();
+    settle(&mut s, 0.0);
+    s
+}
+
+fn overlap(a: egui::Rect, b: egui::Rect) -> bool {
+    a.intersects(b) && a.intersect(b).area() > 0.5
+}
+
+#[test]
+fn rev2_a_fresh_view_keeps_layers_closed_and_lays_the_header_out_across_the_whole_surface() {
+    // (width, tier, Design shown in a fresh view)
+    for (w, tier, design) in [
+        (1280.0, crate::ui::Tier::Wide, true),
+        (1024.0, crate::ui::Tier::Wide, true),
+        (800.0, crate::ui::Tier::Docked, false),
+        (600.0, crate::ui::Tier::Docked, false),
+        (599.0, crate::ui::Tier::Sheet, false),
+        (320.0, crate::ui::Tier::Sheet, false),
+    ] {
+        let mut s = fresh(w, H);
+        let a = s.ui.narrow.shown().unwrap();
+        assert_eq!(a.tier, tier, "{w}");
+        assert!(!a.layers, "{w}: Layers starts closed");
+        assert_eq!(a.design, design, "{w}: Design");
+        let c = s.canvas_rect();
+        assert!(c.min.x < 1.0, "{w}: no left panel: {c:?}");
+        if design {
+            assert!(
+                c.max.x <= w as f32 - 220.0,
+                "{w}: the quiet inspector: {c:?}"
+            );
+        } else {
+            assert!(c.width() >= w as f32 - 1.0, "{w}: canvas only: {c:?}");
+        }
+        // The header comes first: its controls start at the surface's left edge and the
+        // centred identity sits on the surface's centre (or between the groups when narrow).
+        let home = s.ui.chrome.home.unwrap();
+        let design_toggle = s.ui.chrome.design.unwrap();
+        let id = s.ui.chrome.identity.unwrap();
+        assert!(home.min.x < 12.0 && home.max.y <= c.min.y, "{w}: {home:?}");
+        assert!(
+            design_toggle.max.x > w as f32 - 12.0,
+            "{w}: {design_toggle:?}"
+        );
+        if w >= 600.0 {
+            assert!(
+                (id.center().x - w as f32 / 2.0).abs() < 1.0,
+                "{w}: centred: {id:?}"
+            );
+        }
+        // Opening Layers puts the panel under the header, which keeps its place.
+        toggle(&mut s, "Layers", 1000.0);
+        let after = s.ui.chrome.home.unwrap();
+        assert_eq!(after, home, "{w}: the header doesn't move for a panel");
+        assert!(s.ui.narrow.shown().unwrap().layers, "{w}");
+        assert_eq!(
+            s.canvas_rect().min.y,
+            c.min.y,
+            "{w}: panels start below the header"
+        );
+        assert!(paints(&mut s, "Pages"), "{w}: the pages and layers panel");
+        assert!(!s.dirty(), "{w}: arranging changes nothing");
+    }
+}
+
+#[test]
+fn rev2_collapse_panels_hides_both_and_restore_brings_them_back_and_hide_ui_stays_separate() {
+    let mut s = state();
+    let both = s.canvas_rect();
+    assert!(
+        both.min.x >= 180.0 && both.max.x <= W as f32 - 220.0,
+        "{both:?}"
+    );
+    let before = page_to_json(&s.ed.page_data(0));
+    // Collapse through the compact menu, as a person finds it.
+    click_label(&mut s, "···", 100.0);
+    click_label(&mut s, "View", 200.0);
+    click_label(&mut s, "Collapse / Restore Panels", 300.0);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert!(s.ui.panels.collapsed());
+    let a = s.ui.narrow.shown().unwrap();
+    assert!(!a.layers && !a.design, "both hidden");
+    let c = s.canvas_rect();
+    assert!(c.min.x < 1.0 && c.max.x >= W as f32 - 1.0, "{c:?}");
+    assert!(
+        s.ui.chrome.home.is_some() && s.ui.rail.rects.rail.is_some() && s.ui.chrome.zoom.is_some(),
+        "the header, the rail and the zoom stay"
+    );
+    // Restore (the palette's and menu's same action): the same two panels again.
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(s.canvas_rect(), both, "the arrangement before the collapse");
+    // Collapsed again, then one panel opened: the collapse ends, with that panel only.
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    toggle(&mut s, "Design", 400.0);
+    assert!(!s.ui.panels.collapsed());
+    let a = s.ui.narrow.shown().unwrap();
+    assert!(a.design && !a.layers, "{a:?}");
+    // Hide UI is its own mode: everything goes, and comes back as it was.
+    let design_only = s.canvas_rect();
+    s.run(Action::ToggleUi);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.canvas_rect().min, egui::Pos2::ZERO);
+    s.run(Action::ToggleUi);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(s.canvas_rect(), design_only);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert!(!s.dirty(), "panel states are no drawing edits");
+}
+
+#[test]
+fn rev2_collapse_waits_for_a_focused_number_draft_and_never_drops_it() {
+    let mut s = state();
+    let id = open_number_field(&mut s, "X  ");
+    s.paste("-");
+    step(&mut s);
+    let before = s.ui.narrow.shown();
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(
+        s.ui.narrow.shown(),
+        before,
+        "the arrangement waits for the field"
+    );
+    assert!(paints(&mut s, "-"), "the draft is still shown");
+    assert!(s.field_has_keyboard() && s.unsaved_work() && !s.can_reload());
+    press(&mut s, "Escape", "Escape");
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert!(!s.field_has_keyboard());
+    let a = s.ui.narrow.shown().unwrap();
+    assert!(!a.layers && !a.design, "then the collapse applies");
+    assert_eq!(
+        axis(&s, id, "X  "),
+        100.0,
+        "cancelled as upstream cancels it"
+    );
+}
+
+#[test]
+fn rev2_zoom_sits_at_the_canvas_s_lower_left_clear_of_the_rail_and_offers_fit() {
+    let mut s = state();
+    let c = s.canvas_rect();
+    let zoom = s.ui.chrome.zoom.unwrap();
+    let rail = s.ui.rail.rects.rail.unwrap();
+    assert!(c.contains_rect(zoom), "{zoom:?} in {c:?}");
+    assert!(
+        zoom.min.x - c.min.x <= 9.0 && c.max.y - zoom.max.y <= 9.0,
+        "{zoom:?}"
+    );
+    assert!(!overlap(zoom, rail), "{zoom:?} {rail:?}");
+    let z = s.ed.camera.zoom;
+    let zoom_in = centre(s.ui.chrome.zoom_in.unwrap());
+    click(&mut s, zoom_in, 100.0);
+    step(&mut s);
+    assert!(s.ed.camera.zoom > z, "zoom in");
+    let zoom_out = centre(s.ui.chrome.zoom_out.unwrap());
+    click(&mut s, zoom_out, 200.0);
+    step(&mut s);
+    assert!((s.ed.camera.zoom - z).abs() < 1e-9, "and out again");
+    // The level opens the fit commands: zoomed far in, Zoom to Fit shows the rectangle again.
+    let id = s.ed.doc.root[0];
+    let world = s.ed.doc.world_rect(id).unwrap();
+    s.ed.camera.zoom_about(v2(10.0, 10.0), 20.0);
+    assert!(
+        !s.ed
+            .camera
+            .visible_world(s.ed.viewport)
+            .contains_rect(&world)
+    );
+    let level = centre(s.ui.chrome.zoom_level.unwrap());
+    click(&mut s, level, 300.0);
+    step(&mut s);
+    step(&mut s);
+    click_label(&mut s, "Zoom to Fit", 400.0);
+    assert!(
+        s.ed.camera
+            .visible_world(s.ed.viewport)
+            .contains_rect(&world),
+        "fitted at {}",
+        s.ed.camera.zoom
+    );
+    // A transient status never covers the zoom. Its area is new here: egui's first frame of a
+    // new area is an invisible sizing pass (which asks for the next frame); the next one shows
+    // it.
+    s.ed.status = "Snapping off".into();
+    step(&mut s);
+    let text = painted_text(&mut s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, _)| t == "Snapping off")
+        .expect("the status is shown");
+    assert!(r.min.x >= zoom.max.x, "{r:?} {zoom:?}");
+    assert!(!s.dirty(), "zooming is a view change");
+}
+
+#[test]
+fn rev2_the_rail_and_zoom_fit_every_canonical_width_and_short_height_without_overlap() {
+    for (w, h) in [
+        (320.0, TALL),
+        (599.0, TALL),
+        (600.0, TALL),
+        (800.0, TALL),
+        (1024.0, TALL),
+        (1280.0, TALL),
+        (1280.0, 380.0),
+        (1280.0, 270.0),
+        (320.0, 380.0),
+        (320.0, 270.0),
+    ] {
+        let mut s = fresh(w, h);
+        let c = s.canvas_rect();
+        let rail = s.ui.rail.rects.rail.expect("the rail");
+        let zoom = s.ui.chrome.zoom.expect("the zoom");
+        assert!(
+            c.contains_rect(rail) || c.height() < rail.height(),
+            "{w}×{h}: {rail:?}"
+        );
+        assert!(!overlap(rail, zoom), "{w}×{h}: {rail:?} {zoom:?}");
+        assert!(c.contains_rect(zoom), "{w}×{h}: {zoom:?} in {c:?}");
+        if c.height() < crate::ui::rail::SHORT_H {
+            assert!(
+                (rail.min.y - c.min.y - crate::ui::rail::INSET).abs() < 0.5,
+                "{w}×{h}: a short canvas anchors the rail at the top"
+            );
+            assert!(zoom.min.x >= rail.max.x, "{w}×{h}: the zoom beside it");
+        }
+        // The largest family's flyout fits inside the canvas, beside the rail where it can.
+        let (_, chevron) = s.ui.rail.rects.rows[2];
+        click(&mut s, centre(chevron.unwrap()), 100.0);
+        step(&mut s);
+        step(&mut s);
+        let fly = s.ui.rail.rects.flyout.expect("the Shapes flyout");
+        assert!(
+            fly.min.x >= c.min.x && fly.max.x <= c.max.x + 0.5,
+            "{w}×{h}: {fly:?} {c:?}"
+        );
+        assert!(
+            fly.min.y >= c.min.y && fly.max.y <= c.max.y + 0.5,
+            "{w}×{h}: clamped (it scrolls when short): {fly:?} {c:?}"
+        );
+        if c.width() - (rail.max.x - c.min.x) - 4.0 - crate::ui::rail::INSET
+            >= crate::ui::rail::FLYOUT_MIN
+        {
+            assert!(
+                fly.min.x >= rail.max.x,
+                "{w}×{h}: opens inward beside the rail"
+            );
+        }
+        press(&mut s, "Escape", "Escape");
+        step(&mut s);
+    }
+}
+
+// ---- revision 2, slice 2: one rail, six families, all sixteen tools
+
+#[test]
+fn rev2_the_rail_reaches_all_sixteen_tools_and_each_family_remembers_its_member() {
+    let mut s = fresh(W, H);
+    assert_eq!(s.ui.rail.rects.rows.len(), 6, "six families");
+    let reached = reach_every_tool(&mut s, 1000.0);
+    assert_eq!(reached.len(), 16, "{reached:?}");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "probing the tools drew nothing");
+    // A shortcut makes its tool the family's member: S is Sticky note, in Text.
+    press(&mut s, "Escape", "Escape");
+    assert!(s.key_down("s", "KeyS", false));
+    step(&mut s);
+    assert_eq!(s.ed.tool, Tool::Sticky);
+    assert_eq!(s.ui.rail.members[4], Tool::Sticky);
+    // Escape outside a flyout is back to Select; the Text family keeps Sticky note.
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    assert_eq!(s.ed.tool, Tool::Select);
+    assert_eq!(s.ui.rail.members[4], Tool::Sticky);
+    let (text_main, _) = s.ui.rail.rects.rows[4];
+    click(&mut s, centre(text_main), 9000.0);
+    step(&mut s);
+    assert_eq!(
+        s.ed.tool,
+        Tool::Sticky,
+        "the family's main button runs its member"
+    );
+    // On the canonical short canvas too (the largest flyout still fits there), narrow and
+    // wide: every row is painted whole and a click on it chooses its tool.
+    for (w, h) in [(NARROW, 270.0), (W, 270.0)] {
+        let mut s = fresh(w, h);
+        let reached = reach_every_tool(&mut s, 1000.0);
+        assert_eq!(reached.len(), 16, "{w}×{h}: {reached:?}");
+        assert_eq!(s.ed.doc.nodes.len(), 1, "{w}×{h}: probing drew nothing");
+    }
+}
+
+#[test]
+fn rev2_a_focused_flyout_row_is_chosen_with_enter_and_the_key_never_reaches_the_editor() {
+    // A text layer selected: an Enter the editor got would start editing its text.
+    let mut doc = Document::default();
+    let label = doc.alloc_id();
+    let kind = NodeKind::Text {
+        text: "Label".into(),
+        font_size: 16.0,
+        auto_width: true,
+        align: crate::model::TextAlign::Left,
+    };
+    let r = crate::geom::Rect::new(100.0, 100.0, 60.0, 20.0);
+    doc.nodes.insert(label, Node::new(label, kind, r));
+    doc.root.push(label);
+    let p = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[p], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    click_at(&mut s, 110.0, 110.0, 0.0);
+    step(&mut s);
+    assert_eq!(s.ed.selection, vec![label]);
+    assert!(s.ed.text_edit.is_none());
+    // The Shapes flyout, opened with its chevron; then egui's own keyboard navigation (Tab)
+    // until its Polygon row has the focus.
+    let (_, chevron) = s.ui.rail.rects.rows[2];
+    click(&mut s, centre(chevron.unwrap()), 100.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.rail.flyout, Some(2));
+    let mut tabs = 0;
+    while s.ui.rail.rects.focus.map(|(_, t)| t) != Some(Some(Tool::Polygon)) {
+        assert!(tabs < 300, "Tab reaches the Polygon row");
+        s.key_down("Tab", "Tab", false);
+        s.key_up("Tab", "Tab");
+        step(&mut s);
+        step(&mut s);
+        tabs += 1;
+    }
+    assert_eq!(s.ui.rail.flyout, Some(2), "Tab keeps the flyout open");
+    assert_eq!(s.ed.selection, vec![label], "Tab cycled the one layer");
+    assert!(s.ed.text_edit.is_none());
+    // Enter chooses the focused row; the editor never sees it.
+    assert!(s.key_down("Enter", "Enter", false), "the row's key");
+    s.key_up("Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.tool, Tool::Polygon, "Enter chose the focused row");
+    assert_eq!(s.ui.rail.flyout, None, "and closed the flyout");
+    assert_eq!(s.ui.rail.members[2], Tool::Polygon, "its member now");
+    assert!(s.ed.text_edit.is_none(), "no text editing from the Enter");
+    // Control: the text layer selected again from the canvas (a click there also takes egui's
+    // focus away), Enter is the editor's: it edits the text.
+    s.run(Action::Tool(Tool::Select));
+    click_at(&mut s, 700.0, 500.0, 5000.0);
+    step(&mut s);
+    click_at(&mut s, 110.0, 110.0, 6000.0);
+    step(&mut s);
+    assert_eq!(s.ed.selection, vec![label]);
+    assert!(s.ed.text_edit.is_none());
+    assert!(s.key_down("Enter", "Enter", false));
+    assert!(s.ed.text_edit.is_some(), "the editor's Enter edits it");
+}
+
+#[test]
+fn rev2_escape_or_an_outside_press_closes_a_flyout_and_never_reaches_the_canvas() {
+    let mut s = fresh(W, H);
+    assert!(s.key_down("r", "KeyR", false));
+    step(&mut s);
+    assert_eq!(s.ed.tool, Tool::Rect);
+    let open = |s: &mut WebState, t: f64| {
+        let (_, chevron) = s.ui.rail.rects.rows[2];
+        click(s, centre(chevron.unwrap()), t);
+        step(s);
+        step(s);
+        assert_eq!(s.ui.rail.flyout, Some(2));
+    };
+    // Escape closes the flyout only: the tool stays (it isn't the editor's Escape).
+    open(&mut s, 100.0);
+    assert!(s.key_down("Escape", "Escape", false), "taken");
+    s.key_up("Escape", "Escape");
+    step(&mut s);
+    assert_eq!(s.ui.rail.flyout, None);
+    assert_eq!(s.ed.tool, Tool::Rect);
+    // A press on the canvas closes it and draws nothing, though the Rectangle tool is active.
+    open(&mut s, 200.0);
+    let nodes = s.ed.doc.nodes.len();
+    let (from, to) = (at(&s, 600.0, 400.0), at(&s, 680.0, 460.0));
+    drag(&mut s, from, to, 300.0);
+    step(&mut s);
+    assert_eq!(s.ui.rail.flyout, None);
+    assert_eq!(
+        s.ed.doc.nodes.len(),
+        nodes,
+        "no click-through to the canvas"
+    );
+    // Control: the next drag draws.
+    drag(&mut s, from, to, 400.0);
+    assert_eq!(s.ed.doc.nodes.len(), nodes + 1);
+}
+
+#[test]
+fn rev2_a_focused_field_keeps_tool_keys_and_the_families_keep_their_members() {
+    let mut s = state();
+    let _ = open_number_field(&mut s, "X  ");
+    let members = s.ui.rail.members;
+    for (k, code) in [("o", "KeyO"), ("e", "KeyE"), (".", "Period"), ("s", "KeyS")] {
+        assert!(s.key_down(k, code, false), "{k}: the field's");
+        s.key_up(k, code);
+        step(&mut s);
+    }
+    assert_eq!(
+        s.ed.tool,
+        Tool::Select,
+        "no tool shortcut reached the editor"
+    );
+    assert_eq!(
+        s.ui.rail.members, members,
+        "and no family changed its member"
+    );
+    press(&mut s, "Escape", "Escape");
+}
+
+// ---- revision 2, slice 3: the quiet contextual inspector and honest mixed values
+
+/// Painted text with each number field read as a person reads it: upstream's `DragValue`
+/// paints its prefix ("W  ") and its value ("200") as two texts, the value right after the
+/// prefix on the same row; here they are one text ("W  200") with their joint bounds. A
+/// Mixed placeholder ("W  Mixed") is one text already.
+fn fields_read(text: Vec<(String, egui::Rect)>) -> Vec<(String, egui::Rect)> {
+    let mut out: Vec<(String, egui::Rect)> = Vec::new();
+    for (t, r) in text {
+        if let Some((prefix, pr)) = out.last_mut()
+            && prefix.ends_with("  ")
+            && (r.min.x - pr.max.x).abs() < 1.0
+            && (r.center().y - pr.center().y).abs() < 2.0
+        {
+            prefix.push_str(&t);
+            *pr = pr.union(r);
+            continue;
+        }
+        out.push((t, r));
+    }
+    out
+}
+
+/// Painted text in the inspector (right of the canvas), number fields read whole
+/// ([`fields_read`]).
+fn inspector_text(s: &mut WebState) -> Vec<String> {
+    let right = s.canvas_rect().max.x;
+    fields_read(painted_text(s))
+        .into_iter()
+        .filter(|(_, r)| r.min.x >= right)
+        .map(|(t, _)| t)
+        .collect()
+}
+
+#[test]
+fn rev2_an_empty_inspector_is_quiet_and_a_creation_tool_shows_only_its_own_defaults() {
+    let mut s = state();
+    let text = inspector_text(&mut s);
+    assert!(text.iter().any(|t| t == "Page"), "{text:?}");
+    for absent in [
+        "For new shapes",
+        "For new arrows",
+        "For new sticky notes",
+        "For new pencil strokes",
+        "Width",
+        "Smoothing",
+        "Transparent background",
+    ] {
+        assert!(!text.iter().any(|t| t == absent), "{absent}: {text:?}");
+    }
+    assert!(
+        text.iter().any(|t| t == "Export"),
+        "export stays reachable, folded"
+    );
+    // (key, code, shift, wanted, unwanted)
+    for (key, code, shift, wanted, unwanted) in [
+        ("b", "KeyB", false, "For new pencil strokes", "Route"),
+        ("L", "KeyL", true, "For new arrows", "Smoothing"),
+        ("s", "KeyS", false, "For new sticky notes", "Route"),
+        ("r", "KeyR", false, "For new shapes", "Width"),
+    ] {
+        s.modifiers(shift, false, false, false);
+        assert!(s.key_down(key, code, false), "{key}");
+        s.modifiers(false, false, false, false);
+        step(&mut s);
+        step(&mut s);
+        let text = inspector_text(&mut s);
+        assert!(text.iter().any(|t| t == wanted), "{wanted}: {text:?}");
+        assert!(!text.iter().any(|t| t == unwanted), "{unwanted}: {text:?}");
+    }
+    assert!(!s.dirty(), "looking at defaults changes nothing");
+}
+
+/// Two rectangles with different positions, heights and fills and the same width: A at
+/// (100, 100) 200 × 100, B at (400, 300) 200 × 50. Both selected (Ctrl+A), laid out.
+fn two_rects() -> (WebState, crate::model::NodeId, crate::model::NodeId) {
+    let mut doc = Document::default();
+    let a = doc.alloc_id();
+    let mut na = Node::new(
+        a,
+        NodeKind::Rect,
+        crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0),
+    );
+    na.style = crate::model::Style::with_fill(Color::rgb(0xe6, 0x4a, 0x3b));
+    doc.nodes.insert(a, na);
+    let b = doc.alloc_id();
+    let mut nb = Node::new(
+        b,
+        NodeKind::Rect,
+        crate::geom::Rect::new(400.0, 300.0, 200.0, 50.0),
+    );
+    nb.style = crate::model::Style::with_fill(Color::rgb(0x2f, 0x6f, 0xf3));
+    doc.nodes.insert(b, nb);
+    doc.root = vec![a, b];
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    s.modifiers(false, true, false, false);
+    assert!(s.key_down("a", "KeyA", false));
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.selection.len(), 2);
+    (s, a, b)
+}
+
+#[test]
+fn rev2_a_mixed_selection_never_shows_the_first_layer_s_values_as_shared() {
+    let (mut s, _, _) = two_rects();
+    let text = inspector_text(&mut s);
+    assert!(text.iter().any(|t| t == "X  Mixed"), "{text:?}");
+    assert!(text.iter().any(|t| t == "H  Mixed"), "{text:?}");
+    assert!(
+        !text.iter().any(|t| t == "X  100" || t == "H  100"),
+        "the first layer's values aren't shown as everyone's: {text:?}"
+    );
+    assert!(
+        text.iter().any(|t| t.starts_with("W  200")),
+        "the shared width is shown: {text:?}"
+    );
+    assert!(
+        text.iter().any(|t| t.contains("different fills")),
+        "the fills differ: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|t| t == "#e64a3b"),
+        "not the first fill as if shared"
+    );
+}
+
+#[test]
+fn rev2_a_shared_value_edits_every_selected_layer_as_one_undoable_change() {
+    let (mut s, a, b) = two_rects();
+    let right = s.canvas_rect().max.x;
+    let text = fields_read(painted_text(&mut s));
+    let (_, w) = text
+        .iter()
+        .find(|(t, r)| t.starts_with("W  200") && r.min.x >= right)
+        .unwrap_or_else(|| panic!("the shared W field: {text:?}"));
+    click(&mut s, centre(*w), 1000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.field_has_keyboard(), "the W field is in its text mode");
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    // Typed key by key: each keystroke is a change of the same field.
+    for (k, code) in [("2", "Digit2"), ("5", "Digit5"), ("0", "Digit0")] {
+        press(&mut s, k, code);
+        step(&mut s);
+    }
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    let width = |s: &WebState, id| s.ed.doc.get(id).unwrap().rect.w;
+    assert_eq!((width(&s, a), width(&s, b)), (250.0, 250.0), "both layers");
+    assert_eq!(
+        s.ed.doc.get(b).unwrap().rect.h,
+        50.0,
+        "only the edited value"
+    );
+    assert!(s.dirty());
+    s.run(Action::Undo);
+    assert_eq!(
+        (width(&s, a), width(&s, b)),
+        (200.0, 200.0),
+        "one coalesced undo step for the whole edit"
+    );
+}
+
+#[test]
+fn rev2_different_kinds_show_only_what_they_share_and_sketch_and_export_are_folded() {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let mut p = page("p", "Page 1", rect);
+    let t = p.doc.alloc_id();
+    p.doc.nodes.insert(
+        t,
+        Node::new(
+            t,
+            NodeKind::Text {
+                text: "Label".into(),
+                font_size: 16.0,
+                auto_width: true,
+                align: crate::model::TextAlign::Left,
+            },
+            crate::geom::Rect::new(400.0, 300.0, 60.0, 20.0),
+        ),
+    );
+    p.doc.root.push(t);
+    let mut s = WebState::open(&canvas(&[p], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    // One rectangle: its sections, with Sketch and Export folded.
+    click_at(&mut s, 150.0, 150.0, 0.0);
+    step(&mut s);
+    step(&mut s);
+    let text = inspector_text(&mut s);
+    assert!(text.iter().any(|t| t == "Sketch"), "{text:?}");
+    assert!(
+        !text
+            .iter()
+            .any(|t| t == "Hand-drawn style" || t == "Sloppiness"),
+        "folded by default: {text:?}"
+    );
+    assert!(text.iter().any(|t| t == "Export"));
+    assert!(
+        !text.iter().any(|t| t == "Transparent background"),
+        "folded"
+    );
+    // Rectangle and text together: no typography, no fill or stroke lists, and a word on why.
+    s.modifiers(false, true, false, false);
+    assert!(s.key_down("a", "KeyA", false));
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.selection.len(), 2);
+    let text = inspector_text(&mut s);
+    assert!(
+        text.iter()
+            .any(|t| t.starts_with("Only what every selected layer has")),
+        "{text:?}"
+    );
+    for absent in ["Text", "Fill", "Stroke", "Sketch"] {
+        assert!(!text.iter().any(|t| t == absent), "{absent}: {text:?}");
+    }
+    assert!(
+        text.iter().any(|t| t == "Layer"),
+        "shared layer properties stay"
+    );
+    assert!(!s.dirty());
 }
 
 // ---- keys

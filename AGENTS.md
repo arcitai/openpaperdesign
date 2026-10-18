@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.54 · Updated: 2026-10-18
+Revision: 0.56 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -111,6 +111,49 @@ engine architecture is `analysis/DESIGN.md`.
     renames are finished as when the UI is hidden (R23), and upstream's Rename shows the
     layer rows. Same panels, commands and canvas; no DOM copy, no global scaling.
     Upstreamable as a host opt-in for small windows.
+  - Revision 2 workspace, slices 1–3 (owner plan OPD-UX-PLAN revision 2, 2026-10-18; built
+    decisions in root `DESIGN.md`). These change how native windows look and lay out too.
+    - `src/ui/mod.rs`:
+      - **Header first.** `draw` lays the header out before the panels, across the whole
+        surface. It holds All projects, a compact `···` menu (every upstream menu and
+        Appearance) and the Layers toggle; the file's name and page centred; and the Design
+        toggle. Undo/redo, zoom and help left the header and stay in the menu, palette and
+        shortcuts.
+      - **Panel model.** `UiState::panels` (`Panels`) holds the side-panel choices:
+        - Layers closed by default; Design open by default only in the wide tier;
+        - Collapse panels hides both and keeps the arrangement for Restore, separate from
+          Hide UI.
+        - `NarrowLayout` keeps its thresholds and focus-safe settling, but now settles a whole
+          `Arrangement` (`Tier::{Wide, Docked, Sheet}`), and a sheet has a "← Canvas" way
+          back. (Before: a narrow-only `NarrowPanel` choice, and both panels always shown in
+          the ordinary layout.) Docked ↔ sheet with the same panel doesn't wait: the panel's
+          body has the same widget ids in both, so a focused field keeps its draft.
+      - **Removed:** the bottom tool palette (`toolbar`) is gone.
+      - **Zoom** is at the canvas's lower left (`zoom_controls`), and the status line sits
+        right of it.
+      - **Geometry record.** `UiState::chrome` records where the header controls and zoom were
+        laid out, for checks (no behaviour).
+    - `src/ui/rail.rs` (new): the six-family tool rail with all 16 tools, remembered members,
+      a separate chevron and a clamped, scrolling flyout. `Rail::captures_input` lets hosts
+      hold Escape and a dismissing press back from the canvas while a flyout is open, and
+      `Rail::takes_key` Enter and Space while a rail control has egui's keyboard focus.
+    - `src/ui/inspector.rs`:
+      - **Contextual.** The empty state shows the page plus a hint, or a creation tool's own
+        "For new …" defaults.
+      - **Mixed values.** Sections appear only when every selected layer has them. `uniform`
+        shows shared values; differing ones show Mixed or are left out with a reason, never
+        the first layer's value.
+      - **Multi-layer edits.** W/H for several layers is one coalesced resize.
+      - **Folded:** Sketch (explained) and Export.
+    - `src/editor/shortcuts.rs`, `commands.rs`, `mod.rs`, `src/ui/palette.rs`:
+      `Action::TogglePanels` / `UiEvent::TogglePanels`, reached from View ▸ Collapse /
+      Restore Panels and the palette. It has no shortcut until the hosts' key handling is
+      checked; the menu test allows it as menu-only.
+    - `src/app.rs`: the native host holds Escape and a press back from the editor while a
+      flyout is open, and Enter/Space while a rail control has the keyboard focus, as the
+      browser host does (`crates/openpaperdesign-web/src/state.rs`).
+    - Same Editor, Session, transactions, save, binding and lease; no renderer change.
+      Upstreamable as presentation, except the panel defaults, which are an OPD choice.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.

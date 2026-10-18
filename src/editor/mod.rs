@@ -1972,6 +1972,7 @@ impl Editor {
                 }
             }
             A::ToggleUi => self.ui_events.push(commands::UiEvent::ToggleUi),
+            A::TogglePanels => self.ui_events.push(commands::UiEvent::TogglePanels),
             A::ToggleHelp => self.ui_events.push(commands::UiEvent::ToggleHelp),
             A::ToggleGrid => self.ui_events.push(commands::UiEvent::ToggleGrid),
             A::SelectNext => self.select_sibling(true),

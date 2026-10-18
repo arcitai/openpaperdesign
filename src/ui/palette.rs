@@ -115,6 +115,7 @@ pub fn entries(ed: &Editor, st: &UiState) -> Vec<Entry> {
             Action::Boolean(crate::editor::vector_ops::BoolOp::Union),
         ),
         ("Hand-drawn style on/off", Action::ToggleSketch),
+        ("Collapse / restore panels", Action::TogglePanels),
     ] {
         if seen.insert(label.to_string()) {
             out.push(Entry {

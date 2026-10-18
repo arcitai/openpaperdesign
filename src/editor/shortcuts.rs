@@ -57,6 +57,9 @@ pub enum Action {
     CommandPalette,
     Rename,
     ToggleUi,
+    /// Collapse both side panels, or restore the arrangement they had (menu and palette; no
+    /// shortcut yet, see DESIGN.md).
+    TogglePanels,
     ToggleHelp,
     ToggleGrid,
     SelectNext,
@@ -420,6 +423,7 @@ pub fn category(a: Action) -> &'static str {
         | A::ToggleSnapping
         | A::ToggleGrid
         | A::ToggleUi
+        | A::TogglePanels
         | A::ToggleHelp
         | A::NextPage
         | A::PrevPage => "View",
@@ -601,6 +605,7 @@ pub fn menus() -> Vec<(&'static str, Vec<MenuEntry>)> {
                 S,
                 I("Snapping", A::ToggleSnapping),
                 I("Dot Grid", A::ToggleGrid),
+                I("Collapse / Restore Panels", A::TogglePanels),
                 I("Show/Hide UI", A::ToggleUi),
                 I("Keyboard Shortcuts", A::ToggleHelp),
             ],
@@ -652,9 +657,14 @@ mod tests {
                     match x {
                         super::MenuEntry::Item(label, a) => {
                             // Delete is bound to the Delete key; everything should be reachable.
+                            // Collapse panels is menu and palette only until a shortcut has
+                            // been checked against the hosts' own key handling.
                             assert!(
                                 super::chord_of(*a).is_some()
-                                    || matches!(a, super::Action::ExportSvg),
+                                    || matches!(
+                                        a,
+                                        super::Action::ExportSvg | super::Action::TogglePanels
+                                    ),
                                 "{label} has no shortcut"
                             );
                         }

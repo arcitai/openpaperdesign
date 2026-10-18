@@ -572,7 +572,8 @@ impl WebState {
         }
     }
 
-    /// Positions are CSS px in the canvas element (the whole workspace).
+    /// Positions are CSS px in the canvas element (the whole workspace). While a tool flyout
+    /// is open the press is the flyout's (it closes it), never a drawing on the canvas.
     pub fn pointer_down(&mut self, x: f64, y: f64, button: Button, time_ms: f64) {
         let p = egui::pos2(x as f32, y as f32);
         self.events.push(egui::Event::PointerMoved(p));
@@ -582,7 +583,7 @@ impl WebState {
             pressed: true,
             modifiers: self.mods,
         });
-        if self.over_canvas(p) {
+        if self.over_canvas(p) && !self.ui.rail.captures_input() {
             // Clicking the canvas takes keyboard focus away from text fields.
             self.ctx.memory_mut(|m| {
                 if let Some(f) = m.focused() {
@@ -693,6 +694,17 @@ impl WebState {
             });
         }
         self.redraw = true;
+        // An open tool flyout takes Escape (it closes, the tool stays as it is).
+        if named == Some(egui::Key::Escape) && self.ui.rail.captures_input() {
+            return true;
+        }
+        // A rail control with egui's keyboard focus (a family's button or chevron, or a flyout
+        // row, reached with Tab) takes Enter or Space: egui chooses it, and the editor never
+        // also gets the key (Enter would edit the selected text, Space would pan).
+        let focused = self.ctx.memory(|m| m.focused());
+        if named.is_some_and(|k| self.ui.rail.takes_key(k, focused)) {
+            return true;
+        }
         if self.field_has_keyboard() {
             let clipboard_chord = self.mods.command
                 && matches!(named, Some(egui::Key::C | egui::Key::X | egui::Key::V));

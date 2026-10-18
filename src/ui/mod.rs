@@ -6,9 +6,10 @@ pub mod inspector;
 pub mod library;
 pub mod pages;
 pub mod palette;
+pub mod rail;
 
+use crate::editor::Editor;
 use crate::editor::shortcuts::{self, Action};
-use crate::editor::{Editor, Tool};
 use crate::model::{Color, NodeId, NodeKind};
 use crate::theme::{self, Icon};
 use egui::{Align2, Color32, RichText, Ui};
@@ -47,54 +48,200 @@ pub struct UiState {
     pub layer_drag: Option<(NodeId, Option<LayerDrop>)>,
     /// Row rects of the last layers-panel frame (for drop targeting).
     pub layer_rows: Vec<(NodeId, egui::Rect, usize)>,
-    /// A host's opt-in layout for surfaces too narrow for both side panels beside the canvas.
-    /// Off by default (every native window): `draw` then lays out exactly as before.
+    /// A host's opt-in width tiers for surfaces too narrow for both side panels beside the
+    /// canvas, and the arrangement as last laid out. Off by default (every native window
+    /// uses the wide tier).
     pub narrow: NarrowLayout,
+    /// The person's side-panel choices: Layers and Design open or closed, and Collapse panels
+    /// (DESIGN.md: Layers starts closed; Design starts open on a wide surface only).
+    pub panels: Panels,
+    /// The tool rail: each family's current member and the open flyout.
+    pub rail: rail::Rail,
+    /// Where the header's controls and the zoom were laid out in the last frame (no
+    /// behaviour; for hosts' checks and tests, like `PaletteUi::search_id`).
+    pub chrome: Chrome,
     /// The person's appearance: System (the default, following the OS appearance as
     /// `theme::apply` set it), Light or Dark (Menu ▸ Appearance). A view preference, never part
     /// of the canvas; the chrome and the canvas display follow it (DESIGN.md).
     pub appearance: egui::ThemePreference,
 }
 
-/// Which side panel the narrow layout shows over the canvas's room, if any.
+/// One side panel, or neither (what a single-panel tier shows).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NarrowPanel {
-    /// Just the canvas, with the floating tools.
+    /// Just the canvas, with the rail and zoom.
     #[default]
     Canvas,
     Layers,
     Design,
 }
 
-/// The narrow layout (see [`UiState::narrow`]): below `below` logical px of width the top bar
-/// spans the surface (All projects, the file's name, every menu in one, and a Layers and a
-/// Design toggle) and at most one side panel is shown instead of both beside the canvas: from
-/// `dock_from` px it is docked at its usual width beside the canvas (Layers left, Design
-/// right), so drawing room stays; narrower, it fills the room under the top bar. The same
-/// panels, commands and canvas are drawn; only where.
+/// How much room the surface has for side panels (DESIGN.md, Layout tiers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Both panels may sit beside the canvas, resizable.
+    Wide,
+    /// At most one panel, docked beside the canvas at its usual width.
+    Docked,
+    /// At most one panel, as an opaque sheet filling the room under the header.
+    Sheet,
+}
+
+/// What a frame lays out: the tier and which panels are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrangement {
+    pub tier: Tier,
+    pub layers: bool,
+    pub design: bool,
+}
+
+impl Arrangement {
+    /// The panel a single-panel tier shows.
+    pub fn panel(&self) -> NarrowPanel {
+        if self.layers {
+            NarrowPanel::Layers
+        } else if self.design {
+            NarrowPanel::Design
+        } else {
+            NarrowPanel::Canvas
+        }
+    }
+}
+
+/// The person's side-panel choices (see [`UiState::panels`]). A side never chosen yet follows
+/// the fresh default of the current tier: Layers closed; Design open only on a wide surface.
+/// The same toggle means the same panel at every width: on a wide surface the two choices are
+/// independent; in a single-panel tier opening one closes the other, and closing it returns to
+/// the canvas. Collapse panels hides both and keeps the choices, so Restore brings back the
+/// same arrangement; opening a panel while collapsed ends the collapse with that panel only.
+/// Hide UI (`UiState::hide_ui`) is a separate mode.
+#[derive(Debug, Default, Clone)]
+pub struct Panels {
+    layers: Option<bool>,
+    design: Option<bool>,
+    /// The side opened last: what a single-panel tier shows when both are chosen.
+    last: Option<NarrowPanel>,
+    collapsed: bool,
+}
+
+impl Panels {
+    /// The arrangement these choices want on a surface of tier `tier`.
+    pub fn wanted(&self, tier: Tier) -> Arrangement {
+        let none = Arrangement {
+            tier,
+            layers: false,
+            design: false,
+        };
+        if self.collapsed {
+            return none;
+        }
+        let layers = self.layers.unwrap_or(false);
+        let design = self.design.unwrap_or(tier == Tier::Wide);
+        if tier == Tier::Wide || !(layers && design) {
+            return Arrangement {
+                tier,
+                layers,
+                design,
+            };
+        }
+        let layers = self.last != Some(NarrowPanel::Design);
+        Arrangement {
+            tier,
+            layers,
+            design: !layers,
+        }
+    }
+
+    pub fn collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    /// Collapse panels, or Restore the arrangement they had.
+    pub fn toggle_collapsed(&mut self) {
+        self.collapsed = !self.collapsed;
+    }
+
+    fn set(&mut self, side: NarrowPanel, on: bool) {
+        match side {
+            NarrowPanel::Layers => self.layers = Some(on),
+            NarrowPanel::Design => self.design = Some(on),
+            NarrowPanel::Canvas => {}
+        }
+    }
+
+    /// The header's toggle for `side` on a surface of tier `tier`.
+    pub fn toggle(&mut self, side: NarrowPanel, tier: Tier) {
+        let other = match side {
+            NarrowPanel::Layers => NarrowPanel::Design,
+            NarrowPanel::Design => NarrowPanel::Layers,
+            NarrowPanel::Canvas => return,
+        };
+        let shown = self.wanted(tier);
+        let on = if side == NarrowPanel::Layers {
+            shown.layers
+        } else {
+            shown.design
+        };
+        if self.collapsed {
+            // Opening a panel ends the collapse, with that panel only.
+            self.collapsed = false;
+            self.set(side, true);
+            self.set(other, false);
+            self.last = Some(side);
+            return;
+        }
+        if on {
+            self.set(side, false);
+            if tier != Tier::Wide {
+                self.set(other, false);
+            }
+        } else {
+            self.set(side, true);
+            self.last = Some(side);
+            if tier != Tier::Wide {
+                self.set(other, false);
+            }
+        }
+    }
+
+    /// Show `side` (Rename shows the layer rows), leaving it open if it already is.
+    pub fn open(&mut self, side: NarrowPanel, tier: Tier) {
+        let shown = self.wanted(tier);
+        let on = match side {
+            NarrowPanel::Layers => shown.layers,
+            NarrowPanel::Design => shown.design,
+            NarrowPanel::Canvas => true,
+        };
+        if !on {
+            self.toggle(side, tier);
+        }
+    }
+}
+
+/// The width tiers (see [`UiState::narrow`]): below `below` logical px of width the surface has
+/// room for one side panel at a time, docked beside the canvas from `dock_from` px and a sheet
+/// under the header below that. The same panels, commands and canvas are drawn; only where.
 ///
-/// A change of arrangement (a toggle, or the surface crossing `below`) is applied only after
-/// one frame without an egui text field holding the keyboard, so a field that is about to be
-/// hidden first sees its focus go and finishes as a click elsewhere finishes it (a numeric
-/// draft, a rename), never silently dropped. While a field has the keyboard, the arrangement
-/// waits.
+/// A change of arrangement (a toggle, Collapse panels, or the surface crossing a tier) is
+/// applied only after one frame without an egui text field holding the keyboard, so a field
+/// that is about to be hidden first sees its focus go and finishes as a click elsewhere
+/// finishes it (a numeric draft, a rename), never silently dropped. While a field has the
+/// keyboard, the arrangement waits.
 #[derive(Debug, Default)]
 pub struct NarrowLayout {
-    /// The width below which the narrow layout is used; 0 (the default) never uses it.
+    /// The width below which a single-panel tier is used; 0 (the default) never uses one.
     pub below: f32,
-    /// The width from which the narrow layout's panel is docked beside the canvas rather than
-    /// filling the room; 0 (the default) always fills.
+    /// The width from which the single panel is docked beside the canvas rather than shown as
+    /// a sheet; 0 (the default) always a sheet.
     pub dock_from: f32,
-    /// The side panel the person chose for the narrow layout.
-    pub panel: NarrowPanel,
-    /// What is laid out: `None` for the ordinary layout.
-    shown: Option<NarrowPanel>,
+    /// What is laid out (`None` before the first frame).
+    shown: Option<Arrangement>,
     laid_out: bool,
     settling: bool,
 }
 
 impl NarrowLayout {
-    /// The narrow layout below `below` logical px of width, starting on the canvas.
+    /// Single-panel tiers below `below` logical px of width, as sheets.
     pub fn with_threshold(below: f32) -> NarrowLayout {
         NarrowLayout {
             below,
@@ -102,7 +249,7 @@ impl NarrowLayout {
         }
     }
 
-    /// [`NarrowLayout::with_threshold`], with its panel docked beside the canvas from
+    /// [`NarrowLayout::with_threshold`], with the panel docked beside the canvas from
     /// `dock_from` px.
     pub fn with_dock(below: f32, dock_from: f32) -> NarrowLayout {
         NarrowLayout {
@@ -112,9 +259,21 @@ impl NarrowLayout {
         }
     }
 
-    /// What the last frame laid out: `None` for the ordinary layout, else the narrow layout
-    /// with that panel.
-    pub fn shown(&self) -> Option<NarrowPanel> {
+    /// The tier of a surface `width` logical px wide.
+    pub fn tier(&self, width: f32) -> Tier {
+        if self.below > 0.0 && width < self.below {
+            if self.dock_from > 0.0 && width >= self.dock_from {
+                Tier::Docked
+            } else {
+                Tier::Sheet
+            }
+        } else {
+            Tier::Wide
+        }
+    }
+
+    /// What the last frame laid out.
+    pub fn shown(&self) -> Option<Arrangement> {
         self.shown
     }
 }
@@ -125,25 +284,52 @@ fn text_field_focused(ctx: &egui::Context) -> bool {
     focused.is_some_and(|id| egui::widgets::text_edit::TextEditState::load(ctx, id).is_some())
 }
 
-/// The arrangement to lay out this frame, for a surface `width` logical px wide (see
-/// [`NarrowLayout`]).
-fn settle_narrow(ctx: &egui::Context, n: &mut NarrowLayout, width: f32) -> Option<NarrowPanel> {
-    let want = (n.below > 0.0 && width < n.below).then_some(n.panel);
+/// Whether going from `a` to `b` only moves the one panel shown between the docked and sheet
+/// tiers: it is drawn by the same panel with the same widgets, so nothing is hidden and its
+/// fields keep focus (DESIGN.md: docked ↔ sheet is the same panel).
+fn same_single_panel(a: Arrangement, b: Arrangement) -> bool {
+    a.tier != Tier::Wide && b.tier != Tier::Wide && a.panel() == b.panel()
+}
+
+/// The arrangement to lay out this frame (see [`NarrowLayout`]).
+fn settle(ctx: &egui::Context, n: &mut NarrowLayout, want: Arrangement) -> Arrangement {
     if !n.laid_out {
         // The first frame lays out what the surface needs at once.
         n.laid_out = true;
-        n.shown = want;
-    } else if want == n.shown || text_field_focused(ctx) {
+        n.shown = Some(want);
+    } else if n.shown.is_some_and(|s| same_single_panel(s, want)) {
+        // Docked ↔ sheet (or the same arrangement): nothing waits.
+        n.settling = false;
+        n.shown = Some(want);
+    } else if Some(want) == n.shown || text_field_focused(ctx) {
         n.settling = false;
     } else if n.settling {
         n.settling = false;
-        n.shown = want;
+        n.shown = Some(want);
     } else {
         // One more frame as before: a field that lost the keyboard this frame finishes in it.
         n.settling = true;
         ctx.request_repaint();
     }
-    n.shown
+    n.shown.unwrap_or(want)
+}
+
+/// Where the header's controls and the zoom were laid out (see [`UiState::chrome`]).
+#[derive(Debug, Clone, Default)]
+pub struct Chrome {
+    pub home: Option<egui::Rect>,
+    pub menu: Option<egui::Rect>,
+    pub layers: Option<egui::Rect>,
+    pub design: Option<egui::Rect>,
+    /// The file's name and page line, centred in the header.
+    pub identity: Option<egui::Rect>,
+    /// The zoom group (−, percentage, +) at the canvas's lower left.
+    pub zoom: Option<egui::Rect>,
+    pub zoom_out: Option<egui::Rect>,
+    pub zoom_level: Option<egui::Rect>,
+    pub zoom_in: Option<egui::Rect>,
+    /// A sheet's way back to the canvas.
+    pub sheet_back: Option<egui::Rect>,
 }
 
 /// Where a dragged layer lands relative to a row.
@@ -193,6 +379,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         home::draw(ui, hv, st.native_chrome, st.translucent_sidebar);
         return egui::Rect::NOTHING;
     }
+    st.chrome = Chrome::default();
+    let tier = st.narrow.tier(ui.available_rect_before_wrap().width());
     for ev in std::mem::take(&mut ed.ui_events) {
         use crate::editor::commands::UiEvent;
         match ev {
@@ -202,11 +390,12 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                     st.renaming = Some((id, n.name.clone()));
                     st.show_library = false;
                     st.hide_ui = false;
-                    // The narrow layout shows the layer rows for it (unused otherwise).
-                    st.narrow.panel = NarrowPanel::Layers;
+                    // The rename's field is in the layer rows: show them.
+                    st.panels.open(NarrowPanel::Layers, tier);
                 }
             }
             UiEvent::ToggleUi => st.hide_ui = !st.hide_ui,
+            UiEvent::TogglePanels => st.panels.toggle_collapsed(),
             UiEvent::ToggleHelp => st.show_help = !st.show_help,
             UiEvent::ToggleGrid => st.show_grid_off = !st.show_grid_off,
         }
@@ -215,79 +404,20 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         // No layer or page rows are drawn: an open rename is finished as losing focus does.
         commit_rename(ed, st);
         pages::commit_rename(ed, st);
+        st.rail.close();
         let canvas = ui.available_rect_before_wrap();
         palette::draw(ui.ctx(), ed, st, canvas);
         return canvas;
     }
-    let width = ui.available_rect_before_wrap().width();
-    if let Some(panel) = settle_narrow(ui.ctx(), &mut st.narrow, width) {
-        return draw_narrow(ui, ed, st, panel);
-    }
+    let want = st.panels.wanted(tier);
+    let shown = settle(ui.ctx(), &mut st.narrow, want);
     let p = theme::pal(ui);
     let sidebar_fill = if st.translucent_sidebar {
         Color32::TRANSPARENT
     } else {
         p.sidebar
     };
-    egui::Panel::left("layers")
-        .resizable(true)
-        .default_size(240.0)
-        .size_range(180.0..=420.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(sidebar_fill)
-                .inner_margin(egui::Margin::symmetric(10, 8)),
-        )
-        .show(ui, |ui| {
-            if st.native_chrome {
-                // Room for the traffic lights, which sit over the top of the sidebar.
-                ui.add_space(theme::TOOLBAR_H - 8.0);
-            }
-            layers(ui, ed, st)
-        });
-    egui::Panel::top("toolbar")
-        .exact_size(if st.native_chrome {
-            theme::TOOLBAR_H
-        } else {
-            BAR_H
-        })
-        .frame(
-            egui::Frame::NONE
-                .fill(p.window)
-                .inner_margin(egui::Margin::symmetric(10, 0)),
-        )
-        .show(ui, |ui| top_bar(ui, ed, st, false));
-    egui::Panel::right("design")
-        .resizable(true)
-        .default_size(260.0)
-        .size_range(220.0..=420.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(p.inspector)
-                .inner_margin(egui::Margin::symmetric(14, 10)),
-        )
-        .show(ui, |ui| inspector::panel(ui, ed, st));
-    let canvas = ui.available_rect_before_wrap();
-    toolbar(ui.ctx(), ed, canvas, false);
-    status(ui.ctx(), ed, canvas);
-    palette::draw(ui.ctx(), ed, st, canvas);
-    if st.show_help {
-        help(ui.ctx(), st, canvas);
-    }
-    canvas
-}
-
-/// The narrow layout (see [`NarrowLayout`]): the top bar across the surface, then the chosen
-/// side panel docked beside the canvas (from `dock_from` px) or filling the room under the
-/// bar, or just the canvas with its floating tools. Panels the narrow layout opens keep their
-/// own sizes apart from the ordinary layout's.
-fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPanel) -> egui::Rect {
-    let p = theme::pal(ui);
-    let sidebar_fill = if st.translucent_sidebar {
-        Color32::TRANSPARENT
-    } else {
-        p.sidebar
-    };
+    // The header's safe area comes first, across the whole surface; the panels start below it.
     egui::Panel::top("toolbar")
         .exact_size(if st.native_chrome {
             theme::TOOLBAR_H
@@ -299,53 +429,165 @@ fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPane
                 .fill(p.window)
                 .inner_margin(egui::Margin::symmetric(8, 0)),
         )
-        .show(ui, |ui| top_bar(ui, ed, st, true));
+        .show(ui, |ui| top_bar(ui, ed, st, shown));
     let room = ui.available_rect_before_wrap();
-    // Docked: the panel at its usual width, the canvas keeps the rest. Otherwise it fills.
-    let docked = st.narrow.dock_from > 0.0 && room.width() >= st.narrow.dock_from;
-    let width = |usual: f32| if docked { usual } else { room.width() };
-    match panel {
-        NarrowPanel::Layers => {
-            egui::Panel::left("layers-narrow")
-                .resizable(false)
-                .exact_size(width(240.0))
-                .frame(
-                    egui::Frame::NONE
-                        .fill(sidebar_fill)
-                        .inner_margin(egui::Margin::symmetric(10, 8)),
-                )
-                .show(ui, |ui| layers(ui, ed, st));
+    let layers_frame = egui::Frame::NONE
+        .fill(sidebar_fill)
+        .inner_margin(egui::Margin::symmetric(10, 8));
+    let design_frame = egui::Frame::NONE
+        .fill(p.inspector)
+        .inner_margin(egui::Margin::symmetric(14, 10));
+    match shown.tier {
+        Tier::Wide => {
+            if shown.layers {
+                egui::Panel::left("layers")
+                    .resizable(true)
+                    .default_size(240.0)
+                    .size_range(180.0..=420.0)
+                    .frame(layers_frame)
+                    .show(ui, |ui| layers(ui, ed, st));
+            }
+            if shown.design {
+                egui::Panel::right("design")
+                    .resizable(true)
+                    .default_size(260.0)
+                    .size_range(220.0..=420.0)
+                    .frame(design_frame)
+                    .show(ui, |ui| inspector::panel(ui, ed, st));
+            }
         }
-        NarrowPanel::Design => {
-            egui::Panel::right("design-narrow")
-                .resizable(false)
-                .exact_size(width(260.0))
-                .frame(
-                    egui::Frame::NONE
-                        .fill(p.inspector)
-                        .inner_margin(egui::Margin::symmetric(14, 10)),
-                )
-                .show(ui, |ui| inspector::panel(ui, ed, st));
+        Tier::Docked | Tier::Sheet => {
+            // Docked: the panel at its usual width, the canvas keeps the rest. A sheet fills
+            // the room under the header (opaque; it takes its own input) and says how to get
+            // back to the canvas.
+            let sheet = shown.tier == Tier::Sheet;
+            let width = |usual: f32| if sheet { room.width() } else { usual };
+            // The panel's own widgets get the same ids in both tiers whether or not the sheet's
+            // back row comes first (egui numbers widgets in order), so a focused field and its
+            // draft survive docked ↔ sheet.
+            let body = |ui: &Ui| egui::UiBuilder::new().id(ui.id().with("panel-body"));
+            match shown.panel() {
+                NarrowPanel::Layers => {
+                    egui::Panel::left("layers-narrow")
+                        .resizable(false)
+                        .exact_size(width(240.0))
+                        .frame(layers_frame)
+                        .show(ui, |ui| {
+                            if sheet {
+                                sheet_back(ui, st, NarrowPanel::Layers, tier);
+                            }
+                            ui.scope_builder(body(ui), |ui| layers(ui, ed, st));
+                        });
+                }
+                NarrowPanel::Design => {
+                    egui::Panel::right("design-narrow")
+                        .resizable(false)
+                        .exact_size(width(260.0))
+                        .frame(design_frame)
+                        .show(ui, |ui| {
+                            if sheet {
+                                sheet_back(ui, st, NarrowPanel::Design, tier);
+                            }
+                            ui.scope_builder(body(ui), |ui| inspector::panel(ui, ed, st));
+                        });
+                }
+                NarrowPanel::Canvas => {}
+            }
         }
-        NarrowPanel::Canvas => {}
     }
-    if panel != NarrowPanel::Layers && st.narrow.panel != NarrowPanel::Layers {
+    if !shown.layers && !want.layers {
         // No layer or page rows are drawn, and none are about to be: an open rename is
         // finished as losing focus does (as when the UI is hidden).
         commit_rename(ed, st);
         pages::commit_rename(ed, st);
     }
+    // The one canvas rectangle: rendering, clipping and pointer input all use it.
     let canvas = ui.available_rect_before_wrap();
-    // The floating tools whenever the canvas has room (beside a docked panel too).
-    if canvas.width() > 1.0 {
-        toolbar(ui.ctx(), ed, canvas, true);
-        status(ui.ctx(), ed, canvas);
+    if canvas.width() > 1.0 && canvas.height() > 1.0 {
+        rail::draw(ui.ctx(), ed, &mut st.rail, canvas);
+        zoom_controls(ui.ctx(), ed, st, canvas);
+        status(ui.ctx(), ed, canvas, st.chrome.zoom);
+    } else {
+        // A sheet covers the canvas: no rail, and no flyout left open behind it.
+        st.rail.close();
+        st.rail.rects = Default::default();
     }
     palette::draw(ui.ctx(), ed, st, room);
     if st.show_help {
         help(ui.ctx(), st, room);
     }
     canvas
+}
+
+/// A sheet's first row: the way back to the canvas (the header's toggle does the same).
+fn sheet_back(ui: &mut Ui, st: &mut UiState, side: NarrowPanel, tier: Tier) {
+    let r = ui
+        .add(egui::Button::new("← Canvas").frame(false))
+        .on_hover_text("Close this panel and return to the canvas");
+    st.chrome.sheet_back = Some(r.rect);
+    if r.clicked() {
+        st.panels.toggle(side, tier);
+    }
+    ui.add_space(4.0);
+}
+
+/// Zoom out, the zoom level and zoom in, at the canvas's lower left (clear of the rail; beside
+/// it, at the top, on a short canvas). The level opens Fit, selection and 100%.
+fn zoom_controls(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui::Rect) {
+    let rail = rail::rail_rect(canvas);
+    let short = canvas.height() < rail::SHORT_H;
+    let (pivot, pos) = if short {
+        (
+            Align2::LEFT_TOP,
+            egui::pos2(rail.right() + rail::INSET, canvas.top() + rail::INSET),
+        )
+    } else {
+        (
+            Align2::LEFT_BOTTOM,
+            egui::pos2(canvas.left() + rail::INSET, canvas.bottom() - rail::INSET),
+        )
+    };
+    let mut parts = (None, None, None);
+    let r = egui::Area::new("zoom".into())
+        .order(egui::Order::Middle)
+        .pivot(pivot)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            let p = theme::pal(ui);
+            egui::Frame::popup(ui.style())
+                .fill(p.popover)
+                .corner_radius(8.0)
+                .inner_margin(2.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let out =
+                            action_button(ui, ed, theme::Icon::Minus, "Zoom out", Action::ZoomOut);
+                        let level = ui
+                            .menu_button(
+                                RichText::new(format!("{:.0}%", ed.camera.zoom * 100.0))
+                                    .font(theme::medium(theme::SECONDARY + 1.0))
+                                    .color(p.secondary),
+                                |ui| {
+                                    for (label, a) in [
+                                        ("Zoom to Fit", Action::ZoomFit),
+                                        ("Zoom to Selection", Action::ZoomSelection),
+                                        ("Zoom to 100%", Action::Zoom100),
+                                    ] {
+                                        menu_item(ui, ed, label, a);
+                                    }
+                                },
+                            )
+                            .response
+                            .on_hover_text("Zoom options");
+                        let inn =
+                            action_button(ui, ed, theme::Icon::Plus, "Zoom in", Action::ZoomIn);
+                        parts = (Some(out), Some(level.rect), Some(inn));
+                    });
+                });
+        });
+    st.chrome.zoom = Some(r.response.rect);
+    (st.chrome.zoom_out, st.chrome.zoom_level, st.chrome.zoom_in) = parts;
 }
 
 /// The top bar's height without native chrome.
@@ -426,102 +668,128 @@ fn appearance_menu(ui: &mut Ui, st: &mut UiState) {
     }
 }
 
-/// An icon button with its action's name and shortcut as its tooltip.
-fn action_button(ui: &mut Ui, ed: &mut Editor, icon: theme::Icon, name: &str, action: Action) {
+/// An icon button with its action's name and shortcut as its tooltip; returns where it is.
+fn action_button(
+    ui: &mut Ui,
+    ed: &mut Editor,
+    icon: theme::Icon,
+    name: &str,
+    action: Action,
+) -> egui::Rect {
     let keys = shortcuts::chord_text(action);
     let tip = if keys.is_empty() {
         name.to_string()
     } else {
         format!("{name}  {keys}")
     };
-    if theme::quiet_icon_button(ui, icon, 26.0, false)
-        .on_hover_text(tip)
-        .clicked()
-    {
+    let r = theme::quiet_icon_button(ui, icon, 26.0, false).on_hover_text(tip);
+    if r.clicked() {
         ed.run(action);
     }
+    r.rect
 }
 
-/// The one top bar, ordinary and narrow alike (see DESIGN.md). Left: All projects (the way
-/// home), every menu under one Menu (platforms without a native menu bar), then the file's
-/// name over its page and save state, truncated rather than overlapped. Right: undo and redo,
-/// zoom, and help; in the narrow layout the Layers and Design toggles take help's place, and
-/// history and zoom stay while there is room for them (they keep their shortcuts and menu
-/// entries either way). Its icons are quiet (secondary until hovered) and only an open toggle
-/// is tinted, so the bar recedes around the canvas.
-fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, narrow: bool) {
+/// The header (DESIGN.md: the top safe area, laid out before the panels and across the whole
+/// surface, at every width). Left: All projects (the way home), one compact menu holding every
+/// upstream menu (platforms without a native menu bar) and the Layers toggle. Centre: the
+/// file's real name over its page and save state, centred on the surface and truncated rather
+/// than overlapped. Right: the Design toggle. Undo, redo, zoom and help stay in the menu, the
+/// palette and their shortcuts (zoom also at the canvas's lower left). Its controls are quiet
+/// and only an open toggle is tinted, so the header recedes around the canvas.
+fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement) {
     let p = theme::pal(ui);
-    ui.horizontal_centered(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        if theme::quiet_icon_button(ui, theme::Icon::Grid, 26.0, false)
-            .on_hover_text("All projects")
-            .clicked()
-        {
-            ed.requests.push(crate::editor::AppRequest::Home);
-        }
-        if !st.native_chrome {
-            ui.menu_button("Menu", |ui| {
-                for (title, entries) in shortcuts::menus() {
-                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
+    let bar = ui.max_rect();
+    let tier = shown.tier;
+    // Left group (after the traffic lights where the window has native chrome).
+    let left_start = bar.left()
+        + if st.native_chrome {
+            theme::TRAFFIC_LIGHTS_W
+        } else {
+            0.0
+        };
+    let left = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    egui::pos2(left_start, bar.top()),
+                    bar.max,
+                ))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let home = theme::quiet_icon_button(ui, theme::Icon::Grid, 26.0, false)
+                    .on_hover_text("All projects");
+                st.chrome.home = Some(home.rect);
+                if home.clicked() {
+                    ed.requests.push(crate::editor::AppRequest::Home);
                 }
-                ui.separator();
-                ui.menu_button("Appearance", |ui| appearance_menu(ui, st));
-            });
-        }
-        ui.add_space(6.0);
-        let room = ui.available_width();
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if narrow {
-                for (panel, label) in [
-                    (NarrowPanel::Design, "Design"),
-                    (NarrowPanel::Layers, "Layers"),
-                ] {
-                    let on = st.narrow.panel == panel;
-                    if pill(ui, label, on).clicked() {
-                        st.narrow.panel = if on { NarrowPanel::Canvas } else { panel };
-                    }
+                if !st.native_chrome {
+                    let menu = ui
+                        .menu_button(
+                            RichText::new("···")
+                                .font(theme::semibold(theme::BODY))
+                                .color(p.secondary),
+                            |ui| {
+                                for (title, entries) in shortcuts::menus() {
+                                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
+                                }
+                                ui.separator();
+                                ui.menu_button("Appearance", |ui| appearance_menu(ui, st));
+                            },
+                        )
+                        .response
+                        .on_hover_text("Menu");
+                    st.chrome.menu = Some(menu.rect);
                 }
-            } else if theme::quiet_icon_button(ui, theme::Icon::Question, 26.0, st.show_help)
-                .on_hover_text("Keyboard shortcuts")
-                .clicked()
-            {
-                st.show_help = !st.show_help;
-            }
-            if !narrow || room >= 560.0 {
-                ui.add_space(8.0);
-                action_button(ui, ed, theme::Icon::Plus, "Zoom in", Action::ZoomIn);
-                let z = ui.add(
-                    egui::Button::new(
-                        RichText::new(format!("{:.0}%", ed.camera.zoom * 100.0))
-                            .font(theme::medium(theme::SECONDARY + 1.0))
-                            .color(p.secondary),
-                    )
-                    .frame(false)
-                    .min_size(egui::vec2(44.0, 22.0)),
-                );
-                if z.on_hover_text("Zoom to fit").clicked() {
-                    ed.run(Action::ZoomFit);
+                let layers = theme::quiet_icon_button(ui, theme::Icon::Sidebar, 26.0, shown.layers)
+                    .on_hover_text("Layers and pages");
+                st.chrome.layers = Some(layers.rect);
+                if layers.clicked() {
+                    st.panels.toggle(NarrowPanel::Layers, tier);
                 }
-                action_button(ui, ed, theme::Icon::Minus, "Zoom out", Action::ZoomOut);
-            }
-            if !narrow || room >= 420.0 {
-                ui.add_space(8.0);
-                action_button(ui, ed, theme::Icon::Redo, "Redo", Action::Redo);
-                action_button(ui, ed, theme::Icon::Undo, "Undo", Action::Undo);
-            }
-            ui.add_space(8.0);
-            // The file's identity takes what is left, from the left.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                file_identity(ui, ed, st);
-            });
-        });
-    });
-    // 1px separator under the toolbar.
-    let r = ui.max_rect();
+                ui.min_rect().right()
+            },
+        )
+        .inner;
+    // Right group.
+    let right = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(bar)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let design = pill(ui, "Design", shown.design).on_hover_text("Design inspector");
+                st.chrome.design = Some(design.rect);
+                if design.clicked() {
+                    st.panels.toggle(NarrowPanel::Design, tier);
+                }
+                ui.min_rect().left()
+            },
+        )
+        .inner;
+    // Centre: on the surface's centre while that leaves room on both sides, else in the room
+    // between the two groups.
+    let gap = 8.0;
+    let (lo, hi) = (left + gap, right - gap);
+    let half = (bar.center().x - lo).min(hi - bar.center().x);
+    let (x0, x1) = if half >= 60.0 {
+        (bar.center().x - half, bar.center().x + half)
+    } else {
+        (lo, hi.max(lo))
+    };
+    let id_rect = egui::Rect::from_min_max(egui::pos2(x0, bar.top()), egui::pos2(x1, bar.bottom()));
+    st.chrome.identity = Some(id_rect);
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(id_rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+        |ui| file_identity(ui, ed, st),
+    );
+    // 1px separator under the header.
     ui.painter().hline(
-        r.x_range(),
-        r.bottom() - 0.5,
+        bar.x_range(),
+        bar.bottom() - 0.5,
         egui::Stroke::new(1.0, p.separator),
     );
 }
@@ -547,15 +815,12 @@ fn file_identity(ui: &mut Ui, ed: &Editor, st: &UiState) {
     } else {
         format!("{} — {state}", ed.page_name())
     };
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.add_space(if st.native_chrome { 6.0 } else { 2.0 });
-        ui.add(egui::Label::new(title_text(title)).truncate());
-        ui.add(
-            egui::Label::new(RichText::new(sub).size(theme::SECONDARY).color(p.secondary))
-                .truncate(),
-        );
-    });
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.add_space(if st.native_chrome { 6.0 } else { 2.0 });
+    ui.add(egui::Label::new(title_text(title)).truncate());
+    ui.add(
+        egui::Label::new(RichText::new(sub).size(theme::SECONDARY).color(p.secondary)).truncate(),
+    );
 }
 
 fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
@@ -620,9 +885,11 @@ fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             let roots = ed.doc.root.clone();
             if roots.is_empty() {
                 ui.label(
-                    RichText::new("Nothing here yet. Pick a tool below\nand draw on the canvas.")
-                        .size(theme::SECONDARY)
-                        .color(theme::pal(ui).secondary),
+                    RichText::new(
+                        "Nothing here yet. Pick a tool on the left\nand draw on the canvas.",
+                    )
+                    .size(theme::SECONDARY)
+                    .color(theme::pal(ui).secondary),
                 );
             }
             st.layer_rows.clear();
@@ -941,90 +1208,21 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
     }
 }
 
-fn tool_icon(t: Tool) -> Icon {
-    match t {
-        Tool::Select => Icon::Pointer,
-        Tool::Hand => Icon::Hand,
-        Tool::Frame => Icon::Frame,
-        Tool::Rect => Icon::Rect,
-        Tool::Ellipse => Icon::Ellipse,
-        Tool::Polygon => Icon::Polygon,
-        Tool::Diamond => Icon::Diamond,
-        Tool::Arrow => Icon::Arrow,
-        Tool::Sticky => Icon::Sticky,
-        Tool::Laser => Icon::Laser,
-        Tool::Star => Icon::Star,
-        Tool::Pen => Icon::Pen,
-        Tool::Line => Icon::Line,
-        Tool::Text => Icon::Text,
-        Tool::Pencil => Icon::Pencil,
-        Tool::Eraser => Icon::Eraser,
-    }
-}
-
-/// The tools a separator goes before in the floating tool palette.
-const GROUP_STARTS: [Tool; 4] = [Tool::Frame, Tool::Line, Tool::Text, Tool::Pencil];
-
-/// The floating tool palette's width as one row (16 tools, 4 separators, margins), in points.
-const TOOL_ROW_W: f32 = 600.0;
-
-/// Floating tool palette at the bottom of the canvas, styled as a macOS popover. `wrap` (the
-/// narrow layout), or a canvas narrower than one row of tools (side panels widened, a small
-/// window): the tools wrap into rows that fit the canvas, without separators, instead of
-/// running under the panels.
-fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect, wrap: bool) {
-    let wrap = wrap || canvas.width() < TOOL_ROW_W;
-    egui::Area::new("toolbar".into())
-        .pivot(Align2::CENTER_BOTTOM)
-        .fixed_pos(egui::pos2(canvas.center().x, canvas.bottom() - 16.0))
-        .show(ctx, |ui| {
-            let p = theme::pal(ui);
-            egui::Frame::popup(ui.style())
-                .fill(p.popover)
-                .corner_radius(10.0)
-                .inner_margin(5.0)
-                .show(ui, |ui| {
-                    let tools = |ui: &mut Ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for t in Tool::ALL {
-                            if !wrap && GROUP_STARTS.contains(&t) {
-                                let (r, _) = ui.allocate_exact_size(
-                                    egui::vec2(9.0, 28.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().vline(
-                                    r.center().x,
-                                    r.y_range().shrink(6.0),
-                                    egui::Stroke::new(1.0, p.separator),
-                                );
-                            }
-                            if theme::icon_button(ui, tool_icon(t), 30.0, ed.tool == t)
-                                .on_hover_text(format!("{} ({})", t.label(), t.shortcut()))
-                                .clicked()
-                            {
-                                ed.run(Action::Tool(t));
-                            }
-                        }
-                    };
-                    if wrap {
-                        ui.set_max_width((canvas.width() - 32.0).max(32.0));
-                        ui.horizontal_wrapped(tools);
-                    } else {
-                        ui.horizontal(tools);
-                    }
-                });
-        });
-}
-
-fn status(ctx: &egui::Context, ed: &Editor, canvas: egui::Rect) {
+/// A transient status line, right of the zoom controls (or at the canvas's lower left when
+/// they are at the top), so it never covers them or the rail.
+fn status(ctx: &egui::Context, ed: &Editor, canvas: egui::Rect, zoom: Option<egui::Rect>) {
     if ed.status.is_empty() {
         return;
     }
+    let left = zoom
+        .filter(|z| z.bottom() > canvas.center().y)
+        .map_or(canvas.left() + 12.0, |z| z.right() + 12.0);
     egui::Area::new("status".into())
         .pivot(Align2::LEFT_BOTTOM)
-        .fixed_pos(egui::pos2(canvas.left() + 12.0, canvas.bottom() - 12.0))
+        .fixed_pos(egui::pos2(left, canvas.bottom() - 12.0))
         .interactable(false)
         .show(ctx, |ui| {
+            ui.set_max_width((canvas.right() - left - 12.0).max(40.0));
             ui.label(RichText::new(&ed.status).weak().small());
         });
 }

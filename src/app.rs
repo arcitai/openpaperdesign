@@ -1001,7 +1001,10 @@ impl ApplicationHandler<UserEvent> for App {
                     .map(|p| v2(p.x as f64, p.y as f64));
                 let Some(p) = p else { return };
                 match state {
-                    ElementState::Pressed if self.over_canvas(p) => {
+                    // While a tool flyout is open the press only closes it.
+                    ElementState::Pressed
+                        if self.over_canvas(p) && !self.st.rail.captures_input() =>
+                    {
                         // Clicking the canvas takes keyboard focus away from text fields.
                         self.ctx.memory_mut(|m| {
                             if let Some(f) = m.focused() {
@@ -1108,7 +1111,19 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.ctx.egui_wants_keyboard_input() {
+                // A text field's keys are its own; an open tool flyout takes Escape (egui has
+                // the event and closes it; the tool stays as it is); a rail control with egui's
+                // keyboard focus takes Enter and Space (egui chooses it).
+                let flyout_escape = self.st.rail.captures_input()
+                    && matches!(event.logical_key, WKey::Named(NamedKey::Escape));
+                let rail = match event.logical_key {
+                    WKey::Named(NamedKey::Enter) => Some(egui::Key::Enter),
+                    WKey::Named(NamedKey::Space) => Some(egui::Key::Space),
+                    _ => None,
+                };
+                let focused = self.ctx.memory(|m| m.focused());
+                let rail_key = rail.is_some_and(|k| self.st.rail.takes_key(k, focused));
+                if self.ctx.egui_wants_keyboard_input() || flyout_escape || rail_key {
                     self.gfx.as_ref().unwrap().window.request_redraw();
                     return;
                 }

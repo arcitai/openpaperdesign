@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 4 · 2026-10-18 · The one canonical visual and interaction direction for the OPD app
+Revision: 6 · 2026-10-18 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -37,30 +37,76 @@ themes copied):
   cards and feature breadth are not OPD chrome.
 
 The principles:
-1. **Drawing room first.** Panels give way before the canvas does (see Layout). Floating tools
-   never cover panels, and they wrap rather than run under them.
-2. **One top bar, one way home.** From left to right:
-   - All projects (the grid icon, the only way back to Home);
-   - one Menu holding every upstream menu (on platforms without a native menu bar);
-   - the file's name over its page and save state, truncated, never overlapped;
-   - on the right: undo/redo, zoom, help.
+1. **Drawing room first.** Panels give way before the canvas does (see Layout). The tool rail
+   and zoom float over the canvas's edges, never over panels.
+2. **One header, one way home** (revision 2, built). The header's safe area is laid out before
+   the panels, across the whole surface, at every width:
+   - left: All projects (the grid icon, the only way back to Home), one compact menu (`···`,
+     holding every upstream menu and Appearance; native macOS keeps its menu bar instead) and
+     the Layers toggle (pages and layers);
+   - centre: the file's real name over its page and save state, centred on the surface and
+     truncated, never overlapped;
+   - right: the Design toggle.
 
-   Nothing is duplicated outside it, so there is no outer title, stage or action bar. Its icons
-   are quiet: secondary colour, the text colour on hover, and an accent tint only for an open
-   toggle (help, or the narrow layout's Layers and Design). The zoom level is secondary text.
-3. **One strong accent.** The canvas's selected tool is the only solid accent control. Selected
-   rows, open toggles and Home's pressed layout buttons use the accent tint, and their labels
-   keep their colour.
+   Undo/redo, help and every other command stay in the menu, the command palette and their
+   shortcuts; zoom is at the canvas's lower left. Nothing is duplicated outside the header, so
+   there is no outer title, stage or action bar. Its controls are quiet and only an open
+   toggle is tinted.
+3. **One strong accent.** The canvas's selected tool family is the only solid accent control.
+   Selected rows, open toggles and Home's pressed layout buttons use the accent tint, and their
+   labels keep their colour.
 4. **Contextual properties stay in the inspector** (Design), pages and layers in the left
    panel. Arrange (bring forward and send backward) shows in the layers header only while
    something is selected. Every command keeps its menu entry and keyboard binding wherever a
    button moves or hides.
-5. **Quiet surfaces, clear state.** Panels and bar share one colour, separated by hairlines.
+5. **One tool rail** (revision 2, built). A slim vertical rail at the canvas's left edge holds
+   all sixteen tools in six families:
+
+   | Family | Tools (first = initial member) |
+   |---|---|
+   | Pointer | Select, Hand, Laser pointer |
+   | Frame | Frame |
+   | Shapes | Rectangle, Ellipse, Diamond, Polygon, Star |
+   | Lines | Arrow (binds to shapes), Line (free) |
+   | Text | Text, Sticky note (a note, not a neutral box) |
+   | Draw | Pencil, Pen (vector path), Eraser |
+
+   - A family's main button runs its current member. Its own chevron (a separate 24 × 32 px
+     target, always visible) opens a flyout of whole-row choices: icon, name and the real
+     shortcut.
+   - Choosing a tool, by row or shortcut, makes it the family's member.
+   - Escape closes an open flyout first; Escape outside it returns to Select, and every family
+     keeps its member.
+   - A press outside closes the flyout and never reaches the canvas.
+   - The rail's controls and rows take keyboard focus with Tab; Enter or Space chooses the
+     focused one and never reaches the canvas.
+   - Tool keys typed into a field stay the field's.
+   - There is no bottom tool palette.
+6. **A quiet, contextual inspector** (revision 2, built):
+   - **Nothing selected, Select/Hand/Laser:** the page and a one-line hint.
+   - **A creation tool:** only that tool's defaults, titled "For new …"; they never edit the
+     selection.
+   - **A selection:** the sections every selected layer has. A value they share is shown and
+     editable for all, as one coalesced undo step. A value that differs shows Mixed and is
+     never the first layer's value. A widget that can't show Mixed is left out, with a short
+     reason.
+   - **Folded by default:** Sketch (the optional hand-drawn style, with a plain explanation;
+     clean geometry unless turned on, and existing sketchy drawings keep it) and Export.
+7. **Quiet surfaces, clear state.** Panels and header share one colour, separated by hairlines.
    Fields are softly filled.
-6. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
-   neatness (see the status rules in AGENTS.md).
-7. **Light and dark are one design** (see Appearance below): Home, the chrome, every toolbar,
-   menus, the inspector and the canvas itself share one resolved appearance.
+8. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
+   neatness (see the status rules in AGENTS.md). A transient status sits right of the zoom,
+   never over it or the rail.
+9. **Light and dark are one design** (see Appearance below): Home, the chrome, the rail and
+   zoom, menus, the inspector and the canvas itself share one resolved appearance.
+
+Still open from the revision 2 plan (not built yet, and not to be described as built):
+- None / Dots / Lines backgrounds and the blank-canvas menu;
+- the Home grid default, equal cards, footer and storage cue, and view preferences;
+- file rename through the fenced canvas save, and page rename from the centred identity;
+- the diagram workflow and connector labels;
+- the project Design system source;
+- the guide and value editor and Apply.
 
 ## Appearance (System, Light, Dark)
 
@@ -104,19 +150,43 @@ The principles:
 
 ## Layout tiers (CSS px of the granted surface)
 
-| Width | Arrangement |
-|---|---|
-| ≥ 1024 | Ordinary: layers/pages left (240), canvas, inspector right (260), resizable; top bar across canvas and inspector. |
-| 600–1023 | Docked: top bar across the surface; the canvas plus at most ONE panel at its usual width, chosen with the Layers / Design toggles (Layers left, Design right). Default: canvas only. |
-| < 600 | Narrow: top bar across; the chosen panel fills the room under it, or the canvas with the tools wrapped into rows. |
+| Width | Arrangement | A fresh view |
+|---|---|---|
+| ≥ 1024 | Wide: header across; layers/pages left (240) and inspector right (260), each optional and resizable, beside the canvas. | Layers closed; the quiet Design inspector open |
+| 600–1023 | Docked: header across; the canvas plus at most ONE panel at its usual width (Layers left, Design right). | Canvas only |
+| < 600 | Sheet: header across; a chosen panel is an opaque sheet filling the room under the header, with "← Canvas" back (no canvas sliver, no input behind it). | Canvas only |
 
 Rules that apply to every tier:
-- A change of arrangement waits while an egui text field has the keyboard, then lags one
-  frame. A hidden field finishes as a click elsewhere finishes it.
-- Docked ↔ filled is the same panel, so its fields keep focus.
-- Native windows use the ordinary tier only, unless a host opts in (`UiState::narrow`).
-- Undo/redo and zoom leave the narrow top bar first (from about 420 and 560 px of bar). They
-  stay reachable through Menu and their shortcuts.
+- **Layers and Design toggles** mean the same panel at every width. On a wide surface the two
+  are independent. In a single-panel tier, opening one closes the other, and closing it
+  returns to the canvas. Widening shows what the person chose; a side never chosen follows the
+  fresh default.
+- **Collapse panels** (menu View ▸ Collapse / Restore Panels, and the palette) hides both and
+  keeps the arrangement, so Restore brings it back. Opening a panel while collapsed ends the
+  collapse, with that panel only. The header, rail and zoom stay. **Hide UI** (Ctrl/⌘+\) is a
+  separate mode that hides everything. Collapse has no shortcut yet: one is added only after
+  the hosts' key handling has been checked.
+- **Arrangement changes wait for fields.** A change waits while an egui text field has the
+  keyboard, then lags one frame. A hidden field finishes as a click elsewhere finishes it.
+  Docked ↔ sheet is the same panel, so its fields keep focus.
+- **One canvas rectangle** (what the panels leave) is used for rendering, clipping and pointer
+  input.
+- **Native windows** use the wide tier only, unless a host opts in (`UiState::narrow`).
+
+### Rail and zoom geometry
+
+These are the values in `src/ui/rail.rs`. They are design calculations, not proof of how they
+render.
+
+- **Rail:** 64 px wide (32 px main button plus 24 px chevron plus 2 × 4 padding; the plan's
+  52 px is widened so the chevron is a real target). Six 32 px rows with 2 px gaps, 210 px tall,
+  8 px from the canvas's edges.
+- **Placement:** vertically centred in the room above a 48 px zoom reservation. Below a 270 px
+  canvas height it is anchored at the top, with the zoom beside it.
+- **Flyout:** 220 px wide, opening inward at rail.right + 4. Where that leaves less than
+  180 px it opens over the rail instead. Its height is clamped to the canvas (it scrolls).
+- **Zoom:** −, the level (a menu with Zoom to Fit, Zoom to Selection and Zoom to 100%) and +,
+  at the canvas's lower left.
 
 ## Tokens
 
@@ -145,11 +215,11 @@ under the host's MCP Apps style variables.
   - menus 10, windows and popovers 12;
   - Home cards 12.
 - **Spacing:**
-  - top bar 38 (40 with native chrome);
+  - header 38 (40 with native chrome);
   - 24 interactive height;
-  - 26 icon buttons in bars, 30 in the tool dock;
+  - 26 icon buttons in the header and zoom; rail rows 32 × 32 plus a 24 × 32 chevron;
   - 16-unit icon grid, about 1.25 stroke.
-- **Shadow:** only floating things (tool dock, menus, popovers). Panels are flat.
+- **Shadow:** only floating things (the rail, zoom, menus, popovers). Panels are flat.
 - **Borders:** hairlines between regions only. Controls in bars and rows are borderless until
   hovered.
 
