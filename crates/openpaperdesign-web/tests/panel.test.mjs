@@ -34,7 +34,8 @@ const mod = await asModule(SOURCE);
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
 
 test('the assembled module links, imports nothing and is safe inside the view\'s script element', async () => {
-  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
+  // opdStatusKind: the home view's editor uses the editor's own rule for how a status shows.
+  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'opdStatusKind', 'opdQuietStatus', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
     assert.equal(typeof mod[name], 'function', name);
   }
   assert.equal(typeof mod.default, 'function', 'the glue\'s own init (__wbg_init)');
@@ -76,8 +77,9 @@ const T = {
 };
 const ok = (v) => ({ result: { content: [{ type: 'text', text: JSON.stringify(v) }] } });
 const no = (status, error, revision = null) => ({ result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error, status, revision }) }] } });
-// What the editor is given to open: the canvas's pages and active page, as text.
-const opened = (c) => JSON.stringify({ active_page: c.active_page, pages: c.pages });
+// What the editor is given to open: the file's name (the fake server's canvas is "Plan"), the
+// canvas's pages and active page, as text.
+const opened = (c) => JSON.stringify({ canvas: { name: 'Plan' }, active_page: c.active_page, pages: c.pages });
 
 function fakeServer(wasm = new Uint8Array(600000).fill(0x61)) {
   // The canvas as the server has it: its pages (id, name, revision, page file), the active page

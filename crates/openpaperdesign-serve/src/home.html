@@ -16,20 +16,25 @@
   grants nothing. Host theme and style variables only change presentation. Nothing is stored
   in the browser.
 
-  Served by an app-library server (`--app-library`), the view instead lists the canvases
-  OpenPaperDesign keeps in its own data folder and creates, opens, closes, exports and imports
-  them through the `openpaperdesign_app_*` actions, again without any chat message. A file
-  chosen for import travels only as its text; an export is offered as a browser download, which
-  Codex never confirms. The server fills the view's mode slot; nothing else differs per server.
+  Served by an app-library server (`--app-library`), the view is one OpenPaperDesign app: a
+  file library (the canvases OpenPaperDesign keeps in its own data folder: New file, search, a
+  list or grid of named files with their last edit, and a per-file menu with Open, Rename and
+  Export) and, for the file it opens, upstream paper-rs's whole workspace filling the view.
+  Every action is an `openpaperdesign_app_*` call, without any chat message. These files belong
+  to the app's library, not to a Codex project: the library says so, and nothing groups them by
+  project. A file chosen for import travels only as its text; an export is offered as a browser
+  download, which Codex never confirms. The server fills the view's mode slot; nothing else
+  differs per server.
 
-  A created, imported or opened library canvas is handed to its one loopback web editor: the
-  result's own link (the same binding's server, checked against the loopback pattern) is asked
-  to open once, in Codex's browser. The view reports only what that request did; the editor
-  itself shows Ready and Saved. An app-library server also fills the view's editor slot (the first line of its one
-  module) with the optional in-panel editor, when its build has one: the packaged renderer glue,
-  session.js, page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that
-  order. It is offered as "Edit in this view" for the canvas a result shows, with the same
-  renderer and save rules; without it, the slot stays `null` and nothing else changes.
+  An app-library server also fills the view's editor slot (the first line of its one module)
+  with the in-panel editor, when its build has one: the packaged renderer glue, session.js,
+  page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that order. New,
+  Open, Import and Open current file then mount it right here on the result's binding (no link
+  is asked for or given); the workspace's own top bar names the file and its "All projects"
+  button goes back to the library, which saves what is left and closes exactly that binding.
+  Without the module the slot stays `null`, and a library canvas is handed to its one loopback
+  web editor instead: the result's own link (checked against the loopback pattern), asked to
+  open once in Codex's browser, reporting only what that request did.
 -->
 <style>
   @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
@@ -93,7 +98,7 @@
   .btn svg, .row-main svg { flex: none; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
   label { display: block; margin: 12px 0 6px; font-size: 13px; font-weight: 500; }
-  input[type="text"], select { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--opd-line);
+  input[type="text"], input[type="search"], select { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--opd-line);
     border-radius: var(--opd-radius); background: transparent; color: var(--opd-text); font: inherit; }
   select option { background: var(--opd-bg); color: var(--opd-text); }
 
@@ -131,27 +136,53 @@
   summary:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--opd-ring); }
   .fields { margin-top: 8px; font-size: 13px; }
   .hint { margin-top: 12px; font-size: 12px; color: var(--opd-muted); }
-  footer { margin-top: auto; padding-top: 32px; }
+  footer { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: auto; padding-top: 32px; }
   .wordmark { font: 400 16px/1.2 "Geist Pixel", monospace; color: var(--opd-text); }
+  .about { margin: 0; text-align: right; }
+  .about p { max-width: 320px; margin: 6px 0 0; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
-  /* The in-panel editor: upstream's workspace takes the room, with one status line above. */
-  main[data-view="editor"] { max-width: none; padding: 12px 16px 12px; }
-  main[data-view="editor"] header { margin-bottom: 8px; }
-  main[data-view="editor"] footer { padding-top: 12px; }
-  .ed-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
-  .ed-head h2 { margin: 0; }
-  .ed-status { margin: 0; font-size: 12px; color: var(--opd-muted); overflow-wrap: anywhere; }
-  .ed-status.bad { color: var(--opd-danger); }
-  .ed-stage { position: relative; height: max(420px, calc(100vh - 210px)); margin-top: 8px; overflow: hidden;
-    border: 1px solid var(--opd-line); border-radius: var(--opd-radius); }
+  /* The file library: where its files live, then search, layout and New file. */
+  .lib-bar { margin-bottom: 12px; }
+  .lib-context { margin: 0 0 10px; font-size: 12px; color: var(--opd-muted); }
+  .lib-tools { display: flex; align-items: center; gap: 8px; }
+  .lib-tools input[type="search"] { flex: 1 1 auto; width: auto; min-width: 0; }
+  .seg { display: flex; flex: none; gap: 2px; }
+  .icon-btn[aria-pressed="true"] { background: var(--opd-hover); color: var(--opd-text); }
+  .file { position: relative; }
+  .row-time { font-size: 12px; color: var(--opd-muted); }
+  .file-menu { top: 40px; right: -6px; }
+  .files.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+  .files.grid .row { position: relative; align-items: stretch; margin: 0; border: 1px solid var(--opd-line); border-radius: 12px; }
+  .files.grid .row-main { flex-direction: column; align-items: flex-start; min-height: 112px; padding: 12px; }
+  .files.grid .row-text { flex-direction: column; gap: 2px; }
+  .files.grid .more { position: absolute; top: 6px; right: 2px; }
+  .files.grid .file-menu { right: 0; }
+
+  /* The editor: upstream's workspace fills the view. Its own top bar names the file and leads
+     back to the library; this view adds no header, frame or footer around it. A keyboard Back
+     appears only when focused. Healthy states stay in a status live region; a failure,
+     conflict or refusal shows as one note over the workspace. */
+  main[data-view="editor"] { max-width: none; min-height: 0; height: 100vh; padding: 0; }
+  main[data-view="editor"] > header:not(:focus-within) { position: absolute; width: 1px; height: 1px; min-height: 0;
+    margin: 0; overflow: hidden; clip-path: inset(50%); }
+  main[data-view="editor"] > header:focus-within { position: fixed; z-index: 20; top: 8px; left: 8px; margin: 0;
+    padding: 4px 10px 4px 4px; border-radius: 10px; background: var(--opd-bg); box-shadow: 0 4px 16px rgb(0 0 0 / .12); }
+  main[data-view="editor"] > .notice, main[data-view="editor"] > footer { display: none; }
+  .ed-stage { position: fixed; inset: 0; overflow: hidden; }
   .ed-stage canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
   .ed-stage canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--opd-ring); }
   .ed-conflict { display: none; position: absolute; top: 0; right: 0; left: 0; padding: 8px 12px; background: var(--opd-hover);
     color: var(--opd-danger); font-size: 13px; border-bottom: 1px solid var(--opd-line); }
   .ed-conflict.show { display: block; }
   .ed-conflict button { margin-left: 4px; font: inherit; }
-  #editor .actions { margin-top: 10px; }
+  .ed-alert { position: fixed; z-index: 15; bottom: 16px; left: 50%; display: flex; align-items: center; gap: 10px;
+    max-width: min(560px, calc(100vw - 32px)); padding: 8px 8px 8px 14px; transform: translateX(-50%); border-radius: 10px;
+    background: var(--opd-text); color: var(--opd-bg); font-size: 13px; overflow-wrap: anywhere; box-shadow: 0 8px 24px rgb(0 0 0 / .16); }
+  .ed-alert.bad { background: var(--opd-danger); color: #fff; }
+  /* On the way to Ready: small and muted, gone with the next healthy state. */
+  .ed-alert.loading { padding: 4px 10px; opacity: .72; font-size: 12px; box-shadow: none; }
+  .ed-alert .btn { flex: none; border-color: currentColor; color: inherit; }
   @media (max-width: 440px) {
     main { padding: 20px 16px 16px; }
     h1 { font-size: 18px; }
@@ -166,7 +197,7 @@
       <h1 id="title" tabindex="-1">OpenPaperDesign</h1>
     </div>
     <div class="menu-wrap">
-      <button id="menu-button" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="menu"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>New</button>
+      <button id="menu-button" class="btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="menu"><svg id="menu-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><span id="menu-label">New</span></button>
       <div id="menu" class="menu" role="menu" aria-labelledby="menu-button" hidden>
         <button id="m-new" class="item" type="button" role="menuitem" tabindex="-1">New canvas…</button>
         <button id="m-current" class="item" type="button" role="menuitem" tabindex="-1">Open current canvas</button>
@@ -183,9 +214,31 @@
 
   <section id="home" aria-labelledby="h-projects">
     <h2 id="h-projects" class="sr-only">Projects</h2>
+    <div id="lib-bar" class="lib-bar" hidden>
+      <p id="lib-context" class="lib-context">OpenPaperDesign library: files this app keeps itself, not part of a Codex project.</p>
+      <div class="lib-tools">
+        <input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off">
+        <div class="seg" role="group" aria-label="Layout">
+          <button id="layout-list" class="btn icon-btn" type="button" aria-pressed="true" aria-label="List"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M3 4.5h10M3 8h10M3 11.5h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+          <button id="layout-grid" class="btn icon-btn" type="button" aria-pressed="false" aria-label="Grid"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button>
+        </div>
+        <button id="new-file" class="btn btn-primary" type="button">New file</button>
+      </div>
+    </div>
     <p id="inventory" class="muted">Looking up your Codex projects…</p>
     <ul id="projects" aria-labelledby="h-projects"></ul>
+    <p id="no-match" class="muted" hidden>No files match your search.</p>
   </section>
+
+  <form id="rename-form" aria-labelledby="rename-title" hidden>
+    <h2 id="rename-title" tabindex="-1">Rename</h2>
+    <label for="rename-name">Name</label>
+    <input id="rename-name" type="text" maxlength="60" autocomplete="off">
+    <div class="actions">
+      <button id="rename-save" class="btn btn-primary" type="submit">Rename</button>
+      <button id="rename-cancel" class="btn" type="button">Cancel</button>
+    </div>
+  </form>
 
   <section id="pick" aria-labelledby="pick-title" hidden>
     <h2 id="pick-title" tabindex="-1">Choose a folder</h2>
@@ -222,7 +275,6 @@
     <ul id="result-list"></ul>
     <div class="actions" id="result-actions">
       <button id="canvas" class="btn btn-primary" type="button" hidden>Open canvas</button>
-      <button id="edit-here" class="btn" type="button" hidden>Edit in this view</button>
       <button id="reopen" class="btn" type="button" hidden>Open in editor</button>
       <button id="force" class="btn" type="button" hidden>Switch anyway</button>
       <button id="close" class="btn" type="button" hidden>Close canvas</button>
@@ -233,28 +285,22 @@
   </section>
 
   <section id="editor" aria-labelledby="ed-title" hidden>
-    <div class="ed-head">
-      <h2 id="ed-title" tabindex="-1">Canvas</h2>
-      <p id="ed-status" class="ed-status" role="status">Loading the editor…</p>
-    </div>
+    <h2 id="ed-title" class="sr-only" tabindex="-1">Canvas</h2>
+    <p id="ed-status" class="sr-only" role="status" aria-live="polite">Loading the editor…</p>
+    <p id="ed-renderer" hidden></p>
     <div id="ed-stage" class="ed-stage">
       <canvas id="ed-canvas" tabindex="0" aria-label="Canvas"></canvas>
       <div id="ed-conflict" class="ed-conflict" role="alert"></div>
     </div>
-    <div class="actions">
-      <button id="ed-close" class="btn" type="button">Close canvas</button>
+    <div id="ed-alert" class="ed-alert" role="alert" hidden>
+      <span id="ed-alert-text"></span>
       <button id="ed-leave" class="btn" type="button" hidden>Leave without saving</button>
-      <button id="ed-export" class="btn" type="button">Export saved canvas</button>
-      <button id="ed-full" class="btn" type="button" hidden>Full screen</button>
-      <button id="ed-browser" class="btn" type="button">Open in browser</button>
+      <button id="ed-home" class="btn" type="button" hidden>Back to files</button>
     </div>
-    <p id="ed-note" class="hint"></p>
-    <details id="ed-details"><summary>Details</summary><dl id="ed-meta" class="fields"></dl>
-      <p id="ed-renderer" class="hint"></p>
-      <p class="hint">OpenPaperDesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL OFL 1.1. Not affiliated with Paper.</p></details>
   </section>
 
-  <footer><span class="wordmark">onlinesourdough</span></footer>
+  <footer><span class="wordmark">onlinesourdough</span><details id="about" class="about"><summary>About</summary>
+    <p>OpenPaperDesign: a fork of paper-rs (MIT OR Apache-2.0). Inter font: SIL OFL 1.1. Not affiliated with Paper.</p></details></footer>
 </main>
 <script type="module">
 const opdCreatePanel = null; // __OPD_PANEL_MODULE__
@@ -300,13 +346,15 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // links) from appearing under a newer view.
   let gen = 0;
   let view = 'home';
-  const VIEWS = ['home', 'pick', 'new-form', 'folder-help', 'result', 'editor'];
+  const VIEWS = ['home', 'pick', 'new-form', 'rename-form', 'folder-help', 'result', 'editor'];
   let sending = false;
   let editorUrl = null; // memory only, for the Open canvas button
   let editorRoot = null; // the admitted workspace of the shown status/editor result, for reopening
   let editorCanvas = null; // the library canvas id of the shown editor result
   let editorBinding = null; // and its binding: sent back so a stale action is refused
   let retryForce = null; // the refused switch the person may confirm
+  let renaming = null; // the library file the shown rename form is for
+  let fileMenu = null; // the open per-file menu, if any: { more, menu, items }
   const announce = (text, g) => { if (g === undefined || g === gen) $('live').textContent = text; };
   const notice = (text) => { $('notice').textContent = text; };
 
@@ -315,7 +363,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     view = name;
     for (const v of VIEWS) $(v).hidden = v !== name;
     $('back').hidden = name === 'home';
-    // The editor gets the room; its only ways out are Back and Close (no menu).
+    // The editor gets the whole view; its way out is the workspace's own "All projects" (and
+    // a keyboard Back), with no menu.
     $('app').setAttribute('data-view', name);
     $('menu-button').hidden = name === 'editor';
     editorUrl = null;
@@ -323,21 +372,23 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     editorCanvas = null;
     editorBinding = null;
     retryForce = null;
+    renaming = null;
     setBusy(false);
     notice('');
     closeMenu(false);
+    closeFileMenu(false);
   }
   const goHome = () => {
     show('home');
     $('title').focus();
-    announce(LIBRARY ? 'Your canvases' : 'Projects');
+    announce(LIBRARY ? 'Your files' : 'Projects');
     if (LIBRARY) loadLibrary();
   };
   // From the editor, Back first saves what is left (see leaveEditor).
   $('back').onclick = () => (view === 'editor' ? editorBack() : goHome());
   // Escape leaves a secondary view the same way as Back.
   const escapeHome = (e) => { if (e && e.key === 'Escape') { if (e.preventDefault) e.preventDefault(); goHome(); } };
-  for (const v of ['pick', 'new-form', 'folder-help', 'result']) $(v).onkeydown = escapeHome;
+  for (const v of ['pick', 'new-form', 'rename-form', 'folder-help', 'result']) $(v).onkeydown = escapeHome;
 
   // ---- host presentation (MCP Apps HostContext.theme / styles.variables) ----
   // Presentation only: never a workspace, folder or permission. Only standard variable names
@@ -364,8 +415,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // Row buttons that run an action, owned by the list that rendered them. Rebuilding one list
   // (say, the hidden home when a late inventory reply arrives) never replaces another's.
   const rowActions = { projects: [], 'pick-list': [], 'result-list': [] };
-  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), $('close'), $('export'), $('edit-here'),
-    ...Object.values(rowActions).flat()];
+  const ACTIONS = () => [$('menu-button'), $('create'), $('reopen'), $('force'), $('close'), $('export'), $('new-file'),
+    $('rename-save'), ...Object.values(rowActions).flat()];
   function setBusy(busy) {
     sending = busy;
     for (const b of ACTIONS()) b.disabled = busy;
@@ -431,9 +482,21 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
 
   // ---- the New menu ----
 
-  // Library servers have no folder picker; workspace servers have no import.
+  // Library servers have no folder picker; workspace servers have no import. In the library,
+  // New file is its own button, so this menu holds the rest.
   $('m-folder').hidden = LIBRARY;
   $('m-import').hidden = !LIBRARY;
+  if (LIBRARY) {
+    $('m-new').hidden = true;
+    $('menu-icon').setAttribute('hidden', ''); // an SVG element: the attribute, not the property
+    $('menu-label').textContent = 'More';
+    $('m-current').textContent = 'Open current file';
+    $('m-import').textContent = 'Import a canvas file…';
+    $('m-refresh').textContent = 'Refresh files';
+    $('h-projects').textContent = 'Files';
+    $('lib-bar').hidden = false;
+    $('inventory').textContent = 'Reading your files…';
+  }
   const menuItems = () => [$('m-new'), $('m-current'), $('m-folder'), $('m-import'), $('m-refresh')]
     .filter((b) => !b.hidden);
   function openMenu() {
@@ -462,6 +525,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   if (document.addEventListener) {
     document.addEventListener('click', (e) => {
       if (!$('menu').hidden && e.target && !(e.target.closest && e.target.closest('.menu-wrap'))) closeMenu(false);
+      if (fileMenu && e.target && !(e.target.closest && e.target.closest('.file'))) closeFileMenu(false);
     });
   }
   $('m-new').onclick = () => openNewForm();
@@ -596,10 +660,12 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     svg.setAttribute('width', '18'); svg.setAttribute('height', '18'); svg.setAttribute('viewBox', '0 0 18 18');
     svg.setAttribute('fill', 'none'); svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('class', 'glyph');
     const path = document.createElementNS(SVG_NS, 'path');
-    // A generic folder (Codex sends no project icon), or a chat bubble for this chat's project.
-    path.setAttribute('d', kind === 'chat'
-      ? 'M3.5 4.5h11v7h-6l-3 2.5v-2.5h-2z'
-      : 'M2.5 5.5a1 1 0 0 1 1-1h3.6l1.4 1.5h6a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z');
+    // A generic folder (Codex sends no project icon), a chat bubble for this chat's project, or
+    // a page for a library file.
+    path.setAttribute('d', {
+      chat: 'M3.5 4.5h11v7h-6l-3 2.5v-2.5h-2z',
+      file: 'M4.5 2.5h6l3 3v10h-9zM10.5 2.5v3h3',
+    }[kind] || 'M2.5 5.5a1 1 0 0 1 1-1h3.6l1.4 1.5h6a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z');
     path.setAttribute('stroke', 'currentColor'); path.setAttribute('stroke-width', '1.3'); path.setAttribute('stroke-linejoin', 'round');
     svg.append(path);
     return svg;
@@ -756,8 +822,130 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (view === 'home' && g === gen) announce(text || projects.length + ' projects');
   }
 
-  // ---- the app library (an --app-library server): canvases OpenPaperDesign keeps itself ----
-  // Each row opens its canvas directly; ids come only from the server's list.
+  // ---- the app library (an --app-library server): files OpenPaperDesign keeps itself ----
+  // Each row opens its file directly; ids come only from the server's list. The library is the
+  // app's own: its files have no Codex project, so none is shown or implied.
+
+  // When a file was last saved: relative while recent, else its date (this computer's time).
+  function edited(ms) {
+    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
+    const s = Math.max(0, Date.now() - ms) / 1000;
+    if (s < 60) return 'Edited just now';
+    if (s < 3600) return 'Edited ' + Math.floor(s / 60) + ' min ago';
+    if (s < 86400) return 'Edited ' + Math.floor(s / 3600) + ' h ago';
+    const days = Math.floor(s / 86400);
+    if (days < 7) return 'Edited ' + days + (days === 1 ? ' day ago' : ' days ago');
+    const d = new Date(ms);
+    const two = (n) => String(n).padStart(2, '0');
+    return 'Edited ' + d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate());
+  }
+
+  // ---- a file's menu: Open, Rename, Export ----
+  function openFileMenu(more, menu, items) {
+    closeFileMenu(false);
+    menu.hidden = false;
+    more.setAttribute('aria-expanded', 'true');
+    fileMenu = { more, menu, items };
+    items[0].focus();
+  }
+  function closeFileMenu(focusButton) {
+    const m = fileMenu;
+    if (!m) return;
+    fileMenu = null;
+    m.menu.hidden = true;
+    m.more.setAttribute('aria-expanded', 'false');
+    if (focusButton) m.more.focus();
+  }
+  function menuKeys(e) {
+    const m = fileMenu;
+    if (!m) return;
+    const i = m.items.indexOf(document.activeElement);
+    const go = (n) => { e.preventDefault(); m.items[(n + m.items.length) % m.items.length].focus(); };
+    if (e.key === 'ArrowDown') go(i + 1);
+    else if (e.key === 'ArrowUp') go(i - 1);
+    else if (e.key === 'Home') go(0);
+    else if (e.key === 'End') go(m.items.length - 1);
+    else if (e.key === 'Escape') { e.preventDefault(); if (e.stopPropagation) e.stopPropagation(); closeFileMenu(true); }
+    else if (e.key === 'Tab') closeFileMenu(false);
+  }
+
+  // One file: its name, pages and last edit open it; "⋯" opens its menu.
+  let fileItems = []; // [{ li, name }] in list order, for the search
+  function fileRow(i, c, name) {
+    const li = node('li', undefined, 'file');
+    const row = node('div', undefined, 'row');
+    const open = node('button', undefined, 'row-main');
+    open.type = 'button';
+    const text = node('span', undefined, 'row-text');
+    text.append(node('span', name, 'row-name'), node('span', pages(c.pages) + (c.open ? ' · open here' : ''), 'row-hint'));
+    const when = edited(c.modified);
+    if (when) text.append(node('span', when, 'row-time'));
+    open.append(glyph('file'), text);
+    open.onclick = () => openLibrary(c.id, name, false);
+    open.disabled = sending;
+    rowActions.projects.push(open);
+    const more = node('button', '⋯', 'more');
+    more.type = 'button';
+    const menu = node('div', undefined, 'menu file-menu');
+    menu.id = 'file-menu-' + i;
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', name);
+    menu.hidden = true;
+    more.setAttribute('aria-label', 'More for ' + name);
+    more.setAttribute('aria-haspopup', 'menu');
+    more.setAttribute('aria-expanded', 'false');
+    more.setAttribute('aria-controls', menu.id);
+    const items = [
+      ['Open', () => openLibrary(c.id, name, false)],
+      ['Rename…', () => openRename(c.id, name)],
+      ['Export…', () => exportFile(c.id, name)],
+    ].map(([label, run]) => {
+      const b = node('button', label, 'item');
+      b.type = 'button';
+      b.setAttribute('role', 'menuitem');
+      b.setAttribute('tabindex', '-1');
+      b.onclick = () => { closeFileMenu(false); run(); };
+      return b;
+    });
+    menu.append(...items);
+    menu.onkeydown = menuKeys;
+    more.onclick = () => (fileMenu && fileMenu.menu === menu ? closeFileMenu(true) : openFileMenu(more, menu, items));
+    row.append(open, more);
+    li.append(row, menu);
+    fileItems.push({ li, name });
+    return li;
+  }
+
+  // Search narrows the shown files by name; Escape in the field clears it.
+  function filterFiles() {
+    const q = String($('search').value || '').trim().toLowerCase();
+    let shown = 0;
+    for (const f of fileItems) {
+      f.li.hidden = Boolean(q) && !f.name.toLowerCase().includes(q);
+      if (!f.li.hidden) shown += 1;
+    }
+    $('no-match').hidden = !q || !fileItems.length || shown > 0;
+    return shown;
+  }
+  $('search').oninput = filterFiles;
+  $('search').onkeydown = (e) => {
+    if (e && e.key === 'Escape' && $('search').value) {
+      if (e.preventDefault) e.preventDefault();
+      $('search').value = '';
+      filterFiles();
+      announce('Showing all files');
+    }
+  };
+
+  // List or grid, for this view only (nothing is stored).
+  function setLayout(next) {
+    if (LIBRARY) $('projects').className = next === 'grid' ? 'files grid' : 'files';
+    $('layout-list').setAttribute('aria-pressed', next === 'list' ? 'true' : 'false');
+    $('layout-grid').setAttribute('aria-pressed', next === 'grid' ? 'true' : 'false');
+  }
+  $('layout-list').onclick = () => setLayout('list');
+  $('layout-grid').onclick = () => setLayout('grid');
+  setLayout('list');
 
   let libraryRun = 0;
   async function loadLibrary() {
@@ -765,7 +953,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     const g = gen;
     $('inventory').className = 'muted';
     $('inventory').hidden = false;
-    $('inventory').textContent = 'Reading your canvases…';
+    $('inventory').textContent = 'Reading your files…';
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_canvases', arguments: {} });
     if (run !== libraryRun) return; // a newer refresh owns the list
     let v = null;
@@ -775,24 +963,21 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     const list = $('projects');
     list.textContent = '';
     rowActions.projects = [];
+    fileItems = [];
+    if (fileMenu && view === 'home') closeFileMenu(false);
     let text = '';
     if (!v || typeof v !== 'object' || !Array.isArray(v.canvases)) {
-      text = 'Couldn\'t read your canvases' + errorCode(r.error) + '. Refresh from the New menu to try again.';
+      text = 'Couldn\'t read your files' + errorCode(r.error) + '. Refresh from the More menu to try again.';
     } else {
       const shown = v.canvases.filter((c) => c && typeof c.id === 'string' && CANVAS_ID.test(c.id));
-      shown.forEach((c, i) => {
-        const name = cleanName(c.name || '') || 'Untitled';
-        list.append(projectRow('projects', 'canvas-' + i, name, pages(c.pages) + (c.open ? ' · open here' : ''),
-          'folder', '', () => openLibrary(c.id, name, false),
-          [['Canvas id', c.id], ['Stored in', 'OpenPaperDesign library']]));
-      });
+      shown.forEach((c, i) => list.append(fileRow(i, c, cleanName(c.name || '') || 'Untitled')));
       if (!shown.length) {
         // A cut-off read proves nothing about absence.
         text = v.complete === false
-          ? 'This read of your canvases stopped early and returned none; more may exist. Refresh to try again.'
-          : 'No canvases yet. Create one from the New menu.';
+          ? 'This read of your files stopped early and returned none; more may exist. Refresh to try again.'
+          : 'No files yet. Start one with New file.';
       } else if (v.complete === false) {
-        text = 'Showing the first ' + shown.length + ' canvases.';
+        text = 'Showing the first ' + shown.length + ' files.';
       }
       const skipped = Array.isArray(v.skipped) ? v.skipped.length : 0;
       if (skipped) {
@@ -802,22 +987,27 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
     $('inventory').textContent = text;
     $('inventory').hidden = !text;
-    if (view === 'home' && g === gen) announce(text || shownCount() + ' canvases');
+    filterFiles();
+    if (view === 'home' && g === gen) announce(text || shownCount() + ' files');
   }
   const shownCount = () => rowActions.projects.length;
 
   // A confirmed switch names the binding the person confirmed replacing (`replace`); the
-  // server refuses it if another view changed the open canvas meanwhile. Every primary action
-  // hands the canvas to its one loopback web editor: the result's own link, opened once.
+  // server refuses it if another view changed the open canvas meanwhile. With the in-panel
+  // editor, every primary action asks for it (`panel`: no link is given) and mounts it here;
+  // without it, the canvas goes to its one loopback web editor: the result's own link, opened
+  // once.
   const switchArgs = (args, replace) => {
     if (replace) Object.assign(args, { force: true, replace });
+    if (PANEL) args.panel = true;
     return args;
   };
+  const inPanel = () => Boolean(PANEL);
 
   async function openLibrary(id, name, replace) {
     const r = await act('openpaperdesign_app_open', switchArgs({ id }, replace), 'Opening ' + name);
     if (!r) return;
-    if (r.ok) return showLibraryResult(r.ok, { canvas: id });
+    if (r.ok) return showLibraryResult(r.ok, { canvas: id, panel: inPanel() });
     refused(r, (shownFor) => shownFor && openLibrary(id, name, shownFor));
   }
 
@@ -825,37 +1015,71 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // shows what exists.
   function unsure(what) {
     refuse('Not sure it was ' + what,
-      'Codex didn\'t confirm it. A new canvas may have been made anyway, so check your canvases before trying again.');
+      'Codex didn\'t confirm it. A new file may have been made anyway, so check your files before trying again.');
     loadLibrary();
   }
 
   async function createLibrary(name, replace) {
     const r = await act('openpaperdesign_app_create', switchArgs({ name }, replace), 'Creating "' + name + '"');
     if (!r) return;
-    if (r.ok) return showLibraryResult(r.ok);
+    if (r.ok) return showLibraryResult(r.ok, { panel: inPanel() });
     if (r.fail) return unsure('created');
     refused(r, (shownFor) => shownFor && createLibrary(name, shownFor));
   }
+  // New file: made at once, with a plain name the person can change (Rename, or upstream's own
+  // top bar shows it).
+  $('new-file').onclick = () => createLibrary('Untitled', null);
 
   async function reopenLibrary() {
-    const r = await act('openpaperdesign_app_editor', {}, 'Opening the current canvas');
+    const r = await act('openpaperdesign_app_editor', inPanel() ? { panel: true } : {}, 'Opening the current file');
     if (!r) return;
-    if (r.ok) return showLibraryResult(r.ok);
+    if (r.ok) return showLibraryResult(r.ok, { panel: inPanel() });
     refused(r);
   }
 
-  // The optional in-panel editor, only where this build has it, for the canvas this result
-  // shows (its binding): the same renderer and save rules as the web editor.
-  async function editHere() {
-    const binding = editorBinding;
-    const canvas = editorCanvas;
-    if (!PANEL || !binding) return;
-    const r = await act('openpaperdesign_app_editor', { binding, panel: true }, 'Opening it in this view');
+  // Rename: the name only (pages, content and identity stay). The form is for the file it was
+  // opened from; a refusal (the file is open in another window, say) changes nothing.
+  function openRename(id, name) {
+    show('rename-form');
+    renaming = Object.freeze({ id, name });
+    $('rename-title').textContent = 'Rename "' + name + '"';
+    $('rename-name').value = name;
+    $('rename-name').focus();
+    announce('Rename ' + name);
+  }
+  $('rename-form').onsubmit = (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    const target = renaming;
+    if (!target) return;
+    const name = cleanName($('rename-name').value);
+    if (!name) {
+      notice('Name the file first.');
+      $('rename-name').focus();
+      return;
+    }
+    if (name === target.name) return goHome();
+    renameFile(target, name);
+  };
+  $('rename-name').oninput = () => { if (!sending) notice(''); };
+  $('rename-cancel').onclick = goHome;
+  async function renameFile(target, name) {
+    const r = await act('openpaperdesign_app_rename', { id: target.id, name }, 'Renaming "' + target.name + '"');
     if (!r) return;
-    if (r.ok) return showLibraryResult(r.ok, { canvas, binding, panel: true });
+    if (r.ok && r.ok.action === 'renamed' && r.ok.canvas && r.ok.canvas.id === target.id) {
+      goHome();
+      const said = 'Renamed to "' + name + '".';
+      notice(said);
+      announce(said);
+      return;
+    }
+    if (r.ok || r.fail) {
+      // It may have happened: never retried; the list shows the name it has.
+      refuse('Not sure it was renamed', 'Codex didn\'t confirm it. Check your files before trying again.');
+      loadLibrary();
+      return;
+    }
     refused(r);
   }
-  $('edit-here').onclick = editHere;
 
   // Close the canvas this view showed: its binding goes with the request, and with a later
   // confirmation, so the server never closes a canvas another view opened since.
@@ -894,22 +1118,28 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
   }
 
-  // Export the canvas a view shows, as last saved. From the editor, a refusal is shown in the
-  // editor (`report`), which stays open.
-  async function exportCanvas(binding, canvas, report) {
+  // Export the canvas a result shows (its `binding`), as last saved.
+  async function exportCanvas(binding, canvas) {
     if (!binding) return;
-    const fail = (r) => (report ? report(String(r.refused || r.fail).split('\n')[0].slice(0, 300)) : refused(r));
     const r = await act('openpaperdesign_app_export', { binding }, 'Exporting the saved canvas', 120000);
     if (!r) return;
-    if (!r.ok) return fail(r);
-    const v = r.ok;
-    if (typeof v.payload !== 'string' || typeof v.file_name !== 'string') {
-      return fail({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
-    }
+    if (!r.ok) return refused(r);
     // Only bytes of the canvas this view showed are offered for download.
-    if (v.binding !== binding || !v.canvas || v.canvas.id !== canvas) {
-      return fail({ fail: 'Codex answered with another canvas than the one shown here, so nothing was downloaded.' });
+    offerExport(r.ok, r.ok.binding === binding && r.ok.canvas && r.ok.canvas.id === canvas);
+  }
+  // Export a file from the library's list (its id), as last saved; the list stays.
+  async function exportFile(id, name) {
+    const r = await act('openpaperdesign_app_export', { id }, 'Exporting "' + name + '"', 120000);
+    if (!r) return;
+    if (!r.ok) return refused(r);
+    offerExport(r.ok, Boolean(r.ok.canvas) && r.ok.canvas.id === id);
+  }
+  // An export answer, offered as a download only when it is for what was asked (`own`).
+  function offerExport(v, own) {
+    if (typeof v.payload !== 'string' || typeof v.file_name !== 'string') {
+      return refused({ fail: 'Codex sent an answer OpenPaperDesign can\'t read. Nothing was exported.' });
     }
+    if (!own) return refused({ fail: 'Codex answered with another canvas than the one shown here, so nothing was downloaded.' });
     const name = v.file_name.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 80) || 'canvas.opdcanvas.json';
     const kb = Math.max(1, Math.round(v.payload.length / 1024));
     const said = download(name, v.payload)
@@ -958,7 +1188,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function importCanvas(text, replace) {
     const r = await act('openpaperdesign_app_import', switchArgs({ payload: text }, replace), 'Importing the canvas file', 120000);
     if (!r) return;
-    if (r.ok) return showLibraryResult(r.ok);
+    if (r.ok) return showLibraryResult(r.ok, { panel: inPanel() });
     if (r.fail) return unsure('imported');
     refused(r, (shownFor) => shownFor && importCanvas(text, shownFor));
   }
@@ -966,36 +1196,65 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // The home never infers that a browser opening loaded: the binding's shared readiness can come
   // from an earlier tab or the optional panel, not from this opening (R11-F1).
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  // Every request to open the browser editor (Open canvas, or the in-panel editor's browser
-  // button) is its own attempt; only the latest one reports its outcome.
+  // Every request to open the browser editor (Open canvas) is its own attempt; only the latest
+  // one reports its outcome.
   let linkAttempt = 0;
 
   // ---- the in-panel editor (an app-library view whose build has it) ----
-  // The canvas is edited right here: the renderer and its save rules are the browser editor's,
-  // and the page travels only through this view's own calls to the app library's server. Back
-  // and Close first save what is left; an editor with a change that couldn't be saved stays
-  // open until the person saves it or explicitly leaves without saving.
+  // The file is edited right here, in upstream's whole workspace filling the view: the renderer
+  // and its save rules are the browser editor's, and the canvas travels only through this
+  // view's own calls to the app library's server. Going home (the workspace's "All projects",
+  // or the keyboard Back) first saves what is left; an editor with a change that couldn't be
+  // saved stays open until the person saves it or explicitly leaves without saving. Only then
+  // is exactly its binding closed.
 
   const PANEL = LIBRARY && typeof opdCreatePanel === 'function' ? opdCreatePanel({ rpc }) : null;
+  // The editor's own rule for how a status shows (editor.js `opdStatusKind`, assembled into this
+  // module with the panel; the browser page uses it too). Without it every status is shown.
+  const statusKind = typeof opdStatusKind === 'function' ? opdStatusKind : (t, e) => (e ? 'error' : 'note');
   let panelHandle = null; // the editor mounted in the editor view, if any
-  let panelBinding = null; // the binding and canvas it edits
-  let panelCanvas = null;
+  let panelBinding = null; // the binding it edits
   let leaving = false;
-  let pendingLeave = 'back';
+  // A refused leave's note (and its Leave without saving) stays until the editor reports Saved
+  // or the person tries again; a passing healthy status doesn't hide it, a newer problem
+  // replaces its text.
+  let stayReason = false;
+  let alertRun = 0;
+  // `kind`: 'error', 'note' or 'loading' (see `statusKind`).
+  function edAlert(text, kind) {
+    const run = ++alertRun;
+    $('ed-alert-text').textContent = text;
+    $('ed-alert').className = { error: 'ed-alert bad', loading: 'ed-alert loading' }[kind] || 'ed-alert';
+    $('ed-alert').hidden = false;
+    // A note goes after a while; loading goes with the next state (Ready), a failure stays.
+    if (kind === 'note') setTimeout(() => { if (run === alertRun && !stayReason) $('ed-alert').hidden = true; }, 6000);
+  }
+  function hideAlert() {
+    alertRun += 1;
+    $('ed-alert').hidden = true;
+    $('ed-leave').hidden = true;
+    $('ed-home').hidden = true;
+  }
+  // Every status goes to the live region (assistive technology, checks). Stable healthy ones
+  // (Ready, Saved) show nothing more; loading shows as a small note until the next state;
+  // anything else is a note over the workspace.
   const edStatus = (text, error) => {
     $('ed-status').textContent = text;
-    $('ed-status').className = error ? 'ed-status bad' : 'ed-status';
+    $('ed-status').className = error ? 'sr-only bad' : 'sr-only';
+    if (text === 'Saved') stayReason = false;
+    const kind = statusKind(text, Boolean(error));
+    if (kind === 'quiet' || (kind === 'loading' && stayReason)) {
+      if (!stayReason) hideAlert();
+      return;
+    }
+    edAlert(text, kind);
   };
-  const edRenderer = (text, error) => {
-    $('ed-renderer').textContent = text;
-    $('ed-renderer').className = error ? 'hint bad' : 'hint';
-  };
-  const edMeta = (k, v) => { $('ed-meta').append(node('dt', k), node('dd', v)); };
+  // Diagnostics only: which renderer runs. A renderer failure is also a status error.
+  const edRenderer = (text) => { $('ed-renderer').textContent = text; };
   function setEditorBusy(busy) {
-    for (const id of ['ed-close', 'ed-browser', 'ed-leave', 'ed-export']) $(id).disabled = busy;
+    $('ed-leave').disabled = busy;
+    $('ed-home').disabled = busy;
   }
-  const fullscreenOffered = () => Array.isArray(hostContext.availableDisplayModes)
-    && hostContext.availableDisplayModes.includes('fullscreen');
 
   function openPanel(v) {
     const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
@@ -1017,45 +1276,43 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
     show('editor');
     panelBinding = binding;
-    panelCanvas = id;
-    pendingLeave = 'back';
+    // The file's name is the workspace's own top-bar title (from the canvas it loads); here it
+    // only names the view for assistive technology.
     $('ed-title').textContent = name;
-    $('ed-meta').textContent = '';
-    edMeta('Canvas id', id);
-    edMeta('Stored in', 'OpenPaperDesign library');
-    if (typeof v.location === 'string') edMeta('Location', v.location);
     edRenderer('');
-    $('ed-note').textContent = '';
-    $('ed-leave').hidden = true;
-    $('ed-full').hidden = !fullscreenOffered();
+    stayReason = false;
+    hideAlert();
     $('ed-conflict').textContent = '';
     setEditorBusy(false);
-    edStatus({
-      created: 'Created and saved in your library. Loading the editor…',
-      imported: 'Imported as a new canvas in your library. Loading the editor…',
-    }[v.action] || 'Loading the editor…');
+    edStatus('Loading the editor…');
     // Every editor gets a fresh canvas: one that held another renderer's context can't be reused.
     const old = $('ed-canvas');
     if (old.cloneNode && old.replaceWith) old.replaceWith(old.cloneNode(false));
-    $('ed-title').focus();
-    announce(name + '. Loading the editor');
+    $('ed-canvas').focus();
+    announce({
+      created: name + ', created in your library. Loading the editor',
+      imported: name + ', imported into your library. Loading the editor',
+    }[v.action] || name + '. Loading the editor');
     const g = gen;
     const h = PANEL.open({
       binding,
       refs: { canvas: $('ed-canvas'), status: edStatus, renderer: edRenderer, conflict: $('ed-conflict') },
       onStatus: edStatus,
       onReady: () => announce(name + ' is ready to edit', g),
-      // The workspace's Home, New and Open ("All projects"): this view's Back, which saves and
-      // drains first and keeps the editor if anything is left unsaved.
+      // The workspace's Home, New and Open ("All projects"): back to the library, which saves
+      // and drains first and keeps the editor if anything is left unsaved.
       onHome: () => { if (panelHandle === h) editorBack(); },
     });
     panelHandle = h;
     h.started.catch((e) => {
       if (panelHandle !== h) return;
       // Exactly why (the renderer transfer, its compilation, graphics or the page); the view
-      // stays, with Back and Close.
+      // stays, and Back still leaves.
       const why = 'The editor couldn\'t start here: ' + String(e && e.message ? e.message : e).slice(0, 600);
       edStatus(why, true);
+      // Without a workspace there is no "All projects" button: the note has the way back.
+      stayReason = true;
+      $('ed-home').hidden = false;
       announce(why, g);
     });
   }
@@ -1068,8 +1325,9 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (!h) return true;
     if (leaving) return false;
     leaving = true;
+    stayReason = false;
     setEditorBusy(true);
-    edStatus('Saving your last changes…');
+    edStatus('Saving…');
     let r;
     try {
       r = await h.drain();
@@ -1089,6 +1347,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
         error: 'Still open: the renderer stopped with a change that isn\'t saved. Leave without saving to drop it.',
       }[r] || 'Still open: your last change may not be saved. Try again, or leave without saving.';
       edStatus(why, true);
+      stayReason = true;
       $('ed-leave').hidden = false;
       announce(why);
       return false;
@@ -1101,77 +1360,42 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function disposePanel() {
     const h = panelHandle;
     panelHandle = null;
-    if (hostContext.displayMode === 'fullscreen') {
-      rpc('ui/request-display-mode', { mode: 'inline' }, 10000).then((r) => {
-        if (r.result && typeof r.result.mode === 'string') hostContext.displayMode = r.result.mode;
-      });
-    }
     if (h) await h.dispose();
   }
 
-  // Back keeps the canvas open (it stays in this window's list); Close also closes it.
+  // Home: once the editor was saved and let go, exactly the binding it edited is closed (not
+  // forced), and the library shows. The view going away (teardown) closes nothing.
   async function editorBack() {
-    pendingLeave = 'back';
-    if (await leaveEditor()) goHome();
-  }
-  async function editorClose() {
-    pendingLeave = 'close';
+    // Without an editor, its close is already under way: a second Home waits for that answer.
+    if (!panelHandle) return;
     const binding = panelBinding;
-    if (await leaveEditor()) closeCanvas(binding, false);
+    if (await leaveEditor()) closeAndGoHome(binding);
   }
-  $('ed-close').onclick = editorClose;
+  // Leaving without saving: the explicit discard of what a refused leave kept.
   $('ed-leave').onclick = async () => {
     if (leaving || !panelHandle) return;
-    const then = pendingLeave;
     const binding = panelBinding;
     await disposePanel();
-    if (then === 'close') closeCanvas(binding, false);
-    else goHome();
+    closeAndGoHome(binding);
   };
-
-  // A secondary way to edit: the loopback browser editor, for the same binding. Getting its
-  // link counts as given (closing or switching then asks first, as before). As with Open canvas,
-  // each press is one opening attempt, from asking for the link to Codex's answer: a reply to an
-  // earlier attempt, or one after Back, changes nothing (R12-F1). It also belongs to the editor
-  // it was pressed in: once that editor is let go for good (disposePanel, which Back, Close, the
-  // explicit discard and teardown all go through), the attempt is over, even while the panel's
-  // release is still unanswered (R13-F1). A refused Back keeps the editor, and the attempt.
-  $('ed-browser').onclick = async () => {
-    const binding = panelBinding;
-    const h = panelHandle;
-    const g = gen;
-    if (!binding || !h) return;
-    const attempt = ++linkAttempt;
-    const current = () => g === gen && attempt === linkAttempt && panelHandle === h;
-    $('ed-browser').disabled = true;
-    const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding } });
-    if (!current()) return; // a newer attempt or view owns the button and the note now
-    let v = null;
-    if (!r.timeout && !r.error && r.result && !r.result.isError) {
-      try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
-    }
-    if (!v || v.binding !== binding || typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
-      $('ed-browser').disabled = leaving;
-      $('ed-note').textContent = 'No local editor link came back for this canvas, so nothing was opened.';
-      return;
-    }
-    const o = await rpc('ui/open-link', { url: v.url });
-    if (!current()) return;
-    $('ed-browser').disabled = leaving;
-    $('ed-note').textContent = o.timeout ? 'Codex didn\'t answer.'
-      : (o.error || (o.result && o.result.isError)) ? 'Codex didn\'t open the link' + errorCode(o.error) + '.'
-        : 'Codex was asked to open the browser editor too; that doesn\'t confirm it loaded. Both save to this canvas, and a conflict is never merged.';
-  };
-
-  // The canvas as last saved (an edit still being saved isn't in it); the editor stays open.
-  $('ed-export').onclick = () => exportCanvas(panelBinding, panelCanvas, (text) => { $('ed-note').textContent = text; });
-
-  $('ed-full').onclick = async () => {
-    const want = hostContext.displayMode === 'fullscreen' ? 'inline' : 'fullscreen';
-    const r = await rpc('ui/request-display-mode', { mode: want }, 10000);
-    if (r.result && typeof r.result.mode === 'string') hostContext.displayMode = r.result.mode;
-    $('ed-full').textContent = hostContext.displayMode === 'fullscreen' ? 'Exit full screen' : 'Full screen';
-  };
+  $('ed-home').onclick = editorBack;
+  // The close's answer belongs to the view it started in (`act`): a result shown meanwhile
+  // keeps the view. A refusal or an unconfirmed close is said on the library, never shown as
+  // closed; the editor is gone either way, and everything was saved (or knowingly dropped)
+  // before.
+  async function closeAndGoHome(binding) {
+    panelBinding = null;
+    if (!binding) return goHome();
+    const r = await act('openpaperdesign_app_close', { binding }, 'Closing the file');
+    if (!r) return;
+    goHome();
+    if (r.ok && r.ok.action === 'closed') return;
+    const said = r.refused
+      ? 'The file stays open in this window: ' + String(r.refused).split('\n')[0].slice(0, 300)
+      : 'Codex didn\'t confirm closing the file, so it may still be open in this window.';
+    notice(said);
+    announce(said);
+  }
 
   // The host is about to remove this view: the same leaving path, for as long as the host
   // waits. An edit that can't be saved by then is lost; a crash or an abrupt removal saves
@@ -1209,7 +1433,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('result-list').textContent = '';
     $('canvas').hidden = true;
     $('canvas').disabled = false;
-    $('edit-here').hidden = true;
     $('reopen').hidden = true;
     $('force').hidden = true;
     $('close').hidden = true;
@@ -1237,33 +1460,29 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   }
 
   // Why a library result can't be shown, if it can't: it must name a valid canvas id and a valid
-  // binding of that same canvas; the canvas the action asked for (`expected`); and, when the
-  // action named a binding (`expectedBinding`), exactly that one.
-  function libraryMismatch(v, expected, expectedBinding) {
+  // binding of that same canvas, and be for the canvas the action asked for (`expected`).
+  function libraryMismatch(v, expected) {
     const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
     const binding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
     if (!id || !binding || binding.slice(0, id.length + 1) !== id + '.') {
       return 'Codex sent an answer OpenPaperDesign can\'t use (its canvas and binding don\'t match), so nothing was opened.';
     }
     if (expected && id !== expected) return 'Codex answered for another canvas than the one asked for, so it won\'t be opened.';
-    if (expectedBinding && binding !== expectedBinding) {
-      return 'Codex answered for another opening of this canvas than the one shown here, so it won\'t be opened.';
-    }
     return null;
   }
 
   // A library editor result. That it is one comes from this view's own mode or the library
   // action that asked for it, never from the reply's label alone (R12-F2), and it is checked
-  // whole before anything is opened or enabled (R11-F2). `canvas` and `binding` are what the
-  // action asked for; `panel`, whether it asked for the in-panel editor rather than the link.
-  function showLibraryResult(v, { delivered = false, canvas = null, binding = null, panel = false } = {}) {
-    const why = libraryMismatch(v, canvas, binding) || ((v.panel === true) !== panel
+  // whole before anything is opened or enabled (R11-F2). `canvas` is what the action asked for;
+  // `panel`, whether it asked for the in-panel editor rather than the link.
+  function showLibraryResult(v, { delivered = false, canvas = null, panel = false } = {}) {
+    const why = libraryMismatch(v, canvas) || ((v.panel === true) !== panel
       ? 'Codex answered with another way of opening this canvas than the one asked for, so it won\'t be opened.' : null);
     if (why) {
       refuse('Canvas', why);
       return;
     }
-    // The optional in-panel editor: no link.
+    // The in-panel editor: no link.
     if (panel) return openPanel(v);
     const name = (v.canvas && typeof v.canvas.name === 'string') ? v.canvas.name : 'Canvas';
     // A library canvas built without the browser editor has no link to open.
@@ -1303,9 +1522,9 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (!delivered && v.action) openLink();
   }
 
-  // A library canvas: created, imported, opened or reopened in this window, from this result,
-  // and handed to its one loopback web editor (the result's own link, opened once). The
-  // in-panel editor is offered only where this build has it, and only when asked for.
+  // A library canvas as a link result: from a build without the in-panel editor, or a model's
+  // delivered result. A direct action hands it to its one loopback web editor (the result's own
+  // link, opened once); a delivered one waits for Open canvas.
   function showLibraryEditor(v, delivered, name) {
     const id = v.canvas && typeof v.canvas.id === 'string' && CANVAS_ID.test(v.canvas.id) ? v.canvas.id : null;
     reset(name);
@@ -1342,7 +1561,6 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       reopened: 'Opening the editor…',
     }[v.action] || 'The canvas is ready to open.';
     $('canvas').hidden = false;
-    $('edit-here').hidden = !(PANEL && editorBinding);
     $('result-title').focus();
     announce(name + '. ' + $('result-state').textContent);
     if (!delivered && v.action) openLink();
@@ -1470,6 +1688,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
 
   (async () => {
     $('menu-button').disabled = true;
+    $('new-file').disabled = true;
     const r = await rpc('ui/initialize', {
       protocolVersion: '2026-01-26',
       appInfo: { name: 'openpaperdesign-home', version: '1' },
@@ -1485,6 +1704,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     applyHost();
     window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
     $('menu-button').disabled = false;
+    $('new-file').disabled = false;
     // Shown for a model's status or editor result: no list needed there.
     const tool = hostContext.toolInfo && hostContext.toolInfo.tool && hostContext.toolInfo.tool.name;
     if (LIBRARY) {

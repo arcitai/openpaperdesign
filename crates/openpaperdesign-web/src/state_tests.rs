@@ -28,13 +28,18 @@ fn page(id: &str, name: &str, rect: crate::geom::Rect) -> PageData {
 
 /// The canvas as the server sends it (`/api/canvas`): `pages` in list order, `active` shown.
 fn canvas(pages: &[PageData], active: &str) -> String {
+    canvas_named(pages, active, "Canvas")
+}
+
+/// [`canvas`], for a file named `name`.
+fn canvas_named(pages: &[PageData], active: &str, name: &str) -> String {
     let list: Vec<serde_json::Value> = pages
         .iter()
         .map(|p| {
             serde_json::json!({"id": p.id, "name": p.name, "revision": "\"r\"", "text": page_to_json(p)})
         })
         .collect();
-    serde_json::json!({"canvas": {"name": "Canvas"}, "revision": "\"c\"", "active_page": active, "pages": list})
+    serde_json::json!({"canvas": {"name": name}, "revision": "\"c\"", "active_page": active, "pages": list})
         .to_string()
 }
 
@@ -1248,6 +1253,63 @@ fn a_clean_reload_takes_the_whole_canvas_and_keeps_each_page_s_view() {
     assert_eq!(s.ed.page_name(), "Gamma");
     assert!(s.ed.selection.is_empty());
     assert!(!s.dirty());
+}
+
+// ---- one app: the file's identity and the way back live in upstream's own top bar
+
+#[test]
+fn the_file_name_is_upstream_s_top_bar_title_above_the_page_name_and_follows_a_rename() {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages = [page("p", "Page 1", rect)];
+    let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    let top = s.canvas_rect().min.y;
+    let in_bar = |s: &mut WebState, wanted: &str| {
+        painted_text(s)
+            .iter()
+            .any(|(t, r)| t.trim() == wanted && r.max.y <= top)
+    };
+    assert!(in_bar(&mut s, "Landing"), "the file's name is the title");
+    assert!(
+        in_bar(&mut s, "Page 1"),
+        "the page's name is shown beneath it"
+    );
+    assert_eq!(
+        s.ed.page_name(),
+        "Page 1",
+        "the file name is not a page name"
+    );
+    // A rename in the library reaches a clean editor with its next reload.
+    let now = pages_now(&s);
+    s.reload(&canvas_named(&now, "p", "Launch plan")).unwrap();
+    step(&mut s);
+    assert!(in_bar(&mut s, "Launch plan"));
+    assert!(!in_bar(&mut s, "Landing"));
+    assert!(!s.dirty(), "a name from the server is no local change");
+}
+
+#[test]
+fn upstream_s_all_projects_button_is_the_host_s_way_back() {
+    let mut s = state();
+    let top = s.canvas_rect().min.y;
+    // The top bar's grid button ("All projects") sits right of upstream's menus.
+    let (last_x, bar_y) = painted_at(&mut s, "Tools", |r| r.max.y <= top);
+    let mut x = last_x + 20.0;
+    let mut t = 1000.0;
+    let mut asked = None;
+    while asked.is_none() && x < last_x + 120.0 {
+        click(&mut s, (x, bar_y), t);
+        step(&mut s);
+        asked = s.take_request();
+        x += 4.0;
+        t += 500.0;
+    }
+    assert_eq!(
+        asked,
+        Some(HostRequest::Home),
+        "the editor asks its host to go Home"
+    );
+    assert!(!s.dirty(), "asking changes nothing in the document");
 }
 
 // ---- R22: page actions while the pages panel draws, and fields opened on another page.

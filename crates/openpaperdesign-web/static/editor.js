@@ -15,6 +15,32 @@ export const OPD_REVISION_POLL_MS = 1000;
 const OPD_NO_HOME = 'Open, create or import canvases from the OpenPaperDesign home in Codex. '
   + 'This canvas stays open here.';
 
+// The editor's stable healthy states. Hosts keep them for assistive technology and diagnostics
+// (a status live region) but show nothing for them: the workspace itself is the product, and
+// upstream's own top bar says when a page has an unsaved edit.
+const OPD_QUIET_STATUS = new Set(['Ready', 'Saved', 'Saving…', 'Updated with changes made elsewhere']);
+// The way to Ready (the renderer's parts can take a while to arrive): shown as a restrained,
+// temporary indication that the next healthy state (Ready) replaces, never as lasting chrome.
+const OPD_LOADING_STATUS = new Set(['Starting renderer…', 'Loading the editor…', 'Opening the canvas…']);
+
+/**
+ * How a host shows a status: 'quiet' (live region only), 'loading' (a small temporary
+ * indication until the next state), 'error' or 'note' (shown). Every status also goes to the
+ * live region. An error is never quiet or loading.
+ */
+export function opdStatusKind(text, error) {
+  if (error) return 'error';
+  const s = String(text);
+  if (OPD_QUIET_STATUS.has(s)) return 'quiet';
+  if (OPD_LOADING_STATUS.has(s)) return 'loading';
+  return 'note';
+}
+
+/** Whether a status needs nothing visible (see `opdStatusKind`). */
+export function opdQuietStatus(text, error) {
+  return opdStatusKind(text, error) === 'quiet';
+}
+
 /** The browser environment the mount uses (timers, frames, observers, downloads, clipboard). */
 export function opdBrowserEnv(win) {
   return {

@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-13: installed qualification on exact `0078487`; prior results retain their original provenance.
+Updated 2026-10-18: the one-app source candidate (unqualified). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -10,6 +10,53 @@ cloud, no telemetry. Not affiliated with Paper (paper.design).
 
 Out of scope: MCP Apps / file entrypoints (the in-app browser at loopback is the editing
 surface), plugin publishing, other hosts. The later sidebar home is described in the next section.
+
+## One OPD app (issues #6/#10): source candidate, 2026-10-18
+
+Not built, tested, installed or qualified by its writer (run80, corrected in run81); the lead
+runs the checks. The
+owner's admission (2026-10-18) replaces the 2026-10-17 web-editor-first home below wherever the
+build has the in-panel module: the library view renders one OpenPaperDesign application in the
+surface Codex grants, Home and the full workspace alike.
+
+- **Home: a file library.** The app-owned context is said plainly ("OpenPaperDesign library:
+  files this app keeps itself, not part of a Codex project"). App-library files have no
+  native-project grouping or association, so the home shows, implies and grants none; the
+  workspace view keeps its genuine project selection. New file (created at once as
+  "Untitled"), search by name (Escape clears), a list/grid toggle (memory only), and each file
+  with its name, pages and last edit, opened directly or from its menu (Open, Rename…,
+  Export…; arrows, Home/End and Escape). No "Open in new chat" (unsupported).
+- **Rename and export by id.** `openpaperdesign_app_rename {id, name}` changes the manifest's
+  name and modified time only: the open canvas through its binding's writer fence and commit,
+  any other under its own lease (busy refused, nothing changed) with one `commit_fenced` through
+  that canvas's own `Broken`: if the undo of a failed rename fails too, that canvas is fenced in
+  this process (later rename, open and export refused with the files named; its lease kept, so
+  other processes find it busy) until checked and restarted. `openpaperdesign_app_export`
+  takes the shown `binding` or a listed `id`, never both; the open one by id goes through its
+  binding's fence, any other under its lease; nothing is opened or written.
+- **New/Open mount the editor here.** New file, Open, Import and Open current file ask for the
+  panel (`panel: true`); the result's binding is mounted directly: no result screen, no "Edit in
+  this view", no `ui/open-link`, so no browser link is given on this path.
+- **The editor is the workspace.** It fills the view edge to edge, with no heading, frame,
+  fixed-height stage, Close/Export/Full screen/browser buttons, Details or footer. Upstream's own
+  top bar shows the file name (the canvas envelope's `canvas.name`, separate from the page name)
+  and its "All projects" leads home. Every status goes to a live region; by the shared
+  `opdStatusKind`, stable healthy states (Ready, Saved) show nothing, loading shows as a small
+  temporary note until Ready, and failures, conflicts, refusals and notes show as one note.
+- **Home closes exactly its binding.** Home drains the session; a busy, conflicting or unsaved
+  drain keeps the editor (resumed) with the reason and Leave without saving. A clean one
+  disposes the editor (its mount released), then closes that binding, not forced; a refused,
+  failed or unanswered close is said on the library, never shown as closed. The view going away
+  (teardown) drains and closes nothing.
+- **Browser page.** `index.html`/`app.js` are the same app's editor alone: the workspace fills
+  the page, with the same status rule and an About for the notices. A fixed-project standalone
+  page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
+- **Without the module** the library keeps the link hand-off below, and the agent's
+  `_library_editor` still hands out the link.
+- **View version.** `ui://openpaperdesign/home-6.html`; `home-5` and earlier are refused. No
+  eviction of a view a host already has open is promised.
+- **Reuse.** `ui::draw`/`render::frame`, `Editor`, `opdMountEditor`/`Session` and the existing
+  save path; no DOM copy of upstream UI, no new runtime, registry, format or save path.
 
 ## Agents on library canvases, and what is upstream's (issues #6/#10): source candidate, 2026-10-17
 
@@ -42,7 +89,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home is `ui://openpaperdesign/home-5.html` (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (now `home-6`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

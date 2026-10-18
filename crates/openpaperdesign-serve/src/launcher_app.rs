@@ -1,6 +1,6 @@
 //! The app library's direct actions (`openpaperdesign-mcp --app-library <dir>`): list, create,
-//! open, close, reopen, import and export canvases the app owns (see `crate::library`), from
-//! the home view, with no model turn and no message.
+//! open, close, reopen, rename, import and export canvases the app owns (see `crate::library`),
+//! from the home view, with no model turn and no message.
 //!
 //! In an app-library process only these tools, the home, its resource,
 //! `openpaperdesign_status` (this mode's own report), the read-only Codex project inventory and
@@ -46,6 +46,7 @@ pub(super) const EDITOR: &str = "openpaperdesign_app_editor";
 pub(super) const CLOSE: &str = "openpaperdesign_app_close";
 pub(super) const IMPORT: &str = "openpaperdesign_app_import";
 pub(super) const EXPORT: &str = "openpaperdesign_app_export";
+pub(super) const RENAME: &str = "openpaperdesign_app_rename";
 // The in-panel editor's transport (the home view's own editor, see `panel_call`).
 pub(super) const ASSET: &str = "openpaperdesign_app_editor_asset";
 pub(super) const PAGE: &str = "openpaperdesign_app_page";
@@ -69,7 +70,7 @@ pub(super) const PANEL_TOOLS: [&str; 9] = [
     CANVAS_REVISION,
     CANVAS_SAVE,
 ];
-pub(super) const TOOLS: [&str; 16] = [
+pub(super) const TOOLS: [&str; 17] = [
     LIST,
     CREATE,
     OPEN,
@@ -77,6 +78,7 @@ pub(super) const TOOLS: [&str; 16] = [
     CLOSE,
     IMPORT,
     EXPORT,
+    RENAME,
     ASSET,
     PAGE,
     REVISION,
@@ -204,14 +206,18 @@ fn expect_binding(state: &LauncherState, binding: Option<&str>) -> Result<(), St
 }
 
 pub(super) const INSTRUCTIONS: &str = "openpaperdesign (app library): the OpenPaperDesign home \
-    in the Codex sidebar creates, opens, closes and reopens canvases that OpenPaperDesign keeps \
-    in its own data folder, and hands each to its loopback web editor (Codex's built-in \
-    browser, or a browser on this computer; editing inside the view is optional). Those \
-    actions are the person's, from the view; they need no model call.\n\n\
+    in the Codex sidebar is the person's library of canvases that OpenPaperDesign keeps in its \
+    own data folder (they belong to no Codex project). There they create, open, rename, export \
+    and import canvases, and edit the open one right in that view, in paper-rs's own workspace \
+    (a build without that in-view editor hands the canvas to its loopback web editor instead). \
+    Going back to the library saves what is left and closes the canvas. Those actions are the \
+    person's, from the view; they need no model call.\n\n\
     You can work on the same canvases: openpaperdesign_library_current shows the canvas open \
     here (id, binding, pages); openpaperdesign_library_canvases, _create, _open and _close pick \
-    one. The paper-rs design tools below edit it; pass the open canvas's `binding` with every \
-    call (a stale one is refused with no effect). Read a page before changing it \
+    one, and _editor gives its loopback browser editor link if the person wants a browser tab. \
+    The paper-rs design tools below edit it; pass the open canvas's `binding` with every \
+    call (a stale one, such as after the person went back to their library, is refused with no \
+    effect). Read a page before changing it \
     (get_tree_summary with nodeId \"root\" and its pageId); changes to an unread or \
     since-changed page are refused as conflicts. Each successful change is saved at once and \
     shows in the person's editor when it has no unsaved change of its own. A canvas whose editor may hold unsaved changes \
@@ -362,10 +368,19 @@ fn tools() -> Vec<Value> {
                 "panel": panel
             }, "required": ["payload"], "additionalProperties": false}}),
         json!({"name": EXPORT, "_meta": app,
-            "description": "For the home view: the canvas this view shows, as last saved, as \
-                a canvas file (canvas only: no design direction or tokens).",
-            "inputSchema": {"type": "object", "properties": {"binding": binding},
-                "required": ["binding"], "additionalProperties": false}}),
+            "description": "For the home view: a library canvas, as last saved, as a canvas \
+                file (canvas only: no design direction or tokens). Either the canvas this view \
+                shows (`binding`) or a canvas from the list (`id`).",
+            "inputSchema": {"type": "object", "properties": {"binding": binding, "id": id},
+                "additionalProperties": false}}),
+        json!({"name": RENAME, "_meta": app,
+            "description": "For the home view: rename a library canvas (its name only; its \
+                pages, content and identity stay). A canvas another OpenPaperDesign window has \
+                open is refused, with nothing changed.",
+            "inputSchema": {"type": "object", "properties": {
+                "id": id,
+                "name": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS}
+            }, "required": ["id", "name"], "additionalProperties": false}}),
     ]
 }
 
@@ -464,7 +479,8 @@ impl Launcher {
             CREATE => (&["name", "replace"], &["force", "panel"]),
             OPEN => (&["id", "replace"], &["force", "panel"]),
             EDITOR => (&["binding"], &["panel"]),
-            EXPORT => (&["binding"], &[]),
+            EXPORT => (&["binding", "id"], &[]),
+            RENAME => (&["id", "name"], &[]),
             CLOSE => (&["binding"], &["force"]),
             IMPORT => (&["payload", "replace"], &["force", "panel"]),
             _ => (&[], &[]),
@@ -524,7 +540,27 @@ impl Launcher {
                 self.app_create(lib, doc, force, replace, "imported", panel)
                     .await
             }
-            EXPORT => self.app_export(binding).await,
+            EXPORT => match (binding, get("id")) {
+                (Some(_), Some(_)) => Err(
+                    "Name either the shown canvas (binding) or a library canvas (id), not \
+                         both. Nothing was exported."
+                        .into(),
+                ),
+                (None, Some(id)) => self.app_export_id(lib, id).await,
+                _ => self.app_export(binding).await,
+            },
+            RENAME => {
+                let id = get("id")
+                    .filter(|s| valid_id(s))
+                    .ok_or("A canvas id from the library list is required. Nothing was renamed.")?;
+                let name = canvas_name(get("name")).map_err(|_| {
+                    format!(
+                        "A canvas name of 1 to {MAX_NAME_CHARS} characters, without control \
+                         characters, is required. Nothing was renamed."
+                    )
+                })?;
+                self.app_rename(lib, id, &name).await
+            }
             _ => Err(format!("unknown tool {name}")),
         }
     }
@@ -687,6 +723,10 @@ impl Launcher {
         // Checked before a lease file is made for it: only an existing library canvas.
         lib.read_document(id)
             .map_err(|e| format!("This canvas can't be opened: {e}. Nothing was changed."))?;
+        // A canvas whose earlier write here couldn't be undone is never opened writable again in
+        // this process (its lease is kept, so other processes get "busy").
+        lib.refuse_if_broken(id)
+            .map_err(|e| format!("This canvas can't be opened: {e}. Nothing was changed."))?;
         library_switch(&state, force, replace)?;
         let listening = Self::listen(lib.root())
             .await
@@ -796,30 +836,134 @@ impl Launcher {
             .saved_snapshot()
             .await
             .map_err(|e| format!("Not exported: {e}"))?;
-        let stem: String = e
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .take(40)
-            .collect();
-        let stem = stem.trim_matches('-');
-        text(json!({
-            "action": "exported",
-            "binding": current,
-            "canvas": {"id": doc, "name": e.name},
-            "content": payload::CANVAS_ONLY,
-            "file_name": format!("{}.opdcanvas.json", if stem.is_empty() { "canvas" } else { stem }),
-            "bytes": e.text.len(),
-            "payload": e.text,
-            "note": payload::NOTE,
-        }))
+        text(export_result(&doc, current.as_deref(), e))
     }
+
+    /// A library canvas named by its id, as last saved, as a canvas file (the home's file
+    /// menu). The canvas open here is read through its binding's writer fence, as `app_export`
+    /// reads it; any other canvas under its own lease, taken for the read and released after
+    /// (one another window holds is refused as busy). Nothing is opened, bound or written.
+    async fn app_export_id(&self, lib: &Arc<Library>, id: &str) -> ToolResult {
+        if !valid_id(id) {
+            return Err(
+                "A canvas id from the library list is required. Nothing was exported.".into(),
+            );
+        }
+        let state = self.state.clone().lock_owned().await;
+        refuse_if_shut_down(&state)?;
+        let state = Self::fence_library(state).await?;
+        let open = state
+            .bound
+            .as_ref()
+            .filter(|b| b.doc.as_deref() == Some(id))
+            .map(|b| (b.server.clone(), b.binding.clone()));
+        let (e, binding) = match open {
+            Some((server, binding)) => {
+                drop(state);
+                let e = server
+                    .saved_snapshot()
+                    .await
+                    .map_err(|e| format!("Not exported: {e}"))?;
+                (e, binding)
+            }
+            None => {
+                lib.read_document(id).map_err(|e| {
+                    format!("This canvas can't be exported: {e}. Nothing was exported.")
+                })?;
+                // Its files may be inconsistent: not offered as a canvas file.
+                lib.refuse_if_broken(id)
+                    .map_err(|e| format!("Not exported: {e}. Nothing was exported."))?;
+                let lease = match Lease::acquire(lib, id) {
+                    Ok(l) => l,
+                    Err(LeaseError::Busy) => return Err(BUSY.into()),
+                    Err(LeaseError::Failed(e)) => {
+                        return Err(format!("{e}. Nothing was exported."));
+                    }
+                };
+                let e = lib
+                    .export_document(&lease)
+                    .map_err(|e| format!("Not exported: {e}"))?;
+                drop(lease);
+                drop(state);
+                (e, None)
+            }
+        };
+        text(export_result(id, binding.as_deref(), e))
+    }
+
+    /// Rename a library canvas (its name only). The canvas open here is renamed through its
+    /// binding's server (writer fence, commit, rollback, `Broken`); any other one under its own
+    /// lease, taken for the write and released after. A canvas another OpenPaperDesign window
+    /// holds is refused as busy; any refusal leaves its name, content and the open canvas as
+    /// they were. The name is data in `project.json`, never a path.
+    async fn app_rename(&self, lib: &Arc<Library>, id: &str, name: &str) -> ToolResult {
+        let state = self.state.clone().lock_owned().await;
+        refuse_if_shut_down(&state)?;
+        let state = Self::fence_library(state).await?;
+        let open = state
+            .bound
+            .as_ref()
+            .filter(|b| b.doc.as_deref() == Some(id))
+            .map(|b| b.server.clone());
+        match open {
+            Some(server) => {
+                drop(state);
+                server
+                    .rename_canvas(name)
+                    .await
+                    .map_err(|e| format!("Not renamed: {}", e.msg))?;
+            }
+            None => {
+                lib.read_document(id).map_err(|e| {
+                    format!("This canvas can't be renamed: {e}. Nothing was changed.")
+                })?;
+                // A canvas fenced here keeps its lease, so this comes first: its reason, not
+                // "busy".
+                lib.refuse_if_broken(id)
+                    .map_err(|e| format!("Not renamed: {e}. Nothing was changed."))?;
+                let lease = match Lease::acquire(lib, id) {
+                    Ok(l) => l,
+                    Err(LeaseError::Busy) => return Err(BUSY.into()),
+                    Err(LeaseError::Failed(e)) => {
+                        return Err(format!("{e}. Nothing was renamed."));
+                    }
+                };
+                // The lease goes with the rename: released after it, or kept for good if its
+                // write couldn't be undone. Its message is shown as it is.
+                lib.rename_document(lease, name)?;
+                drop(state);
+            }
+        }
+        text(json!({"action": "renamed", "canvas": {"id": id, "name": name}}))
+    }
+}
+
+/// A canvas file export's result: the file's suggested name (from the canvas name, letters,
+/// digits, `-` and `_` only), its text and the notes about what it holds.
+fn export_result(id: &str, binding: Option<&str>, e: payload::Exported) -> Value {
+    let stem: String = e
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    let stem = stem.trim_matches('-');
+    json!({
+        "action": "exported",
+        "binding": binding,
+        "canvas": {"id": id, "name": e.name},
+        "content": payload::CANVAS_ONLY,
+        "file_name": format!("{}.opdcanvas.json", if stem.is_empty() { "canvas" } else { stem }),
+        "bytes": e.text.len(),
+        "payload": e.text,
+        "note": payload::NOTE,
+    })
 }
 
 /// Only the named arguments, each of its type: `strings`, and `ints` (whole numbers from 0 to

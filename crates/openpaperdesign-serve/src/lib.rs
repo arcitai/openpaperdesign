@@ -1567,6 +1567,26 @@ impl Server {
         Ok(rev)
     }
 
+    /// Rename the bound canvas: its manifest's name and modified time, through the same writer
+    /// fence, checks, commit, rollback and `Broken` rule as every save. Pages and files don't
+    /// change; an editor of this canvas sees a new canvas revision (a clean one reloads, a dirty
+    /// one's next save is a conflict, nothing merges).
+    pub(crate) async fn rename_canvas(&self, name: &str) -> Result<(), ApiError> {
+        let _write = self.start_write(SAVE_START, None).await?;
+        let mut p = self.project()?;
+        p.manifest.name = name.to_string();
+        p.manifest.modified = now_ms();
+        self.check()?;
+        refuse_if_broken(&self.broken)
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        let writes = [commit::Write {
+            path: p.dir.join(MANIFEST),
+            data: p.manifest.to_json().into_bytes(),
+        }];
+        commit_fenced(&self.broken, &writes)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.describe()))
+    }
+
     /// An editor of this binding (the browser tab or an in-panel editor) reports that it loaded
     /// its page and its renderer is Ready. Changes no file.
     pub(crate) fn mark_ready(&self) -> Result<(), ApiError> {

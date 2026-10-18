@@ -172,9 +172,14 @@ export function opdCreatePanel(opts) {
       && typeof v.active_page === 'string' && Array.isArray(v.pages) && v.pages.length > 0
       && v.pages.every((p) => p && typeof p.id === 'string' && typeof p.name === 'string'
         && typeof p.text === 'string');
-    // What the editor opens (its pages and active page, as text) and the revision it is at.
+    // What the editor opens (the file's name, its pages and active page, as text) and the
+    // revision it is at.
     const canvasPage = (v) => ({
-      text: JSON.stringify({ active_page: v.active_page, pages: v.pages }),
+      text: JSON.stringify({
+        canvas: v.canvas && typeof v.canvas.name === 'string' ? { name: v.canvas.name } : undefined,
+        active_page: v.active_page,
+        pages: v.pages,
+      }),
       revision: v.revision,
     });
     h.started = (async () => {

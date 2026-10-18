@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.48 · Updated: 2026-10-17
+Revision: 0.49 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -175,7 +175,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-5.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-6.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -192,8 +192,11 @@ resource registration uses it) and the URI tests. No earlier URI is served or al
 home, where New/Open/Import/Open current canvas open the web editor link and the panel is
 optional; `home-4` (2026-10-17) hosts upstream's workspace UI in the editor (no tool buttons of
 the view's own); `home-5` (2026-10-17) is the whole-canvas pages protocol: its renderer starts on
-the whole canvas and its in-panel editor reads and saves through `_app_canvas*`. A view a host
-already cached under an earlier key is not evicted or refreshed by this.
+the whole canvas and its in-panel editor reads and saves through `_app_canvas*`; `home-6`
+(2026-10-18) is the one app: a file library whose New/Open mount the editor in the view, with
+the file name and the way back in upstream's own top bar, and which calls `_app_rename` and
+exports by `id`. A view a host already cached under an earlier key is not evicted or refreshed
+by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
@@ -257,7 +260,7 @@ tool argument as a path. Layout `<root>/library/v1/canvases/<id>/` (a standard p
 the only live copy) and `locks/<id>.lock`; ids are 16 hex digits made by the server; names are
 data. Listing creates and locks nothing and is bounded (entries and manifest bytes). In that
 process only the home, its resource, `openpaperdesign_status` (library report), the read-only
-inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export}`
+inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,close,import,export,rename}`
 and in-panel editor tools (`_app_editor_asset`, `_app_canvas`, `_app_canvas_revision`,
 `_app_canvas_save`, the per-page `_app_page`, `_app_page_revision`, `_app_page_save`,
 `_app_ready`, `_app_page_release`), plus the agent's library controls and
@@ -292,7 +295,17 @@ correspondence, node ids at most 2^53 - 1 and
 from the top level with matching parents and at most 256 levels, exact image set); images
 come only from the file or the canvas's own `assets/`, never the process image registry. Export
 reads one saved snapshot under the lease and the writer fence and says it holds saved content
-without direction or tokens. Companions (`DESIGN.md`, tokens) are unsupported in version 1 and
+without direction or tokens; it names the shown `binding` or a listed `id` (never both): the
+open canvas by id goes through its binding's fence, any other under its own lease taken for the
+read (busy is refused). Rename (`_app_rename`, `id` and a 1–60 character name) changes the
+manifest's name and modified time only: the open canvas through its binding's
+`start_write`/`commit_fenced` (rollback, `Broken`), any other under its own lease with one
+`commit_fenced` of `project.json` through that canvas's own `Broken` in the `Library`: if its
+undo fails too, the canvas is fenced in this process (every later rename, open and export of it
+is refused with the files named, and its lease is kept so other processes find it busy) until
+the files are checked and OpenPaperDesign restarts; other canvases are unaffected. A lease that
+no longer checks out after a committed rename is reported as written but unconfirmed, never as
+nothing changed. Busy, retired or invalid targets change nothing. Names stay data, never paths. Companions (`DESIGN.md`, tokens) are unsupported in version 1 and
 refused; project-bound export is not offered. A new blank canvas infers no design system. The
 editor reports readiness itself (`POST /api/ready`); an open-link acknowledgement is never a
 load. Close retires and saves nothing in browser memory; it needs `force` once the link was
@@ -348,32 +361,48 @@ its JSON-RPC response, a save as its whole `tools/call` request, each escaping c
 fixed 16 KiB host allowance (not a known host limit), separately from the 64 MiB page limit;
 larger pages stay browser-only, untouched, and no mount is registered for them. `panel: true` on create/open/import/
 editor returns no link and gives none; mounted panels and a given link both make Close/Switch
-need `force`. Back and Close drain (wait for the save in flight, save what is left, require
-`can_reload`); conflict, failed/unanswered save or an edit under way keep the editor until an
-explicit discard. Teardown uses the same drain, but an abrupt host removal or crash saves
-nothing. Ready is the mount's own renderer's; Saved only a matching commit answer. The panel is
-optional (owner decision 2026-10-17): the home offers it only as "Edit in this view" for a
-shown canvas when its build has the module, and the server refuses `panel` requests its build
-can't serve before any lock, file, lease, switch or mount. Host CSP for WebAssembly,
-WebGL2/WebGPU, message limits, input and focus in the native panel are unproven.
+need `force`. Leaving (Home) drains (wait for the save in flight, save what is left, require
+`can_reload`); conflict, failed/unanswered save or an edit under way keep the editor, resumed,
+with the reason and an explicit Leave without saving. Teardown uses the same drain and closes
+nothing, but an abrupt host removal or crash saves nothing. Ready is the mount's own renderer's;
+Saved only a matching commit answer. The server refuses `panel` requests its build can't serve
+before any lock, file, lease, switch or mount. Host CSP for WebAssembly, WebGL2/WebGPU, message
+limits, input and focus in the native panel are unproven.
 
-Home and the web editor (owner decision 2026-10-17): the home stays the entry (overview, native
-project inventory, library list, New/Open/Import/Close/Export). Its primary New/Open/Import and
-"Open current canvas" hand the canvas to its one loopback web editor: the result's own
-same-binding link, checked against the loopback pattern and asked to open once (`ui/open-link`)
-in Codex's browser; an ordinary browser on this computer can use the same link. That counts as a
-link given, so Close/Switch then ask first. Whether a result is a library one comes from the
-view's own mode and the library action that asked, never from the reply's `storage` label alone.
-A library result is used only if its canvas id is valid and its binding is valid and names that
-canvas (and is exactly the binding an action named, when it named one), in the presentation the
-action asked for (link or panel); otherwise nothing opens and no action targets it. The home
-reports only what its opening request did (each attempt on its own, for Open canvas and the
-panel's browser button alike, from link fetch to Codex's answer; a late reply never replaces a
-later one) and never infers a load: the binding's shared `editor_loaded` can come from an
-earlier tab or the panel, so the editor itself shows Ready and Saved. The home owns
-routing and lifecycle; the web editor (browser/WASM, upstream engine) owns editing; the server
-owns the document, conflicts and authority. Don't add a second library home or editor.
-Native qualification is pending.
+One OPD app (owner admission 2026-10-18, superseding the 2026-10-17 web-editor-first home):
+the library view is one application in whatever surface Codex grants it. Home is a calm file
+library: the app-owned context said plainly ("OpenPaperDesign library: files this app keeps
+itself, not part of a Codex project"; app-library files have no native-project grouping or
+association, so none is shown, implied or granted), New file (created at once as "Untitled"),
+search by name (Escape clears), a list/grid toggle (memory only), and named files with pages
+and last edit (relative, else the date), each with a restrained menu: Open, Rename… (a form;
+`_app_rename`) and Export… (`_app_export {id}`), keyboard-operable (arrows, Home/End, Escape
+back to its button). There is no "Open in new chat". Workspace mode keeps its genuine project
+selection unchanged. With the module, New file, Open, Import and Open current file send
+`panel: true` and mount the editor directly in the view: no result screen, no "Edit in this
+view", no `ui/open-link`, and nothing on this path marks a browser link as given. The editor
+fills the view edge to edge (no heading, frame, fixed-height stage, Close/Export/Full
+screen/browser buttons, Details or footer); upstream's own top bar shows the file name
+(`canvas.name`, separate from the page name) and its "All projects" is the way home. Every
+status goes to a status live region for assistive technology and diagnostics; how it shows is
+`opdStatusKind` (editor.js, shared with the browser page): stable healthy states (Ready, Saved,
+Saving…) show nothing, loading on the way to Ready shows as a small temporary note that the
+next state replaces, and failures, conflicts, refusals and notes show as one note over the
+workspace. Home drains, disposes (releasing the mount), then closes exactly that
+binding, not forced; a refused, failed or unanswered close is said on the library and never
+shown as closed, and a close answer after a newer result belongs to nothing. A start failure
+offers a visible Back to files. Without the module, the library falls back to the old link
+hand-off (the result's own same-binding loopback link, opened once, which counts as given), and
+the agent's `_library_editor` still hands out the link. Whether a result is a library one comes
+from the view's own mode and the action that asked, never from its `storage` label alone; it is
+used only if its canvas id and binding are valid and match the canvas asked for, in the
+presentation asked for (link or panel). The home never infers a browser load. The browser page
+(`index.html`/`app.js`) is the same app's editor alone: the workspace fills the page, with the
+same status rule and an About for the notices; a fixed-project standalone page has no library
+Home (upstream's Home shows the "Open, create or import canvases from the OpenPaperDesign home
+in Codex" note). The home owns routing and lifecycle; the web editor (WASM, upstream engine)
+owns editing; the server owns the document, conflicts and authority. Don't add a second library
+home or editor. Native qualification is pending.
 
 The web editor's workspace (owner decision 2026-10-17, `crates/openpaperdesign-web/src/state.rs`):
 the one web editor (browser page and optional panel alike) hosts upstream's own workspace UI,
@@ -397,8 +426,9 @@ upstream reports (`UiState::rename_field`, `PagesUi::rename_field`); a stored re
 exempts another focused field.
 Every `AppRequest` is
 handled explicitly in `WebState::handle_requests`: Save is the page's checked save at once;
-Home/New/Open go to the host's own navigation (the panel's drained Back, or a status line in
-a browser tab); SVG/PDF export is upstream's in-memory export offered as a download; PNG
+Home/New/Open go to the host's own navigation (the view's drained Home, which then closes its
+binding, or a note in a browser tab); upstream's top-bar title (`UiState::project_name`) is the
+canvas envelope's `canvas.name`, updated on reload; SVG/PDF export is upstream's in-memory export offered as a download; PNG
 export/copy (GPU read-back), Duplicate project and placing images from files are refused
 with a visible reason. Copy/cut/paste use the page's clipboard events through upstream's
 `clipboard::Provider`; no OS clipboard. The

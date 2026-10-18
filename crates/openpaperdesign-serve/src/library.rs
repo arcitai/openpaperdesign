@@ -100,6 +100,14 @@ pub struct Library {
     root_id: (u64, u64),
     /// (device, inode) of each folder of the hierarchy once it was seen (it may not exist yet).
     seen: Mutex<HashMap<PathBuf, (u64, u64)>>,
+    /// Writes this process makes to a canvas that isn't open in a binding (Rename), fenced as
+    /// every server's writes are (`crate::Broken`, `crate::commit_fenced`): once such a write
+    /// couldn't be undone, the canvas's entry names the files and every later rename, open or
+    /// export of it here is refused. In memory, for this process, like a server's.
+    broken: Mutex<HashMap<String, crate::Broken>>,
+    /// The leases of those canvases, kept until this process ends, so no other OpenPaperDesign
+    /// process (or a later binding here) opens and writes them meanwhile.
+    kept: Mutex<Vec<Lease>>,
 }
 
 impl Library {
@@ -177,6 +185,8 @@ impl Library {
             root,
             root_id,
             seen: Mutex::default(),
+            broken: Mutex::default(),
+            kept: Mutex::default(),
         })
     }
 
@@ -402,6 +412,7 @@ impl Library {
     /// [`Library::read_document`] plus the size bounds of every file the server will load,
     /// checked before it is prepared.
     pub(crate) fn check_document(&self, id: &str) -> Result<Manifest, String> {
+        self.refuse_if_broken(id)?;
         let manifest = self.read_document(id)?;
         let dir = self.document_dir(id);
         let size = |p: &Path| {
@@ -517,6 +528,73 @@ impl Library {
         }
         lease.check(self).map_err(|e| made.fail(&e))?;
         Ok((dir, made))
+    }
+}
+
+impl Library {
+    /// Canvas `id`'s write fence in this process (see `broken`).
+    fn fence(&self, id: &str) -> crate::Broken {
+        self.broken
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Refused once a write of canvas `id` that isn't open in a binding couldn't be undone:
+    /// names the files that may be inconsistent. Every other canvas is unaffected.
+    pub(crate) fn refuse_if_broken(&self, id: &str) -> Result<(), String> {
+        match self.broken.lock().unwrap().get(id) {
+            Some(b) => crate::refuse_if_broken(b)
+                .map_err(|e| format!("{e} (this window keeps the canvas locked until then)")),
+            None => Ok(()),
+        }
+    }
+
+    /// Rename canvas `lease.doc` (held by this process, and not open in a binding here): its
+    /// manifest's name and modified time, as one checked commit of `project.json` through the
+    /// canvas's write fence (`commit_fenced`: all or, after an error, nothing). Its id, pages,
+    /// files and location don't change; the name is data, never part of a path. A commit whose
+    /// undo failed fences the canvas: this and every later rename, open or export of it here
+    /// is refused with the files named, and its lease is kept until this process ends. Returns
+    /// the message to show as it is.
+    pub(crate) fn rename_document(&self, lease: Lease, name: &str) -> Result<Manifest, String> {
+        let not = |e: String| format!("Not renamed: {e}. Nothing was changed.");
+        self.refuse_if_broken(&lease.doc).map_err(not)?;
+        lease.check(self).map_err(not)?;
+        let mut manifest = self.read_document(&lease.doc).map_err(not)?;
+        manifest.name = name.to_string();
+        manifest.modified = paper_rs::project::now_ms();
+        let writes = [crate::commit::Write {
+            path: self.document_dir(&lease.doc).join(MANIFEST),
+            data: manifest.to_json().into_bytes(),
+        }];
+        if let Err(e) = crate::commit_fenced(&self.fence(&lease.doc), &writes) {
+            if matches!(e, crate::commit::CommitError::Broken { .. }) {
+                self.kept.lock().unwrap().push(lease);
+            }
+            return Err(format!("Not renamed: {}", e.describe()));
+        }
+        // Committed. The lease is checked once more: if it no longer checks out, the new name
+        // was still written (nothing is undone), only this process's exclusive ownership while
+        // it wrote can't be confirmed.
+        lease.check(self).map_err(|e| {
+            format!(
+                "The new name was written to this canvas's {MANIFEST}, but this OpenPaperDesign \
+                 window couldn't confirm afterwards that it still held the canvas ({e}). Check \
+                 the canvas in the library before changing it again."
+            )
+        })?;
+        Ok(manifest)
+    }
+
+    /// Canvas `lease.doc` (held by this process, and not open in a binding here) as a portable
+    /// canvas file, read under its lease (no OpenPaperDesign process can write it meanwhile).
+    pub(crate) fn export_document(&self, lease: &Lease) -> Result<payload::Exported, String> {
+        lease.check(self)?;
+        self.check_document(&lease.doc)?;
+        payload::export(&self.document_dir(&lease.doc))
     }
 }
 

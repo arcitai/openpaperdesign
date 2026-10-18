@@ -475,6 +475,361 @@ async fn library_leases_exclude_the_same_canvas_only() {
     task3.abort();
 }
 
+/// Every file under `dir`, with its bytes.
+fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// The home's Rename for a canvas that isn't open here: done under its own lease, taken for the
+/// write and released after. Only its `project.json` changes (the name and modified time); its
+/// id, pages, page names, active page and content stay, and the list shows the new name. A
+/// canvas another window holds is refused unchanged, and a bad id or name is refused before
+/// anything is read or written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_of_a_closed_canvas_changes_its_name_only() {
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    let (port, token) = url(&made);
+    browser_edit(port, &token).await;
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let before = tree(&dir);
+    let old = crate::read_manifest_checked(&dir).unwrap();
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": id, "name": "  Launch plan "}),
+        )
+        .await,
+    );
+    assert_eq!(
+        renamed,
+        json!({"action": "renamed", "canvas": {"id": id, "name": "Launch plan"}})
+    );
+    let after = tree(&dir);
+    let changed: Vec<&PathBuf> = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    assert_eq!(changed, [&dir.join("project.json")], "only the manifest");
+    let new = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(new.name, "Launch plan");
+    let pages = |m: &paper_rs::project::Manifest| -> Vec<(String, String)> {
+        m.pages
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect()
+    };
+    assert_eq!(pages(&new), pages(&old));
+    assert_eq!(new.active_page, old.active_page);
+    assert!(new.modified >= old.modified);
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["id"], json!(id));
+    assert_eq!(listed["canvases"][0]["name"], "Launch plan");
+    assert_eq!(open_doc(&lib.l).await, None, "renaming opens nothing");
+    // Its lease was released: another window opens it, under the new name.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let opened = value(call(&c2, app::OPEN, json!({"id": id})).await);
+    assert_eq!(opened["canvas"]["name"], "Launch plan");
+    // Held by that window: refused here, unchanged.
+    let held = tree(&dir);
+    let e = call(&lib.c, app::RENAME, json!({"id": id, "name": "Other"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("open in another OpenPaperDesign window"), "{e}");
+    assert_eq!(tree(&dir), held);
+    for (args, want) in [
+        (json!({"id": "../x", "name": "A"}), "canvas id"),
+        (json!({"name": "A"}), "canvas id"),
+        (json!({"id": id}), "Nothing was renamed"),
+        (json!({"id": id, "name": "   "}), "Nothing was renamed"),
+        (json!({"id": id, "name": "a\u{7}b"}), "control characters"),
+        (json!({"id": id, "name": "x".repeat(61)}), "1 to 60"),
+        (
+            json!({"id": id, "name": "A", "path": "/etc"}),
+            "unexpected argument",
+        ),
+        (
+            json!({"id": "0123456789abcdef", "name": "A"}),
+            "can't be renamed",
+        ),
+    ] {
+        let e = call(&lib.c, app::RENAME, args.clone()).await.unwrap_err();
+        assert!(e.contains(want), "{args}: {e}");
+    }
+    assert_eq!(tree(&dir), held, "no refusal touched it");
+    assert!(
+        !lib.root
+            .join("library/v1/locks/0123456789abcdef.lock")
+            .exists(),
+        "no lease file for a canvas that doesn't exist"
+    );
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// A failed Rename of a canvas that isn't open is undone; one whose undo fails too fences that
+/// canvas, as every server write is fenced (`commit_fenced`, `Broken`). The failures are
+/// injected on this thread (`commit::fault`, thread-local), around a synchronous
+/// `Library::rename_document` on the launcher's own library, with no await in between: a
+/// one-file commit stages (step 0), renames (1) and syncs its folder (2); its undo stages the
+/// old bytes (3), renames them back (4) and syncs (5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_whose_undo_fails_fences_that_canvas_only() {
+    use crate::library::{LeaseError, Library};
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let library = lib.l.library.clone().unwrap();
+    let lease = |library: &Library| {
+        Lease::acquire(library, &id)
+            .ok()
+            .expect("the canvas's lease")
+    };
+
+    // The folder sync fails and the old bytes are put back: nothing changed, nothing fenced.
+    let before = tree(&dir);
+    let held = lease(&library);
+    crate::commit::fault::fail_at(&[2]);
+    let undone = library.rename_document(held, "First");
+    crate::commit::fault::fail_at(&[]);
+    let e = undone.unwrap_err();
+    assert!(
+        e.starts_with(
+            "Not renamed: not saved; nothing was written (directory sync: injected failure at \
+             step 2)"
+        ),
+        "{e}"
+    );
+    assert_eq!(tree(&dir), before, "put back");
+    library.refuse_if_broken(&id).unwrap();
+    let renamed = value(call(&lib.c, app::RENAME, json!({"id": id, "name": "Second"})).await);
+    assert_eq!(renamed["canvas"]["name"], "Second", "a later rename works");
+
+    // The sync fails and putting the old bytes back fails too: the canvas is fenced.
+    let held = lease(&library);
+    crate::commit::fault::fail_at(&[2, 3]);
+    let broken = library.rename_document(held, "Third");
+    crate::commit::fault::fail_at(&[]);
+    let e = broken.unwrap_err();
+    assert!(
+        e.starts_with("Not renamed: not saved, and undoing the partial save failed")
+            && e.contains("may now be inconsistent: project.json (injected failure at step 3)"),
+        "{e}"
+    );
+    // The new bytes stayed (the undo failed); nothing claims they were put back.
+    assert_eq!(crate::read_manifest_checked(&dir).unwrap().name, "Third");
+    let fenced = tree(&dir);
+    // Every later rename, open or export of it here is refused with the file named.
+    for (tool, args) in [
+        (app::RENAME, json!({"id": id, "name": "Later"})),
+        (app::OPEN, json!({"id": id})),
+        (app::EXPORT, json!({"id": id})),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(
+            e.contains("may be inconsistent: project.json (injected failure at step 3)"),
+            "{tool}: {e}"
+        );
+    }
+    assert!(library.refuse_if_broken(&id).is_err());
+    assert!(
+        matches!(Lease::acquire(&library, &id), Err(LeaseError::Busy)),
+        "its lease is kept"
+    );
+    assert_eq!(open_doc(&lib.l).await, None, "never opened writable");
+    assert_eq!(tree(&dir), fenced);
+    // Another process finds it busy: it can neither open nor rename it.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    for (tool, args) in [
+        (app::OPEN, json!({"id": id})),
+        (app::RENAME, json!({"id": id, "name": "Elsewhere"})),
+    ] {
+        let e = call(&c2, tool, args).await.unwrap_err();
+        assert!(
+            e.contains("open in another OpenPaperDesign window"),
+            "{tool}: {e}"
+        );
+    }
+    assert_eq!(tree(&dir), fenced);
+    // Other canvases are unaffected.
+    let other = value(call(&lib.c, app::CREATE, json!({"name": "Other"})).await);
+    let other_id = other["canvas"]["id"].as_str().unwrap().to_string();
+    library.refuse_if_broken(&other_id).unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&other), "force": true}),
+    )
+    .await
+    .unwrap();
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": other_id, "name": "Other two"}),
+        )
+        .await,
+    );
+    assert_eq!(renamed["canvas"]["name"], "Other two");
+    task2.abort();
+}
+
+/// Renaming the canvas open here goes through its binding's server (writer fence, commit,
+/// rollback): the open editors read the new name in the canvas envelope (`canvas.name`, the
+/// workspace's top-bar title) under a new canvas revision, so an editor that polls picks it up;
+/// the binding, its URL and its pages stay. A retired binding refuses it, unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_of_the_open_canvas_goes_through_its_binding() {
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    let b = binding(&made);
+    let (port, token) = url(&made);
+    let (st, head, body) = raw(port, &token, "GET", "/api/canvas", "", "").await;
+    assert_eq!(st, 200, "{body}");
+    let before: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(before["canvas"]["name"], "Landing");
+    let rev = etag_of(&head);
+    let server = bound_server(&lib.l).await;
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": id, "name": "Launch plan"}),
+        )
+        .await,
+    );
+    assert_eq!(renamed["canvas"]["name"], "Launch plan");
+    assert!(
+        Arc::ptr_eq(&bound_server(&lib.l).await, &server),
+        "the same binding"
+    );
+    let (st, head, body) = raw(port, &token, "GET", "/api/canvas", "", "").await;
+    assert_eq!(st, 200, "{body}");
+    let after: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(after["canvas"]["name"], "Launch plan");
+    assert_eq!(after["pages"], before["pages"], "pages untouched");
+    assert_eq!(after["active_page"], before["active_page"]);
+    assert_ne!(etag_of(&head), rev, "a new canvas revision");
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b})).await);
+    assert_eq!(state["canvas"]["name"], "Launch plan");
+    assert_eq!(binding(&state), b);
+    assert_eq!(url(&state), (port, token.clone()));
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["name"], "Launch plan");
+    assert_eq!(listed["canvases"][0]["open"], true);
+    // Retired (its admission closed): refused, nothing written.
+    server.retire().await;
+    let kept = tree(&dir);
+    let e = call(&lib.c, app::RENAME, json!({"id": id, "name": "Late"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("Not renamed"), "{e}");
+    assert_eq!(tree(&dir), kept);
+    assert_eq!(
+        crate::read_manifest_checked(&dir).unwrap().name,
+        "Launch plan"
+    );
+}
+
+/// Export from the home's file menu names a canvas by its id. The open one is read through its
+/// binding's writer fence (the same bytes as exporting it by binding); any other one under its
+/// own lease, released after. Nothing is opened, bound or written; one another window holds is
+/// refused as busy, and naming both a binding and an id is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_export_by_id_reads_the_saved_canvas_without_opening_it() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir1: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    browser_edit(port, &token).await;
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&one), "force": true}),
+    )
+    .await
+    .unwrap();
+    let two = value(call(&lib.c, app::CREATE, json!({"name": "Two"})).await);
+    let id2 = two["canvas"]["id"].as_str().unwrap().to_string();
+    let b2 = binding(&two);
+    let before = tree(&dir1);
+    let by_id = value(call(&lib.c, app::EXPORT, json!({"id": id1})).await);
+    assert_eq!(by_id["action"], "exported");
+    assert_eq!(by_id["binding"], Value::Null, "not an open binding's");
+    assert_eq!(by_id["canvas"], json!({"id": id1, "name": "One"}));
+    assert_eq!(by_id["file_name"], "One.opdcanvas.json");
+    let file = by_id["payload"].as_str().unwrap();
+    crate::library::payload::validate(file).unwrap();
+    assert_eq!(by_id["bytes"], json!(file.len()));
+    assert_eq!(tree(&dir1), before, "nothing written");
+    assert_eq!(
+        open_doc(&lib.l).await.as_deref(),
+        Some(id2.as_str()),
+        "nothing opened or switched"
+    );
+    // The open canvas by id: the same bytes as by its binding.
+    let open_by_id = value(call(&lib.c, app::EXPORT, json!({"id": id2})).await);
+    let open_by_binding = value(call(&lib.c, app::EXPORT, json!({"binding": b2})).await);
+    assert_eq!(open_by_id["payload"], open_by_binding["payload"]);
+    assert_eq!(open_by_id["binding"], json!(b2));
+    for (args, want) in [
+        (json!({"binding": b2, "id": id2}), "not both"),
+        (json!({"id": "../x"}), "canvas id"),
+        (json!({"id": "0123456789abcdef"}), "can't be exported"),
+        (json!({"id": id1, "path": "/etc"}), "unexpected argument"),
+    ] {
+        let e = call(&lib.c, app::EXPORT, args.clone()).await.unwrap_err();
+        assert!(e.contains(want), "{args}: {e}");
+    }
+    // Held by another window: refused as busy, and still nothing written.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    value(call(&c2, app::OPEN, json!({"id": id1})).await);
+    let held = tree(&dir1);
+    let e = call(&lib.c, app::EXPORT, json!({"id": id1}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("open in another OpenPaperDesign window"), "{e}");
+    assert_eq!(tree(&dir1), held);
+    bound_server(&l2).await.retire().await;
+    bound_server(&lib.l).await.retire().await;
+    task2.abort();
+}
+
 /// A switch keeps the old canvas's lease until its started writer finished: another process
 /// can't open it meanwhile. A caller that goes away doesn't stop the handoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2249,8 +2604,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-5.html",
-        "versioned for the whole-canvas view code"
+        HOME_URI, "ui://openpaperdesign/home-6.html",
+        "versioned for the one-app view code"
     );
 }
 

@@ -6,17 +6,34 @@
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
 import { discardStep, frameStep, saveStep } from './page.js';
-import { opdBrowserEnv, opdIsMac, opdMountEditor } from './editor.js';
+import { opdBrowserEnv, opdIsMac, opdMountEditor, opdStatusKind } from './editor.js';
 
 // State for people and for automated checks (read-only from outside).
 const state = {};
 window.__opd = state;
 
 const $ = (id) => document.getElementById(id);
-// Long text is cut with an ellipsis; the full text is in the tooltip.
-const setText = (el, s) => { el.textContent = s; el.title = s; };
-const status = (s, error = false) => { setText($('status'), s); $('status').classList.toggle('error', error); };
-const renderer = (s, error = false) => { setText($('renderer'), s); $('renderer').classList.toggle('error', error); };
+// Every status goes to the live region (assistive technology, checks). Stable healthy ones
+// (Ready, Saved) show nothing; loading shows as a small note until the next state replaces it;
+// anything else (a failure, conflict, refusal, download) is shown, briefly unless it is an
+// error (editor.js `opdStatusKind`, the same rule as the home view's editor).
+let alertTimer = 0;
+const status = (s, error = false) => {
+  $('status').textContent = s;
+  const a = $('alert');
+  clearTimeout(alertTimer);
+  const kind = opdStatusKind(s, error);
+  if (kind === 'quiet') {
+    a.hidden = true;
+    return;
+  }
+  a.textContent = s;
+  a.className = kind;
+  a.hidden = false;
+  if (kind === 'note') alertTimer = setTimeout(() => { a.hidden = true; }, 6000);
+};
+// Diagnostics only (which renderer runs); a renderer failure is also a status error.
+const renderer = (s) => { $('renderer').textContent = s; };
 
 function token() {
   // The URL fragment carries the per-launch token. Keep it for reloads in this tab only and
@@ -58,7 +75,7 @@ async function main() {
     if (!res.ok) throw new Error(`Could not load the canvas (${res.status}).`);
     return { revision: res.headers.get('ETag'), text: await res.text() };
   };
-  $('title').textContent = project.name;
+  // The file's name is shown by the workspace's own top bar (from the canvas it loads).
   document.title = `${project.name} — openpaperdesign`;
 
   const seed = crypto.getRandomValues(new Uint32Array(2));

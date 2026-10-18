@@ -114,11 +114,19 @@ struct Inflight {
     meta: Meta,
 }
 
-/// The canvas the server sent (`/api/canvas`, or the in-panel canvas read): `{active_page,
-/// pages: [{id, name, text}]}` (its other fields are the transport's), each `text` an upstream
-/// page file. The list's ids and names win over the files' (the manifest owns them, as in
-/// upstream `Project::load_page`).
-fn parse_canvas(json: &str) -> Result<(Vec<PageData>, Option<String>), String> {
+/// A canvas as the server sent it: its pages, its active page and its file name.
+struct Canvas {
+    pages: Vec<PageData>,
+    active: Option<String>,
+    name: Option<String>,
+}
+
+/// The canvas the server sent (`/api/canvas`, or the in-panel canvas read): `{canvas: {name},
+/// active_page, pages: [{id, name, text}]}` (its other fields are the transport's), each `text`
+/// an upstream page file. The list's ids and names win over the files' (the manifest owns
+/// them, as in upstream `Project::load_page`). `canvas.name` is the file's name (the project's,
+/// in upstream's terms), separate from any page's.
+fn parse_canvas(json: &str) -> Result<Canvas, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("the canvas can't be read: {e}"))?;
     let list = v
@@ -144,7 +152,16 @@ fn parse_canvas(json: &str) -> Result<(Vec<PageData>, Option<String>), String> {
         .get("active_page")
         .and_then(|a| a.as_str())
         .map(str::to_string);
-    Ok((pages, active))
+    let name = v
+        .get("canvas")
+        .and_then(|c| c.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    Ok(Canvas {
+        pages,
+        active,
+        name,
+    })
 }
 
 pub struct WebState {
@@ -252,16 +269,18 @@ impl WebState {
     /// Open the whole canvas the server sent (see [`parse_canvas`]): every page, in list
     /// order, on the active page it names, through upstream `Editor::open_pages`, so the pages
     /// panel switches, adds, renames, duplicates, reorders and deletes pages as upstream does.
+    /// The file's name is upstream's own top-bar title (`UiState::project_name`), shown above
+    /// the page's name; its "All projects" button is the host's way back (`HostRequest::Home`).
     pub fn open(
         canvas_json: &str,
         mac: bool,
         css_width: f64,
         css_height: f64,
     ) -> Result<WebState, String> {
-        let (pages, active) = parse_canvas(canvas_json)?;
+        let canvas = parse_canvas(canvas_json)?;
         let mut ed = Editor::default();
         ed.viewport = v2(css_width.max(1.0), css_height.max(1.0));
-        ed.open_pages(pages, active.as_deref());
+        ed.open_pages(canvas.pages, canvas.active.as_deref());
         let clipboard = Rc::new(RefCell::new(ClipboardBuf::default()));
         ed.clipboard_io = Some(Box::new(WebClipboard(clipboard.clone())));
         let ctx = egui::Context::default();
@@ -274,7 +293,10 @@ impl WebState {
         let mut s = WebState {
             saved_stamp: ed.doc_stamp,
             ed,
-            ui: UiState::default(),
+            ui: UiState {
+                project_name: canvas.name.unwrap_or_default(),
+                ..Default::default()
+            },
             ctx,
             mac,
             inflight: None,
@@ -943,9 +965,17 @@ impl WebState {
     /// Undo history starts over. Only when `can_reload`, or as the explicit discard of every
     /// local change. Open rename fields (layer or page) close and a page drag ends: they were
     /// for the replaced canvas, so their text (unchanged after a clean reload, or deliberately
-    /// dropped by the conflict banner's discard) never lands on the new one.
+    /// dropped by the conflict banner's discard) never lands on the new one. The file's name
+    /// follows the server's (a rename from the library shows).
     pub fn reload(&mut self, canvas_json: &str) -> Result<(), String> {
-        let (mut pages, active) = parse_canvas(canvas_json)?;
+        let Canvas {
+            mut pages,
+            active,
+            name,
+        } = parse_canvas(canvas_json)?;
+        if let Some(name) = name {
+            self.ui.project_name = name;
+        }
         self.ui.renaming = None;
         let collapsed = self.ui.pages.collapsed;
         self.ui.pages = Default::default();
