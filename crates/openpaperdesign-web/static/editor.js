@@ -204,7 +204,8 @@ export function opdIsMac(nav) {
  *                                    status line says where that is
  *   log(message), env                (see opdBrowserEnv)
  * }
- * Returns { session, started, drain(), resume(), dispose(), hostThemeChanged(), appearance }.
+ * Returns { session, started, drain(), resume(), dispose(), hostThemeChanged(), setAppearance(a),
+ * appearance }. `setAppearance`: a kept preference the host learned late (not a new choice).
  * `started` settles once the renderer has booted (or failed); Ready comes later, from the frame
  * loop. `hostThemeChanged()`: the host's theme changed (it matters only where the browser can't
  * report the OS appearance).
@@ -488,6 +489,13 @@ export function opdMountEditor(opts) {
     resume: () => session.resume(),
     dispose,
     hostThemeChanged: system,
+    // The host learned the kept preference only now (a late read): the editor shown now takes
+    // it (one booting later starts in it); it isn't reported back as a new choice.
+    setAppearance(a) {
+      if (disposed) return;
+      appearance = opdAppearance(a);
+      session.withEditor((ed) => ed.set_appearance(appearance));
+    },
     get appearance() { return appearance; },
     get disposed() { return disposed; },
   };

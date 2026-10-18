@@ -449,11 +449,11 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // view's own palette for that appearance applies. A host palette never overrides it.
   function applyTheme() {
     const root = document.documentElement;
-    const sys = systemDark();
-    const dark = appearance === 'dark' ? true : appearance === 'light' ? false : sys;
-    // System with no signal at all: the style sheet's own colour-scheme rule decides.
-    if (dark !== null) root.setAttribute('data-theme', dark ? 'dark' : 'light');
-    const matched = dark !== null && hostColoursFor === (dark ? 'dark' : 'light');
+    // System with no signal at all (neither the browser nor the host says) is Light, as the
+    // editor's own fallback is, never an earlier explicit mode left on the root.
+    const dark = appearance === 'dark' ? true : appearance === 'light' ? false : systemDark() === true;
+    root.setAttribute('data-theme', dark ? 'dark' : 'light');
+    const matched = hostColoursFor === (dark ? 'dark' : 'light');
     for (const key of STYLE_KEYS) {
       const v = hostVars[key];
       if (v !== undefined && (matched || !key.startsWith('--color-'))) root.style.setProperty(key, v);
@@ -463,15 +463,45 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   if (scheme && typeof scheme.addEventListener === 'function') scheme.addEventListener('change', applyTheme);
   // The mounted editor learns of a host theme change (set where the editor is mounted).
   let hostThemeChanged = () => {};
-  // A new choice from the editor's menu: shown at once, then kept by the library (only the
-  // validated preference is sent). A choice it couldn't keep still applies here, and says so.
-  async function keepAppearance(next) {
+  // Freshness of the preference (R30). Every menu choice is numbered. A library list's kept
+  // preference applies only if no choice was made since that read began, no keep is under way,
+  // and the latest choice wasn't refused (this view's own choice then stays). Otherwise the
+  // list itself is still shown.
+  let appearanceChoice = 0;
+  let keepsInFlight = 0;
+  let choiceUnkept = false;
+  // A new choice from the editor's menu (`from`: the editor it came from): shown at once, then
+  // kept by the library (only the validated preference is sent). A choice it couldn't keep
+  // still applies here. Its refusal is said only while it is the latest choice and its editor
+  // is still the one shown; a newer choice or another editor owns the screen by then.
+  async function keepAppearance(next, from) {
+    const choice = ++appearanceChoice;
     appearance = opdAppearanceName(next);
     applyTheme();
     if (!LIBRARY) return;
-    const r = await rpc('tools/call', { name: 'openpaperdesign_app_appearance', arguments: { appearance } }, 15000);
+    keepsInFlight += 1;
+    let r;
+    try {
+      r = await rpc('tools/call', { name: 'openpaperdesign_app_appearance', arguments: { appearance } }, 15000);
+    } finally {
+      keepsInFlight -= 1;
+    }
+    if (choice !== appearanceChoice) return;
     const kept = !r.timeout && !r.error && r.result && !r.result.isError;
-    if (!kept && view === 'editor') edStatus('Appearance applied here, but it couldn\'t be kept for next time.');
+    choiceUnkept = !kept;
+    if (!kept && view === 'editor' && from && panelHandle === from) {
+      edStatus('Appearance applied here, but it couldn\'t be kept for next time.');
+    }
+  }
+  // The kept preference a library list reported, read when choice `readAt` was the latest.
+  function listedAppearance(value, readAt) {
+    if (readAt !== appearanceChoice || keepsInFlight > 0 || choiceUnkept) return;
+    const next = opdAppearanceName(value);
+    if (next === appearance) return;
+    appearance = next;
+    applyTheme();
+    // An editor opened before the read came back takes it too (it can't report it as a choice).
+    if (panelHandle && panelHandle.setAppearance) panelHandle.setAppearance(appearance);
   }
 
   // ---- direct actions ----
@@ -1019,16 +1049,17 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('inventory').className = 'muted';
     $('inventory').hidden = false;
     $('inventory').textContent = 'Reading your files…';
+    const readAt = appearanceChoice;
     const r = await rpc('tools/call', { name: 'openpaperdesign_app_canvases', arguments: {} });
     if (run !== libraryRun) return; // a newer refresh owns the list
     let v = null;
     if (!r.timeout && !r.error && r.result && !r.result.isError) {
       try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
     }
-    // The library's kept appearance comes with its list (a missing or unknown one is System).
+    // The library's kept appearance comes with its list (a missing or unknown one is System),
+    // unless a choice made since this read began owns it (see listedAppearance).
     if (v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, 'appearance')) {
-      appearance = opdAppearanceName(v.appearance);
-      applyTheme();
+      listedAppearance(v.appearance, readAt);
     }
     const list = $('projects');
     list.textContent = '';
@@ -1406,7 +1437,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       // The editor starts in the library's kept appearance and resolves it as this view does.
       appearance,
       hostTheme: () => hostContext.theme,
-      onAppearance: (a) => { if (panelHandle === h) keepAppearance(a); },
+      onAppearance: (a) => { if (panelHandle === h) keepAppearance(a, h); },
     });
     panelHandle = h;
     h.started.catch((e) => {

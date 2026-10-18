@@ -1466,6 +1466,9 @@ function fakePanel() {
           drain: async () => { log.push('drain'); if (h.drainGate) await h.drainGate; return h.nextDrain; },
           resume: () => { log.push('resume'); },
           dispose: async () => { log.push('dispose'); },
+          // A kept preference the view learned late (panel.js `setAppearance`), recorded.
+          kept: [],
+          setAppearance: (a) => { h.kept.push(a); },
         };
         h.started.catch(() => {});
         h.finish = () => settle.resolve('mounted');
@@ -1594,6 +1597,174 @@ test('System follows the OS first, live, whatever the host says; the host palett
   assert.equal(v.props['--border-radius-md'], '6px', 'the earlier radius is kept (non-colour, merged)');
   assert.equal(libCalls(v, 'openpaperdesign_app_appearance'), 0, 'an OS or host change keeps nothing');
   libOnly(v);
+});
+
+// ---- R30: freshness of the preference, the no-signal fallback, and whose refusal it is ----
+// Consolidated from the R30 review's probes (theme-r30-corrections/home-review-probes.mjs),
+// with their reproductions and assertions, plus the controls the findings ask for.
+
+const APPEARANCE_TOOL = 'openpaperdesign_app_appearance';
+const UNKEPT = 'Appearance applied here, but it couldn\'t be kept for next time.';
+
+test('R30-F1: an older list never replaces a newer explicit choice, and the list itself still shows', async () => {
+  const fake = fakePanel();
+  const v = mount({ library: true, panel: fake, media: osScheme(false) });
+  v.from({ id: v.sent[0].id, result: { hostCapabilities: {}, hostContext: { theme: 'light' } } });
+  await flush();
+  const initial = v.last('tools/call');
+  assert.equal(initial.params.name, LIB_LIST);
+  v.els['new-file'].onclick();
+  await flush();
+  const create = libAction(v);
+  assert.equal(create.params.name, 'openpaperdesign_app_create');
+  await answer(v, PANEL_EDITOR('created'), create);
+  const h = fake.handles[0];
+  h.o.onStatus('Ready');
+  h.o.onAppearance('dark');
+  await flush();
+  const preference = libAction(v);
+  assert.deepEqual(preference.params, { name: APPEARANCE_TOOL, arguments: { appearance: 'dark' } });
+  await answer(v, { appearance: 'dark' }, preference);
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  // The read that began before the choice comes back with the older System.
+  await answer(v, { ...LIBRARY_LIST, appearance: 'system' }, initial);
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'an older list cannot override a newer explicit preference');
+  assert.deepEqual(h.kept, [], 'nor is the editor told to take it');
+  assert.deepEqual(rows(v).map((r) => r.name), ['Landing', 'Notes'], 'the list itself is still shown');
+  panelOnly(v);
+});
+
+test('R30-F1: a kept preference that arrives only after New mounted reaches that editor, as no new choice', async () => {
+  const fake = fakePanel();
+  const v = mount({ library: true, panel: fake, media: osScheme(false) });
+  v.from({ id: v.sent[0].id, result: { hostCapabilities: {}, hostContext: { theme: 'light' } } });
+  await flush();
+  const initial = v.last('tools/call');
+  v.els['new-file'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('created'), libAction(v));
+  const h = fake.handles[0];
+  assert.equal(h.o.appearance, 'system', 'opened before the kept preference was known');
+  await answer(v, { ...LIBRARY_LIST, appearance: 'dark' }, initial);
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  assert.deepEqual(h.kept, ['dark'], 'the mounted editor takes the kept Dark');
+  assert.equal(libCalls(v, APPEARANCE_TOOL), 0, 'learning the kept preference keeps nothing');
+  panelOnly(v);
+});
+
+test('R30-F1: a list read while a keep is under way, or after a refused choice, leaves this view\'s choice', async () => {
+  const { v, fake } = await appearanceView('system', { theme: 'light' }, osScheme(false));
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onStatus('Ready');
+  h.o.onAppearance('dark');
+  await flush();
+  const keep = libAction(v);
+  // A refresh that begins and ends while the keep is unanswered.
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, appearance: 'system' }, v.last('tools/call'));
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'a keep under way owns the preference');
+  // The keep is refused (current choice, current editor): said, and the choice still applies.
+  await answer(v, { refused: 'The appearance couldn\'t be kept.' }, keep);
+  assert.equal(v.els['ed-alert-text'].textContent, UNKEPT);
+  assert.equal(v.els['ed-alert'].hidden, false);
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, appearance: 'system' }, v.last('tools/call'));
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'the refused choice stays this view\'s');
+  assert.deepEqual(h.kept, []);
+  // A later kept choice makes the library's list authoritative again.
+  h.o.onAppearance('light');
+  await flush();
+  await answer(v, { appearance: 'light' }, libAction(v));
+  v.els['m-refresh'].onclick();
+  await flush();
+  await answer(v, { ...LIBRARY_LIST, appearance: 'dark' }, v.last('tools/call'));
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'a fresh read after a kept choice applies (changed elsewhere)');
+  assert.deepEqual(h.kept, ['dark']);
+  panelOnly(v);
+});
+
+test('R30-F2: System without any OS or host signal is Light, also after an explicit Dark and when a fallback signal goes', async () => {
+  const { v, fake } = await appearanceView('dark', {});
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  await openInPanel(v);
+  fake.handles[0].o.onAppearance('system');
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'System without a signal resolves Light, as the editor\'s fallback does');
+  // The host's theme stands in (no browser signal here), then goes away again.
+  hostSays(v, { theme: 'dark' });
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  hostSays(v, { theme: null });
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'the fallback signal gone: Light again, not the last Dark');
+  // An explicit mode still wins without any signal.
+  fake.handles[0].o.onAppearance('dark');
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  panelOnly(v);
+});
+
+test('R30-F3: an older refusal after a newer kept choice says nothing', async () => {
+  const { v, fake } = await appearanceView('system', { theme: 'light' });
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onStatus('Ready');
+  h.o.onAppearance('dark');
+  await flush();
+  const old = libAction(v);
+  h.o.onAppearance('light');
+  await flush();
+  const latest = libAction(v);
+  assert.notEqual(old.id, latest.id);
+  await answer(v, { appearance: 'light' }, latest);
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  assert.equal(v.els['ed-alert'].hidden, true);
+  await answer(v, { refused: 'The older Dark preference could not be kept' }, old);
+  assert.equal(v.els['ed-alert'].hidden, true, 'a later successful preference supersedes this older refusal');
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  panelOnly(v);
+});
+
+test('R30-F3: a refusal for a replaced editor says nothing on its replacement; a current one is said, and latched problems stay', async () => {
+  const { v, fake } = await appearanceView('system', { theme: 'light' });
+  await openInPanel(v);
+  const old = fake.handles[0];
+  old.o.onStatus('Ready');
+  old.o.onAppearance('dark');
+  await flush();
+  const pending = libAction(v);
+  old.o.onHome();
+  await flush();
+  await closedHome(v);
+  await relist(v);
+  await openInPanel(v);
+  const current = fake.handles[1];
+  current.o.onStatus('Ready');
+  assert.equal(v.els['ed-alert'].hidden, true);
+  await answer(v, { refused: 'Preference could not be persisted' }, pending);
+  assert.equal(v.els['ed-alert'].hidden, true, 'the old editor owns this failure');
+  // Control: the shown editor's own refusal is said.
+  current.o.onAppearance('light');
+  await flush();
+  await answer(v, { refused: 'Preference could not be persisted' }, libAction(v));
+  assert.equal(v.els['ed-alert'].hidden, false);
+  assert.equal(v.els['ed-alert-text'].textContent, UNKEPT);
+  // Control: a current save failure or terminal error stays shown through a current refusal.
+  for (const [message, fatal] of [['Save failed; retrying', false], ['The renderer stopped: device lost', true]]) {
+    const w = await appearanceView('system', { theme: 'light' });
+    await openInPanel(w.v);
+    const e = w.fake.handles[0];
+    e.o.onAppearance('dark');
+    await flush();
+    const keep = libAction(w.v);
+    e.o.onStatus(message, fatal);
+    await answer(w.v, { refused: 'Preference could not be persisted' }, keep);
+    assert.equal(w.v.els['ed-alert-text'].textContent, message);
+    assert.equal(w.v.els['ed-alert'].className, 'ed-alert bad');
+    assert.equal(w.v.els['ed-alert'].hidden, false);
+  }
+  panelOnly(v);
 });
 
 test('panel: the editor gets the kept appearance; a menu choice shows at once and is kept by the library as a validated preference only', async () => {

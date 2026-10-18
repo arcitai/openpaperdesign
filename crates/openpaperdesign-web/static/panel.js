@@ -160,6 +160,9 @@ export function opdCreatePanel(opts) {
    */
   function open({ binding, refs, onStatus, onReady, onHome, appearance, hostTheme, onAppearance }) {
     const h = { left: false, mounted: null, mount: null, released: false };
+    // The kept preference, as the view knows it now (it can learn it late, `setAppearance`):
+    // the editor is mounted with the latest one.
+    let kept = appearance;
     wanting.add(h);
     const live = () => !h.left;
     const say = (text, error) => { if (live() && onStatus) onStatus(text, Boolean(error)); };
@@ -247,12 +250,12 @@ export function opdCreatePanel(opts) {
         renderer: refs.renderer,
         conflictBox: refs.conflict,
         onHome,
-        boot: (canvas, page, webgl, systemDark, kept) => {
+        boot: (canvas, page, webgl, systemDark, startIn) => {
           const r = canvas.getBoundingClientRect();
           return engine.start(canvas, page.text, seed[0], seed[1], mac, webgl,
-            r.width, r.height, env.devicePixelRatio(), systemDark, kept);
+            r.width, r.height, env.devicePixelRatio(), systemDark, startIn);
         },
-        appearance,
+        appearance: kept,
         hostTheme,
         onAppearance: (a) => { if (live() && onAppearance) onAppearance(a); },
         transport: { fetchPage, put, revision },
@@ -276,6 +279,13 @@ export function opdCreatePanel(opts) {
     h.resume = () => { if (h.mounted && !h.left) h.mounted.resume(); };
     // The host's theme changed (the OS fallback where the browser can't report it).
     h.hostThemeChanged = () => { if (h.mounted && !h.left) h.mounted.hostThemeChanged(); };
+    // The view learned the kept preference late: before the mount it is what the editor starts
+    // in; after it, the shown editor takes it. Nothing once left.
+    h.setAppearance = (a) => {
+      if (h.left) return;
+      kept = a;
+      if (h.mounted) h.mounted.setAppearance(a);
+    };
     // For good: the mount is undone and the server told this editor is gone. Saves nothing.
     h.dispose = async () => {
       if (h.left) return;
