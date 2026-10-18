@@ -19,6 +19,9 @@
 //   is left; it reports 'clean' only when the editor has nothing unsaved and no gesture or text
 //   edit under way. Anything else (a conflict, a failed or unanswered save, an unfinished edit)
 //   keeps the editor; `resume` gives it back to the person.
+// - A resize redraws at once (`resized`): reconfiguring the canvas to its new size clears it,
+//   and the page would paint that before the next animation frame (a white flash per resize
+//   step while a panel divider is dragged).
 // - `dispose` ends the session for good, at any point: every later step of a boot, fallback,
 //   poll, discard or save finds it disposed and does nothing more. An editor that finishes
 //   booting afterwards is freed at once: no observer, canvas, Ready or save comes from it.
@@ -53,6 +56,8 @@ export class Session {
     // discard): an answer only applies if nothing started after its own request.
     this.generation = 0;
     this.polling = false;
+    // The page clock of the last animation frame drawn (a resize redraws at it, see `resized`).
+    this.lastFrameTime = undefined;
     this.saveDone = Promise.resolve();
     this.discardDone = Promise.resolve();
     // Set by `drain` (no input or polling while leaving) and `dispose` (for good).
@@ -109,7 +114,18 @@ export class Session {
   }
 
   resized() {
-    this.withEditor((ed) => this.deps.resize && this.deps.resize(ed, this.canvas));
+    this.withEditor((ed) => {
+      if (!this.deps.resize) return;
+      this.deps.resize(ed, this.canvas);
+      // A new backing size (the editor reconfigures its GPU surface to it) clears what the
+      // canvas shows, and the page paints right after resize observers run, before the next
+      // animation frame: without a picture now, every resize step of a continuous resize would
+      // show a cleared (white) canvas once. So the picture is drawn again here, in the same task
+      // as the reconfigure, at the last frame's time (no animation advances). Only after a first
+      // frame, and never over a terminal error; Ready, errors and fallback stay the frame loop's
+      // (`frame` reports them on the next animation frame, as before).
+      if (this.lastFrameTime !== undefined && !this.state.error) ed.frame(this.lastFrameTime);
+    });
   }
 
   /** WebGPU failed before Ready: reopen with WebGL2 on a fresh canvas, visibly. */
@@ -147,6 +163,7 @@ export class Session {
       return 'error';
     }
     if (s.switching || !this.ed) return undefined;
+    this.lastFrameTime = t;
     this.ed.frame(t);
     const gpuError = this.ed.gpu_error();
     if (gpuError) {

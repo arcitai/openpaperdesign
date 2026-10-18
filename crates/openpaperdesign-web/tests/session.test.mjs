@@ -329,6 +329,124 @@ test('the page glue shows Ready once and keeps the loop running', async () => {
   assert.equal(ui.fatals.length, 1);
 });
 
+// ---- resizing: the canvas is never painted cleared between animation frames ----
+// A model of the canvas as the page shows it: a new backing size (the editor's surface
+// reconfigure in `resize`) clears it; `frame` draws it again when something changed (the
+// real WebEditor's redraw rule). The browser runs animation frames, then resize observers,
+// then paints. What is painted is checked after each step's resize callbacks.
+
+/** A mock editor whose canvas is cleared by a new size and drawn by a frame. */
+function canvasEditor(name = 'gpu') {
+  const ed = editor(name);
+  ed.size = [960, 760];
+  ed.shown = 'drawn 960x760';
+  ed.redraw = false;
+  ed.frames = [];
+  ed.resize = (w, h) => {
+    ed.calls.push(`resize ${w}x${h}`);
+    if (w !== ed.size[0] || h !== ed.size[1]) {
+      ed.size = [w, h];
+      ed.shown = 'cleared';
+    }
+    ed.redraw = true;
+  };
+  ed.frame = (t) => {
+    ed.calls.push(`frame ${t}`);
+    ed.frames.push(t);
+    if (ed.redraw && !ed.gpuError) {
+      ed.shown = `drawn ${ed.size[0]}x${ed.size[1]}`;
+      ed.redraw = false;
+    }
+  };
+  return ed;
+}
+
+/** A Ready session on `ed`, resizing to `size.w` × `size.h`, after one animation frame. */
+async function resizingSession(ed) {
+  const size = { w: 960, h: 760 };
+  const { s, observers } = setup([ed]);
+  s.deps.resize = (e) => e.resize(size.w, size.h);
+  await s.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+  assert.equal(s.frame(16), 'ready');
+  ed.calls.length = 0;
+  return { s, observers, size };
+}
+
+test('a resize draws the reconfigured canvas at once, in the same task, at the last frame\'s time', async () => {
+  const ed = canvasEditor();
+  const { observers, size } = await resizingSession(ed);
+  size.w = 900;
+  observers[0].cb();
+  assert.deepEqual(ed.calls, ['resize 900x760', 'frame 16'], 'reconfigured, then drawn before the page paints');
+  assert.equal(ed.shown, 'drawn 900x760', 'what the page paints next is the new picture');
+});
+
+test('a sustained resize in both directions, across the narrow breakpoint, never paints a cleared canvas', async () => {
+  const ed = canvasEditor();
+  const { s, observers, size } = await resizingSession(ed);
+  // A divider dragged from 960 down to 300 (below the 720 breakpoint) and back, one step per
+  // animation frame, with the occasional frame of no movement and two steps in one frame.
+  const widths = [];
+  for (let w = 960; w >= 300; w -= 24) widths.push(w);
+  for (let w = 300; w <= 960; w += 36) widths.push(w);
+  const painted = [];
+  let t = 16;
+  for (const [i, w] of widths.entries()) {
+    t += 16;
+    s.frame(t); // the animation frame
+    size.w = w;
+    observers[0].cb(); // resize observers run
+    if (i % 7 === 3) { size.w = w - 10; observers[0].cb(); } // two steps in one frame
+    painted.push(ed.shown); // then the page paints
+    if (i % 5 === 4) { t += 16; s.frame(t); painted.push(ed.shown); } // a frame of no movement
+  }
+  assert.deepEqual(painted.filter((p) => !p.startsWith('drawn')), [], 'no cleared canvas is ever painted');
+  assert.equal(painted.at(-1), `drawn ${size.w}x760`, 'the last picture is at the final size');
+  assert.ok(widths.some((w) => w < 720) && widths.some((w) => w > 720), 'the burst crosses the narrow breakpoint');
+  assert.equal(s.editable(), true, 'still editing');
+  assert.equal(s.state.error, null);
+});
+
+test('a resize before the first frame, after a terminal error, while switching or after dispose draws nothing', async () => {
+  // Before any animation frame: start presented its own frame; the loop draws the first.
+  const early = canvasEditor();
+  const { s: s0, observers: o0 } = setup([early]);
+  s0.deps.resize = (e) => e.resize(800, 600);
+  await s0.start({ id: 'canvas0' }, { text: 'v1', revision: '"r1"' }, false);
+  o0[0].cb();
+  assert.deepEqual(early.calls, ['resize 800x600'], 'no frame before the loop\'s first');
+  // After a terminal error: it stays the editor's last word; the frame loop has stopped.
+  const failing = canvasEditor();
+  const { s, observers, size } = await resizingSession(failing);
+  failing.gpuError = 'device lost';
+  assert.equal(s.frame(32), 'error');
+  failing.calls.length = 0;
+  size.w = 700;
+  observers[0].cb();
+  assert.deepEqual(failing.calls, ['resize 700x760'], 'resized, not drawn over the error');
+  assert.equal(s.frame(48), 'stopped');
+  // Disposed: the observer's late call reaches nothing.
+  const gone = canvasEditor();
+  const d = await resizingSession(gone);
+  d.s.dispose();
+  gone.calls.length = 0;
+  d.size.w = 640;
+  d.observers[0].cb();
+  assert.deepEqual(gone.calls, []);
+});
+
+test('a resize during a drain (input stopped) still redraws, and the drain\'s outcome is unchanged', async () => {
+  const ed = canvasEditor();
+  ed.pending = undefined; // nothing unsaved
+  const { s, observers, size } = await resizingSession(ed);
+  const leaving = s.drain();
+  size.w = 500;
+  observers[0].cb();
+  assert.equal(ed.shown, 'drawn 500x760', 'the picture follows the surface while leaving');
+  assert.equal(s.edit(() => true), undefined, 'input stays stopped');
+  assert.equal(await leaving, 'clean');
+});
+
 // ---- a terminal error while a save is in flight (static/page.js saveStep + frameStep)
 
 import { discardStep, saveStep } from '../static/page.js';

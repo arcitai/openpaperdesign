@@ -165,7 +165,9 @@ function fakeEnv() {
     clearInterval(id) { env.intervals.delete(id); },
     requestAnimationFrame(fn) { const id = env.next++; env.frames.push([id, fn]); return id; },
     cancelAnimationFrame(id) { env.frames = env.frames.filter(([i]) => i !== id); },
-    ResizeObserver: class { constructor(cb) { this.cb = cb; } observe() {} disconnect() { this.disconnected = true; } },
+    // Each observer the mount creates is kept (`env.observers`), so a test can fire it.
+    ResizeObserver: class { constructor(cb) { this.cb = cb; env.observers.push(this); } observe() {} disconnect() { this.disconnected = true; } },
+    observers: [],
     AbortController,
     devicePixelRatio: () => 1,
   };
@@ -511,6 +513,35 @@ test('an answer for another binding, or without pages, is never opened', async (
     assert.equal(t.engine.editors.length, 0, 'no editor booted');
     assert.deepEqual(srv.named(T.RELEASE), [{ binding: BINDING, mount: 1 }], 'its mount is released');
   }
+});
+
+// ---- resizing: the real mount redraws in the resize callback itself ----
+// The actual mount and Session: the mount's ResizeObserver callback resizes the editor (which
+// reconfigures its surface, clearing the canvas) and the picture is drawn again before the
+// callback returns, i.e. before the page paints; the animation frame loop is unchanged.
+// Graphics are the stand-in engine, so this shows the call order, not pixels.
+
+test('the mount\'s resize callback resizes the editor and draws it again before returning', async () => {
+  const t = await readyEditor();
+  const order = [];
+  t.ed.resize = (w, h, dpr) => order.push(`resize ${w}x${h}@${dpr}`);
+  t.ed.frame = (time) => order.push(`frame ${time}`);
+  const frames = t.env.frames.length;
+  const observer = t.env.observers.at(-1);
+  assert.ok(observer && !observer.disconnected, 'the editor\'s canvas is observed');
+  observer.cb();
+  assert.deepEqual(order, ['resize 800x600@1', 'frame 16'], 'resized, then drawn at the last frame\'s time');
+  assert.equal(t.env.frames.length, frames, 'no extra animation frame is scheduled');
+  // A burst of resize callbacks between two animation frames: each one redraws.
+  order.length = 0;
+  for (let i = 0; i < 3; i++) observer.cb();
+  assert.deepEqual(order, ['resize 800x600@1', 'frame 16', 'resize 800x600@1', 'frame 16', 'resize 800x600@1', 'frame 16']);
+  // After disposal nothing reaches the editor.
+  await t.h.dispose();
+  order.length = 0;
+  observer.cb();
+  assert.deepEqual(order, []);
+  assert.equal(observer.disconnected, true);
 });
 
 // ---- R26-F2: an informational note never replaces an unresolved problem ----
