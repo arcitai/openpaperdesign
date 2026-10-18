@@ -113,6 +113,19 @@ export function opdStatusNote(live, note, timers) {
   };
 }
 
+/**
+ * Whether the workspace is drawn dark: the host page's own appearance when its root element
+ * names one (`data-theme="dark"` or `"light"`; the home view sets it from its host's theme),
+ * else the browser's colour-scheme preference (`media`, a `(prefers-color-scheme: dark)`
+ * MediaQueryList), else light. Presentation only.
+ */
+export function opdThemeDark(root, media) {
+  const named = root && typeof root.getAttribute === 'function' ? root.getAttribute('data-theme') : null;
+  if (named === 'dark') return true;
+  if (named === 'light') return false;
+  return Boolean(media && media.matches);
+}
+
 /** The browser environment the mount uses (timers, frames, observers, downloads, clipboard). */
 export function opdBrowserEnv(win) {
   return {
@@ -121,8 +134,11 @@ export function opdBrowserEnv(win) {
     requestAnimationFrame: (fn) => win.requestAnimationFrame(fn),
     cancelAnimationFrame: (id) => win.cancelAnimationFrame(id),
     ResizeObserver: win.ResizeObserver,
+    MutationObserver: win.MutationObserver,
     AbortController: win.AbortController,
     devicePixelRatio: () => win.devicePixelRatio,
+    // The browser's dark colour-scheme query, if this page can ask (see opdThemeDark).
+    colorScheme: () => (typeof win.matchMedia === 'function' ? win.matchMedia('(prefers-color-scheme: dark)') : null),
     // A browser download of `bytes`, if this page may start one; never says a file was saved.
     download: (name, mime, bytes) => {
       const doc = win.document;
@@ -161,7 +177,7 @@ export function opdIsMac(nav) {
  *   lib: { Session, frameStep, saveStep, discardStep },
  *   canvas,                          the canvas element (inside the editor's own root)
  *   status(text, error), renderer(text, error), conflictBox
- *   boot(canvas, page, webgl) -> Promise<editor>
+ *   boot(canvas, page, webgl, dark) -> Promise<editor>   dark: the page's appearance now
  *   transport: { fetchPage(), put(snapshot, revision), revision() }
  *   firstPage: { text, revision }, forceWebgl, state
  *   onReady(session)                 the renderer is Ready (once per mount)
@@ -187,7 +203,13 @@ export function opdMountEditor(opts) {
   const on = (el, type, fn, o = {}) => el.addEventListener(type, fn, Object.assign({}, o, { signal }));
 
   const session = new lib.Session({
-    boot: opts.boot,
+    // Each editor (the first, and a WebGL fallback's) starts in the page's appearance, and is
+    // given it again once booted: a change while it booted is not lost (see `theme` below).
+    boot: async (canvas, page, webgl) => {
+      const ed = await opts.boot(canvas, page, webgl, dark());
+      if (!disposed) ed.set_dark(dark());
+      return ed;
+    },
     fetchPage: transport.fetchPage,
     replaceCanvas: (old) => {
       const fresh = old.cloneNode(false);
@@ -296,6 +318,22 @@ export function opdMountEditor(opts) {
     });
   }
 
+  // ---- appearance (presentation only): the workspace is light or dark as the page is (see
+  // opdThemeDark), and follows it when the host's theme or the browser's preference changes.
+  // Only the editor shown now is told (not one being replaced by a fallback, which boots in
+  // the current appearance); the listener and observer go with the mount. Nothing here reaches
+  // the canvas, its saves or its binding.
+  const root = doc ? doc.documentElement : null;
+  const media = env.colorScheme ? env.colorScheme() : null;
+  const dark = () => opdThemeDark(root, media);
+  const theme = () => { if (!disposed) session.withEditor((ed) => ed.set_dark(dark())); };
+  if (media && typeof media.addEventListener === 'function') on(media, 'change', theme);
+  let themeObserver = null;
+  if (root && env.MutationObserver) {
+    themeObserver = new env.MutationObserver(theme);
+    themeObserver.observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  }
+
   // ---- what the editor asks the page for, after each frame
   const afterFrame = () => session.withEditor((ed) => {
     if (session.canvas && session.canvas.style) session.canvas.style.cursor = ed.cursor();
@@ -399,6 +437,7 @@ export function opdMountEditor(opts) {
     if (disposed) return;
     disposed = true;
     abort.abort();
+    if (themeObserver) { themeObserver.disconnect(); themeObserver = null; }
     for (const t of timers) env.clearInterval(t);
     timers.length = 0;
     if (raf) env.cancelAnimationFrame(raf);

@@ -94,8 +94,11 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// `_app_canvas*` tools; `home-6` is one app: a file library (search, grid/list, file menu with
 /// Open, Rename and Export, which expects `_app_rename` and export by id) whose New and Open
 /// mount the editor in the view itself, filling it, with the file name and the way back in the
-/// upstream workspace's own top bar. No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-6.html";
+/// upstream workspace's own top bar; `home-7` is the quieter workspace (one calm surface,
+/// grouped top bar, docked panels on medium surfaces; DESIGN.md) whose in-panel editor follows
+/// the view's light or dark appearance (its renderer's `start` takes it and `set_dark` follows
+/// it). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-7.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

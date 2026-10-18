@@ -64,8 +64,10 @@ pub enum NarrowPanel {
 
 /// The narrow layout (see [`UiState::narrow`]): below `below` logical px of width the top bar
 /// spans the surface (All projects, the file's name, every menu in one, and a Layers and a
-/// Design toggle) and at most one side panel is shown, filling the room under it, instead of
-/// both beside the canvas. The same panels, commands and canvas are drawn; only where.
+/// Design toggle) and at most one side panel is shown instead of both beside the canvas: from
+/// `dock_from` px it is docked at its usual width beside the canvas (Layers left, Design
+/// right), so drawing room stays; narrower, it fills the room under the top bar. The same
+/// panels, commands and canvas are drawn; only where.
 ///
 /// A change of arrangement (a toggle, or the surface crossing `below`) is applied only after
 /// one frame without an egui text field holding the keyboard, so a field that is about to be
@@ -76,6 +78,9 @@ pub enum NarrowPanel {
 pub struct NarrowLayout {
     /// The width below which the narrow layout is used; 0 (the default) never uses it.
     pub below: f32,
+    /// The width from which the narrow layout's panel is docked beside the canvas rather than
+    /// filling the room; 0 (the default) always fills.
+    pub dock_from: f32,
     /// The side panel the person chose for the narrow layout.
     pub panel: NarrowPanel,
     /// What is laid out: `None` for the ordinary layout.
@@ -89,6 +94,16 @@ impl NarrowLayout {
     pub fn with_threshold(below: f32) -> NarrowLayout {
         NarrowLayout {
             below,
+            ..Default::default()
+        }
+    }
+
+    /// [`NarrowLayout::with_threshold`], with its panel docked beside the canvas from
+    /// `dock_from` px.
+    pub fn with_dock(below: f32, dock_from: f32) -> NarrowLayout {
+        NarrowLayout {
+            below,
+            dock_from,
             ..Default::default()
         }
     }
@@ -224,14 +239,14 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         .exact_size(if st.native_chrome {
             theme::TOOLBAR_H
         } else {
-            34.0
+            BAR_H
         })
         .frame(
             egui::Frame::NONE
                 .fill(p.window)
-                .inner_margin(egui::Margin::symmetric(12, 0)),
+                .inner_margin(egui::Margin::symmetric(10, 0)),
         )
-        .show(ui, |ui| top_bar(ui, ed, st));
+        .show(ui, |ui| top_bar(ui, ed, st, false));
     egui::Panel::right("design")
         .resizable(true)
         .default_size(260.0)
@@ -253,8 +268,9 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
 }
 
 /// The narrow layout (see [`NarrowLayout`]): the top bar across the surface, then the chosen
-/// side panel filling the room under it, or the canvas with its floating tools. Panels the
-/// narrow layout opens keep their own sizes apart from the ordinary layout's.
+/// side panel docked beside the canvas (from `dock_from` px) or filling the room under the
+/// bar, or just the canvas with its floating tools. Panels the narrow layout opens keep their
+/// own sizes apart from the ordinary layout's.
 fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPanel) -> egui::Rect {
     let p = theme::pal(ui);
     let sidebar_fill = if st.translucent_sidebar {
@@ -266,20 +282,23 @@ fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPane
         .exact_size(if st.native_chrome {
             theme::TOOLBAR_H
         } else {
-            34.0
+            BAR_H
         })
         .frame(
             egui::Frame::NONE
                 .fill(p.window)
                 .inner_margin(egui::Margin::symmetric(8, 0)),
         )
-        .show(ui, |ui| narrow_top_bar(ui, ed, st));
+        .show(ui, |ui| top_bar(ui, ed, st, true));
     let room = ui.available_rect_before_wrap();
+    // Docked: the panel at its usual width, the canvas keeps the rest. Otherwise it fills.
+    let docked = st.narrow.dock_from > 0.0 && room.width() >= st.narrow.dock_from;
+    let width = |usual: f32| if docked { usual } else { room.width() };
     match panel {
         NarrowPanel::Layers => {
             egui::Panel::left("layers-narrow")
                 .resizable(false)
-                .exact_size(room.width())
+                .exact_size(width(240.0))
                 .frame(
                     egui::Frame::NONE
                         .fill(sidebar_fill)
@@ -290,7 +309,7 @@ fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPane
         NarrowPanel::Design => {
             egui::Panel::right("design-narrow")
                 .resizable(false)
-                .exact_size(room.width())
+                .exact_size(width(260.0))
                 .frame(
                     egui::Frame::NONE
                         .fill(p.inspector)
@@ -307,7 +326,8 @@ fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPane
         pages::commit_rename(ed, st);
     }
     let canvas = ui.available_rect_before_wrap();
-    if panel == NarrowPanel::Canvas {
+    // The floating tools whenever the canvas has room (beside a docked panel too).
+    if canvas.width() > 1.0 {
         toolbar(ui.ctx(), ed, canvas, true);
         status(ui.ctx(), ed, canvas);
     }
@@ -318,57 +338,35 @@ fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPane
     canvas
 }
 
-/// The narrow layout's top bar: All projects, every menu under one Menu button, then the
-/// Layers and Design toggles at the right and the file's name in between.
-fn narrow_top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+/// The top bar's height without native chrome.
+const BAR_H: f32 = 38.0;
+
+/// A text toggle of the top bar (the narrow layout's Layers and Design): a soft accent tint
+/// when on, a hover fill otherwise.
+fn pill(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
     let p = theme::pal(ui);
-    ui.horizontal_centered(|ui| {
-        if theme::icon_button(ui, theme::Icon::Grid, 26.0, false)
-            .on_hover_text("All projects")
-            .clicked()
-        {
-            ed.requests.push(crate::editor::AppRequest::Home);
-        }
-        if !st.native_chrome {
-            ui.menu_button("Menu", |ui| {
-                for (title, entries) in shortcuts::menus() {
-                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
-                }
-            });
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (panel, label) in [
-                (NarrowPanel::Design, "Design"),
-                (NarrowPanel::Layers, "Layers"),
-            ] {
-                let on = st.narrow.panel == panel;
-                let r = ui.add(
-                    egui::Label::new(
-                        RichText::new(label)
-                            .font(theme::semibold(theme::SECONDARY))
-                            .color(if on { p.text } else { p.secondary }),
-                    )
-                    .sense(egui::Sense::click()),
-                );
-                if r.clicked() {
-                    st.narrow.panel = if on { NarrowPanel::Canvas } else { panel };
-                }
-                ui.add_space(6.0);
-            }
-            let title = if st.project_name.is_empty() {
-                ed.doc.name.clone()
-            } else {
-                st.project_name.clone()
-            };
-            ui.add(egui::Label::new(title_text(title)).truncate());
-        });
-    });
-    let r = ui.max_rect();
-    ui.painter().hline(
-        r.x_range(),
-        r.bottom() - 0.5,
-        egui::Stroke::new(1.0, p.separator),
+    let color = if on { p.text } else { p.secondary };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        theme::medium(theme::SECONDARY + 1.0),
+        color,
     );
+    let size = galley.size() + egui::vec2(16.0, 10.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let fill = if on {
+        theme::selected_fill(ui)
+    } else if resp.hovered() {
+        p.hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 7.0, fill);
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        Color32::PLACEHOLDER,
+    );
+    resp
 }
 
 fn menu_item(ui: &mut Ui, ed: &mut Editor, label: &str, action: Action) {
@@ -395,77 +393,93 @@ fn menu_entries(ui: &mut Ui, ed: &mut Editor, entries: &[shortcuts::MenuEntry]) 
     }
 }
 
-/// The unified toolbar: document title on the left, zoom and help on the right. Without native
-/// chrome (Linux) it also carries an egui menu bar.
-fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+/// An icon button with its action's name and shortcut as its tooltip.
+fn action_button(ui: &mut Ui, ed: &mut Editor, icon: theme::Icon, name: &str, action: Action) {
+    let keys = shortcuts::chord_text(action);
+    let tip = if keys.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}  {keys}")
+    };
+    if theme::quiet_icon_button(ui, icon, 26.0, false)
+        .on_hover_text(tip)
+        .clicked()
+    {
+        ed.run(action);
+    }
+}
+
+/// The one top bar, ordinary and narrow alike (see DESIGN.md). Left: All projects (the way
+/// home), every menu under one Menu (platforms without a native menu bar), then the file's
+/// name over its page and save state, truncated rather than overlapped. Right: undo and redo,
+/// zoom, and help; in the narrow layout the Layers and Design toggles take help's place, and
+/// history and zoom stay while there is room for them (they keep their shortcuts and menu
+/// entries either way). Its icons are quiet (secondary until hovered) and only an open toggle
+/// is tinted, so the bar recedes around the canvas.
+fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, narrow: bool) {
     let p = theme::pal(ui);
     ui.horizontal_centered(|ui| {
-        if !st.native_chrome {
-            menu_bar(ui, ed);
-            ui.add_space(8.0);
-        }
-        if theme::icon_button(ui, theme::Icon::Grid, 26.0, false)
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if theme::quiet_icon_button(ui, theme::Icon::Grid, 26.0, false)
             .on_hover_text("All projects")
             .clicked()
         {
             ed.requests.push(crate::editor::AppRequest::Home);
         }
-        ui.add_space(4.0);
-        let title = if st.project_name.is_empty() {
-            ed.doc.name.clone()
-        } else {
-            st.project_name.clone()
-        };
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            ui.add_space(if st.native_chrome { 6.0 } else { 1.0 });
-            ui.label(title_text(title));
-            let state = if !st.save_state.is_empty() {
-                st.save_state.clone()
-            } else if ed.is_dirty() {
-                "Edited".into()
-            } else {
-                String::new()
-            };
-            let sub = if state.is_empty() {
-                ed.page_name().to_string()
-            } else {
-                format!("{} — {state}", ed.page_name())
-            };
-            ui.label(RichText::new(sub).size(theme::SECONDARY).color(p.secondary));
-        });
+        if !st.native_chrome {
+            ui.menu_button("Menu", |ui| {
+                for (title, entries) in shortcuts::menus() {
+                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
+                }
+            });
+        }
+        ui.add_space(6.0);
+        let room = ui.available_width();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if theme::icon_button(ui, theme::Icon::Question, 26.0, st.show_help)
+            if narrow {
+                for (panel, label) in [
+                    (NarrowPanel::Design, "Design"),
+                    (NarrowPanel::Layers, "Layers"),
+                ] {
+                    let on = st.narrow.panel == panel;
+                    if pill(ui, label, on).clicked() {
+                        st.narrow.panel = if on { NarrowPanel::Canvas } else { panel };
+                    }
+                }
+            } else if theme::quiet_icon_button(ui, theme::Icon::Question, 26.0, st.show_help)
                 .on_hover_text("Keyboard shortcuts")
                 .clicked()
             {
                 st.show_help = !st.show_help;
             }
+            if !narrow || room >= 560.0 {
+                ui.add_space(8.0);
+                action_button(ui, ed, theme::Icon::Plus, "Zoom in", Action::ZoomIn);
+                let z = ui.add(
+                    egui::Button::new(
+                        RichText::new(format!("{:.0}%", ed.camera.zoom * 100.0))
+                            .font(theme::medium(theme::SECONDARY + 1.0))
+                            .color(p.secondary),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(44.0, 22.0)),
+                );
+                if z.on_hover_text("Zoom to fit").clicked() {
+                    ed.run(Action::ZoomFit);
+                }
+                action_button(ui, ed, theme::Icon::Minus, "Zoom out", Action::ZoomOut);
+            }
+            if !narrow || room >= 420.0 {
+                ui.add_space(8.0);
+                action_button(ui, ed, theme::Icon::Redo, "Redo", Action::Redo);
+                action_button(ui, ed, theme::Icon::Undo, "Undo", Action::Undo);
+            }
             ui.add_space(8.0);
-            if theme::icon_button(ui, theme::Icon::Plus, 26.0, false)
-                .on_hover_text("Zoom in")
-                .clicked()
-            {
-                ed.run(Action::ZoomIn);
-            }
-            let z = ui.add(
-                egui::Button::new(
-                    RichText::new(format!("{:.0}%", ed.camera.zoom * 100.0))
-                        .font(theme::medium(theme::SECONDARY + 1.0)),
-                )
-                .frame(false)
-                .min_size(egui::vec2(44.0, 22.0)),
-            );
-            if z.on_hover_text("Zoom to fit").clicked() {
-                ed.run(Action::ZoomFit);
-            }
-            if theme::icon_button(ui, theme::Icon::Minus, 26.0, false)
-                .on_hover_text("Zoom out")
-                .clicked()
-            {
-                ed.run(Action::ZoomOut);
-            }
+            // The file's identity takes what is left, from the left.
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                file_identity(ui, ed, st);
+            });
         });
     });
     // 1px separator under the toolbar.
@@ -477,14 +491,36 @@ fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     );
 }
 
-/// egui menus for platforms without a native menu bar (inline, so the toolbar row keeps
-/// the title and zoom controls).
-fn menu_bar(ui: &mut Ui, ed: &mut Editor) {
-    for (title, entries) in shortcuts::menus() {
-        ui.menu_button(title, |ui| {
-            menu_entries(ui, ed, &entries);
-        });
-    }
+/// The file's name (upstream's project title) over its page name and save state, each
+/// truncated to the room it has.
+fn file_identity(ui: &mut Ui, ed: &Editor, st: &UiState) {
+    let p = theme::pal(ui);
+    let title = if st.project_name.is_empty() {
+        ed.doc.name.clone()
+    } else {
+        st.project_name.clone()
+    };
+    let state = if !st.save_state.is_empty() {
+        st.save_state.clone()
+    } else if ed.is_dirty() {
+        "Edited".into()
+    } else {
+        String::new()
+    };
+    let sub = if state.is_empty() {
+        ed.page_name().to_string()
+    } else {
+        format!("{} — {state}", ed.page_name())
+    };
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add_space(if st.native_chrome { 6.0 } else { 2.0 });
+        ui.add(egui::Label::new(title_text(title)).truncate());
+        ui.add(
+            egui::Label::new(RichText::new(sub).size(theme::SECONDARY).color(p.secondary))
+                .truncate(),
+        );
+    });
 }
 
 fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
@@ -513,26 +549,25 @@ fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 st.show_library = lib;
             }
         }
-        if st.show_library {
+        // Arrange is contextual: shown only while something is selected (it stays in the menu,
+        // the command palette and its shortcuts), so an empty or unselected layers panel is quiet.
+        if st.show_library || ed.selection.is_empty() {
             return;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let some = !ed.selection.is_empty();
-            ui.add_enabled_ui(some, |ui| {
-                if theme::icon_button(ui, Icon::ChevronDown, 20.0, false)
-                    .on_hover_text("Send backward")
-                    .clicked()
-                {
-                    ed.run(Action::Backward);
-                }
-                if theme::icon_button(ui, Icon::ChevronUp, 20.0, false)
-                    .on_hover_text("Bring forward")
-                    .clicked()
-                {
-                    ed.run(Action::Forward);
-                }
-            });
+            if theme::icon_button(ui, Icon::ChevronDown, 20.0, false)
+                .on_hover_text("Send backward")
+                .clicked()
+            {
+                ed.run(Action::Backward);
+            }
+            if theme::icon_button(ui, Icon::ChevronUp, 20.0, false)
+                .on_hover_text("Bring forward")
+                .clicked()
+            {
+                ed.run(Action::Forward);
+            }
         });
     });
     ui.add_space(2.0);
@@ -716,8 +751,8 @@ fn commit_rename(ed: &mut Editor, st: &mut UiState) {
     }
 }
 
-/// One sidebar row, drawn like an NSOutlineView row: 24pt tall, 6pt radius selection in the
-/// accent colour, subtle hover, disclosure chevron, symbol, name, and eye/lock on hover.
+/// One sidebar row, drawn like an NSOutlineView row: 24pt tall, 6pt radius selection as an
+/// accent tint, subtle hover, disclosure chevron, symbol, name, and eye/lock on hover.
 fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: usize) {
     let Some(n) = ed.doc.get(id).cloned() else {
         return;
@@ -732,23 +767,15 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         st.layer_drag = Some((id, None));
     }
     let hovered = ui.rect_contains_pointer(row);
+    // Selection is a soft accent tint (the name keeps its text colour), as in the pages list
+    // and the top bar's toggles.
     if selected {
-        ui.painter().rect_filled(row, 6.0, theme::accent());
+        ui.painter().rect_filled(row, 6.0, theme::selected_fill(ui));
     } else if hovered {
         ui.painter().rect_filled(row, 6.0, p.hover);
     }
-    let fg = if selected {
-        Color32::WHITE
-    } else if n.visible {
-        p.text
-    } else {
-        p.secondary
-    };
-    let fg2 = if selected {
-        Color32::from_white_alpha(200)
-    } else {
-        p.secondary
-    };
+    let fg = if n.visible { p.text } else { p.secondary };
+    let fg2 = p.secondary;
     let mut x = row.left() + 4.0 + depth as f32 * 14.0;
     let cy = row.center().y;
     let sq = |x: f32, s: f32| {
@@ -783,16 +810,7 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         }
     }
     x += 16.0;
-    theme::paint_icon(
-        ui.painter(),
-        sq(x, 14.0),
-        node_icon(&n),
-        if selected {
-            Color32::WHITE
-        } else {
-            theme::accent()
-        },
-    );
+    theme::paint_icon(ui.painter(), sq(x, 14.0), node_icon(&n), theme::accent());
     x += 20.0;
 
     // Trailing eye / lock buttons: always shown when hidden or locked, otherwise on hover.
@@ -805,15 +823,7 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         }
         let b = ui.interact(r, ui.id().with((tip, id)), egui::Sense::click());
         if b.hovered() {
-            ui.painter().rect_filled(
-                r,
-                5.0,
-                if selected {
-                    Color32::from_white_alpha(40)
-                } else {
-                    p.hover
-                },
-            );
+            ui.painter().rect_filled(r, 5.0, p.hover);
         }
         theme::paint_icon(ui.painter(), r.shrink(3.0), icon, fg2);
         b.on_hover_text(tip).clicked()
@@ -920,9 +930,15 @@ fn tool_icon(t: Tool) -> Icon {
 /// The tools a separator goes before in the floating tool palette.
 const GROUP_STARTS: [Tool; 4] = [Tool::Frame, Tool::Line, Tool::Text, Tool::Pencil];
 
+/// The floating tool palette's width as one row (16 tools, 4 separators, margins), in points.
+const TOOL_ROW_W: f32 = 600.0;
+
 /// Floating tool palette at the bottom of the canvas, styled as a macOS popover. `wrap` (the
-/// narrow layout only): the tools wrap into rows that fit the canvas, without separators.
+/// narrow layout), or a canvas narrower than one row of tools (side panels widened, a small
+/// window): the tools wrap into rows that fit the canvas, without separators, instead of
+/// running under the panels.
 fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect, wrap: bool) {
+    let wrap = wrap || canvas.width() < TOOL_ROW_W;
     egui::Area::new("toolbar".into())
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(egui::pos2(canvas.center().x, canvas.bottom() - 16.0))

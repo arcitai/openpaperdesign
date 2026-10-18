@@ -77,10 +77,10 @@ async function main() {
     status,
     renderer,
     conflictBox: $('conflict'),
-    boot: (canvas, page, webgl) => {
+    boot: (canvas, page, webgl, dark) => {
       const r = canvas.getBoundingClientRect();
       return start(canvas, page.text, seed[0], seed[1], opdIsMac(navigator), webgl,
-        r.width, r.height, devicePixelRatio);
+        r.width, r.height, devicePixelRatio, dark);
     },
     transport: {
       fetchPage: fetchCanvas,

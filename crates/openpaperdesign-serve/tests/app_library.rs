@@ -340,7 +340,8 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 }
 
 /// The home view through the real executable in app-library mode. The home entry and the one
-/// listed resource name the current versioned URI (`home-6`, the one-app view). Reading
+/// listed resource name the current versioned URI (`home-7`, the quieter one-app view whose
+/// editor follows the view's light or dark appearance). Reading
 /// it returns this source tree's unchanged view frame with its slots filled (checked here for
 /// shape only), with the view's MIME type, and changes nothing. Earlier, other,
 /// query and file URIs are refused, so a fresh read can't get an older view. This says nothing
@@ -349,7 +350,7 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() {
     use rmcp::model::ReadResourceRequestParams;
-    const HOME: &str = "ui://openpaperdesign/home-6.html";
+    const HOME: &str = "ui://openpaperdesign/home-7.html";
     const PANEL_SLOT: &str = "const opdCreatePanel = null; // __OPD_PANEL_MODULE__";
     let t = tmp();
     let (root, home) = (t.0.join("data"), t.0.join("home"));
@@ -429,8 +430,9 @@ async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() 
         "the editor slot holds this build's module or nothing"
     );
     for other in [
-        "ui://openpaperdesign/home-6.html?x",
+        "ui://openpaperdesign/home-7.html?x",
         // Earlier view URIs: never served with this server's behaviour.
+        "ui://openpaperdesign/home-6.html",
         "ui://openpaperdesign/home-5.html",
         "ui://openpaperdesign/home-4.html",
         "ui://openpaperdesign/home-3.html",

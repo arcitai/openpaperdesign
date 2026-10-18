@@ -1,11 +1,13 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.51 · Updated: 2026-10-18
+Revision: 0.53 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
 built-in browser or an MCP App panel ([issue #1](https://github.com/arcitai/openpaperdesign/issues/1)).
 It is not affiliated with or endorsed by Paper (paper.design). Do not suggest that it is.
+The product's visual and interaction direction is root `DESIGN.md` (one canonical file); the
+engine architecture is `analysis/DESIGN.md`.
 
 ## Upstream and credits
 
@@ -59,11 +61,33 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     each frame the palette is drawn (no behaviour change). The browser host needs it to exempt
     only that ephemeral search from its unfinished-input guard; the id is otherwise automatic
     and can't be known without guessing. Upstreamable as a read-only host seam.
+  - UI/UX pass (owner-admitted 2026-10-18, minimal/airy/low-noise direction in root
+    `DESIGN.md`):
+    - `src/theme.rs`: one calm palette (bar and panels share one surface, softly filled fields,
+      more readable secondary text); slightly larger control padding and radii;
+      `selected_fill` (an accent tint for selected rows and toggles); `quiet_icon_button`
+      (secondary until hovered, tinted when on) for the top bar; Undo/Redo icons.
+    - `src/ui/mod.rs`:
+      - one shared `top_bar` (All projects, one Menu with every upstream menu, the file's name
+        and page/save state truncated instead of overlapped, undo/redo, zoom, help), with
+        quiet icons and the zoom level as secondary text;
+      - the floating tool palette wraps whenever one row doesn't fit the canvas (before, it
+        ran under the side panels);
+      - layer selection is the accent tint; the layers header's bring forward / send backward
+        show only while something is selected (Arrange menu, palette and shortcuts unchanged).
+    - The native ordinary layout looks different too: the new palette and spacing, the
+      quieter top bar with undo/redo buttons, and (where there is no native menu bar, i.e. not
+      macOS) one Menu button in place of the inline menu titles. Shortcuts, menu entries,
+      commands and editing semantics are unchanged. Native windows still follow the system
+      appearance through egui-winit; the browser host sets it (`WebState::set_dark`).
+      Upstreamable as presentation.
   - `src/ui/mod.rs` (R25-F3): an opt-in narrow layout, `UiState::narrow` (`NarrowLayout`,
     `NarrowPanel`). Off by default (`below` 0), so every native window lays out exactly as
-    before; the browser host turns it on below 720 CSS px, where the side panels (240 + 260
-    px, at least 180 + 220) leave the canvas no room (a 320 px sidebar showed only the layers
-    panel and a clipped inspector). Below it the top bar spans the surface (All projects, the
+    before. The browser host turns it on below 1024 CSS px (it was 720 until the UI/UX pass),
+    where the side panels (240 + 260 px, at least 180 + 220) leave the canvas too little room
+    (a 320 px sidebar showed only the layers panel and a clipped inspector). From `dock_from`
+    (600 in the browser host) the one chosen panel is docked beside the canvas at its usual
+    width; narrower, it fills the room. Below it the top bar spans the surface (All projects, the
     file's name, every menu under one Menu, Layers and Design toggles) and at most one of the
     same side panels fills the room under it; otherwise the canvas with the same floating
     tools, which wrap there (`toolbar`'s `wrap`, false in the ordinary layout). An arrangement
@@ -188,7 +212,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-6.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-7.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -208,7 +232,10 @@ the view's own); `home-5` (2026-10-17) is the whole-canvas pages protocol: its r
 the whole canvas and its in-panel editor reads and saves through `_app_canvas*`; `home-6`
 (2026-10-18) is the one app: a file library whose New/Open mount the editor in the view, with
 the file name and the way back in upstream's own top bar, and which calls `_app_rename` and
-exports by `id`. A view a host already cached under an earlier key is not evicted or refreshed
+exports by `id`; `home-7` (2026-10-18 source candidate) is the quieter workspace of DESIGN.md
+(one calm surface, grouped top bar, docked panels on medium surfaces) whose in-panel editor
+follows the view's light or dark appearance (the renderer's `start` takes it, `set_dark`
+follows it). A view a host already cached under an earlier key is not evicted or refreshed
 by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher

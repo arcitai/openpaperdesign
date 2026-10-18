@@ -93,8 +93,11 @@ const LIBRARY_SESSION: &str = "Library items stay only while this editor is open
 
 /// The workspace width (CSS px) below which upstream's narrow layout is used: under it the
 /// ordinary layout's side panels (240 + 260 px by default, 180 + 220 at least) would leave the
-/// canvas too little room.
-pub const NARROW_BELOW: f32 = 720.0;
+/// canvas less than about 500 px, too little room to draw (DESIGN.md).
+pub const NARROW_BELOW: f32 = 1024.0;
+/// The width (CSS px) from which the narrow layout's one panel is docked beside the canvas at
+/// its usual width; narrower, it fills the room under the top bar.
+pub const DOCK_FROM: f32 = 600.0;
 
 /// The page list (ids and names, in order) and the active page's id.
 type Meta = (Vec<(String, String)>, String);
@@ -303,7 +306,7 @@ impl WebState {
                 // The granted surface can be a narrow sidebar: below this width upstream's
                 // narrow layout (one side panel at a time, the top bar across) keeps the canvas,
                 // tools, All projects and panels reachable. Wider, the ordinary layout.
-                narrow: ui::NarrowLayout::with_threshold(NARROW_BELOW),
+                narrow: ui::NarrowLayout::with_dock(NARROW_BELOW, DOCK_FROM),
                 ..Default::default()
             },
             ctx,
@@ -340,6 +343,24 @@ impl WebState {
             1.0
         };
         self.redraw = true;
+    }
+
+    /// The page's appearance: dark or light, as the page tells it (the host's theme, else the
+    /// browser's colour-scheme preference). The native app's egui follows the system appearance
+    /// through egui-winit; a page has no such input, so it is set here with egui's own
+    /// `Context::set_theme`, which picks one of upstream's two styles (`theme::apply`).
+    /// Presentation only: the document, its save state, undo, focus and any field's draft are
+    /// untouched. Redraws only when the appearance changes.
+    pub fn set_dark(&mut self, dark: bool) {
+        let theme = if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        if self.ctx.theme() != theme {
+            self.ctx.set_theme(theme);
+            self.redraw = true;
+        }
     }
 
     /// Advance time; returns whether a frame should be laid out and drawn now.

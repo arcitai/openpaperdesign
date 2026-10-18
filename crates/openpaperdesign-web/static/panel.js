@@ -245,10 +245,10 @@ export function opdCreatePanel(opts) {
         renderer: refs.renderer,
         conflictBox: refs.conflict,
         onHome,
-        boot: (canvas, page, webgl) => {
+        boot: (canvas, page, webgl, dark) => {
           const r = canvas.getBoundingClientRect();
           return engine.start(canvas, page.text, seed[0], seed[1], mac, webgl,
-            r.width, r.height, env.devicePixelRatio());
+            r.width, r.height, env.devicePixelRatio(), dark);
         },
         transport: { fetchPage, put, revision },
         firstPage: canvasPage(v),

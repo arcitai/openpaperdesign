@@ -83,40 +83,55 @@ pub struct Palette {
     pub popover: Color32,
 }
 
+/// The chrome is one calm surface around the canvas (see DESIGN.md): the top bar and both
+/// side panels share one panel colour, separated by hairlines; fields are softly filled
+/// rather than outlined; secondary text keeps enough contrast to read at 11pt.
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            window: Color32::from_rgb(0x2b, 0x2b, 0x2d),
-            sidebar: Color32::from_rgb(0x26, 0x26, 0x28),
-            inspector: Color32::from_rgb(0x25, 0x25, 0x27),
-            control: Color32::from_rgb(0x3a, 0x3a, 0x3c),
-            control_border: Color32::from_white_alpha(22),
-            field: Color32::from_rgb(0x1f, 0x1f, 0x21),
-            text: Color32::from_rgb(0xec, 0xec, 0xee),
-            secondary: Color32::from_rgb(0x98, 0x98, 0x9d),
-            tertiary: Color32::from_rgb(0x63, 0x63, 0x66),
-            separator: Color32::from_rgb(0x3a, 0x3a, 0x3c),
-            hover: Color32::from_white_alpha(16),
-            pressed: Color32::from_white_alpha(30),
-            popover: Color32::from_rgb(0x32, 0x32, 0x34),
+            window: Color32::from_rgb(0x1f, 0x1f, 0x22),
+            sidebar: Color32::from_rgb(0x1f, 0x1f, 0x22),
+            inspector: Color32::from_rgb(0x1f, 0x1f, 0x22),
+            control: Color32::from_rgb(0x2c, 0x2c, 0x30),
+            control_border: Color32::from_white_alpha(20),
+            field: Color32::from_rgb(0x2a, 0x2a, 0x2e),
+            text: Color32::from_rgb(0xec, 0xec, 0xef),
+            secondary: Color32::from_rgb(0xa1, 0xa1, 0xa8),
+            tertiary: Color32::from_rgb(0x5f, 0x5f, 0x66),
+            separator: Color32::from_rgb(0x33, 0x33, 0x38),
+            hover: Color32::from_white_alpha(14),
+            pressed: Color32::from_white_alpha(26),
+            popover: Color32::from_rgb(0x29, 0x29, 0x2d),
         }
     } else {
         Palette {
-            window: Color32::from_rgb(0xf6, 0xf6, 0xf6),
-            sidebar: Color32::from_rgb(0xee, 0xee, 0xf0),
-            inspector: Color32::from_rgb(0xf6, 0xf6, 0xf6),
+            window: Color32::from_rgb(0xfb, 0xfb, 0xfc),
+            sidebar: Color32::from_rgb(0xfb, 0xfb, 0xfc),
+            inspector: Color32::from_rgb(0xfb, 0xfb, 0xfc),
             control: Color32::WHITE,
-            control_border: Color32::from_black_alpha(30),
-            field: Color32::WHITE,
+            control_border: Color32::from_black_alpha(24),
+            field: Color32::from_rgb(0xf1, 0xf1, 0xf3),
             text: Color32::from_rgb(0x1d, 0x1d, 0x1f),
-            secondary: Color32::from_rgb(0x86, 0x86, 0x8b),
-            tertiary: Color32::from_rgb(0xb8, 0xb8, 0xbc),
-            separator: Color32::from_rgb(0xdc, 0xdc, 0xde),
-            hover: Color32::from_black_alpha(12),
-            pressed: Color32::from_black_alpha(24),
-            popover: Color32::from_rgb(0xfc, 0xfc, 0xfc),
+            secondary: Color32::from_rgb(0x6e, 0x6e, 0x76),
+            tertiary: Color32::from_rgb(0xb4, 0xb4, 0xba),
+            separator: Color32::from_rgb(0xe6, 0xe6, 0xea),
+            hover: Color32::from_black_alpha(10),
+            pressed: Color32::from_black_alpha(20),
+            popover: Color32::WHITE,
         }
     }
+}
+
+/// The fill of a selected row or toggle: a tint of the accent, so the label stays in the
+/// ordinary text colour and the selection reads without shouting.
+pub fn selected_fill(ui: &egui::Ui) -> Color32 {
+    let base = pal(ui).sidebar;
+    let a = accent();
+    let alpha = if ui.visuals().dark_mode { 70 } else { 34 };
+    blend(
+        base,
+        Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), alpha),
+    )
 }
 
 pub fn pal(ui: &egui::Ui) -> Palette {
@@ -185,9 +200,9 @@ fn style_for(s: &mut egui::Style, dark: bool) {
     ]
     .into();
     s.spacing.item_spacing = vec2(6.0, 4.0);
-    s.spacing.button_padding = vec2(8.0, 3.0);
-    s.spacing.interact_size = vec2(24.0, 22.0);
-    s.spacing.menu_margin = egui::Margin::same(5);
+    s.spacing.button_padding = vec2(9.0, 4.0);
+    s.spacing.interact_size = vec2(24.0, 24.0);
+    s.spacing.menu_margin = egui::Margin::same(6);
     s.spacing.window_margin = egui::Margin::same(12);
     s.spacing.scroll = egui::style::ScrollStyle {
         bar_width: 7.0,
@@ -210,7 +225,7 @@ fn style_for(s: &mut egui::Style, dark: bool) {
     v.extreme_bg_color = p.field;
     v.text_edit_bg_color = Some(p.field);
     v.window_stroke = Stroke::new(1.0, p.control_border);
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(10);
     v.window_shadow = Shadow {
         offset: [0, 8],
@@ -233,7 +248,7 @@ fn style_for(s: &mut egui::Style, dark: bool) {
     v.interact_cursor = None;
     v.collapsing_header_frame = false;
 
-    let r6 = CornerRadius::same(6);
+    let r6 = CornerRadius::same(7);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.inspector;
     w.noninteractive.weak_bg_fill = p.inspector;
@@ -337,6 +352,8 @@ pub enum Icon {
     Laser,
     Library,
     Sketch,
+    Undo,
+    Redo,
 }
 
 pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -718,6 +735,19 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&pts);
             line(&[pt(2.5, 13.5), pt(13.5, 13.5)]);
         }
+        Icon::Undo | Icon::Redo => {
+            // A curved arrow: over the top from one side, down to an arrowhead on the other.
+            let m = |x: f32| if icon == Icon::Undo { x } else { 16.0 - x };
+            let (a0, a1) = if icon == Icon::Undo {
+                (0.0, -std::f32::consts::PI)
+            } else {
+                (-std::f32::consts::PI, 0.0)
+            };
+            let mut a = arc(pt(8.0, 9.5), 5.0 * u, a0, a1, 12);
+            a.insert(0, pt(m(13.0), 13.0));
+            line(&a);
+            line(&[pt(m(1.0), 7.0), pt(m(3.0), 9.8), pt(m(5.6), 7.4)]);
+        }
         Icon::Grid => {
             for (x, y) in [(2.5, 2.5), (9.0, 2.5), (2.5, 9.0), (9.0, 9.0)] {
                 painter.rect_stroke(
@@ -783,6 +813,40 @@ fn arc(c: Pos2, r: f32, a0: f32, a1: f32, n: usize) -> Vec<Pos2> {
             c + r * Vec2::angled(a)
         })
         .collect()
+}
+
+/// An icon button for permanent chrome (the top bar): drawn in the secondary colour and only
+/// in the text colour while hovered, so the bar stays quiet around the canvas. `on` (an open
+/// toggle) is the accent tint of `selected_fill`, not a solid accent: the canvas's selected
+/// tool stays the one strong accent.
+pub fn quiet_icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = pal(ui);
+        let hovered = resp.hovered() && ui.is_enabled();
+        let fill = if on {
+            selected_fill(ui)
+        } else if resp.is_pointer_button_down_on() {
+            p.pressed
+        } else if hovered {
+            p.hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, 6.0, fill);
+        let color = if !ui.is_enabled() {
+            p.tertiary
+        } else if on {
+            accent()
+        } else if hovered {
+            p.text
+        } else {
+            p.secondary
+        };
+        let inset = (size * 0.22).round();
+        paint_icon(ui.painter(), rect.shrink(inset), icon, color);
+    }
+    resp
 }
 
 /// A borderless icon button: subtle hover/pressed fill, accent fill when `selected`.

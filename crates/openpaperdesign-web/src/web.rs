@@ -70,7 +70,8 @@ fn install_panic_hook() {
 }
 
 /// Open `canvas_json` (the whole canvas as the server sends it: every page, the page list and
-/// the active page, see `WebState::open`) on `canvas`.
+/// the active page, see `WebState::open`) on `canvas`, in the page's appearance (`dark`, see
+/// `WebState::set_dark`) from the first frame on.
 ///
 /// `seed` comes from `crypto.getRandomValues`: fastrand has no entropy source on
 /// wasm32-unknown-unknown and would otherwise start from a fixed seed, so ids made with
@@ -87,10 +88,12 @@ pub async fn start(
     css_width: f64,
     css_height: f64,
     dpr: f64,
+    dark: bool,
 ) -> Result<WebEditor, JsError> {
     install_panic_hook();
     fastrand::seed(((seed_hi as u64) << 32) | seed_lo as u64);
-    let state = WebState::open(&canvas_json, mac, css_width, css_height).map_err(js_err)?;
+    let mut state = WebState::open(&canvas_json, mac, css_width, css_height).map_err(js_err)?;
+    state.set_dark(dark);
 
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = if force_webgl {
@@ -294,6 +297,11 @@ impl WebEditor {
         g.queue.present(tex);
         self.state.drawn();
         self.health.lock().unwrap().presented();
+    }
+
+    /// The page's appearance changed (see `WebState::set_dark`); drawn on the next frame.
+    pub fn set_dark(&mut self, dark: bool) {
+        self.state.set_dark(dark);
     }
 
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {

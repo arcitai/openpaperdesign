@@ -39,23 +39,28 @@
 <style>
   @font-face { font-family: "Geist Pixel"; src: url("data:font/woff2;base64,__OPD_WORDMARK_FONT__") format("woff2");
     font-weight: 400; font-style: normal; font-display: swap; }
-  /* Fallbacks, used where the host sends no style variable. */
+  /* Fallbacks, used where the host sends no style variable: the workspace's own surface,
+     text, hairline and accent tokens (src/theme.rs, DESIGN.md), so Home and the editor read
+     as one product. */
   :root {
     color-scheme: light dark;
-    --opd-bg-fb: #ffffff; --opd-hover-fb: #f4f4f5; --opd-text-fb: #1f1f22; --opd-muted-fb: #66666e;
-    --opd-line-fb: #e6e6e9; --opd-line-strong-fb: #cfcfd5; --opd-danger-fb: #b42318; --opd-ring-fb: #8a8a94;
+    --opd-bg-fb: #fbfbfc; --opd-hover-fb: #f1f1f3; --opd-text-fb: #1d1d1f; --opd-muted-fb: #6e6e76;
+    --opd-line-fb: #e6e6ea; --opd-line-strong-fb: #d4d4da; --opd-danger-fb: #b42318; --opd-ring-fb: #007aff;
+    --opd-accent: #007aff; --opd-selected: rgb(0 122 255 / .13);
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --opd-bg-fb: #181818; --opd-hover-fb: #262628; --opd-text-fb: #ececee; --opd-muted-fb: #a5a5ad;
-      --opd-line-fb: #333336; --opd-line-strong-fb: #4a4a50; --opd-danger-fb: #ff9a90; --opd-ring-fb: #8e8e98;
+      --opd-bg-fb: #1f1f22; --opd-hover-fb: #2a2a2e; --opd-text-fb: #ececef; --opd-muted-fb: #a1a1a8;
+      --opd-line-fb: #333338; --opd-line-strong-fb: #46464c; --opd-danger-fb: #ff9a90; --opd-ring-fb: #4c9bff;
+      --opd-accent: #4c9bff; --opd-selected: rgb(76 155 255 / .27);
     }
   }
   :root[data-theme="light"] { color-scheme: light; }
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --opd-bg-fb: #181818; --opd-hover-fb: #262628; --opd-text-fb: #ececee; --opd-muted-fb: #a5a5ad;
-    --opd-line-fb: #333336; --opd-line-strong-fb: #4a4a50; --opd-danger-fb: #ff9a90; --opd-ring-fb: #8e8e98;
+    --opd-bg-fb: #1f1f22; --opd-hover-fb: #2a2a2e; --opd-text-fb: #ececef; --opd-muted-fb: #a1a1a8;
+    --opd-line-fb: #333338; --opd-line-strong-fb: #46464c; --opd-danger-fb: #ff9a90; --opd-ring-fb: #4c9bff;
+    --opd-accent: #4c9bff; --opd-selected: rgb(76 155 255 / .27);
   }
   /* Host variables first (MCP Apps standard names), then the fallbacks above. */
   :root {
@@ -98,8 +103,9 @@
   .btn svg, .row-main svg { flex: none; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
   label { display: block; margin: 12px 0 6px; font-size: 13px; font-weight: 500; }
-  input[type="text"], input[type="search"], select { width: 100%; height: 32px; padding: 0 10px; border: 1px solid var(--opd-line);
-    border-radius: var(--opd-radius); background: transparent; color: var(--opd-text); font: inherit; }
+  /* Fields are softly filled, as in the workspace's inspector; focus shows the ring. */
+  input[type="text"], input[type="search"], select { width: 100%; height: 32px; padding: 0 10px; border: 1px solid transparent;
+    border-radius: var(--opd-radius); background: var(--opd-hover); color: var(--opd-text); font: inherit; }
   select option { background: var(--opd-bg); color: var(--opd-text); }
 
   /* The New menu. */
@@ -148,12 +154,14 @@
   .lib-tools { display: flex; align-items: center; gap: 8px; }
   .lib-tools input[type="search"] { flex: 1 1 auto; width: auto; min-width: 0; }
   .seg { display: flex; flex: none; gap: 2px; }
-  .icon-btn[aria-pressed="true"] { background: var(--opd-hover); color: var(--opd-text); }
+  /* Selected toggles: the workspace's accent tint (its layer rows and Layers/Design toggles). */
+  .icon-btn[aria-pressed="true"] { border-color: transparent; background: var(--opd-selected); color: var(--opd-accent); }
   .file { position: relative; }
   .row-time { font-size: 12px; color: var(--opd-muted); }
   .file-menu { top: 40px; right: -6px; }
   .files.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
   .files.grid .row { position: relative; align-items: stretch; margin: 0; border: 1px solid var(--opd-line); border-radius: 12px; }
+  .files.grid .row:hover { border-color: var(--opd-line-strong); }
   .files.grid .row-main { flex-direction: column; align-items: flex-start; min-height: 112px; padding: 12px; }
   .files.grid .row-text { flex-direction: column; gap: 2px; }
   .files.grid .more { position: absolute; top: 6px; right: 2px; }

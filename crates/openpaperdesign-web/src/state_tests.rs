@@ -1293,12 +1293,14 @@ fn the_file_name_is_upstream_s_top_bar_title_above_the_page_name_and_follows_a_r
 fn upstream_s_all_projects_button_is_the_host_s_way_back() {
     let mut s = state();
     let top = s.canvas_rect().min.y;
-    // The top bar's grid button ("All projects") sits right of upstream's menus.
-    let (last_x, bar_y) = painted_at(&mut s, "Tools", |r| r.max.y <= top);
-    let mut x = last_x + 20.0;
+    // The top bar's grid button ("All projects") comes first, left of the one Menu (whose
+    // entries are upstream's menus), above the layers panel.
+    let (menu_x, bar_y) = painted_at(&mut s, "Menu", |r| r.max.y <= top);
+    // The bar starts where the canvas does (the layers panel is left of both).
+    let mut x = s.canvas_rect().min.x as f64 + 2.0;
     let mut t = 1000.0;
     let mut asked = None;
-    while asked.is_none() && x < last_x + 120.0 {
+    while asked.is_none() && x < menu_x {
         click(&mut s, (x, bar_y), t);
         step(&mut s);
         asked = s.take_request();
@@ -1576,6 +1578,177 @@ fn r25_the_narrow_layout_is_opt_in_and_off_by_default() {
         c.min.x >= 180.0,
         "upstream's side panels as they were: {c:?}"
     );
+}
+
+// ---- the docked tier (DESIGN.md): from DOCK_FROM to NARROW_BELOW, the chosen panel sits at
+// its usual width beside the canvas, which keeps its drawing room and the floating tools.
+
+#[test]
+fn a_medium_surface_docks_one_panel_beside_the_canvas_and_keeps_a_draft_across_resizes() {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages = [page("p", "Page 1", rect)];
+    let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, 800.0, TALL).unwrap();
+    settle(&mut s, 0.0);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    assert!(s.canvas_rect().width() >= 799.0, "the canvas first");
+    // The rectangle selected, then Design docked on the right.
+    click_at(&mut s, 150.0, 150.0, 0.0);
+    step(&mut s);
+    let id = s.ed.selection[0];
+    toggle(&mut s, "Design", 500.0);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    let c = s.canvas_rect();
+    assert_eq!(c.min.x, 0.0, "{c:?}");
+    assert!(
+        (c.width() - (800.0 - 260.0)).abs() < 4.0,
+        "the inspector at its usual width beside the canvas: {c:?}"
+    );
+    // The canvas still draws: a drag with the rectangle tool where the canvas is.
+    s.run(Action::Tool(Tool::Rect));
+    let (from, to) = (at(&s, 300.0, 300.0), at(&s, 360.0, 340.0));
+    drag(&mut s, from, to, 700.0);
+    assert_eq!(s.ed.doc.nodes.len(), 2, "drawn beside the docked panel");
+    s.run(Action::Tool(Tool::Select));
+    // A number draft in the docked inspector, then the surface narrows below DOCK_FROM: the
+    // panel fills the room, the same field keeps the keyboard and the draft.
+    click_at(&mut s, 150.0, 150.0, 900.0);
+    step(&mut s);
+    assert_eq!(s.ed.selection, vec![id]);
+    let text = painted_text(&mut s);
+    let (_, bounds) = text
+        .iter()
+        .find(|(t, _)| t.starts_with("X  "))
+        .unwrap_or_else(|| panic!("X field not painted: {text:?}"));
+    let p = bounds.center();
+    click(&mut s, (p.x as f64, p.y as f64), 1000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.field_has_keyboard(), "the X field has the keyboard");
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("-");
+    step(&mut s);
+    for (w, filled) in [(500.0, true), (800.0, false), (500.0, true)] {
+        s.resize(w, TALL, 1.0);
+        for _ in 0..4 {
+            step(&mut s);
+        }
+        assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design), "{w}");
+        assert_eq!(
+            s.canvas_rect().width() < 2.0,
+            filled,
+            "{w}: filled or docked"
+        );
+        assert!(paints(&mut s, "-"), "{w}: the draft is still shown");
+        assert!(
+            s.field_has_keyboard() && s.unsaved_work() && !s.can_reload(),
+            "{w}"
+        );
+    }
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        axis(&s, id, "X  "),
+        100.0,
+        "cancelled as upstream cancels it"
+    );
+}
+
+#[test]
+fn the_top_bar_keeps_the_file_name_and_its_controls_apart_at_every_width() {
+    // The bar's text never overlaps: the file's name (truncated if need be) ends before the
+    // first control painted right of it, from the narrow sidebar to a wide window.
+    for w in [320.0, 480.0, 640.0, 800.0, 1100.0, 1600.0] {
+        let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+        let pages = [page("p", "Page 1", rect)];
+        let name = "A rather long file name for the top bar";
+        let mut s = WebState::open(&canvas_named(&pages, "p", name), false, w, TALL).unwrap();
+        settle(&mut s, 0.0);
+        let top = s.canvas_rect().min.y;
+        let bar: Vec<(String, egui::Rect)> = painted_text(&mut s)
+            .into_iter()
+            .filter(|(_, r)| r.max.y <= top)
+            .collect();
+        let (_, title) = bar
+            .iter()
+            .find(|(t, _)| t.trim() == name)
+            .unwrap_or_else(|| panic!("{w}: the file name is painted: {bar:?}"));
+        assert!(
+            title.max.x <= w as f32,
+            "{w}: inside the surface: {title:?}"
+        );
+        for (t, r) in bar
+            .iter()
+            .filter(|(t, r)| t.trim() != name && r.min.x > title.min.x)
+        {
+            assert!(
+                r.min.x >= title.max.x - 0.5 || r.max.y <= title.min.y || r.min.y >= title.max.y,
+                "{w}: {t:?} {r:?} overlaps the name {title:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_page_s_appearance_switches_upstream_s_style_and_keeps_the_document_and_a_draft() {
+    // Light until the page says otherwise (egui's light fallback: a page reports no system
+    // theme); the page's dark and light then pick upstream's two styles. Presentation only.
+    let mut s = state();
+    let dark = |s: &WebState| s.ctx.global_style().visuals.dark_mode;
+    assert!(!dark(&s));
+    s.set_dark(false);
+    assert!(!s.redraw, "the same appearance asks for no frame");
+    // A number draft in the inspector ("-" before a negative X).
+    click_at(&mut s, 150.0, 150.0, 100.0);
+    step(&mut s);
+    let id = s.ed.selection[0];
+    let text = painted_text(&mut s);
+    let (_, bounds) = text
+        .iter()
+        .find(|(t, _)| t.starts_with("X  "))
+        .unwrap_or_else(|| panic!("X field not painted: {text:?}"));
+    let p = bounds.center();
+    click(&mut s, (p.x as f64, p.y as f64), 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.field_has_keyboard(), "the X field has the keyboard");
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("-");
+    step(&mut s);
+    let (stamp, revision, dirty) = (s.ed.doc_stamp, s.ed.revision, s.dirty());
+    for want in [true, false, true] {
+        s.set_dark(want);
+        assert!(s.redraw, "{want}: a change of appearance is drawn");
+        step(&mut s);
+        step(&mut s);
+        assert_eq!(dark(&s), want);
+        assert!(paints(&mut s, "-"), "{want}: the draft is still shown");
+        assert!(
+            s.field_has_keyboard() && s.unsaved_work() && !s.can_reload(),
+            "{want}: the draft keeps the keyboard and its protection"
+        );
+        assert_eq!(
+            (s.ed.doc_stamp, s.ed.revision, s.dirty()),
+            (stamp, revision, dirty),
+            "{want}: the document is untouched"
+        );
+    }
+    assert_eq!(s.ed.selection, vec![id]);
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(
+        axis(&s, id, "X  "),
+        100.0,
+        "cancelled as upstream cancels it"
+    );
+    assert!(dark(&s), "and the appearance stays");
 }
 
 // ---- R22: page actions while the pages panel draws, and fields opened on another page.
