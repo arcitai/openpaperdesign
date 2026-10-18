@@ -36,6 +36,9 @@ pub enum HostRequest {
     /// Back to the canvases (upstream's Home, New and Open): the page's own navigation, which
     /// saves and drains first, or says where that is when it has none.
     Home,
+    /// The person chose another appearance (Menu ▸ Appearance): the page keeps the view
+    /// preference ([`WebState::appearance`]) where it can. Nothing about the canvas changed.
+    Appearance,
 }
 
 impl HostRequest {
@@ -43,7 +46,26 @@ impl HostRequest {
         match self {
             HostRequest::Save => "save",
             HostRequest::Home => "home",
+            HostRequest::Appearance => "appearance",
         }
+    }
+}
+
+/// An appearance preference by its stored name: `system`, `light` or `dark`.
+pub fn appearance_from_name(name: &str) -> Option<egui::ThemePreference> {
+    match name {
+        "system" => Some(egui::ThemePreference::System),
+        "light" => Some(egui::ThemePreference::Light),
+        "dark" => Some(egui::ThemePreference::Dark),
+        _ => None,
+    }
+}
+
+pub fn appearance_name(p: egui::ThemePreference) -> &'static str {
+    match p {
+        egui::ThemePreference::System => "system",
+        egui::ThemePreference::Light => "light",
+        egui::ThemePreference::Dark => "dark",
     }
 }
 
@@ -205,6 +227,11 @@ pub struct WebState {
     requests: VecDeque<HostRequest>,
     downloads: VecDeque<Download>,
     library_noted: bool,
+    /// The OS appearance as the page reports it (egui's system theme; see
+    /// [`WebState::set_system_dark`]); `None` until it does.
+    system_theme: Option<egui::Theme>,
+    /// The appearance the page last knew of, so a change made in the menu is reported once.
+    reported_appearance: egui::ThemePreference,
 }
 
 /// Shortcuts the browser keeps: copy, cut and paste arrive as the page's own clipboard events
@@ -328,6 +355,8 @@ impl WebState {
             requests: VecDeque::new(),
             downloads: VecDeque::new(),
             library_noted: false,
+            system_theme: None,
+            reported_appearance: egui::ThemePreference::System,
         };
         s.resize(css_width, css_height, 1.0);
         Ok(s)
@@ -345,22 +374,45 @@ impl WebState {
         self.redraw = true;
     }
 
-    /// The page's appearance: dark or light, as the page tells it (the host's theme, else the
-    /// browser's colour-scheme preference). The native app's egui follows the system appearance
-    /// through egui-winit; a page has no such input, so it is set here with egui's own
-    /// `Context::set_theme`, which picks one of upstream's two styles (`theme::apply`).
-    /// Presentation only: the document, its save state, undo, focus and any field's draft are
-    /// untouched. Redraws only when the appearance changes.
-    pub fn set_dark(&mut self, dark: bool) {
-        let theme = if dark {
-            egui::Theme::Dark
-        } else {
-            egui::Theme::Light
-        };
-        if self.ctx.theme() != theme {
-            self.ctx.set_theme(theme);
+    /// The OS appearance, as the page reports it (the browser's colour-scheme preference, else
+    /// the host's theme where the browser can't say). The native app's egui gets it from
+    /// egui-winit; here it reaches egui the same way, as its raw input's system theme, which the
+    /// System appearance follows. Presentation only: the document, its save state, undo, focus
+    /// and any field's draft are untouched. Redraws only when it changes.
+    pub fn set_system_dark(&mut self, dark: bool) {
+        let theme = egui::Theme::from_dark_mode(dark);
+        if self.system_theme != Some(theme) {
+            self.system_theme = Some(theme);
             self.redraw = true;
         }
+    }
+
+    /// The appearance preference the page kept (`system`, `light` or `dark`; see
+    /// [`appearance_from_name`]): applied before the next frame, without being reported back.
+    /// Anything else is refused and changes nothing (the page then keeps System). Presentation
+    /// only, as [`WebState::set_system_dark`].
+    pub fn set_appearance(&mut self, name: &str) -> bool {
+        let Some(p) = appearance_from_name(name) else {
+            return false;
+        };
+        self.ui.appearance = p;
+        self.reported_appearance = p;
+        if self.ctx.options(|o| o.theme_preference) != p {
+            self.ctx.set_theme(p);
+            self.redraw = true;
+        }
+        true
+    }
+
+    /// The person's appearance preference now: `system`, `light` or `dark`.
+    pub fn appearance(&self) -> &'static str {
+        appearance_name(self.ui.appearance)
+    }
+
+    /// Whether the workspace is shown dark now (the preference resolved with the OS
+    /// appearance), as the chrome and the canvas display are.
+    pub fn dark(&self) -> bool {
+        self.ctx.theme() == egui::Theme::Dark
     }
 
     /// Advance time; returns whether a frame should be laid out and drawn now.
@@ -393,6 +445,7 @@ impl WebState {
             // Modifier changes reach egui as `Event::ModifiersChanged`, in order (`modifiers`).
             events: std::mem::take(&mut self.events),
             focused: self.focused,
+            system_theme: self.system_theme,
             ..Default::default()
         }
     }
@@ -422,6 +475,11 @@ impl WebState {
             None
         };
         self.handle_requests();
+        if self.ui.appearance != self.reported_appearance {
+            self.reported_appearance = self.ui.appearance;
+            self.requests.push_back(HostRequest::Appearance);
+            self.redraw = true;
+        }
         if self.ui.library.dirty {
             // Nothing persists the library from a page (it is the native app's own file).
             self.ui.library.dirty = false;

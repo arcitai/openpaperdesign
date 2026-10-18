@@ -6,6 +6,7 @@
 //! ```text
 //! <root>/library/v1/canvases/<id>/    one standard paper-rs project per canvas: the live copy
 //! <root>/library/v1/locks/<id>.lock   its lease file: permanent, never removed or truncated
+//! <root>/library/v1/appearance        the views' appearance preference (system/light/dark)
 //! ```
 //!
 //! `<id>` is 16 lowercase hex digits made by the server. A canvas's name is data in its
@@ -55,6 +56,10 @@ pub(crate) const MAX_ASSET_BYTES: u64 = 16 << 20;
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 256 << 20;
 /// A new canvas's name, in characters.
 pub(crate) const MAX_NAME_CHARS: usize = 60;
+/// The views' kept appearance preference (`<root>/library/v1/appearance`, see
+/// [`Library::appearance`]): one of [`APPEARANCES`], nothing else.
+const APPEARANCE_FILE: &str = "appearance";
+pub(crate) const APPEARANCES: [&str; 3] = ["system", "light", "dark"];
 
 /// A canvas id: exactly 16 lowercase hex digits (made by [`new_id`]).
 pub(crate) fn valid_id(s: &str) -> bool {
@@ -365,6 +370,69 @@ impl Library {
             "note": "Read-only: nothing was created, opened or locked. These canvases belong to \
                 OpenPaperDesign's own library, not to a project folder.",
         }))
+    }
+
+    /// The appearance preference the library keeps for its views: `system`, `light` or `dark`
+    /// (DESIGN.md). A view preference, never part of a canvas. Read-only and bounded: a missing,
+    /// unreadable, linked, oversized or unknown value is `system`, and nothing is created.
+    pub fn appearance(&self) -> &'static str {
+        if self.check().is_err() {
+            return "system";
+        }
+        let path = self.version_dir().join(APPEARANCE_FILE);
+        // `symlink_metadata`: a link is not a plain file, and is never followed.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() && m.len() <= 16 => {}
+            _ => return "system",
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return "system";
+        };
+        APPEARANCES
+            .into_iter()
+            .find(|a| *a == text.trim())
+            .unwrap_or("system")
+    }
+
+    /// Keep `value` (`system`, `light` or `dark`) as the appearance preference: written to a new
+    /// file beside it, made durable and renamed over the old one, so a reader sees the old or the
+    /// new value, never part of one. Touches no canvas, lease or binding.
+    pub fn set_appearance(&self, value: &str) -> Result<&'static str, String> {
+        let v = APPEARANCES
+            .into_iter()
+            .find(|a| *a == value)
+            .ok_or("An appearance of system, light or dark is required. Nothing was changed.")?;
+        self.ensure_hierarchy()?;
+        let dir = self.version_dir();
+        let path = dir.join(APPEARANCE_FILE);
+        if let Ok(m) = std::fs::symlink_metadata(&path)
+            && !m.is_file()
+        {
+            return Err(
+                "The kept appearance isn't a plain file, so it wasn't replaced. Nothing \
+                was changed."
+                    .into(),
+            );
+        }
+        let tmp = dir.join(format!(".{APPEARANCE_FILE}.{}.tmp", new_id()?));
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(v.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(e) = write() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "The appearance couldn't be kept ({e}). Nothing else was changed."
+            ));
+        }
+        sync_dir(&dir)?;
+        Ok(v)
     }
 
     /// A canvas's manifest, read only from a real folder on the library's file system with a

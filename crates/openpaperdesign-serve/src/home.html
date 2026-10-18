@@ -406,15 +406,72 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     '--color-text-secondary', '--color-text-danger', '--color-border-primary', '--color-border-secondary',
     '--color-ring-primary', '--font-sans', '--font-mono', '--border-radius-md'];
   let hostContext = {};
-  function applyHost() {
-    const root = document.documentElement;
-    if (hostContext.theme === 'light' || hostContext.theme === 'dark') root.setAttribute('data-theme', hostContext.theme);
-    const vars = hostContext.styles && hostContext.styles.variables;
-    if (!vars || typeof vars !== 'object') return;
-    for (const key of STYLE_KEYS) {
-      const v = vars[key];
-      if (typeof v === 'string' && v.length <= 200 && !/[;{}<>\\@]|url\(|expression\(/i.test(v)) root.style.setProperty(key, v);
+  // The host's sanitized style variables, and the host theme its colour variables were sent with:
+  // they are that theme's palette, so they paint only that appearance (see applyTheme). A palette
+  // comes whole: new variables replace every earlier colour (none is left over from another
+  // theme). Fonts and radius merge across partial updates and apply whatever the appearance.
+  const hostVars = {};
+  let hostColoursFor = null;
+  // `update`: the context (or partial update) the host just sent.
+  function applyHost(update) {
+    const vars = update && update.styles && update.styles.variables;
+    if (vars && typeof vars === 'object') {
+      for (const key of STYLE_KEYS) {
+        const v = vars[key];
+        if (typeof v === 'string' && v.length <= 200 && !/[;{}<>\\@]|url\(|expression\(/i.test(v)) hostVars[key] = v;
+        else if (key.startsWith('--color-')) delete hostVars[key];
+      }
+      hostColoursFor = hostContext.theme === 'light' || hostContext.theme === 'dark' ? hostContext.theme : null;
     }
+    applyTheme();
+    hostThemeChanged();
+  }
+
+  // ---- appearance (DESIGN.md): presentation only, never a canvas edit ----
+  // System follows the OS appearance: the browser's colour-scheme, live. Only where the browser
+  // can't say does the host's theme (HostContext.theme) stand in. Light and Dark, chosen in the
+  // editor's Menu ▸ Appearance, override it. An app library keeps the choice in its own data
+  // folder (its list reports it, `openpaperdesign_app_appearance` keeps a new one); nothing is
+  // stored in the browser. Home and the editor resolve it the same way.
+  const APPEARANCES = ['system', 'light', 'dark'];
+  const opdAppearanceName = (v) => (APPEARANCES.includes(v) ? v : 'system');
+  let appearance = 'system';
+  const scheme = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  function systemDark() {
+    if (scheme && typeof scheme.matches === 'boolean') return scheme.matches;
+    if (hostContext.theme === 'dark') return true;
+    if (hostContext.theme === 'light') return false;
+    return null;
+  }
+  // The resolved appearance decides every colour here. The host's colour variables are used only
+  // while it is the host theme they were sent for. Otherwise (an explicit Light or Dark, or a
+  // System OS that differs from the host) they are removed, stale ones included, and this
+  // view's own palette for that appearance applies. A host palette never overrides it.
+  function applyTheme() {
+    const root = document.documentElement;
+    const sys = systemDark();
+    const dark = appearance === 'dark' ? true : appearance === 'light' ? false : sys;
+    // System with no signal at all: the style sheet's own colour-scheme rule decides.
+    if (dark !== null) root.setAttribute('data-theme', dark ? 'dark' : 'light');
+    const matched = dark !== null && hostColoursFor === (dark ? 'dark' : 'light');
+    for (const key of STYLE_KEYS) {
+      const v = hostVars[key];
+      if (v !== undefined && (matched || !key.startsWith('--color-'))) root.style.setProperty(key, v);
+      else root.style.removeProperty(key);
+    }
+  }
+  if (scheme && typeof scheme.addEventListener === 'function') scheme.addEventListener('change', applyTheme);
+  // The mounted editor learns of a host theme change (set where the editor is mounted).
+  let hostThemeChanged = () => {};
+  // A new choice from the editor's menu: shown at once, then kept by the library (only the
+  // validated preference is sent). A choice it couldn't keep still applies here, and says so.
+  async function keepAppearance(next) {
+    appearance = opdAppearanceName(next);
+    applyTheme();
+    if (!LIBRARY) return;
+    const r = await rpc('tools/call', { name: 'openpaperdesign_app_appearance', arguments: { appearance } }, 15000);
+    const kept = !r.timeout && !r.error && r.result && !r.result.isError;
+    if (!kept && view === 'editor') edStatus('Appearance applied here, but it couldn\'t be kept for next time.');
   }
 
   // ---- direct actions ----
@@ -968,6 +1025,11 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (!r.timeout && !r.error && r.result && !r.result.isError) {
       try { v = JSON.parse(firstText(r.result)); } catch { v = null; }
     }
+    // The library's kept appearance comes with its list (a missing or unknown one is System).
+    if (v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, 'appearance')) {
+      appearance = opdAppearanceName(v.appearance);
+      applyTheme();
+    }
     const list = $('projects');
     list.textContent = '';
     rowActions.projects = [];
@@ -1225,6 +1287,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   let display = null;
   let panelHandle = null; // the editor mounted in the editor view, if any
   let panelBinding = null; // the binding it edits
+  hostThemeChanged = () => { if (panelHandle && panelHandle.hostThemeChanged) panelHandle.hostThemeChanged(); };
   // The editor a departure is draining (R26-F1): a second departure of that same editor waits
   // for it, any other editor's doesn't. Cleared by that departure only, or when that editor is
   // let go (a teardown that timed out, say), so a newer editor never inherits it.
@@ -1340,6 +1403,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       // The workspace's Home, New and Open ("All projects"): back to the library, which saves
       // and drains first and keeps the editor if anything is left unsaved.
       onHome: () => { if (panelHandle === h) editorBack(); },
+      // The editor starts in the library's kept appearance and resolves it as this view does.
+      appearance,
+      hostTheme: () => hostContext.theme,
+      onAppearance: (a) => { if (panelHandle === h) keepAppearance(a); },
     });
     panelHandle = h;
     h.started.catch((e) => {
@@ -1733,7 +1800,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       announce('Cancelled');
     } else if (m.method === 'ui/notifications/host-context-changed' && m.params && typeof m.params === 'object') {
       hostContext = Object.assign({}, hostContext, m.params); // partial update: merge
-      applyHost();
+      applyHost(m.params);
     } else if (m.method === 'ui/resource-teardown' && m.id !== undefined) {
       // Answered once the editor (if any) was drained and let go.
       const id = m.id;
@@ -1756,7 +1823,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       return;
     }
     hostContext = Object.assign({}, r.result.hostContext || {});
-    applyHost();
+    applyHost(hostContext);
     window.parent.postMessage({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }, '*');
     $('menu-button').disabled = false;
     $('new-file').disabled = false;

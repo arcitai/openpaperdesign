@@ -50,6 +50,10 @@ pub struct UiState {
     /// A host's opt-in layout for surfaces too narrow for both side panels beside the canvas.
     /// Off by default (every native window): `draw` then lays out exactly as before.
     pub narrow: NarrowLayout,
+    /// The person's appearance: System (the default, following the OS appearance as
+    /// `theme::apply` set it), Light or Dark (Menu ▸ Appearance). A view preference, never part
+    /// of the canvas; the chrome and the canvas display follow it (DESIGN.md).
+    pub appearance: egui::ThemePreference,
 }
 
 /// Which side panel the narrow layout shows over the canvas's room, if any.
@@ -179,6 +183,12 @@ pub(crate) fn title_text(text: impl Into<String>) -> RichText {
 
 /// Lay out the chrome and return the remaining canvas rectangle (logical px).
 pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
+    // The chosen appearance, applied with egui's own theme preference (the next frame uses it).
+    // The default, System, is what `theme::apply` set: unchanged windows lay out as before.
+    if ui.ctx().options(|o| o.theme_preference) != st.appearance {
+        ui.ctx().set_theme(st.appearance);
+        ui.ctx().request_repaint();
+    }
     if let Some(hv) = &mut st.home {
         home::draw(ui, hv, st.native_chrome, st.translucent_sidebar);
         return egui::Rect::NOTHING;
@@ -393,6 +403,29 @@ fn menu_entries(ui: &mut Ui, ed: &mut Editor, entries: &[shortcuts::MenuEntry]) 
     }
 }
 
+/// Menu ▸ Appearance: System (follows the OS appearance), Light or Dark. It changes how the
+/// chrome and canvas are shown, never the canvas itself.
+fn appearance_menu(ui: &mut Ui, st: &mut UiState) {
+    for (pref, label, tip) in [
+        (
+            egui::ThemePreference::System,
+            "System",
+            "Follow the system appearance",
+        ),
+        (egui::ThemePreference::Light, "Light", "Always light"),
+        (egui::ThemePreference::Dark, "Dark", "Always dark"),
+    ] {
+        if ui
+            .radio(st.appearance == pref, label)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            st.appearance = pref;
+            ui.close();
+        }
+    }
+}
+
 /// An icon button with its action's name and shortcut as its tooltip.
 fn action_button(ui: &mut Ui, ed: &mut Editor, icon: theme::Icon, name: &str, action: Action) {
     let keys = shortcuts::chord_text(action);
@@ -431,6 +464,8 @@ fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, narrow: bool) {
                 for (title, entries) in shortcuts::menus() {
                     ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
                 }
+                ui.separator();
+                ui.menu_button("Appearance", |ui| appearance_menu(ui, st));
             });
         }
         ui.add_space(6.0);

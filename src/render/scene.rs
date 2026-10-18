@@ -14,11 +14,167 @@ use std::sync::Arc;
 
 pub const CANVAS_BG: Color = Color::rgb(0xee, 0xee, 0xf0);
 pub const GRID_DOT: Color = Color::rgb(0xcf, 0xcf, 0xd6);
+/// The dark work surface and its grid (see [`Display::Dark`]).
+pub const CANVAS_BG_DARK: Color = Color::rgb(0x18, 0x18, 0x1b);
+pub const GRID_DOT_DARK: Color = Color::rgb(0x34, 0x34, 0x3a);
 pub const ACCENT: Color = Color::rgb(0x2f, 0x6f, 0xf3);
 pub const GUIDE: Color = Color::rgb(0xf2, 0x2f, 0x7a);
 
 pub fn rgba(c: Color) -> [f32; 4] {
     c.to_f32(1.0)
+}
+
+// ---------------------------------------------------------------------------------- display
+
+/// How the interactive canvas is shown: presentation only, never the document. `Light` draws
+/// the document exactly as authored, as every export does (exports always use `Light`).
+/// `Dark` draws a dark work surface and adapts each drawn colour to it: its OKLab lightness is
+/// mirrored into a dark range while its hue, its chroma (as far as sRGB allows) and its alpha
+/// are kept. Black text and strokes read light, white fills sit just above the surface, and a
+/// red shape stays red. Image paints are never adapted (artwork stays as it is), and nothing
+/// in the document, its history or its saves changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Display {
+    #[default]
+    Light,
+    Dark,
+}
+
+/// Adapted lightness range of [`Display::Dark`]: authored black (L 0) is shown at `HI`,
+/// authored white (L 1) at `LO`, just above the dark surface (L ≈ 0.21).
+const DARK_HI: f32 = 0.93;
+const DARK_LO: f32 = 0.27;
+
+impl Display {
+    /// The display for an egui theme (the resolved appearance of the window or page).
+    pub fn for_theme(theme: egui::Theme) -> Display {
+        match theme {
+            egui::Theme::Dark => Display::Dark,
+            egui::Theme::Light => Display::Light,
+        }
+    }
+
+    pub fn background(self) -> Color {
+        match self {
+            Display::Light => CANVAS_BG,
+            Display::Dark => CANVAS_BG_DARK,
+        }
+    }
+
+    pub fn grid_dot(self) -> Color {
+        match self {
+            Display::Light => GRID_DOT,
+            Display::Dark => GRID_DOT_DARK,
+        }
+    }
+
+    /// A drawn colour (straight-alpha sRGB) as shown. The alpha is never changed.
+    pub fn color(self, c: [f32; 4]) -> [f32; 4] {
+        match self {
+            Display::Light => c,
+            Display::Dark => {
+                let [l, a, b] = oklab([c[0], c[1], c[2]]);
+                let l = DARK_HI - l.clamp(0.0, 1.0) * (DARK_HI - DARK_LO);
+                let [r, g, b] = from_oklab_in_gamut(l, a, b);
+                [r, g, b, c[3]]
+            }
+        }
+    }
+
+    fn model_color(self, c: Color) -> Color {
+        if self == Display::Light {
+            return c;
+        }
+        let [r, g, b, _] = self.color(c.to_f32(1.0));
+        let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+        Color::rgba(byte(r), byte(g), byte(b), c.a)
+    }
+
+    /// Adapt a node's draw ops for display: solid fills, gradient stops (positions kept),
+    /// strokes and glyphs. Image paints are left exactly as they are.
+    pub fn ops(self, ops: &mut [draw::DrawOp]) {
+        if self == Display::Light {
+            return;
+        }
+        use draw::{DrawOp, PaintSpec};
+        for op in ops {
+            match op {
+                DrawOp::Fill { paint, .. } => match paint {
+                    PaintSpec::Solid(c) => *c = self.color(*c),
+                    PaintSpec::Linear { stops, .. } | PaintSpec::Radial { stops, .. } => {
+                        for s in stops.iter_mut() {
+                            s.color = self.model_color(s.color);
+                        }
+                    }
+                    PaintSpec::Image { .. } => {}
+                },
+                DrawOp::Stroke { color, .. } | DrawOp::Glyphs { color, .. } => {
+                    *color = self.color(*color)
+                }
+            }
+        }
+    }
+}
+
+fn to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// sRGB (0..1) to OKLab (Björn Ottosson's published matrices).
+fn oklab([r, g, b]: [f32; 3]) -> [f32; 3] {
+    let (r, g, b) = (to_linear(r), to_linear(g), to_linear(b));
+    let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+fn from_oklab([l, a, b]: [f32; 3]) -> [f32; 3] {
+    let l_ = (l + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m_ = (l - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s_ = (l - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    [
+        to_srgb(4.076_741_7 * l_ - 3.307_711_6 * m_ + 0.230_969_94 * s_),
+        to_srgb(-1.268_438 * l_ + 2.609_757_4 * m_ - 0.341_319_38 * s_),
+        to_srgb(-0.004_196_086_3 * l_ - 0.703_418_6 * m_ + 1.707_614_7 * s_),
+    ]
+}
+
+/// OKLab to sRGB at lightness `l`, reducing chroma (never the hue) until it fits sRGB.
+fn from_oklab_in_gamut(l: f32, a: f32, b: f32) -> [f32; 3] {
+    let fits = |c: &[f32; 3]| c.iter().all(|v| (-0.001..=1.001).contains(v));
+    let mut k = 1.0;
+    let mut c = from_oklab([l, a, b]);
+    for _ in 0..12 {
+        if fits(&c) {
+            break;
+        }
+        k *= 0.85;
+        c = from_oklab([l, a * k, b * k]);
+    }
+    c.map(|v| {
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    })
 }
 
 /// What to draw and where.
@@ -50,6 +206,10 @@ impl View<'_> {
 
 /// Dot grid whose spacing adapts to the zoom so it never gets too dense or sparse.
 pub fn grid(mb: &mut MeshBuilder, v: &View) {
+    grid_dots(mb, v, GRID_DOT);
+}
+
+fn grid_dots(mb: &mut MeshBuilder, v: &View, dot: Color) {
     let z = v.camera.zoom;
     let mut spacing = 20.0;
     while spacing * z < 14.0 {
@@ -63,7 +223,7 @@ pub fn grid(mb: &mut MeshBuilder, v: &View) {
     let y0 = (vis.y / spacing).floor() as i64;
     let x1 = (vis.right() / spacing).ceil() as i64;
     let y1 = (vis.bottom() / spacing).ceil() as i64;
-    let color = rgba(GRID_DOT);
+    let color = rgba(dot);
     let r = 0.9;
     for yi in y0..=y1 {
         for xi in x0..=x1 {
@@ -104,6 +264,9 @@ pub struct SceneCache {
     last: Option<(u64, i32, Rect, Vec<Item>)>,
     /// Tessellations performed during the last `items` call (for tests and profiling).
     pub last_misses: usize,
+    /// How the items are shown (see [`Display`]); `Light`, the document as authored, by
+    /// default, as for every export.
+    display: Display,
 }
 
 /// Zoom buckets are powers of two: geometry built for 2^b is accurate up to 2^(b+1).
@@ -115,6 +278,19 @@ impl SceneCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.last = None;
+    }
+
+    pub fn display(&self) -> Display {
+        self.display
+    }
+
+    /// Show the items with `display` from now on. A change drops the cached meshes (they carry
+    /// their shown colours); the document is not touched.
+    pub fn set_display(&mut self, display: Display) {
+        if self.display != display {
+            self.display = display;
+            self.clear();
+        }
     }
 
     /// Items for `roots` (or the whole page) in paint order. `cull` skips subtrees outside a
@@ -178,7 +354,8 @@ impl SceneCache {
             });
             if !hit {
                 self.last_misses += 1;
-                let d = draw::node_draw(n, wr, opacity);
+                let mut d = draw::node_draw(n, wr, opacity);
+                self.display.ops(&mut d.ops);
                 let pieces = Arc::new(tess.ops(&d.ops));
                 self.entries.insert(
                     id,
@@ -286,6 +463,16 @@ pub fn draw_text(
 
 /// Interactive overlay: hover, selection, handles, marquee, guides, labels, caret.
 pub fn overlay(mb: &mut MeshBuilder, ed: &Editor, offset: V2) {
+    overlay_shown(mb, ed, offset, Display::Light);
+}
+
+/// [`overlay`] over a canvas shown with `display`: only the quiet frame-name labels change, so
+/// they stay legible on the dark surface; the accent marks are the same in both.
+fn overlay_shown(mb: &mut MeshBuilder, ed: &Editor, offset: V2, display: Display) {
+    let label = match display {
+        Display::Light => [0.42, 0.42, 0.46, 1.0],
+        Display::Dark => [0.64, 0.64, 0.69, 1.0],
+    };
     let v = View {
         doc: &ed.doc,
         camera: ed.camera,
@@ -300,11 +487,7 @@ pub fn overlay(mb: &mut MeshBuilder, ed: &Editor, offset: V2) {
     for (id, r) in ed.frame_labels() {
         let n = ed.doc.get(id).unwrap();
         let selected = ed.selection.contains(&id);
-        let color = if selected {
-            accent
-        } else {
-            [0.42, 0.42, 0.46, 1.0]
-        };
+        let color = if selected { accent } else { label };
         let r = r.translate(offset);
         let mut name = n.name.clone();
         let max_w = r.w;
@@ -585,7 +768,8 @@ fn fmt_num(x: f64) -> String {
     }
 }
 
-/// Full interactive canvas: background grid, document, overlay.
+/// Full interactive canvas: background grid, document, overlay, shown with the cache's
+/// [`Display`].
 pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) -> CanvasFrame {
     let v = View {
         doc: &ed.doc,
@@ -593,11 +777,12 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
         viewport: ed.viewport,
         offset,
     };
+    let display = cache.display();
     let mut under = MeshBuilder::default();
     under.set_clip(Some(v.canvas_rect()));
-    under.rect(v.canvas_rect(), rgba(CANVAS_BG));
+    under.rect(v.canvas_rect(), rgba(display.background()));
     if show_grid {
-        grid(&mut under, &v);
+        grid_dots(&mut under, &v, display.grid_dot());
     }
     let vis = ed.camera.visible_world(ed.viewport);
     let bucket = zoom_bucket(ed.camera.zoom);
@@ -616,7 +801,7 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
         }
     };
     let mut over = MeshBuilder::default();
-    overlay(&mut over, ed, offset);
+    overlay_shown(&mut over, ed, offset, display);
     CanvasFrame {
         under: under.finish(),
         items,
@@ -624,6 +809,284 @@ pub fn canvas(ed: &Editor, cache: &mut SceneCache, offset: V2, show_grid: bool) 
         camera: ed.camera,
         offset,
         viewport: v.canvas_rect(),
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use crate::model::{Cap, Join, Stop};
+    use crate::vector::VPath;
+    use draw::{DrawOp, PaintSpec};
+
+    fn lightness(c: [f32; 4]) -> f32 {
+        oklab([c[0], c[1], c[2]])[0]
+    }
+
+    /// One op of each kind: a solid fill, a gradient, an image, a stroke and glyphs.
+    fn sample_ops() -> Vec<DrawOp> {
+        let path = VPath::new();
+        vec![
+            DrawOp::Fill {
+                path: path.clone(),
+                paint: PaintSpec::Solid([1.0, 1.0, 1.0, 1.0]),
+                even_odd: false,
+            },
+            DrawOp::Fill {
+                path: path.clone(),
+                paint: PaintSpec::Linear {
+                    p0: V2::ZERO,
+                    p1: v2(1.0, 0.0),
+                    stops: vec![
+                        Stop {
+                            pos: 0.0,
+                            color: Color::WHITE,
+                        },
+                        Stop {
+                            pos: 0.7,
+                            color: Color::rgba(0, 0, 0, 128),
+                        },
+                    ],
+                    opacity: 0.8,
+                },
+                even_odd: false,
+            },
+            DrawOp::Fill {
+                path: path.clone(),
+                paint: PaintSpec::Image {
+                    asset: "artwork".into(),
+                    place: Rect::new(0.0, 0.0, 10.0, 10.0),
+                    tile: false,
+                    opacity: 0.6,
+                },
+                even_odd: false,
+            },
+            DrawOp::Stroke {
+                path,
+                color: [0.0, 0.0, 0.0, 1.0],
+                width: 2.0,
+                cap: Cap::Round,
+                join: Join::Round,
+                dash: vec![],
+            },
+            DrawOp::Glyphs {
+                face: 0,
+                size: 12.0,
+                color: [0.11, 0.11, 0.12, 0.75],
+                glyphs: vec![(1, V2::ZERO)],
+            },
+        ]
+    }
+
+    #[test]
+    fn light_shows_the_document_exactly_as_authored() {
+        let ops = sample_ops();
+        let mut shown = ops.clone();
+        Display::Light.ops(&mut shown);
+        assert_eq!(shown, ops);
+        assert_eq!(
+            Display::default(),
+            Display::Light,
+            "exports and caches start light"
+        );
+        assert_eq!(SceneCache::default().display(), Display::Light);
+    }
+
+    #[test]
+    fn dark_mirrors_lightness_and_keeps_hue_family_and_alpha() {
+        let d = Display::Dark;
+        let surface = lightness(rgba(CANVAS_BG_DARK));
+        let ink = d.color([0.0, 0.0, 0.0, 1.0]);
+        assert!(
+            lightness(ink) > 0.88,
+            "black text and strokes read light: {ink:?}"
+        );
+        let paper = d.color([1.0, 1.0, 1.0, 0.5]);
+        assert!(
+            lightness(paper) > surface && lightness(paper) < 0.35,
+            "white sits just above the dark surface: {paper:?}"
+        );
+        assert_eq!(paper[3], 0.5, "alpha is kept exactly");
+        assert!(
+            (paper[0] - paper[1]).abs() < 0.01 && (paper[1] - paper[2]).abs() < 0.01,
+            "a neutral stays neutral: {paper:?}"
+        );
+        let (dark, light) = (d.color([0.2, 0.2, 0.2, 1.0]), d.color([0.8, 0.8, 0.8, 1.0]));
+        assert!(
+            lightness(dark) > lightness(light),
+            "the lightness order is mirrored"
+        );
+        let red = d.color([0.9, 0.15, 0.15, 1.0]);
+        assert!(
+            red[0] > red[1] + 0.2 && red[0] > red[2] + 0.2,
+            "red stays red: {red:?}"
+        );
+        let blue = d.color([0.15, 0.35, 0.95, 1.0]);
+        assert!(
+            blue[2] > blue[0] + 0.2 && blue[2] > blue[1],
+            "blue stays blue: {blue:?}"
+        );
+        let green = d.color([0.2, 0.7, 0.3, 1.0]);
+        assert!(
+            green[1] > green[0] && green[1] > green[2],
+            "green stays green: {green:?}"
+        );
+        for i in 0..=8 {
+            for j in 0..=8 {
+                for k in 0..=8 {
+                    let c = [i as f32 / 8.0, j as f32 / 8.0, k as f32 / 8.0, 0.3];
+                    let shown = d.color(c);
+                    assert!(
+                        shown
+                            .iter()
+                            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                        "{c:?} -> {shown:?}"
+                    );
+                    assert_eq!(shown, d.color(c), "deterministic");
+                    assert_eq!(shown[3], 0.3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dark_adapts_fills_gradients_strokes_and_glyphs_but_never_images() {
+        let ops = sample_ops();
+        let mut shown = ops.clone();
+        Display::Dark.ops(&mut shown);
+        let PaintSpec::Solid(fill) = (match &shown[0] {
+            DrawOp::Fill { paint, .. } => paint.clone(),
+            _ => unreachable!(),
+        }) else {
+            panic!("a solid stays solid")
+        };
+        assert!(lightness(fill) < 0.35, "{fill:?}");
+        match (&shown[1], &ops[1]) {
+            (
+                DrawOp::Fill {
+                    paint: PaintSpec::Linear { stops, opacity, .. },
+                    ..
+                },
+                DrawOp::Fill {
+                    paint:
+                        PaintSpec::Linear {
+                            stops: authored,
+                            opacity: o,
+                            ..
+                        },
+                    ..
+                },
+            ) => {
+                assert_eq!(opacity, o);
+                assert_eq!(stops.len(), authored.len());
+                for (s, a) in stops.iter().zip(authored) {
+                    assert_eq!(s.pos, a.pos, "stop positions are kept");
+                    assert_eq!(s.color.a, a.color.a, "stop alpha is kept");
+                }
+                assert!(
+                    stops[0].color.r < 100,
+                    "white stop shown dark: {:?}",
+                    stops[0]
+                );
+                assert!(
+                    stops[1].color.r > 200,
+                    "black stop shown light: {:?}",
+                    stops[1]
+                );
+            }
+            _ => panic!("the gradient stays a gradient"),
+        }
+        assert_eq!(shown[2], ops[2], "image paints are never adapted");
+        match &shown[3] {
+            DrawOp::Stroke { color, width, .. } => {
+                assert!(lightness(*color) > 0.88);
+                assert_eq!(*width, 2.0);
+            }
+            _ => panic!(),
+        }
+        // The glyphs are near-black ink (OKLab L ≈ 0.23), not pure black: shown at the mirrored
+        // lightness the contract gives it (DARK_HI - L * (DARK_HI - DARK_LO), ≈ 0.78), well
+        // above the dark surface, still neutral, with the alpha and everything else kept.
+        let ink = match &ops[4] {
+            DrawOp::Glyphs { color, .. } => *color,
+            _ => unreachable!(),
+        };
+        match &shown[4] {
+            DrawOp::Glyphs {
+                face,
+                size,
+                color,
+                glyphs,
+            } => {
+                let want = DARK_HI - lightness(ink) * (DARK_HI - DARK_LO);
+                assert!(
+                    (lightness(*color) - want).abs() < 0.01,
+                    "mirrored lightness {want}: {color:?}"
+                );
+                assert!(
+                    lightness(*color) > lightness(ink) + 0.4,
+                    "dark ink reads light: {color:?}"
+                );
+                assert!(
+                    lightness(*color) - lightness(rgba(CANVAS_BG_DARK)) > 0.5,
+                    "legible on the dark surface: {color:?}"
+                );
+                assert!(
+                    (color[0] - color[1]).abs() < 0.02 && (color[2] - color[0]).abs() < 0.03,
+                    "neutral ink stays neutral: {color:?}"
+                );
+                assert_eq!(color[3], 0.75, "alpha is kept exactly");
+                assert_eq!(
+                    (*face, *size, glyphs.clone()),
+                    (0, 12.0, vec![(1, V2::ZERO)]),
+                    "only the colour changes"
+                );
+            }
+            _ => panic!("glyphs stay glyphs"),
+        }
+    }
+
+    #[test]
+    fn a_display_change_drops_cached_meshes_and_exports_stay_light() {
+        let mut doc = Document::default();
+        let id = doc.alloc_id();
+        let mut n = Node::new(id, NodeKind::Rect, Rect::new(0.0, 0.0, 40.0, 30.0));
+        n.style = crate::model::Style::with_fill(Color::rgb(0xe6, 0x4a, 0x3b));
+        n.style.stroke = Some(Color::BLACK);
+        n.style.stroke_width = 2.0;
+        doc.nodes.insert(id, n);
+        doc.root.push(id);
+        let authored = doc.clone();
+        let mut cache = SceneCache::default();
+        let light = cache.items(&doc, None, 1.0, None);
+        cache.set_display(Display::Dark);
+        let dark = cache.items(&doc, None, 1.0, None);
+        assert_eq!(cache.last_misses, 1, "re-tessellated for the new display");
+        let colours = |items: &[Item]| -> Vec<[f32; 4]> {
+            items
+                .iter()
+                .flat_map(|i| i.pieces.iter())
+                .flat_map(|p| p.mesh.vertices.iter().map(|v| v.color))
+                .collect()
+        };
+        assert_ne!(colours(&light), colours(&dark));
+        cache.set_display(Display::Dark);
+        cache.items(&doc, None, 1.0, None);
+        assert_eq!(
+            cache.last_misses, 0,
+            "the same display again keeps the cache"
+        );
+        let export = SceneCache::default().items(&doc, None, 1.0, None);
+        assert_eq!(
+            colours(&export),
+            colours(&light),
+            "exports draw the document as authored"
+        );
+        assert_eq!(
+            doc.nodes.get(&id),
+            authored.nodes.get(&id),
+            "the document is untouched"
+        );
     }
 }
 

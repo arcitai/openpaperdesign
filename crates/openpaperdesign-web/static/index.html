@@ -5,27 +5,39 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>openpaperdesign</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px/1.4 system-ui, sans-serif; background: #eeeef0; }
+  /* The page around the workspace follows the same appearance as the editor (DESIGN.md):
+     the browser's colour-scheme, unless Menu ▸ Appearance chose Light or Dark (data-theme). */
+  :root { color-scheme: light dark; --bg: #eeeef0; --pop: #fff; --pop-text: #333; --muted: #777;
+    --conflict-bg: #fdecea; --conflict-text: #8a1c13; --conflict-line: #f3b8b2; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #18181b; --pop: #29292d; --pop-text: #ececef; --muted: #a1a1a8;
+      --conflict-bg: #3a1d1b; --conflict-text: #ffb4ab; --conflict-line: #6b2b26; }
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"] { color-scheme: dark; --bg: #18181b; --pop: #29292d; --pop-text: #ececef; --muted: #a1a1a8;
+    --conflict-bg: #3a1d1b; --conflict-text: #ffb4ab; --conflict-line: #6b2b26; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 13px/1.4 system-ui, sans-serif; background: var(--bg); }
   /* One app: upstream paper-rs's workspace fills the page. Its own top bar names the file and
      the page; this page adds no header, footer or frame of its own. */
   #canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; outline: none; touch-action: none; }
   /* Over the canvas, not in the flow, so showing it doesn't move the canvas. */
   #conflict { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 8px 10px;
-              background: #fdecea; color: #8a1c13; border-bottom: 1px solid #f3b8b2; }
+              background: var(--conflict-bg); color: var(--conflict-text); border-bottom: 1px solid var(--conflict-line); }
   #conflict.show { display: block; }
   /* A note only when there is something to say (a failure, a refusal, a download, or loading on
      the way to Ready); stable healthy states stay in the status live region for assistive
      technology and checks. */
   #alert { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: min(560px, 90vw);
-           padding: 8px 12px; border-radius: 8px; background: #1f1f22; color: #fff; overflow-wrap: anywhere; }
+           padding: 8px 12px; border-radius: 8px; background: #1f1f22; color: #fff; overflow-wrap: anywhere;
+           border: 1px solid rgb(255 255 255 / .14); }
   #alert.error, #alert.failure, #alert.conflict { background: #b3261e; }
   /* On the way to Ready: small and muted, gone with the next healthy state. */
   #alert.loading { padding: 4px 10px; background: rgb(31 31 34 / .72); font-size: 12px; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   /* Licences and notices, out of the way. */
-  #about { position: fixed; right: 6px; bottom: 4px; font-size: 11px; color: #777; }
+  #about { position: fixed; right: 6px; bottom: 4px; font-size: 11px; color: var(--muted); }
   #about summary { cursor: pointer; list-style: none; padding: 2px 6px; border-radius: 4px; }
-  #about[open] { max-width: 320px; padding: 8px 10px; border-radius: 8px; background: #fff; color: #333;
+  #about[open] { max-width: 320px; padding: 8px 10px; border-radius: 8px; background: var(--pop); color: var(--pop-text);
                  box-shadow: 0 4px 16px rgb(0 0 0 / .12); }
 </style>
 </head>

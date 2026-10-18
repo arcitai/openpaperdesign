@@ -53,10 +53,17 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-7.html` (2026-10-18 source candidate: the
-  quieter workspace of DESIGN.md, whose in-panel editor follows the view's light or dark
-  appearance); `home-6` (the first one-app view) and earlier are refused. No eviction of a view
-  a host already has open is promised.
+- **View version.** `ui://openpaperdesign/home-8.html` (2026-10-18 source candidate: one
+  System/Light/Dark appearance across the view, the editor's chrome and its canvas display,
+  kept by the library through `openpaperdesign_app_appearance`); `home-7` (the quieter
+  workspace whose editor first followed the view's light or dark theme), `home-6` (the first
+  one-app view) and earlier are refused. No eviction of a view a host already has open is
+  promised.
+- **Appearance.** Menu ▸ Appearance in the editor: System (the OS appearance, followed live;
+  the host's theme only where the browser can't report it), Light or Dark. The home keeps the
+  choice in the library's own folder (`library/v1/appearance`; the list reports it), never in
+  the browser; the standalone browser page keeps it while it is open. Presentation only: no
+  canvas, revision, lease or binding is touched.
 - **Reuse.** `ui::draw`/`render::frame`, `Editor`, `opdMountEditor`/`Session` and the existing
   save path; no DOM copy of upstream UI, no new runtime, registry, format or save path.
 
@@ -91,7 +98,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6`, now `home-7`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` and `home-7`, now `home-8`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

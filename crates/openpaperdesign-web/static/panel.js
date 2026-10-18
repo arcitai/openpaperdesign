@@ -155,8 +155,10 @@ export function opdCreatePanel(opts) {
   /**
    * Open the canvas `binding` in this view's editor (`refs`: its canvas, status and conflict
    * banner). `onHome`: the view's own way back (upstream's Home, New and Open ask for it).
+   * Appearance (see opdMountEditor): `appearance` the view's kept preference, `hostTheme()` the
+   * host's theme, `onAppearance(appearance)` a new choice from the editor's menu.
    */
-  function open({ binding, refs, onStatus, onReady, onHome }) {
+  function open({ binding, refs, onStatus, onReady, onHome, appearance, hostTheme, onAppearance }) {
     const h = { left: false, mounted: null, mount: null, released: false };
     wanting.add(h);
     const live = () => !h.left;
@@ -245,11 +247,14 @@ export function opdCreatePanel(opts) {
         renderer: refs.renderer,
         conflictBox: refs.conflict,
         onHome,
-        boot: (canvas, page, webgl, dark) => {
+        boot: (canvas, page, webgl, systemDark, kept) => {
           const r = canvas.getBoundingClientRect();
           return engine.start(canvas, page.text, seed[0], seed[1], mac, webgl,
-            r.width, r.height, env.devicePixelRatio(), dark);
+            r.width, r.height, env.devicePixelRatio(), systemDark, kept);
         },
+        appearance,
+        hostTheme,
+        onAppearance: (a) => { if (live() && onAppearance) onAppearance(a); },
         transport: { fetchPage, put, revision },
         firstPage: canvasPage(v),
         forceWebgl: false,
@@ -269,6 +274,8 @@ export function opdCreatePanel(opts) {
     // Leaving: whatever is left to save is saved first (see Session.drain).
     h.drain = async () => (h.mounted && !h.left ? h.mounted.drain() : 'clean');
     h.resume = () => { if (h.mounted && !h.left) h.mounted.resume(); };
+    // The host's theme changed (the OS fallback where the browser can't report it).
+    h.hostThemeChanged = () => { if (h.mounted && !h.left) h.mounted.hostThemeChanged(); };
     // For good: the mount is undone and the server told this editor is gone. Saves nothing.
     h.dispose = async () => {
       if (h.left) return;

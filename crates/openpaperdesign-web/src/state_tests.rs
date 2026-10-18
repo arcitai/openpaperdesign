@@ -1692,15 +1692,73 @@ fn the_top_bar_keeps_the_file_name_and_its_controls_apart_at_every_width() {
     }
 }
 
+/// Click the painted text `label` (hovered first, so a submenu opens), then lay out twice.
+fn click_label(s: &mut WebState, label: &str, t: f64) {
+    let text = painted_text(s);
+    let (_, r) = text
+        .iter()
+        .find(|(x, _)| x.trim() == label)
+        .unwrap_or_else(|| panic!("{label:?} not painted: {text:?}"));
+    let p = r.center();
+    s.pointer_move(p.x as f64, p.y as f64, t);
+    step(s);
+    click(s, (p.x as f64, p.y as f64), t + 5.0);
+    step(s);
+    step(s);
+}
+
 #[test]
-fn the_page_s_appearance_switches_upstream_s_style_and_keeps_the_document_and_a_draft() {
-    // Light until the page says otherwise (egui's light fallback: a page reports no system
-    // theme); the page's dark and light then pick upstream's two styles. Presentation only.
+fn menu_appearance_switches_the_chrome_and_the_canvas_and_is_reported_once() {
+    let mut s = state();
+    let authored = page_to_json(&s.ed.page_data(0));
+    assert_eq!(s.appearance(), "system");
+    click_label(&mut s, "Menu", 100.0);
+    click_label(&mut s, "Appearance", 200.0);
+    click_label(&mut s, "Dark", 300.0);
+    assert_eq!(s.appearance(), "dark");
+    assert_eq!(s.take_request(), Some(HostRequest::Appearance));
+    assert_eq!(s.take_request(), None, "reported once");
+    settle(&mut s, 400.0);
+    assert!(s.dark() && s.ctx.global_style().visuals.dark_mode);
+    // The canvas is shown with the same resolved appearance (what `Painter::paint` picks):
+    // a dark work surface; an export still draws the document as authored.
+    let display = scene::Display::for_theme(s.ctx.theme());
+    assert_eq!(display, scene::Display::Dark);
+    let mut cache = SceneCache::default();
+    cache.set_display(display);
+    let f = scene::canvas(&s.ed, &mut cache, V2::ZERO, true);
+    assert_eq!(
+        f.under[0].mesh.vertices[0].color,
+        scene::rgba(scene::CANVAS_BG_DARK)
+    );
+    // Presentation only.
+    assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
+    assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
+    // Back to System, through the same menu.
+    click_label(&mut s, "Menu", 500.0);
+    click_label(&mut s, "Appearance", 600.0);
+    click_label(&mut s, "System", 700.0);
+    assert_eq!(s.appearance(), "system");
+    assert_eq!(s.take_request(), Some(HostRequest::Appearance));
+    settle(&mut s, 800.0);
+    assert!(
+        !s.dark(),
+        "System with no OS report is light (egui's light fallback)"
+    );
+}
+
+#[test]
+fn the_appearance_follows_the_os_unless_chosen_and_keeps_the_document_and_a_draft() {
+    // Light until the page reports a dark OS (egui's light fallback); System follows the OS
+    // live; an explicit Light or Dark wins. Presentation only.
     let mut s = state();
     let dark = |s: &WebState| s.ctx.global_style().visuals.dark_mode;
-    assert!(!dark(&s));
-    s.set_dark(false);
-    assert!(!s.redraw, "the same appearance asks for no frame");
+    assert!(!dark(&s) && !s.dark());
+    s.set_system_dark(false);
+    assert!(s.redraw, "the first OS report is drawn");
+    step(&mut s);
+    s.set_system_dark(false);
+    assert!(!s.redraw, "the same OS appearance asks for no frame");
     // A number draft in the inspector ("-" before a negative X).
     click_at(&mut s, 150.0, 150.0, 100.0);
     step(&mut s);
@@ -1722,12 +1780,30 @@ fn the_page_s_appearance_switches_upstream_s_style_and_keeps_the_document_and_a_
     s.paste("-");
     step(&mut s);
     let (stamp, revision, dirty) = (s.ed.doc_stamp, s.ed.revision, s.dirty());
-    for want in [true, false, true] {
-        s.set_dark(want);
-        assert!(s.redraw, "{want}: a change of appearance is drawn");
+    let authored = page_to_json(&s.ed.page_data(0));
+    // (OS dark?, kept preference or none, shown dark?)
+    for (os, pref, want) in [
+        (true, None, true),
+        (true, Some("light"), false),
+        (false, Some("dark"), true),
+        (false, Some("system"), false),
+        (true, None, true),
+    ] {
+        s.set_system_dark(os);
+        if let Some(p) = pref {
+            assert!(s.set_appearance(p));
+        }
+        assert!(s.redraw, "{os} {pref:?}: a change of appearance is drawn");
         step(&mut s);
         step(&mut s);
-        assert_eq!(dark(&s), want);
+        assert_eq!(dark(&s), want, "{os} {pref:?}");
+        assert_eq!(s.dark(), want);
+        assert_eq!(
+            s.take_request(),
+            None,
+            "a kept preference isn't reported back"
+        );
+        assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
         assert!(paints(&mut s, "-"), "{want}: the draft is still shown");
         assert!(
             s.field_has_keyboard() && s.unsaved_work() && !s.can_reload(),

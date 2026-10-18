@@ -69,12 +69,16 @@ impl Painter {
     ) {
         let ppp = layout.output.pixels_per_point;
         let offset = v2(layout.canvas.min.x as f64, layout.canvas.min.y as f64);
+        // The canvas follows the chrome's resolved appearance (egui's theme): a dark window
+        // gets a dark work surface and display-adapted drawing colours (`scene::Display`).
+        let display = scene::Display::for_theme(ctx.theme());
+        self.cache.set_display(display);
         let frame = scene::canvas(ed, &mut self.cache, offset, show_grid);
         let mut enc = device.create_command_encoder(&Default::default());
         let bg = if self.transparent {
             [0.0; 4]
         } else {
-            scene::CANVAS_BG.to_f32(1.0)
+            display.background().to_f32(1.0)
         };
         self.canvas.render(
             device,

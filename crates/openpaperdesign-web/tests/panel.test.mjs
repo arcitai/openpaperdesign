@@ -36,7 +36,7 @@ const flush = async () => { for (let i = 0; i < 8; i++) await new Promise((r) =>
 test('the assembled module links, imports nothing and is safe inside the view\'s script element', async () => {
   // opdStatusDisplay: the home view's editor uses the editor's own rule for how its statuses
   // show (and keeps an unresolved save failure shown); the browser page uses opdStatusNote.
-  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'opdStatusDisplay', 'opdStatusNote', 'opdStatusKind', 'opdQuietStatus', 'opdThemeDark', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
+  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'opdStatusDisplay', 'opdStatusNote', 'opdStatusKind', 'opdQuietStatus', 'opdSystemDark', 'opdResolveDark', 'opdAppearance', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
     assert.equal(typeof mod[name], 'function', name);
   }
   assert.equal(typeof mod.default, 'function', 'the glue\'s own init (__wbg_init)');
@@ -181,12 +181,17 @@ function fakeEnv() {
 function fakeEngine() {
   const eng = { inits: [], editors: [] };
   eng.init = async (bytes) => { eng.inits.push(bytes); };
-  eng.start = async (canvas, text, seedHi, seedLo, mac, webgl, width, height, dpr, dark) => {
+  eng.start = async (canvas, text, seedHi, seedLo, mac, webgl, width, height, dpr, systemDark, appearance) => {
     // The real editor's page-facing API (web.rs); the workspace itself draws in the canvas.
-    // `startDark`: the appearance it was started in; `themes`: each `set_dark` since.
-    const ed = { canvas, text, mac, webgl, startDark: dark, themes: [], calls: [], pending: undefined, isReady: false, freed: false, canReload: true,
+    // Appearance: what it was started with (`startSystem`, `startAppearance`), then each
+    // `set_system_dark` (`systems`) and `set_appearance` (`kept`) since; `pref` is what its
+    // menu shows (a test sets it, then asks for an 'appearance' request).
+    const ed = { canvas, text, mac, webgl, startSystem: systemDark, startAppearance: appearance, systems: [], kept: [],
+      pref: appearance, calls: [], pending: undefined, isReady: false, freed: false, canReload: true,
       requests: [], downloads: [], clip: undefined,
-      set_dark(d) { this.themes.push(d); },
+      set_system_dark(d) { this.systems.push(d); },
+      set_appearance(a) { this.kept.push(a); this.pref = a; return true; },
+      appearance() { return this.pref; },
       backend() { return 'mock (test)'; }, frame() {}, gpu_error() { return undefined; }, ready() { return this.isReady; },
       tool() { return 'select'; }, resize() {}, modifiers() {}, focus(f) { this.calls.push('focus:' + f); },
       pointer_down() { this.calls.push('down'); }, pointer_move() {}, pointer_up() { this.calls.push('up'); }, pointer_leave() {}, wheel() {},
@@ -547,94 +552,122 @@ test('the mount\'s resize callback resizes the editor and draws it again before 
   assert.equal(observer.disconnected, true);
 });
 
-// ---- appearance: the page's theme reaches the real mount's editor, and follows it ----
-// The page's two sources as the mount sees them: its root element's data-theme (the home view
-// sets it from the host's theme) and the browser's colour-scheme query. Stand-ins for both;
-// what is checked is which appearance each editor is given and when, not pixels.
+// ---- appearance: the real mount gives each editor the OS appearance and the kept preference,
+// follows the OS live, and hands a menu choice to the view to keep ----
+// The browser's colour-scheme query and the host's theme are stand-ins; what is checked is
+// what each editor is given and when, and what the view is asked to keep, not pixels.
 
-function themed(t, prefersDark) {
-  const root = fakeEl(t.doc, 'html');
-  t.doc.documentElement = root;
-  const media = Object.assign(fakeEl(t.doc, 'media'), { matches: prefersDark });
+function scheme(t, matches) {
+  const media = Object.assign(fakeEl(t.doc, 'media'), { matches });
   t.env.colorScheme = () => media;
-  const observers = [];
-  t.env.MutationObserver = class {
-    constructor(cb) { this.cb = cb; observers.push(this); }
-    observe(target, o) { this.target = target; this.opts = o; }
-    disconnect() { this.disconnected = true; }
-  };
-  return { root, media, observers };
+  return media;
 }
 
-test('the editor starts in the page\'s appearance and follows the host\'s theme, else the browser\'s; nothing after disposal', async () => {
+test('the resolution rule: the browser\'s colour-scheme first, the host\'s theme only without it, explicit modes win', () => {
+  assert.equal(mod.opdSystemDark({ matches: true }, 'light'), true, 'the OS signal wins over the host');
+  assert.equal(mod.opdSystemDark({ matches: false }, 'dark'), false);
+  assert.equal(mod.opdSystemDark(null, 'dark'), true, 'the host only where the browser can\'t say');
+  assert.equal(mod.opdSystemDark({}, 'light'), false);
+  assert.equal(mod.opdSystemDark(null, 'sepia'), null);
+  assert.equal(mod.opdResolveDark('system', true), true);
+  assert.equal(mod.opdResolveDark('system', null), false, 'no signal at all: light');
+  assert.equal(mod.opdResolveDark('light', true), false, 'Light overrides a dark OS');
+  assert.equal(mod.opdResolveDark('dark', false), true, 'Dark overrides a light OS');
+  for (const bad of [undefined, null, '', 'Dark', 'auto', 5, {}]) assert.equal(mod.opdAppearance(bad), 'system', String(bad));
+});
+
+test('the editor starts in the kept appearance and the OS one, follows the OS live, and a menu choice is kept by the view; nothing after disposal', async () => {
   const t = setup();
-  const { root, media, observers } = themed(t, true);
-  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {} });
+  const media = scheme(t, true);
+  let host = 'light';
+  const chosen = [];
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {},
+    appearance: 'light', hostTheme: () => host, onAppearance: (a) => chosen.push(a) });
   assert.equal(await h.started, 'mounted');
   const ed = t.engine.editors.at(-1);
-  assert.equal(ed.startDark, true, 'no theme named: the browser prefers dark, from the first frame');
-  assert.deepEqual(ed.themes, [true]);
-  assert.equal(observers.length, 1);
-  assert.equal(observers[0].target, root);
-  assert.deepEqual(observers[0].opts.attributeFilter, ['data-theme']);
+  assert.equal(ed.startSystem, true, 'the browser\'s dark OS, from the first frame (not the host\'s light)');
+  assert.equal(ed.startAppearance, 'light', 'the kept preference, from the first frame');
+  assert.deepEqual([ed.systems, ed.kept], [[true], ['light']], 'given again once booted');
   ed.isReady = true;
   t.env.frame(16);
   await flush();
-  const changed = () => observers[0].cb([]);
-  // The host names light: it wins over the browser's preference, then and later.
-  root.setAttribute('data-theme', 'light');
-  changed();
-  assert.equal(ed.themes.at(-1), false);
+  // The OS changes: told live. The host's theme doesn't matter while the browser can say.
   media.matches = false;
   media.fire('change');
-  media.matches = true;
-  media.fire('change');
-  assert.equal(ed.themes.at(-1), false, 'the host\'s theme still wins');
-  root.setAttribute('data-theme', 'dark');
-  changed();
-  assert.equal(ed.themes.at(-1), true);
-  // No theme named any more: the browser's preference again.
-  delete root.attrs['data-theme'];
-  media.matches = false;
-  changed();
-  assert.equal(ed.themes.at(-1), false);
-  // Presentation only: nothing was saved, reloaded or asked for.
+  assert.equal(ed.systems.at(-1), false);
+  host = 'dark';
+  h.hostThemeChanged();
+  assert.equal(ed.systems.at(-1), false, 'the browser\'s signal still wins');
+  // Menu ▸ Appearance ▸ Dark in the editor: the view is asked to keep it, once.
+  ed.pref = 'dark';
+  ed.requests.push('appearance');
+  t.env.frame(32);
+  assert.deepEqual(chosen, ['dark']);
+  assert.equal(h.mounted.appearance, 'dark');
+  // An unknown answer is kept as System, never passed on as it is.
+  ed.pref = 'sepia';
+  ed.requests.push('appearance');
+  t.env.frame(48);
+  assert.deepEqual(chosen, ['dark', 'system']);
+  // Presentation only: nothing was saved, reloaded or released.
   t.env.every(300);
   await flush();
   assert.equal(t.srv.named(T.SAVE).length, 0);
+  assert.equal(t.srv.named(T.RELEASE).length, 0);
   assert.ok(!ed.calls.some((c) => c.startsWith('reload')));
-  // Disposal: the listener and the observer go; nothing reaches the freed editor.
+  // Disposal: the listener goes; nothing reaches the freed editor, nothing more is kept.
   await h.dispose();
-  const told = ed.themes.length;
+  const told = ed.systems.length;
+  media.matches = true;
   media.fire('change');
-  changed();
-  assert.equal(ed.themes.length, told);
+  h.hostThemeChanged();
+  assert.equal(ed.systems.length, told);
   assert.equal(media.listeners.length, 0, 'the colour-scheme listener is removed');
-  assert.equal(observers[0].disconnected, true);
   assert.equal(ed.freed, true);
+  assert.deepEqual(chosen, ['dark', 'system']);
 });
 
-test('a theme change during a WebGL fallback reaches only the new editor, which boots in it', async () => {
+test('without a browser signal the host\'s theme stands in, and changes with it', async () => {
   const t = setup();
-  const { root, observers } = themed(t, false);
-  root.setAttribute('data-theme', 'dark');
-  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {} });
+  let host = 'dark';
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {}, hostTheme: () => host });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors.at(-1);
+  assert.equal(ed.startSystem, true);
+  assert.equal(ed.startAppearance, 'system', 'no kept preference: System');
+  host = 'light';
+  h.hostThemeChanged();
+  assert.equal(ed.systems.at(-1), false);
+  host = undefined;
+  const n = ed.systems.length;
+  h.hostThemeChanged();
+  assert.equal(ed.systems.length, n, 'no signal at all: nothing is claimed');
+  await h.dispose();
+});
+
+test('an appearance chosen before a WebGL fallback is what the new editor boots in; the editor being replaced is not told', async () => {
+  const t = setup();
+  const media = scheme(t, false);
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {}, appearance: 'system' });
   assert.equal(await h.started, 'mounted');
   const first = t.engine.editors.at(-1);
-  assert.equal(first.startDark, true);
+  first.pref = 'dark';
+  first.requests.push('appearance');
+  t.env.frame(8);
+  assert.equal(h.mounted.appearance, 'dark');
   // WebGPU fails before Ready: the session switches to a fresh WebGL editor.
   first.gpu_error = () => 'WebGPU device lost';
   t.env.frame(16);
-  root.setAttribute('data-theme', 'light');
-  observers[0].cb([]);
-  assert.deepEqual(first.themes, [true], 'the editor being replaced is not told');
+  media.matches = true;
+  media.fire('change');
+  assert.deepEqual(first.systems, [false], 'the editor being replaced is not told');
   await flush();
   const second = t.engine.editors.at(-1);
   assert.notEqual(second, first);
   assert.equal(second.webgl, true);
   assert.equal(first.freed, true);
-  assert.equal(second.startDark, false, 'the fallback boots in the appearance the page has now');
-  assert.deepEqual(second.themes, [false]);
+  assert.equal(second.startSystem, true, 'the OS appearance the page has now');
+  assert.equal(second.startAppearance, 'dark', 'the choice made before the fallback');
   await h.dispose();
 });
 

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.53 · Updated: 2026-10-18
+Revision: 0.54 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -78,9 +78,24 @@ engine architecture is `analysis/DESIGN.md`.
     - The native ordinary layout looks different too: the new palette and spacing, the
       quieter top bar with undo/redo buttons, and (where there is no native menu bar, i.e. not
       macOS) one Menu button in place of the inline menu titles. Shortcuts, menu entries,
-      commands and editing semantics are unchanged. Native windows still follow the system
-      appearance through egui-winit; the browser host sets it (`WebState::set_dark`).
-      Upstreamable as presentation.
+      commands and editing semantics are unchanged. Upstreamable as presentation.
+  - Appearance, System/Light/Dark (owner-admitted 2026-10-18; semantics in root `DESIGN.md`):
+    - `src/ui/mod.rs`: `UiState::appearance` (egui's `ThemePreference`, default System),
+      applied by `draw` with egui's `Context::set_theme`. Menu ▸ Appearance sets it. Native
+      default unchanged: System is what `theme::apply` already set, and native macOS (no egui
+      Menu) keeps it and follows the OS through egui-winit.
+    - `src/render/scene.rs` / `frame.rs`: `scene::Display` (Light = the document as authored;
+      Dark = a dark work surface and grid, plus display-adapted fill, gradient-stop, stroke
+      and glyph colours: OKLab lightness mirrored, hue/chroma/alpha kept, images never
+      adapted). It is held by `SceneCache` (a change drops cached meshes). `Painter::paint`
+      picks it from the egui context's resolved theme.
+    - Exports and `SceneCache::default()` stay Light. Nothing writes the document.
+    - Native windows in a dark OS appearance now get the dark canvas too (before, dark chrome
+      around a light canvas). Upstreamable as presentation.
+    - The browser host feeds the OS appearance as egui's raw-input `system_theme`
+      (`WebState::set_system_dark`), applies a kept preference (`set_appearance`) and reports
+      a menu choice (`HostRequest::Appearance`). The app library keeps it through
+      `openpaperdesign_app_appearance` in `library/v1/appearance`, and its list reports it.
   - `src/ui/mod.rs` (R25-F3): an opt-in narrow layout, `UiState::narrow` (`NarrowLayout`,
     `NarrowPanel`). Off by default (`below` 0), so every native window lays out exactly as
     before. The browser host turns it on below 1024 CSS px (it was 720 until the UI/UX pass),
@@ -212,7 +227,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-7.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-8.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -234,9 +249,11 @@ the whole canvas and its in-panel editor reads and saves through `_app_canvas*`;
 the file name and the way back in upstream's own top bar, and which calls `_app_rename` and
 exports by `id`; `home-7` (2026-10-18 source candidate) is the quieter workspace of DESIGN.md
 (one calm surface, grouped top bar, docked panels on medium surfaces) whose in-panel editor
-follows the view's light or dark appearance (the renderer's `start` takes it, `set_dark`
-follows it). A view a host already cached under an earlier key is not evicted or refreshed
-by this.
+follows the view's light or dark appearance; `home-8` (2026-10-18 source candidate) is one
+System/Light/Dark appearance across the view, the editor's chrome and its canvas display (the
+renderer's `start` takes the OS appearance and the kept preference; the view keeps a menu
+choice with `openpaperdesign_app_appearance`). A view a host already cached under an earlier
+key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
 embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.

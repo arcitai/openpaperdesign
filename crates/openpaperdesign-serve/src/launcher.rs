@@ -96,9 +96,11 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// mount the editor in the view itself, filling it, with the file name and the way back in the
 /// upstream workspace's own top bar; `home-7` is the quieter workspace (one calm surface,
 /// grouped top bar, docked panels on medium surfaces; DESIGN.md) whose in-panel editor follows
-/// the view's light or dark appearance (its renderer's `start` takes it and `set_dark` follows
-/// it). No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-7.html";
+/// the view's light or dark appearance; `home-8` is one System/Light/Dark appearance across the
+/// view, the editor's chrome and its canvas display (the renderer's `start` takes the OS
+/// appearance and the kept preference, the editor reports a new choice, and the view keeps it
+/// with `_app_appearance`, its list reporting it). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-8.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

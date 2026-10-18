@@ -113,17 +113,31 @@ export function opdStatusNote(live, note, timers) {
   };
 }
 
+/** The appearance preferences: System follows the OS appearance; Light and Dark override it. */
+export const OPD_APPEARANCES = Object.freeze(['system', 'light', 'dark']);
+
+/** A kept appearance preference, or 'system' for anything that isn't one (a missing or bad value). */
+export function opdAppearance(value) {
+  return OPD_APPEARANCES.includes(value) ? value : 'system';
+}
+
 /**
- * Whether the workspace is drawn dark: the host page's own appearance when its root element
- * names one (`data-theme="dark"` or `"light"`; the home view sets it from its host's theme),
- * else the browser's colour-scheme preference (`media`, a `(prefers-color-scheme: dark)`
- * MediaQueryList), else light. Presentation only.
+ * Whether the OS appearance is dark: the browser's colour-scheme preference (`media`, a
+ * `(prefers-color-scheme: dark)` MediaQueryList), else, only where the browser can't say, the
+ * host's theme (`hostTheme`, 'dark' or 'light'). `null` when neither says. Presentation only.
  */
-export function opdThemeDark(root, media) {
-  const named = root && typeof root.getAttribute === 'function' ? root.getAttribute('data-theme') : null;
-  if (named === 'dark') return true;
-  if (named === 'light') return false;
-  return Boolean(media && media.matches);
+export function opdSystemDark(media, hostTheme) {
+  if (media && typeof media.matches === 'boolean') return media.matches;
+  if (hostTheme === 'dark') return true;
+  if (hostTheme === 'light') return false;
+  return null;
+}
+
+/** Whether `appearance` shows dark with the OS appearance `systemDark` (see opdSystemDark). */
+export function opdResolveDark(appearance, systemDark) {
+  const a = opdAppearance(appearance);
+  if (a !== 'system') return a === 'dark';
+  return systemDark === true;
 }
 
 /** The browser environment the mount uses (timers, frames, observers, downloads, clipboard). */
@@ -134,10 +148,9 @@ export function opdBrowserEnv(win) {
     requestAnimationFrame: (fn) => win.requestAnimationFrame(fn),
     cancelAnimationFrame: (id) => win.cancelAnimationFrame(id),
     ResizeObserver: win.ResizeObserver,
-    MutationObserver: win.MutationObserver,
     AbortController: win.AbortController,
     devicePixelRatio: () => win.devicePixelRatio,
-    // The browser's dark colour-scheme query, if this page can ask (see opdThemeDark).
+    // The browser's dark colour-scheme query, if this page can ask (see opdSystemDark).
     colorScheme: () => (typeof win.matchMedia === 'function' ? win.matchMedia('(prefers-color-scheme: dark)') : null),
     // A browser download of `bytes`, if this page may start one; never says a file was saved.
     download: (name, mime, bytes) => {
@@ -177,7 +190,12 @@ export function opdIsMac(nav) {
  *   lib: { Session, frameStep, saveStep, discardStep },
  *   canvas,                          the canvas element (inside the editor's own root)
  *   status(text, error), renderer(text, error), conflictBox
- *   boot(canvas, page, webgl, dark) -> Promise<editor>   dark: the page's appearance now
+ *   boot(canvas, page, webgl, systemDark, appearance) -> Promise<editor>
+ *                                    the OS appearance now (true, false or null) and the kept
+ *                                    preference ('system', 'light' or 'dark')
+ *   appearance                       the kept preference to start with (default 'system')
+ *   hostTheme()                      the host's theme, the OS fallback (see opdSystemDark)
+ *   onAppearance(appearance)         the person chose another one (Menu ▸ Appearance): keep it
  *   transport: { fetchPage(), put(snapshot, revision), revision() }
  *   firstPage: { text, revision }, forceWebgl, state
  *   onReady(session)                 the renderer is Ready (once per mount)
@@ -186,8 +204,10 @@ export function opdIsMac(nav) {
  *                                    status line says where that is
  *   log(message), env                (see opdBrowserEnv)
  * }
- * Returns { session, started, drain(), resume(), dispose() }. `started` settles once the
- * renderer has booted (or failed); Ready comes later, from the frame loop.
+ * Returns { session, started, drain(), resume(), dispose(), hostThemeChanged(), appearance }.
+ * `started` settles once the renderer has booted (or failed); Ready comes later, from the frame
+ * loop. `hostThemeChanged()`: the host's theme changed (it matters only where the browser can't
+ * report the OS appearance).
  */
 export function opdMountEditor(opts) {
   const { lib, transport, env } = opts;
@@ -203,11 +223,15 @@ export function opdMountEditor(opts) {
   const on = (el, type, fn, o = {}) => el.addEventListener(type, fn, Object.assign({}, o, { signal }));
 
   const session = new lib.Session({
-    // Each editor (the first, and a WebGL fallback's) starts in the page's appearance, and is
-    // given it again once booted: a change while it booted is not lost (see `theme` below).
+    // Each editor (the first, and a WebGL fallback's) starts in the current appearance, and is
+    // given it again once booted: a change while it booted is not lost (see `appearance` below).
     boot: async (canvas, page, webgl) => {
-      const ed = await opts.boot(canvas, page, webgl, dark());
-      if (!disposed) ed.set_dark(dark());
+      const ed = await opts.boot(canvas, page, webgl, systemDark(), appearance);
+      if (!disposed) {
+        const d = systemDark();
+        if (d !== null) ed.set_system_dark(d);
+        ed.set_appearance(appearance);
+      }
       return ed;
     },
     fetchPage: transport.fetchPage,
@@ -318,21 +342,21 @@ export function opdMountEditor(opts) {
     });
   }
 
-  // ---- appearance (presentation only): the workspace is light or dark as the page is (see
-  // opdThemeDark), and follows it when the host's theme or the browser's preference changes.
-  // Only the editor shown now is told (not one being replaced by a fallback, which boots in
-  // the current appearance); the listener and observer go with the mount. Nothing here reaches
-  // the canvas, its saves or its binding.
-  const root = doc ? doc.documentElement : null;
+  // ---- appearance (presentation only). The editor resolves it itself, with egui's own theme
+  // preference: the kept preference (System, Light or Dark) and the OS appearance it follows
+  // in System (opdSystemDark: the browser's colour-scheme, else the host's theme). The
+  // browser's changes are followed live; only the editor shown now is told (not one being
+  // replaced by a fallback, which boots in the current appearance). The listener goes with the
+  // mount. Nothing here reaches the canvas, its saves or its binding.
+  let appearance = opdAppearance(opts.appearance);
   const media = env.colorScheme ? env.colorScheme() : null;
-  const dark = () => opdThemeDark(root, media);
-  const theme = () => { if (!disposed) session.withEditor((ed) => ed.set_dark(dark())); };
-  if (media && typeof media.addEventListener === 'function') on(media, 'change', theme);
-  let themeObserver = null;
-  if (root && env.MutationObserver) {
-    themeObserver = new env.MutationObserver(theme);
-    themeObserver.observe(root, { attributes: true, attributeFilter: ['data-theme'] });
-  }
+  const systemDark = () => opdSystemDark(media, opts.hostTheme ? opts.hostTheme() : null);
+  const system = () => {
+    if (disposed) return;
+    const d = systemDark();
+    if (d !== null) session.withEditor((ed) => ed.set_system_dark(d));
+  };
+  if (media && typeof media.addEventListener === 'function') on(media, 'change', system);
 
   // ---- what the editor asks the page for, after each frame
   const afterFrame = () => session.withEditor((ed) => {
@@ -342,6 +366,10 @@ export function opdMountEditor(opts) {
       else if (r === 'home') {
         if (opts.onHome) opts.onHome();
         else opts.status(OPD_NO_HOME);
+      } else if (r === 'appearance') {
+        // Menu ▸ Appearance: a view preference, kept by the host where it can keep one.
+        appearance = opdAppearance(ed.appearance());
+        if (opts.onAppearance) opts.onAppearance(appearance);
       }
     }
     for (let d = ed.take_download(); d !== undefined && d !== null; d = ed.take_download()) {
@@ -437,7 +465,6 @@ export function opdMountEditor(opts) {
     if (disposed) return;
     disposed = true;
     abort.abort();
-    if (themeObserver) { themeObserver.disconnect(); themeObserver = null; }
     for (const t of timers) env.clearInterval(t);
     timers.length = 0;
     if (raf) env.cancelAnimationFrame(raf);
@@ -460,6 +487,8 @@ export function opdMountEditor(opts) {
     drain: () => session.drain(),
     resume: () => session.resume(),
     dispose,
+    hostThemeChanged: system,
+    get appearance() { return appearance; },
     get disposed() { return disposed; },
   };
 }

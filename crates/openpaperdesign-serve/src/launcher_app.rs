@@ -47,6 +47,9 @@ pub(super) const CLOSE: &str = "openpaperdesign_app_close";
 pub(super) const IMPORT: &str = "openpaperdesign_app_import";
 pub(super) const EXPORT: &str = "openpaperdesign_app_export";
 pub(super) const RENAME: &str = "openpaperdesign_app_rename";
+/// The views' appearance preference (System, Light or Dark), kept in the library's own data
+/// folder; the list reports it. A view preference: no canvas, lease or binding is involved.
+pub(super) const APPEARANCE: &str = "openpaperdesign_app_appearance";
 // The in-panel editor's transport (the home view's own editor, see `panel_call`).
 pub(super) const ASSET: &str = "openpaperdesign_app_editor_asset";
 pub(super) const PAGE: &str = "openpaperdesign_app_page";
@@ -70,7 +73,7 @@ pub(super) const PANEL_TOOLS: [&str; 9] = [
     CANVAS_REVISION,
     CANVAS_SAVE,
 ];
-pub(super) const TOOLS: [&str; 17] = [
+pub(super) const TOOLS: [&str; 18] = [
     LIST,
     CREATE,
     OPEN,
@@ -79,6 +82,7 @@ pub(super) const TOOLS: [&str; 17] = [
     IMPORT,
     EXPORT,
     RENAME,
+    APPEARANCE,
     ASSET,
     PAGE,
     REVISION,
@@ -288,7 +292,14 @@ fn tools() -> Vec<Value> {
     vec![
         json!({"name": LIST, "_meta": app, "inputSchema": none,
             "description": "For the home view: the canvases in OpenPaperDesign's app library \
-                (read-only: nothing is created, opened or locked)."}),
+                (read-only: nothing is created, opened or locked), and the views' kept \
+                appearance."}),
+        json!({"name": APPEARANCE, "_meta": app,
+            "description": "For the home view: keep the views' appearance (system follows the \
+                OS; light or dark override it). A view preference in the library's own folder: \
+                no canvas is read or changed.",
+            "inputSchema": doc(json!({"appearance": {"type": "string",
+                "enum": crate::library::APPEARANCES}}), &["appearance"])}),
         json!({"name": CREATE, "_meta": app,
             "description": "For the home view: create a new, empty canvas in the app library \
                 and open it in the editor. No design system or direction is applied.",
@@ -481,6 +492,7 @@ impl Launcher {
             EDITOR => (&["binding"], &["panel"]),
             EXPORT => (&["binding", "id"], &[]),
             RENAME => (&["id", "name"], &[]),
+            APPEARANCE => (&["appearance"], &[]),
             CLOSE => (&["binding"], &["force"]),
             IMPORT => (&["payload", "replace"], &["force", "panel"]),
             _ => (&[], &[]),
@@ -508,7 +520,18 @@ impl Launcher {
                 let state = self.state.lock().await;
                 let open = state.bound.as_ref().and_then(|b| b.doc.clone());
                 drop(state);
-                text(lib.list(open.as_deref())?)
+                let mut listed = lib.list(open.as_deref())?;
+                // Read-only too: a missing or unknown preference is System, and nothing is made.
+                listed["appearance"] = json!(lib.appearance());
+                text(listed)
+            }
+            APPEARANCE => {
+                let kept = lib.set_appearance(get("appearance").unwrap_or(""))?;
+                text(json!({
+                    "appearance": kept,
+                    "note": "Kept as this library's appearance (a view preference). No canvas \
+                        was read or changed.",
+                }))
             }
             CREATE => {
                 let name = canvas_name(get("name"))?;

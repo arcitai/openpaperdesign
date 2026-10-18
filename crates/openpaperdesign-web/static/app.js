@@ -6,13 +6,16 @@
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
 import { discardStep, frameStep, saveStep } from './page.js';
-import { opdBrowserEnv, opdIsMac, opdMountEditor, opdStatusNote } from './editor.js';
+import {
+  opdBrowserEnv, opdIsMac, opdMountEditor, opdResolveDark, opdStatusNote, opdSystemDark,
+} from './editor.js';
 
 // State for people and for automated checks (read-only from outside).
 const state = {};
 window.__opd = state;
 
 const $ = (id) => document.getElementById(id);
+const scheme = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null;
 // Every status goes to the live region (assistive technology, checks). Stable healthy ones
 // (Ready, Saved, Saving…) show nothing; loading shows as a small note until the next state; a
 // save failure or conflict stays shown through the retries until a save is acknowledged (or
@@ -77,10 +80,19 @@ async function main() {
     status,
     renderer,
     conflictBox: $('conflict'),
-    boot: (canvas, page, webgl, dark) => {
+    // Appearance: System (the browser's colour-scheme, live) unless Menu ▸ Appearance chooses
+    // Light or Dark. This standalone page has no store that outlives it (its origin's port
+    // changes per launch), so a choice lasts while it is open; the page around the workspace
+    // follows the editor's resolved appearance.
+    boot: (canvas, page, webgl, systemDark, appearance) => {
       const r = canvas.getBoundingClientRect();
       return start(canvas, page.text, seed[0], seed[1], opdIsMac(navigator), webgl,
-        r.width, r.height, devicePixelRatio, dark);
+        r.width, r.height, devicePixelRatio, systemDark, appearance);
+    },
+    onAppearance: (appearance) => {
+      const dark = opdResolveDark(appearance, opdSystemDark(scheme, null));
+      if (appearance === 'system') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
     },
     transport: {
       fetchPage: fetchCanvas,

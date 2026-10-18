@@ -70,8 +70,10 @@ fn install_panic_hook() {
 }
 
 /// Open `canvas_json` (the whole canvas as the server sends it: every page, the page list and
-/// the active page, see `WebState::open`) on `canvas`, in the page's appearance (`dark`, see
-/// `WebState::set_dark`) from the first frame on.
+/// the active page, see `WebState::open`) on `canvas`, shown in the person's appearance from
+/// the first frame on: `appearance` is the kept preference (`system`, `light` or `dark`; any
+/// other value is System) and `system_dark` the OS appearance, if the page can tell (see
+/// `WebState::set_appearance` and `WebState::set_system_dark`).
 ///
 /// `seed` comes from `crypto.getRandomValues`: fastrand has no entropy source on
 /// wasm32-unknown-unknown and would otherwise start from a fixed seed, so ids made with
@@ -88,12 +90,16 @@ pub async fn start(
     css_width: f64,
     css_height: f64,
     dpr: f64,
-    dark: bool,
+    system_dark: Option<bool>,
+    appearance: String,
 ) -> Result<WebEditor, JsError> {
     install_panic_hook();
     fastrand::seed(((seed_hi as u64) << 32) | seed_lo as u64);
     let mut state = WebState::open(&canvas_json, mac, css_width, css_height).map_err(js_err)?;
-    state.set_dark(dark);
+    if let Some(dark) = system_dark {
+        state.set_system_dark(dark);
+    }
+    state.set_appearance(&appearance);
 
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = if force_webgl {
@@ -299,9 +305,25 @@ impl WebEditor {
         self.health.lock().unwrap().presented();
     }
 
-    /// The page's appearance changed (see `WebState::set_dark`); drawn on the next frame.
-    pub fn set_dark(&mut self, dark: bool) {
-        self.state.set_dark(dark);
+    /// The OS appearance changed (see `WebState::set_system_dark`); drawn on the next frame.
+    pub fn set_system_dark(&mut self, dark: bool) {
+        self.state.set_system_dark(dark);
+    }
+
+    /// Apply a kept appearance preference; false (and nothing changed) for an unknown one.
+    pub fn set_appearance(&mut self, name: &str) -> bool {
+        self.state.set_appearance(name)
+    }
+
+    /// The appearance preference now (`system`, `light` or `dark`), after an `appearance`
+    /// request.
+    pub fn appearance(&self) -> String {
+        self.state.appearance().to_string()
+    }
+
+    /// Whether the workspace is shown dark now.
+    pub fn dark(&self) -> bool {
+        self.state.dark()
     }
 
     pub fn modifiers(&mut self, shift: bool, ctrl: bool, alt: bool, meta: bool) {
@@ -368,7 +390,7 @@ impl WebEditor {
         self.state.cursor().to_string()
     }
 
-    /// The next host request ("save" or "home"), if any.
+    /// The next host request ("save", "home" or "appearance"), if any.
     pub fn take_request(&mut self) -> Option<String> {
         self.state.take_request().map(|r| r.name().to_string())
     }

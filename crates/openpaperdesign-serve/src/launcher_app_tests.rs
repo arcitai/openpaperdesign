@@ -283,6 +283,70 @@ async fn library_create_edit_save_close_and_reopen_without_metadata() {
     task2.abort();
 }
 
+/// The views' appearance is a library preference: the list reports System until one is kept
+/// (and listing creates nothing), a kept one survives a new process, an unknown value or
+/// argument is refused with nothing written, and damaged contents read as System. No canvas,
+/// lease or binding is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kept_appearance_survives_a_new_process_and_touches_no_canvas() {
+    let lib = library().await;
+    let file = lib.root.join("library/v1/appearance");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["appearance"], "system");
+    assert!(
+        !lib.root.join("library").exists(),
+        "listing creates nothing"
+    );
+    for bad in [
+        json!({"appearance": "sepia"}),
+        json!({}),
+        json!({"appearance": "dark", "id": "0123456789abcdef"}),
+        json!({"appearance": true}),
+    ] {
+        assert!(
+            call(&lib.c, app::APPEARANCE, bad.clone()).await.is_err(),
+            "{bad}"
+        );
+    }
+    assert!(!file.exists(), "a refusal writes nothing");
+    let kept = value(call(&lib.c, app::APPEARANCE, json!({"appearance": "dark"})).await);
+    assert_eq!(kept["appearance"], "dark");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "dark");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "dark"
+    );
+    // A new process (a reopened view) on the same root.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    assert_eq!(
+        value(call(&c2, app::LIST, json!({})).await)["appearance"],
+        "dark"
+    );
+    let kept = value(call(&c2, app::APPEARANCE, json!({"appearance": "light"})).await);
+    assert_eq!(kept["appearance"], "light");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "light"
+    );
+    // Unknown contents read as System.
+    std::fs::write(&file, "purple").unwrap();
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "system"
+    );
+    // No canvas, lease or binding came of any of it.
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"], json!([]));
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
 /// Library mode refuses every project route without admission, whatever the arguments or
 /// metadata say, and a workspace process refuses library actions without retiring anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2604,8 +2668,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-7.html",
-        "versioned for the quieter, themed workspace view code"
+        HOME_URI, "ui://openpaperdesign/home-8.html",
+        "versioned for the System/Light/Dark appearance view code"
     );
 }
 

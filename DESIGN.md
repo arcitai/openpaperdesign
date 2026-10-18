@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 2 · 2026-10-18 · The one canonical visual and interaction direction for the OPD app
+Revision: 4 · 2026-10-18 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -59,10 +59,48 @@ The principles:
    Fields are softly filled.
 6. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
    neatness (see the status rules in AGENTS.md).
-7. **Light and dark are one design.** The workspace follows its page: the host's theme when
-   it names one (Home's `data-theme`), else the browser's colour-scheme preference, else light.
-   Native windows follow the system appearance. Only the presentation changes: the canvas's
-   content, saves and focus are untouched.
+7. **Light and dark are one design** (see Appearance below): Home, the chrome, every toolbar,
+   menus, the inspector and the canvas itself share one resolved appearance.
+
+## Appearance (System, Light, Dark)
+
+- **The choice.** Menu ▸ Appearance in the editor: System (default), Light or Dark. It is
+  compact and lives in the existing menu, so there is no extra toolbar.
+- **System** follows the OS appearance, live: the browser's colour-scheme preference (in the
+  native app, egui-winit's system theme). The host's theme stands in only where the browser
+  can't report one. With no signal at all, it is light.
+- **Light and Dark** override the OS.
+- **Where it is kept.** It is a view preference, never part of a canvas:
+  - the app library keeps it in its own data folder (`library/v1/appearance`), so it survives
+    closing and reopening the view;
+  - the standalone browser page keeps it only while it is open (its origin changes per launch);
+  - nothing is stored in the browser;
+  - native macOS has no egui Menu, so it stays System and follows the OS.
+- **Home and the editor** resolve it with the same rule, including narrow layouts.
+- **The resolved appearance owns every colour.** A host's colour variables (MCP Apps style
+  variables) are its palette for the theme it sent them with. They join Home's colours only
+  while that theme is the resolved appearance. Under an explicit Light or Dark, or a System OS
+  that differs from the host, they are removed and Home's own palette applies. A new host
+  palette replaces the earlier colours entirely. The host's sanitized font and radius
+  variables apply in every appearance.
+
+### The canvas in Dark (display, not data)
+
+- **The work surface** is dark (#18181b) with a quiet grid (#34343a). The chrome surface is
+  #1f1f22, so the canvas sits a step deeper than the panels, as in light.
+- **Each drawn colour** (solid fills, gradient stops, strokes, text) is adapted for display.
+  Its OKLab lightness is mirrored into 0.93 (authored black) … 0.27 (authored white). Its hue,
+  its chroma (reduced only as far as sRGB requires) and its alpha are kept. So black text and
+  strokes read light, white shapes sit just above the surface, and red stays red. This is in
+  the spirit of tldraw and Excalidraw dark modes; nothing was copied.
+- **Images** are never adapted, and the composited result is never inverted.
+- **Unchanged by the canvas display:** the selection accent, handles and guides are the same in
+  both. Frame-name labels use a lighter grey on the dark surface.
+- **Nothing in the document changes.** A theme switch writes nothing and doesn't mark the
+  canvas dirty, save it, touch undo or change a revision. The document's colours are its own:
+  the inspector and swatches show the authored values.
+- **Exports** (SVG, PDF, PNG, thumbnails) always draw the document as authored, whatever the
+  appearance.
 
 ## Layout tiers (CSS px of the granted surface)
 
@@ -96,6 +134,8 @@ under the host's MCP Apps style variables.
 | hairline | #e6e6ea | #333338 |
 | accent | system accent, else #007aff | system accent, else #007aff (Home: #4c9bff) |
 | selected | accent tint over surface (≈13% light, 27% dark) | |
+| canvas work surface | #eeeef0 | #18181b |
+| canvas grid dot | #cfcfd6 | #34343a |
 
 - **Type:** Inter. 13 body, 11 secondary and section labels (semibold), 13 semibold titles.
 - **Shape:**

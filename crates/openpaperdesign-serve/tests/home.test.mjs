@@ -35,7 +35,9 @@ const TOOLS = new Set([INVENTORY, 'openpaperdesign_choose_folder', 'openpaperdes
 // What the view may call when an app-library server serves it: only the library's own actions.
 const LIB_LIST = 'openpaperdesign_app_canvases';
 const LIB_TOOLS = new Set([LIB_LIST, 'openpaperdesign_app_create', 'openpaperdesign_app_open', 'openpaperdesign_app_editor',
-  'openpaperdesign_app_close', 'openpaperdesign_app_import', 'openpaperdesign_app_export', 'openpaperdesign_app_rename']);
+  'openpaperdesign_app_close', 'openpaperdesign_app_import', 'openpaperdesign_app_export', 'openpaperdesign_app_rename',
+  // The kept appearance (a view preference; no canvas).
+  'openpaperdesign_app_appearance']);
 
 // Fictional fixtures. Two local projects share a name; Acme has two folders.
 const ACME = { source: 'codex-app-server', host: 'this computer', id: 'prj_fixture_acme', name: 'Acme site', position: 0, recencyAt: null, roots: [{ path: '/w/acme' }, { path: '/w/acme-docs' }] };
@@ -79,7 +81,15 @@ const panelScript = libScript.replace(PANEL_SLOT, 'const opdCreatePanel = __opdT
 // `clock: true` gives the view a live, deterministic clock (`tick(ms)` runs the timers set for
 // that delay; `runAllTimers()` runs every timer set so far). Without it timers never fire.
 // Adapted from the R11 reviewer's timer-active probe harness.
-function mount({ library = false, panel = null, clock = false } = {}) {
+// `media`: a stand-in for the browser's `(prefers-color-scheme: dark)` query (`{ matches }`;
+// `media.change(dark)` reports a new OS appearance). Without it the view has no OS signal.
+function osScheme(matches) {
+  const media = { matches, listeners: [] };
+  media.addEventListener = (type, fn) => { if (type === 'change') media.listeners.push(fn); };
+  media.change = (dark) => { media.matches = dark; for (const fn of media.listeners) fn({ matches: dark }); };
+  return media;
+}
+function mount({ library = false, panel = null, clock = false, media = null } = {}) {
   const timers = [];
   const setTimeout = clock ? (fn, ms) => { timers.push({ fn, ms }); return timers.length; } : () => 0;
   const tick = (ms) => {
@@ -97,13 +107,15 @@ function mount({ library = false, panel = null, clock = false } = {}) {
   }
   const props = {};
   const rootAttrs = {};
-  const documentElement = { style: { setProperty: (k, v) => { props[k] = v; } }, setAttribute: (k, v) => { rootAttrs[k] = String(v); } };
+  const documentElement = { style: { setProperty: (k, v) => { props[k] = v; }, removeProperty: (k) => { delete props[k]; } },
+    setAttribute: (k, v) => { rootAttrs[k] = String(v); } };
   const sent = [];
   let listener = null;
   // Copy into this realm so deep equality is not confused by the VM context's prototypes.
   const parent = { postMessage: (m) => sent.push(JSON.parse(JSON.stringify(m))) };
   const forbidden = () => { throw new Error('storage or network access'); };
   const window = { parent, addEventListener: (n, fn) => { if (n === 'message') listener = fn; } };
+  if (media) window.matchMedia = (q) => { assert.equal(q, '(prefers-color-scheme: dark)'); return media; };
   for (const k of ['localStorage', 'sessionStorage', 'indexedDB', 'fetch', 'XMLHttpRequest']) {
     Object.defineProperty(window, k, { get: forbidden });
   }
@@ -701,7 +713,9 @@ test('host theme and standard style variables apply as presentation only, with p
   assert.deepEqual(v.props, { '--color-background-primary': '#101010', '--color-text-primary': 'rgb(240 240 240)', '--font-sans': 'Inter, system-ui' });
   v.from({ method: 'ui/notifications/host-context-changed', params: { theme: 'light' } });
   assert.equal(v.rootAttrs['data-theme'], 'light');
-  assert.equal(v.props['--color-background-primary'], '#101010', 'partial update keeps earlier styles');
+  // The colours were the dark theme's: they never paint the light one (no stale host palette);
+  // the font is kept across the partial update.
+  assert.deepEqual(v.props, { '--font-sans': 'Inter, system-ui' }, 'partial update keeps the earlier font, not dark colours');
   const before = { ...v.props };
   v.from({ method: 'ui/notifications/host-context-changed', params: { styles: { css: { fonts: '@import url(https://fonts.invalid/x.css);' } } } });
   assert.deepEqual(v.props, before, 'font-loading CSS is never applied');
@@ -871,6 +885,9 @@ test('the view sends no chat message, calls only its own tools, stores nothing a
   // Tool names at call sites: act('…', …) and the inventory's tools/call.
   const named = new Set([...script.matchAll(/(?:act\(|name: )'(openpaperdesign_[a-z_]+)'/g)].map((m) => m[1]));
   assert.deepEqual([...named].sort(), [...TOOLS, ...LIB_TOOLS].sort(), 'exactly these server tools');
+  // The appearance call: one call site, sending only the validated preference.
+  assert.deepEqual([...script.matchAll(/name: 'openpaperdesign_app_appearance', arguments: \{ ([^}]*) \}/g)].map((m) => m[1].trim()),
+    ['appearance'], 'one call site, sending only the preference');
   for (const banned of ['resources/read', 'localStorage', 'sessionStorage', 'indexedDB', 'document.cookie', 'fetch(', 'XMLHttpRequest', 'innerHTML',
     'openpaperdesign_status\'', 'bind_project\'', 'create_project\'', 'open_editor\'', '@import']) {
     assert.ok(!html.includes(banned), banned);
@@ -1499,6 +1516,115 @@ async function closedHome(v, reply = CLOSED) {
   assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } });
   await answer(v, reply, libAction(v));
 }
+
+// ---- the resolved appearance decides Home's colours; a host palette only joins it when it
+// was sent for that appearance (theme-host-palette-correction/observed.json) ----
+
+const LIGHT_HOST = { theme: 'light', styles: { variables: { '--color-background-primary': '#ffffff',
+  '--color-background-secondary': '#f5f5f5', '--color-text-primary': '#202020', '--color-text-secondary': '#606060',
+  '--font-sans': 'Inter, system-ui', '--border-radius-md': '6px' } } };
+const DARK_HOST = { theme: 'dark', styles: { variables: { '--color-background-primary': '#101010',
+  '--color-text-primary': 'rgb(240 240 240)', '--font-sans': 'Inter, system-ui' } } };
+const SHAPE = { '--font-sans': 'Inter, system-ui', '--border-radius-md': '6px' };
+const colourKeys = (props) => Object.keys(props).filter((k) => k.startsWith('--color-'));
+const hostSays = (v, params) => v.from({ method: 'ui/notifications/host-context-changed', params });
+
+// A library view with the editor module whose list reports `kept` as the appearance.
+async function appearanceView(kept, context, media = null) {
+  const fake = fakePanel();
+  const v = mount({ library: true, panel: fake, media });
+  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: context } });
+  await flush();
+  v.from({ id: v.last('tools/call').id, result: toolText({ ...LIBRARY_LIST, appearance: kept }) });
+  await flush();
+  return { v, fake };
+}
+
+test('explicit Dark keeps Home dark against a light host palette (the observed defect); Light lets that palette join; stale colours go', async () => {
+  const { v, fake } = await appearanceView('dark', {});
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  hostSays(v, LIGHT_HOST);
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'still dark');
+  assert.deepEqual(colourKeys(v.props), [], 'no light host colour paints the dark view');
+  assert.deepEqual(v.props, SHAPE, 'the host\'s font and radius still apply');
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.o.onAppearance('light');
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  assert.equal(v.props['--color-background-primary'], '#ffffff', 'Light agrees with the host: its palette joins');
+  assert.equal(v.props['--color-text-secondary'], '#606060');
+  h.o.onAppearance('dark');
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  assert.deepEqual(v.props, SHAPE, 'back to Dark: the light colours are removed again');
+  assert.equal(libCalls(v, 'openpaperdesign_app_appearance'), 2, 'only the two menu choices were kept');
+  panelOnly(v);
+});
+
+test('explicit Light keeps Home light against a dark host palette', async () => {
+  const { v } = await appearanceView('light', DARK_HOST);
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  assert.deepEqual(colourKeys(v.props), [], 'the dark palette shown before the kept Light arrived is gone');
+  assert.equal(v.props['--font-sans'], 'Inter, system-ui');
+  hostSays(v, { theme: 'dark' });
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'a host theme change doesn\'t override an explicit mode');
+  assert.deepEqual(colourKeys(v.props), []);
+  libOnly(v);
+});
+
+test('System follows the OS first, live, whatever the host says; the host palette joins only when it agrees, and never leaves stale colours', async () => {
+  const media = osScheme(true);
+  const { v } = await appearanceView('system', LIGHT_HOST, media);
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'the OS, not the host\'s light');
+  assert.deepEqual(colourKeys(v.props), [], 'the light palette doesn\'t paint the dark view');
+  media.change(false);
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  assert.equal(v.props['--color-background-primary'], '#ffffff', 'OS and host agree: the host palette joins');
+  hostSays(v, { theme: 'dark' });
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'the host\'s theme doesn\'t override the OS');
+  assert.equal(v.props['--color-background-primary'], '#ffffff', 'the light palette still paints the light view');
+  hostSays(v, DARK_HOST);
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  assert.deepEqual(colourKeys(v.props), [], 'the host\'s dark palette never paints the light view');
+  media.change(true);
+  assert.equal(v.rootAttrs['data-theme'], 'dark');
+  assert.equal(v.props['--color-background-primary'], '#101010', 'OS and host agree again: dark palette');
+  assert.equal(v.props['--color-background-secondary'], undefined, 'no light colour is left over from the earlier palette');
+  assert.equal(v.props['--border-radius-md'], '6px', 'the earlier radius is kept (non-colour, merged)');
+  assert.equal(libCalls(v, 'openpaperdesign_app_appearance'), 0, 'an OS or host change keeps nothing');
+  libOnly(v);
+});
+
+test('panel: the editor gets the kept appearance; a menu choice shows at once and is kept by the library as a validated preference only', async () => {
+  const fake = fakePanel();
+  const v = mount({ library: true, panel: fake });
+  v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: { theme: 'light' } } });
+  await flush();
+  v.from({ id: v.last('tools/call').id, result: toolText({ ...LIBRARY_LIST, appearance: 'dark' }) });
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'dark', 'the kept Dark wins over the host\'s light');
+  await openInPanel(v);
+  const h = fake.handles[0];
+  assert.equal(h.o.appearance, 'dark', 'the editor starts in the kept preference');
+  assert.equal(h.o.hostTheme(), 'light', 'the host\'s theme, the editor\'s OS fallback');
+  // Menu ▸ Appearance ▸ Light in the editor: shown here at once, then kept.
+  h.o.onAppearance('light');
+  await flush();
+  assert.equal(v.rootAttrs['data-theme'], 'light');
+  const kept = libAction(v);
+  assert.deepEqual(kept.params, { name: 'openpaperdesign_app_appearance', arguments: { appearance: 'light' } });
+  await answer(v, { appearance: 'light', note: 'Kept.' }, kept);
+  // Anything else goes as System, never as it came.
+  h.o.onAppearance('sepia');
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_appearance', arguments: { appearance: 'system' } });
+  // Not kept: said over the workspace; the choice still applies here.
+  await answer(v, { refused: 'An appearance of system, light or dark is required. Nothing was changed.' }, libAction(v));
+  assert.match(v.els['ed-alert-text'].textContent, /couldn't be kept/);
+  assert.equal(v.rootAttrs['data-theme'], 'light', 'System with the host\'s light (no browser signal here)');
+  panelOnly(v);
+});
 
 test('panel: Open mounts the editor right here on the result\'s binding: no result screen, no link, no message', async () => {
   const { v, fake } = await panelView();
