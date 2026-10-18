@@ -6,7 +6,7 @@
 import init, { start } from './openpaperdesign_web.js';
 import { Session } from './session.js';
 import { discardStep, frameStep, saveStep } from './page.js';
-import { opdBrowserEnv, opdIsMac, opdMountEditor, opdStatusKind } from './editor.js';
+import { opdBrowserEnv, opdIsMac, opdMountEditor, opdStatusNote } from './editor.js';
 
 // State for people and for automated checks (read-only from outside).
 const state = {};
@@ -14,24 +14,14 @@ window.__opd = state;
 
 const $ = (id) => document.getElementById(id);
 // Every status goes to the live region (assistive technology, checks). Stable healthy ones
-// (Ready, Saved) show nothing; loading shows as a small note until the next state replaces it;
-// anything else (a failure, conflict, refusal, download) is shown, briefly unless it is an
-// error (editor.js `opdStatusKind`, the same rule as the home view's editor).
-let alertTimer = 0;
-const status = (s, error = false) => {
-  $('status').textContent = s;
-  const a = $('alert');
-  clearTimeout(alertTimer);
-  const kind = opdStatusKind(s, error);
-  if (kind === 'quiet') {
-    a.hidden = true;
-    return;
-  }
-  a.textContent = s;
-  a.className = kind;
-  a.hidden = false;
-  if (kind === 'note') alertTimer = setTimeout(() => { a.hidden = true; }, 6000);
-};
+// (Ready, Saved, Saving…) show nothing; loading shows as a small note until the next state; a
+// save failure or conflict stays shown through the retries until a save is acknowledged (or
+// the conflict is reloaded); anything else is a note (editor.js `opdStatusNote`, the same rule
+// as the home view's editor).
+const status = opdStatusNote($('status'), $('alert'), {
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
+});
 // Diagnostics only (which renderer runs); a renderer failure is also a status error.
 const renderer = (s) => { $('renderer').textContent = s; };
 

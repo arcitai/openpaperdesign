@@ -3,6 +3,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Session } from '../static/session.js';
+// `saveStep` (with `discardStep`) is imported once, below, with the page-step tests; module
+// imports are hoisted, so the R25-F2 tests here use it too.
+import { opdStatusNote } from '../static/editor.js';
 
 /** A mock editor that records calls. */
 function editor(name, { gpuError = null, ready = true, snapshot = '{"page":1}' } = {}) {
@@ -31,6 +34,89 @@ function deferred() {
   const promise = new Promise((r, j) => { resolve = r; reject = j; });
   return { promise, resolve, reject };
 }
+
+// ---- R25-F2: the browser page's status note (app.js uses `opdStatusNote`) through the real
+// save tick and session. The mount forwards save statuses as text only (opdMountEditor's
+// `ui.status`), so the stand-in `ui` below does the same; adapted from the R25 review's probe.
+
+/** The page's #status (live region) and #alert (the note), and a timer list that never fires. */
+function pageNote() {
+  const live = { textContent: '' };
+  const note = { textContent: '', className: '', hidden: true };
+  const timers = [];
+  const status = opdStatusNote(live, note, {
+    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout: () => {},
+  });
+  return { live, note, timers, status };
+}
+
+/** A ready session with one unsaved change, saving through `put`. */
+function savingSession(put) {
+  const session = new Session({ put, log: () => {} });
+  session.ed = { dirty: () => true, save_snapshot: () => '{"pages":[]}', save_failed: () => {}, save_succeeded: () => {} };
+  session.state.ready = true;
+  return session;
+}
+
+test('R25-F2 (browser page): a failed save stays shown through an unanswered retry until a save is acknowledged', async () => {
+  const p = pageNote();
+  const ui = { status: (text) => p.status(text), conflict: () => {} };
+  p.status('Ready');
+  assert.equal(p.note.hidden, true, 'healthy: nothing shown');
+  const session = savingSession(async () => ({ ok: false, status: 500, revision: null }));
+  await saveStep(session, ui);
+  assert.equal(p.note.hidden, false);
+  assert.equal(p.note.textContent, 'Save failed; retrying');
+  assert.equal(p.note.className, 'failure');
+  // The retry: its "Saving…" is in the live region, the failure stays on screen.
+  const answer = deferred();
+  session.deps.put = () => answer.promise;
+  const retry = saveStep(session, ui);
+  assert.equal(p.live.textContent, 'Saving…');
+  assert.equal(p.note.hidden, false, 'last save failure stays visible until a successful save acknowledgement');
+  assert.equal(p.note.textContent, 'Save failed; retrying');
+  for (const t of p.timers) t.fn();
+  assert.equal(p.note.hidden, false, 'no timer hides it');
+  answer.resolve({ ok: true, status: 200, revision: '"next"' });
+  await retry;
+  assert.equal(p.live.textContent, 'Saved');
+  assert.equal(p.note.hidden, true, 'the acknowledged save resolves it');
+  p.status('Saving…');
+  assert.equal(p.note.hidden, true, 'healthy again: Saving… shows nothing');
+});
+
+test('R25-F2 (browser page): a persistent or unreachable failure and a conflict stay distinct and shown', async () => {
+  const p = pageNote();
+  const ui = { status: (text) => p.status(text), conflict: () => {} };
+  const session = savingSession(async () => ({ ok: false, status: 500, revision: null }));
+  await saveStep(session, ui);
+  await saveStep(session, ui);
+  assert.equal(p.note.textContent, 'Save failed; retrying', 'still failing');
+  session.deps.put = async () => { throw new Error('offline'); };
+  await saveStep(session, ui);
+  assert.equal(p.note.textContent, 'Save failed (server unreachable); retrying');
+  assert.equal(p.note.className, 'failure');
+  p.status('Ready');
+  assert.equal(p.note.hidden, false, 'Ready doesn\'t resolve an unsaved change');
+  // A conflict: not retried; shown until the explicit reload of the version on disk.
+  session.deps.put = async () => ({ ok: false, status: 409, revision: '"other"' });
+  await saveStep(session, ui);
+  assert.equal(p.note.textContent, 'Not saved: conflict');
+  assert.equal(p.note.className, 'conflict');
+  await saveStep(session, ui);
+  p.status('Updated with changes made elsewhere');
+  assert.equal(p.note.textContent, 'Not saved: conflict', 'nothing healthy hides it');
+  p.status('Reloaded the version on disk');
+  assert.equal(p.note.className, 'note', 'the reload is said');
+  p.status('Ready');
+  assert.equal(p.note.hidden, true, 'resolved');
+  // A terminal error stays.
+  p.status('The renderer stopped', true);
+  p.status('Saved');
+  assert.equal(p.note.hidden, false);
+  assert.equal(p.note.className, 'error');
+});
 
 /** A session with mock deps. `editors` are handed out by boot() in order. */
 function setup(editors, { pages = [{ text: 'v1', revision: '"r1"' }], put, revision } = {}) {

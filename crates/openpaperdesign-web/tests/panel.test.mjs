@@ -34,8 +34,9 @@ const mod = await asModule(SOURCE);
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r)); };
 
 test('the assembled module links, imports nothing and is safe inside the view\'s script element', async () => {
-  // opdStatusKind: the home view's editor uses the editor's own rule for how a status shows.
-  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'opdStatusKind', 'opdQuietStatus', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
+  // opdStatusDisplay: the home view's editor uses the editor's own rule for how its statuses
+  // show (and keeps an unresolved save failure shown); the browser page uses opdStatusNote.
+  for (const name of ['opdCreatePanel', 'opdMountEditor', 'opdBrowserEnv', 'opdStatusDisplay', 'opdStatusNote', 'opdStatusKind', 'opdQuietStatus', 'Session', 'frameStep', 'saveStep', 'discardStep', 'start']) {
     assert.equal(typeof mod[name], 'function', name);
   }
   assert.equal(typeof mod.default, 'function', 'the glue\'s own init (__wbg_init)');

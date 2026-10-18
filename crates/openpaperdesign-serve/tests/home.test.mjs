@@ -7,7 +7,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 // The editor's own status rule, which the assembled module puts in scope with the panel.
-import { opdQuietStatus, opdStatusKind } from '../../openpaperdesign-web/static/editor.js';
+import { opdQuietStatus, opdStatusDisplay, opdStatusKind } from '../../openpaperdesign-web/static/editor.js';
+// The real save tick and session, for the save-failure cases (R25-F2).
+import { discardStep, saveStep } from '../../openpaperdesign-web/static/page.js';
+import { Session } from '../../openpaperdesign-web/static/session.js';
 
 const html = readFileSync(new URL('../src/home.html', import.meta.url), 'utf8');
 // The view's one inline module. Its first line is the editor slot (`opdCreatePanel = null`,
@@ -111,7 +114,7 @@ function mount({ library = false, panel = null, clock = false } = {}) {
   Object.defineProperty(document, 'cookie', { get: forbidden, set: forbidden });
   const source = panel ? panelScript : library ? libScript : script;
   vm.runInNewContext(source, { window, document, setTimeout, JSON, String, RegExp, Array, Map, Promise, Object, Number, Math,
-    __opdTestPanel: panel, opdStatusKind: panel ? opdStatusKind : undefined });
+    __opdTestPanel: panel, opdStatusDisplay: panel ? opdStatusDisplay : undefined });
   const from = (m, source = parent) => listener({ source, data: { jsonrpc: '2.0', ...m } });
   const last = (method) => [...sent].reverse().find((m) => m.method === method);
   const count = (method) => sent.filter((m) => m.method === method).length;
@@ -1545,24 +1548,150 @@ test('panel: stable healthy states stay in the status live region; loading shows
     assert.equal(v.els['ed-status'].textContent, s, 'observable');
     assert.equal(v.els['ed-alert'].hidden, true, `${s}: no visible chrome`);
   }
-  h.o.onStatus('Could not save (409). Reload from the banner.', true);
-  assert.equal(v.els['ed-alert'].hidden, false);
-  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
-  assert.equal(v.els['ed-alert-text'].textContent, 'Could not save (409). Reload from the banner.');
-  assert.equal(v.els['ed-status'].className, 'sr-only bad');
-  h.o.onStatus('Ready');
-  assert.equal(v.els['ed-alert'].hidden, true, 'gone once healthy again');
   h.o.onStatus('Downloaded "Landing.png".');
   assert.equal(v.els['ed-alert'].hidden, false, 'a note is shown');
   assert.equal(v.els['ed-alert'].className, 'ed-alert');
+  h.o.onStatus('Ready');
+  assert.equal(v.els['ed-alert'].hidden, true, 'a note goes once healthy again');
+  // A terminal error (the mount's fatal status) stays: nothing healthy hides it.
+  h.o.onStatus('The renderer stopped: device lost', true);
+  assert.equal(v.els['ed-alert'].hidden, false);
+  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
+  assert.equal(v.els['ed-alert-text'].textContent, 'The renderer stopped: device lost');
+  assert.equal(v.els['ed-status'].className, 'sr-only bad');
+  h.o.onStatus('Ready');
+  assert.equal(v.els['ed-status'].textContent, 'Ready', 'the live region has the status');
+  assert.equal(v.els['ed-alert'].hidden, false, 'the error is still shown');
+  assert.equal(v.els['ed-alert-text'].textContent, 'The renderer stopped: device lost');
   // The same rule as the browser page's (editor.js).
   assert.deepEqual(['Ready', 'Saved', 'Saving…', 'Updated with changes made elsewhere', 'Starting renderer…',
-    'Loading the editor…', 'Opening the canvas…', 'Downloaded "x.svg".'].map((s) => opdStatusKind(s, false)),
-  ['quiet', 'quiet', 'quiet', 'quiet', 'loading', 'loading', 'loading', 'note']);
+    'Loading the editor…', 'Opening the canvas…', 'Downloaded "x.svg".', 'Save failed; retrying',
+    'Save failed (server unreachable); retrying', 'Not saved: conflict'].map((s) => opdStatusKind(s, false)),
+  ['quiet', 'quiet', 'quiet', 'quiet', 'loading', 'loading', 'loading', 'note', 'failure', 'failure', 'conflict']);
   assert.equal(opdStatusKind('Ready', true), 'error', 'an error is never quiet');
   assert.equal(opdStatusKind('Loading the editor…', true), 'error', 'nor loading');
   assert.equal(opdQuietStatus('Ready', false), true);
   assert.equal(opdQuietStatus('Loading the editor…', false), false, 'loading is not quiet');
+});
+
+// ---- R25-F2: an autosave failure stays shown through its retry, with the real save tick and
+// session. The mount forwards save statuses as text only (opdMountEditor's `ui.status`), so the
+// stand-in `ui` does the same. Adapted from the R25 review's probe ("an unacknowledged retry
+// must not hide the last save failure"), with its fixture and assertion kept.
+
+/**
+ * A ready session with one unsaved change, saving through `put`, and its tick's `ui`. For the
+ * conflict banner's reload (`discardStep` → `Session.discard`): the server's canvas as
+ * `fetchPage` returns it, the editor's `reload` (recorded in `reloaded`), and the banner's
+ * `conflict`/`hideConflict` (recorded in `ui.banner`).
+ */
+function realSave(onStatus, put) {
+  const ui = {
+    banner: false,
+    status: (text) => onStatus(text),
+    conflict: () => { ui.banner = true; },
+    hideConflict: () => { ui.banner = false; },
+  };
+  const disk = { text: '{"pages":[]}', revision: '"disk"' };
+  const session = new Session({ put, fetchPage: async () => disk, log: () => {} });
+  const reloaded = [];
+  session.ed = {
+    dirty: () => true, save_snapshot: () => '{"pages":[]}', save_failed: () => {}, save_succeeded: () => {},
+    reload: (text) => { reloaded.push(text); },
+  };
+  session.state.ready = true;
+  return { session, ui, reloaded, disk };
+}
+
+test('R25-F2: an unacknowledged retry must not hide the last save failure; the acknowledged save resolves it', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const h = v.fake.handles[0];
+  h.o.onStatus('Ready');
+  assert.equal(v.els['ed-alert'].hidden, true, 'healthy: nothing shown');
+  const { session, ui } = realSave(h.o.onStatus, async () => ({ ok: false, status: 500, revision: null }));
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert'].hidden, false, 'a failed save is initially shown');
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed; retrying');
+  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
+  let finish;
+  session.deps.put = () => new Promise((resolve) => { finish = resolve; });
+  const retry = saveStep(session, ui);
+  const hiddenWhileUnconfirmed = v.els['ed-alert'].hidden;
+  assert.equal(v.els['ed-status'].textContent, 'Saving…', 'the live region has the retry');
+  assert.equal(hiddenWhileUnconfirmed, false, 'last save failure stays visible until a successful save acknowledgement');
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed; retrying');
+  v.runAllTimers();
+  await flush();
+  assert.equal(v.els['ed-alert'].hidden, false, 'no timer hides it');
+  finish({ ok: true, status: 200, revision: '"next"' });
+  await retry;
+  assert.equal(v.els['ed-status'].textContent, 'Saved');
+  assert.equal(v.els['ed-alert'].hidden, true, 'the acknowledged save resolves it');
+  h.o.onStatus('Saving…');
+  assert.equal(v.els['ed-alert'].hidden, true, 'healthy again: Saving… shows nothing');
+});
+
+test('R25-F2: persistent, unreachable and conflict failures stay shown and distinct; a new editor starts clear', async () => {
+  const v = await libraryView(LIBRARY_LIST, { panel: true, clock: true });
+  await openInPanel(v);
+  const h = v.fake.handles[0];
+  const { session, ui, reloaded, disk } = realSave(h.o.onStatus, async () => ({ ok: false, status: 500, revision: null }));
+  await saveStep(session, ui);
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed; retrying', 'still failing');
+  session.deps.put = async () => { throw new Error('offline'); };
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert-text'].textContent, 'Save failed (server unreachable); retrying');
+  h.o.onStatus('Ready');
+  h.o.onStatus('Updated with changes made elsewhere');
+  assert.equal(v.els['ed-alert'].hidden, false, 'nothing healthy resolves an unsaved change');
+  // A conflict: not retried (no "Saving…" follows), shown until the explicit reload.
+  session.deps.put = async () => ({ ok: false, status: 409, revision: '"other"' });
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert-text'].textContent, 'Not saved: conflict');
+  assert.equal(v.els['ed-alert'].className, 'ed-alert bad');
+  assert.equal(session.state.conflict, true);
+  assert.equal(ui.banner, true, 'the conflict banner is shown');
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-status'].textContent, 'Not saved: conflict', 'no retry while in conflict');
+  v.runAllTimers();
+  await flush();
+  assert.equal(v.els['ed-alert'].hidden, false);
+  // The banner's reload (the real discard): the version on disk is loaded, the session leaves
+  // the conflict, and the view says so.
+  assert.equal(await discardStep(session, ui), 'discarded');
+  assert.equal(session.state.conflict, false, 'the session is out of the conflict');
+  assert.equal(session.state.revision, disk.revision, 'at the version on disk');
+  assert.deepEqual(reloaded, [disk.text], 'the editor loaded it');
+  assert.equal(ui.banner, false, 'the banner is gone');
+  assert.equal(v.els['ed-status'].textContent, 'Reloaded the version on disk');
+  h.o.onStatus('Ready');
+  assert.equal(v.els['ed-alert'].hidden, true, 'resolved by the reload');
+  // A failure, then Home (refused, the editor stays): its reason shows; once a save succeeds,
+  // both go.
+  session.deps.put = async () => ({ ok: false, status: 500, revision: null });
+  await saveStep(session, ui);
+  h.nextDrain = 'failed';
+  v.els.back.onclick();
+  await flush();
+  assert.match(v.els['ed-alert-text'].textContent, /couldn't be saved yet/);
+  assert.equal(v.els['ed-leave'].hidden, false);
+  h.o.onStatus('Saving…');
+  assert.match(v.els['ed-alert-text'].textContent, /couldn't be saved yet/, 'the reason, not an echo');
+  session.deps.put = async () => ({ ok: true, status: 200, revision: '"ok"' });
+  await saveStep(session, ui);
+  assert.equal(v.els['ed-alert'].hidden, true);
+  assert.equal(v.els['ed-leave'].hidden, true);
+  // A new editor has nothing outstanding.
+  h.nextDrain = 'clean';
+  v.els.back.onclick();
+  await flush();
+  await closedHome(v);
+  await relist(v);
+  await openInPanel(v);
+  v.fake.handles[1].o.onStatus('Ready');
+  assert.equal(v.els['ed-alert'].hidden, true);
 });
 
 test('panel: New file, Import, Open current file and the menu\'s Open all mount here, asking for the panel', async () => {
@@ -2226,5 +2355,155 @@ test('R13 control: with the real panel, a refused Home keeps the editor (no rele
   await answer(v, { action: 'closed', canvas: { id: ID1 } }, libAction(v));
   assert.equal(v.els.home.hidden, false);
   assert.equal(v.count('ui/open-link'), 0);
+  panelOnly(v);
+});
+
+// ---- R25-F1: a departure owns its view, editor and binding across the mount release ----
+// The real panel module, with the release acknowledgement held back while something newer
+// takes the view. The first three cases are the R25 review's probes (lifecycle-probes.mjs),
+// with their fixtures and assertions; only `probe` is this file's `test`, and its CLOSED is
+// this file's.
+
+// The Close calls the view sent so far.
+const closes = (v) => v.sent.filter((m) => m.method === 'tools/call' && m.params.name === 'openpaperdesign_app_close');
+
+test('R25 control: a normal release acknowledgement closes the originating binding', async () => {
+  const { v } = await realPanelView();
+  const back = v.els.back.onclick();
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  await answer(v, { binding: B1, released: true }, release);
+  await back;
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } });
+  await answer(v, CLOSED, libAction(v));
+  assert.equal(v.els.home.hidden, false);
+});
+
+test('R25: a delayed disposal must not navigate a newer result', async () => {
+  const { v } = await realPanelView();
+  const back = v.els.back.onclick();
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  // The server has processed release but its response is delayed. A newer model result is
+  // now delivered, which the production view accepts because the editor was let go.
+  v.from(result(LIB_EDITOR('opened', ID2)));
+  assert.equal(v.els.result.hidden, false);
+  await answer(v, { binding: B1, released: true }, release);
+  await back;
+  const close = libAction(v);
+  if (close.params.name === 'openpaperdesign_app_close') await answer(v, { refused: 'The shown canvas is no longer current; nothing was closed.' }, close);
+  assert.equal(v.els.result.hidden, false, 'the newer result must stay after the old release/close finishes');
+  // Added: nothing at all was closed for the old departure, and the newer result is intact.
+  assert.equal(closes(v).length, 0, 'no Close from the departure that lost the view');
+  assert.equal(v.els['result-title'].textContent, 'Notes');
+  panelOnly(v);
+});
+
+test('R25: a delayed disposal must not hide a newly mounted editor', async () => {
+  const { v, editor } = await realPanelView();
+  const back = v.els.back.onclick();
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  // A Home result arrives while the old release acknowledgement is delayed.
+  v.from(result({ surface: 'home' }));
+  await flush();
+  assert.equal(v.els.home.hidden, false);
+  await relist(v);
+  v.els['new-file'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('created', ID2), libAction(v));
+  const canvas = v.last('tools/call');
+  assert.equal(canvas.params.name, 'openpaperdesign_app_canvas');
+  await answer(v, { binding: B2, canvas: { name: 'New document' }, revision: '"new"', active_page: 'p2', pages: [{ id: 'p2', name: 'Page 1', text: '{}' }], mount: 8 }, canvas);
+  const newHandle = editor.handle;
+  assert.equal(await newHandle.started, 'mounted');
+  assert.equal(v.els.editor.hidden, false);
+  // Local work can now be unsaved in this new editor.
+  editor.nextDrain = 'busy';
+  await answer(v, { binding: B1, released: true }, release);
+  await back;
+  const close = libAction(v);
+  if (close.params.name === 'openpaperdesign_app_close') await answer(v, { refused: 'The shown canvas is no longer current; nothing was closed.' }, close);
+  assert.equal(v.els.editor.hidden, false, 'the new editor and its unfinished work must remain visible');
+  assert.equal(newHandle.left, false);
+  // Added: no Close for the old binding, the new editor still owns its binding and Home, and
+  // its own Home (refused: its work is unfinished) keeps it.
+  assert.equal(closes(v).length, 0);
+  editor.mountOpts.onHome();
+  await flush();
+  assert.equal(v.els.editor.hidden, false, 'its own refused Home keeps it');
+  assert.equal(newHandle.left, false);
+  assert.match(v.els['ed-alert-text'].textContent, /edit is still under way/);
+  // Finished, its own Home goes: its release, then exactly its binding is closed.
+  editor.nextDrain = 'clean';
+  editor.mountOpts.onHome();
+  await flush();
+  const own = v.last('tools/call');
+  assert.deepEqual(own.params, { name: 'openpaperdesign_app_page_release', arguments: { binding: B2, mount: 8 } });
+  await answer(v, { binding: B2, released: true }, own);
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B2 } });
+  panelOnly(v);
+});
+
+test('R25: an explicit discard whose release is delayed past a newer result closes and navigates nothing', async () => {
+  const { v, editor } = await realPanelView();
+  editor.nextDrain = 'failed';
+  await v.els.back.onclick();
+  assert.equal(v.els['ed-leave'].hidden, false);
+  const leaving = v.els['ed-leave'].onclick();
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  assert.equal(editor.disposed, true, 'the discarded editor is let go at once');
+  v.from(result(LIB_EDITOR('opened', ID2)));
+  await answer(v, { binding: B1, released: true }, release);
+  await leaving;
+  await flush();
+  assert.equal(closes(v).length, 0);
+  assert.equal(v.els.result.hidden, false, 'the newer result stays');
+  assert.equal(v.els['result-title'].textContent, 'Notes');
+  // Control: the same discard without anything newer closes exactly its binding.
+  const w = await realPanelView();
+  w.editor.nextDrain = 'failed';
+  await w.v.els.back.onclick();
+  const discard = w.v.els['ed-leave'].onclick();
+  await flush();
+  await answer(w.v, { binding: B1, released: true }, w.v.last('tools/call'));
+  await discard;
+  await flush();
+  assert.deepEqual(libAction(w.v).params, { name: 'openpaperdesign_app_close', arguments: { binding: B1 } });
+  panelOnly(v);
+  panelOnly(w.v);
+});
+
+test('R25: a teardown whose release is delayed past a newer editor lets only its own editor go', async () => {
+  const { v, editor } = await realPanelView();
+  const first = editor.handle;
+  v.from({ id: 'td-r25', method: 'ui/resource-teardown', params: {} });
+  await flush();
+  const release = v.last('tools/call');
+  assert.equal(release.params.name, 'openpaperdesign_app_page_release');
+  // Meanwhile Home and a new file (as in the case above).
+  v.from(result({ surface: 'home' }));
+  await flush();
+  await relist(v);
+  v.els['new-file'].onclick();
+  await flush();
+  await answer(v, PANEL_EDITOR('created', ID2), libAction(v));
+  const canvas = v.last('tools/call');
+  await answer(v, { binding: B2, canvas: { name: 'New document' }, revision: '"new"', active_page: 'p2', pages: [{ id: 'p2', name: 'Page 1', text: '{}' }], mount: 8 }, canvas);
+  const second = editor.handle;
+  assert.notEqual(second, first);
+  await answer(v, { binding: B1, released: true }, release);
+  await flush();
+  assert.ok(v.sent.some((m) => m.id === 'td-r25' && m.result), 'the teardown is answered');
+  assert.equal(first.left, true);
+  assert.equal(second.left, false, 'the newer editor is untouched');
+  assert.equal(v.els.editor.hidden, false);
+  assert.equal(closes(v).length, 0, 'a teardown closes nothing');
   panelOnly(v);
 });

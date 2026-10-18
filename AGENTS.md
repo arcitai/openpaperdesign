@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.49 · Updated: 2026-10-18
+Revision: 0.50 · Updated: 2026-10-18
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -59,6 +59,19 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
     each frame the palette is drawn (no behaviour change). The browser host needs it to exempt
     only that ephemeral search from its unfinished-input guard; the id is otherwise automatic
     and can't be known without guessing. Upstreamable as a read-only host seam.
+  - `src/ui/mod.rs` (R25-F3): an opt-in narrow layout, `UiState::narrow` (`NarrowLayout`,
+    `NarrowPanel`). Off by default (`below` 0), so every native window lays out exactly as
+    before; the browser host turns it on below 720 CSS px, where the side panels (240 + 260
+    px, at least 180 + 220) leave the canvas no room (a 320 px sidebar showed only the layers
+    panel and a clipped inspector). Below it the top bar spans the surface (All projects, the
+    file's name, every menu under one Menu, Layers and Design toggles) and at most one of the
+    same side panels fills the room under it; otherwise the canvas with the same floating
+    tools, which wrap there (`toolbar`'s `wrap`, false in the ordinary layout). An arrangement
+    change waits while an egui text field has the keyboard and then lags one frame, so a
+    field about to be hidden finishes as a click elsewhere finishes it; hidden layer/page
+    renames are finished as when the UI is hidden (R23), and upstream's Rename shows the
+    layer rows. Same panels, commands and canvas; no DOM copy, no global scaling.
+    Upstreamable as a host opt-in for small windows.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
@@ -388,7 +401,13 @@ status goes to a status live region for assistive technology and diagnostics; ho
 `opdStatusKind` (editor.js, shared with the browser page): stable healthy states (Ready, Saved,
 Saving…) show nothing, loading on the way to Ready shows as a small temporary note that the
 next state replaces, and failures, conflicts, refusals and notes show as one note over the
-workspace. Home drains, disposes (releasing the mount), then closes exactly that
+workspace. A save failure ("Save failed; retrying", unreachable), a conflict or a terminal
+error stays shown through the retry's "Saving…", Ready and every timer until it is resolved
+(an acknowledged Saved, the conflict's reload, or a new editor): `opdStatusDisplay` per editor
+in the view, `opdStatusNote` on the page (R25-F2). A departure (Home, the explicit discard,
+teardown) captures its view generation, editor handle and binding once and, after every await
+(drain, the mount's release, Close), acts only while it still owns the view: a newer result,
+Home or editor is never closed, hidden or let go by it (R25-F1). Home drains, disposes (releasing the mount), then closes exactly that
 binding, not forced; a refused, failed or unanswered close is said on the library and never
 shown as closed, and a close answer after a newer result belongs to nothing. A start failure
 offers a visible Back to files. Without the module, the library falls back to the old link

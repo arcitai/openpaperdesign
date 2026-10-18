@@ -91,6 +91,11 @@ const NO_IMAGE: &str =
 const LIBRARY_SESSION: &str = "Library items stay only while this editor is open; they aren't \
     saved with the canvas.";
 
+/// The workspace width (CSS px) below which upstream's narrow layout is used: under it the
+/// ordinary layout's side panels (240 + 260 px by default, 180 + 220 at least) would leave the
+/// canvas too little room.
+pub const NARROW_BELOW: f32 = 720.0;
+
 /// The page list (ids and names, in order) and the active page's id.
 type Meta = (Vec<(String, String)>, String);
 
@@ -295,6 +300,10 @@ impl WebState {
             ed,
             ui: UiState {
                 project_name: canvas.name.unwrap_or_default(),
+                // The granted surface can be a narrow sidebar: below this width upstream's
+                // narrow layout (one side panel at a time, the top bar across) keeps the canvas,
+                // tools, All projects and panels reachable. Wider, the ordinary layout.
+                narrow: ui::NarrowLayout::with_threshold(NARROW_BELOW),
                 ..Default::default()
             },
             ctx,

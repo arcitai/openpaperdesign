@@ -8,6 +8,7 @@ use crate::geom::V2;
 use crate::model::{Node, NodeKind};
 use crate::project::PageData;
 use crate::render::scene::{self, SceneCache};
+use crate::ui::NarrowPanel;
 
 const W: f64 = 1280.0;
 const H: f64 = 800.0;
@@ -1310,6 +1311,271 @@ fn upstream_s_all_projects_button_is_the_host_s_way_back() {
         "the editor asks its host to go Home"
     );
     assert!(!s.dirty(), "asking changes nothing in the document");
+}
+
+// ---- R25-F3: the granted surface can be a narrow sidebar (320 px). Upstream's narrow layout
+// (`UiState::narrow`, opted into by this host below `NARROW_BELOW`) keeps the canvas, the
+// tools, All projects and one side panel at a time reachable; wider, the ordinary layout.
+
+const NARROW: f64 = 320.0;
+const TALL: f64 = 760.0;
+
+/// The one-rectangle canvas of [`state`] on a 320 × 760 surface, laid out.
+fn narrow_state() -> WebState {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages = [page("p", "Page 1", rect)];
+    let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, NARROW, TALL).unwrap();
+    settle(&mut s, 0.0);
+    s
+}
+
+/// Click the narrow top bar's painted toggle `label` ("Layers", "Design") and let the
+/// arrangement settle (it changes after one frame without a focused text field).
+fn toggle(s: &mut WebState, label: &str, t: f64) {
+    // The top bar is 34 px tall; the panels below paint "Layers" and "Design" too.
+    let p = painted_at(s, label, |r| r.max.y <= 36.0);
+    click(s, p, t);
+    for _ in 0..4 {
+        step(s);
+    }
+}
+
+#[test]
+fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable() {
+    let mut s = narrow_state();
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    let c = s.canvas_rect();
+    assert_eq!(c.min.x, 0.0, "no side panel beside the canvas: {c:?}");
+    assert!(
+        c.width() >= NARROW as f32 - 1.0,
+        "the canvas spans the surface: {c:?}"
+    );
+    assert!(
+        c.min.y > 0.0 && c.height() > 600.0,
+        "under the top bar: {c:?}"
+    );
+    assert_eq!(
+        (s.ed.viewport.x, s.ed.viewport.y),
+        (c.width() as f64, c.height() as f64)
+    );
+    // The top bar carries the file's name and both toggles, inside the surface.
+    for wanted in ["Landing", "Layers", "Design", "Menu"] {
+        let painted = painted_text(&mut s);
+        let (_, r) = painted
+            .iter()
+            .find(|(t, _)| t.trim() == wanted)
+            .unwrap_or_else(|| panic!("{wanted} not painted: {painted:?}"));
+        assert!(
+            r.max.x <= NARROW as f32 && r.max.y <= c.min.y,
+            "{wanted}: {r:?}"
+        );
+    }
+    // All projects (upstream's grid button) at the bar's left edge asks the host to go Home.
+    let bar_y = (c.min.y / 2.0) as f64;
+    let mut asked = None;
+    let (mut x, mut t) = (4.0, 1000.0);
+    while asked.is_none() && x < 60.0 {
+        click(&mut s, (x, bar_y), t);
+        step(&mut s);
+        asked = s.take_request();
+        x += 4.0;
+        t += 500.0;
+    }
+    assert_eq!(asked, Some(HostRequest::Home), "All projects is reachable");
+    // Every tool of the floating palette can be clicked inside the surface (it wraps).
+    let mut reached = std::collections::BTreeSet::new();
+    let mut y = c.max.y as f64 - 130.0;
+    while y < c.max.y as f64 - 4.0 {
+        let mut x = 4.0;
+        while x < NARROW - 4.0 {
+            click(&mut s, (x, y), t);
+            step(&mut s);
+            if s.ed.tool != Tool::Select {
+                reached.insert(format!("{:?}", s.ed.tool));
+                // Back to Select, so the next probe's click on the canvas draws nothing.
+                s.run(Action::Tool(Tool::Select));
+                step(&mut s);
+            }
+            x += 6.0;
+            t += 500.0;
+        }
+        y += 6.0;
+    }
+    let all: std::collections::BTreeSet<String> = Tool::ALL
+        .iter()
+        .filter(|t| **t != Tool::Select)
+        .map(|t| format!("{t:?}"))
+        .collect();
+    assert_eq!(reached, all, "every tool is on the surface");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "probing the tools drew nothing");
+    // The canvas itself takes input: a drag with the rectangle tool draws where it went.
+    s.run(Action::Tool(Tool::Rect));
+    let (from, to) = (at(&s, 40.0, 60.0), at(&s, 120.0, 140.0));
+    drag(&mut s, from, to, t);
+    assert_eq!(s.ed.doc.nodes.len(), 2);
+    let id = s.ed.selection[0];
+    let r = s.ed.doc.world_rect(id).unwrap();
+    assert_eq!((r.x, r.y, r.w, r.h), (40.0, 60.0, 80.0, 80.0), "{r:?}");
+}
+
+#[test]
+fn r25_narrow_panels_open_one_at_a_time_and_the_wide_layout_returns_unchanged() {
+    let mut s = narrow_state();
+    toggle(&mut s, "Layers", 1000.0);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Layers));
+    assert!(
+        paints(&mut s, "Pages") && paints(&mut s, "Page 1"),
+        "upstream's pages and layers"
+    );
+    assert!(s.canvas_rect().width() < 2.0, "the panel takes the room");
+    // A press over the panel never reaches the canvas.
+    s.run(Action::Tool(Tool::Rect));
+    step(&mut s);
+    drag(&mut s, (100.0, 400.0), (180.0, 460.0), 1500.0);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn from the panel");
+    press(&mut s, "Escape", "Escape");
+    toggle(&mut s, "Design", 2000.0);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    assert!(paints(&mut s, "Export"), "upstream's inspector");
+    assert!(!paints(&mut s, "Pages"), "one panel at a time");
+    toggle(&mut s, "Design", 3000.0);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    assert!(s.canvas_rect().width() >= NARROW as f32 - 1.0);
+    // Wide: upstream's ordinary layout, as before (both panels beside the canvas).
+    s.resize(W, H, 1.0);
+    let t = settle(&mut s, 4000.0);
+    assert_eq!(s.ui.narrow.shown(), None);
+    let c = s.canvas_rect();
+    assert!(c.min.x >= 180.0 && c.max.x <= W as f32 - 220.0, "{c:?}");
+    assert!(paints(&mut s, "Pages") && paints(&mut s, "Export"));
+    // Narrow again: the canvas, as last chosen.
+    s.resize(NARROW, TALL, 1.0);
+    settle(&mut s, t);
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Canvas));
+    assert_eq!(s.canvas_rect().min.x, 0.0);
+    assert!(
+        !s.dirty(),
+        "arranging the panels changes nothing in the document"
+    );
+}
+
+#[test]
+fn r25_the_narrow_layout_waits_for_a_focused_number_field_and_never_drops_its_draft() {
+    for (typed, finish) in [("-", "Escape"), ("-150", "Enter")] {
+        let mut s = narrow_state();
+        click_at(&mut s, 150.0, 150.0, 0.0);
+        step(&mut s);
+        let id = s.ed.selection[0];
+        toggle(&mut s, "Design", 500.0);
+        assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+        let text = painted_text(&mut s);
+        let (_, bounds) = text
+            .iter()
+            .find(|(t, _)| t.starts_with("X  "))
+            .unwrap_or_else(|| panic!("X field not painted: {text:?}"));
+        let p = bounds.center();
+        click(&mut s, (p.x as f64, p.y as f64), 1000.0);
+        step(&mut s);
+        step(&mut s);
+        assert!(
+            s.field_has_keyboard(),
+            "{typed}: the X field has the keyboard"
+        );
+        s.modifiers(false, true, false, false);
+        press(&mut s, "a", "KeyA");
+        s.modifiers(false, false, false, false);
+        step(&mut s);
+        s.paste(typed);
+        step(&mut s);
+        // The surface widens and narrows while the field has the keyboard: nothing moves.
+        for (w, h) in [(W, H), (NARROW, TALL), (W, H)] {
+            s.resize(w, h, 1.0);
+            for _ in 0..4 {
+                step(&mut s);
+            }
+            assert_eq!(
+                s.ui.narrow.shown(),
+                Some(NarrowPanel::Design),
+                "{typed}: waits"
+            );
+            assert!(paints(&mut s, typed), "{typed}: the draft is still shown");
+            assert!(
+                s.field_has_keyboard() && s.unsaved_work() && !s.can_reload(),
+                "{typed}"
+            );
+        }
+        // Finished by upstream's own keys, then the arrangement follows the surface.
+        press(&mut s, finish, finish);
+        for _ in 0..4 {
+            step(&mut s);
+        }
+        assert!(!s.field_has_keyboard(), "{typed}: finished");
+        assert_eq!(s.ui.narrow.shown(), None, "{typed}: wide now");
+        let want = if typed == "-" { 100.0 } else { -150.0 };
+        assert_eq!(
+            axis(&s, id, "X  "),
+            want,
+            "{typed}: as upstream finishes it"
+        );
+        assert_eq!(s.dirty(), typed != "-", "{typed}");
+    }
+}
+
+#[test]
+fn r25_a_narrow_rename_opens_the_layers_panel_and_a_toggle_finishes_it_as_click_away_does() {
+    let mut s = narrow_state();
+    click_at(&mut s, 150.0, 150.0, 0.0);
+    let id = s.ed.selection[0];
+    let old = s.ed.doc.get(id).unwrap().name.clone();
+    s.modifiers(false, true, false, false);
+    press(&mut s, "r", "KeyR");
+    s.modifiers(false, false, false, false);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(
+        s.ui.narrow.shown(),
+        Some(NarrowPanel::Layers),
+        "Rename shows the rows"
+    );
+    assert!(
+        s.ui.renaming.is_some(),
+        "the rename stays open while they appear"
+    );
+    assert!(s.field_has_keyboard(), "its field has the keyboard");
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    assert_eq!(s.ed.doc.get(id).unwrap().name, old, "still a draft");
+    // Choosing Design is a click elsewhere: the field finishes (commits), then Design shows.
+    toggle(&mut s, "Design", 2000.0);
+    let renamed = s.ed.doc.get(id).unwrap().name.clone();
+    assert!(
+        renamed != old && renamed.contains('q'),
+        "{old} -> {renamed}"
+    );
+    assert!(s.ui.renaming.is_none());
+    assert_eq!(s.ui.narrow.shown(), Some(NarrowPanel::Design));
+    assert!(s.dirty(), "one ordinary edit to save");
+}
+
+#[test]
+fn r25_the_narrow_layout_is_opt_in_and_off_by_default() {
+    assert_eq!(
+        crate::ui::UiState::default().narrow.below,
+        0.0,
+        "native windows: off"
+    );
+    let mut s = narrow_state();
+    s.ui.narrow = Default::default();
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.narrow.shown(), None, "the ordinary layout, as before");
+    let c = s.canvas_rect();
+    assert!(
+        c.min.x >= 180.0,
+        "upstream's side panels as they were: {c:?}"
+    );
 }
 
 // ---- R22: page actions while the pages panel draws, and fields opened on another page.

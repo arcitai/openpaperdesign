@@ -22,23 +22,92 @@ const OPD_QUIET_STATUS = new Set(['Ready', 'Saved', 'Saving…', 'Updated with c
 // The way to Ready (the renderer's parts can take a while to arrive): shown as a restrained,
 // temporary indication that the next healthy state (Ready) replaces, never as lasting chrome.
 const OPD_LOADING_STATUS = new Set(['Starting renderer…', 'Loading the editor…', 'Opening the canvas…']);
+// What a save tick reports when the save didn't happen (page.js `saveStep`): it is retried, but
+// the change is not saved until a later save is acknowledged.
+const OPD_SAVE_FAILED = new Set(['Save failed; retrying', 'Save failed (server unreachable); retrying']);
+// A save refused because the canvas changed elsewhere (page.js `saveStep`): nothing is retried;
+// only the conflict banner's reload (or a later acknowledged save) resolves it.
+const OPD_CONFLICT = new Set(['Not saved: conflict']);
+// What resolves an outstanding failure or conflict: an acknowledged save, or the explicit
+// reload of the version on disk (page.js `discardStep`).
+const OPD_RESOLVED = new Set(['Saved', 'Reloaded the version on disk']);
 
 /**
  * How a host shows a status: 'quiet' (live region only), 'loading' (a small temporary
- * indication until the next state), 'error' or 'note' (shown). Every status also goes to the
- * live region. An error is never quiet or loading.
+ * indication until the next state), 'failure' (a save that didn't happen, being retried),
+ * 'conflict', 'error' (terminal) or 'note' (shown). Every status also goes to the live region.
+ * An error is never quiet or loading.
  */
 export function opdStatusKind(text, error) {
   if (error) return 'error';
   const s = String(text);
   if (OPD_QUIET_STATUS.has(s)) return 'quiet';
   if (OPD_LOADING_STATUS.has(s)) return 'loading';
+  if (OPD_SAVE_FAILED.has(s)) return 'failure';
+  if (OPD_CONFLICT.has(s)) return 'conflict';
   return 'note';
 }
 
 /** Whether a status needs nothing visible (see `opdStatusKind`). */
 export function opdQuietStatus(text, error) {
   return opdStatusKind(text, error) === 'quiet';
+}
+
+/**
+ * The status shown for one editor, with the one thing it remembers (R25-F2): a save failure, a
+ * conflict or a terminal error stays shown until it is resolved: an acknowledged save
+ * ("Saved"), the conflict's explicit reload, or a new editor (a new display). The next tick's
+ * "Saving…" of a retry, Ready or "Updated…" never hides it, and no timer does. A newer problem
+ * or note replaces its text. `show(text, error)` returns what the visible note shows:
+ * `{ kind, text, latched }` (`kind` 'quiet' hides it; `latched`: the earlier problem, still
+ * unresolved, shown instead of this status).
+ */
+export function opdStatusDisplay() {
+  let outstanding = null;
+  return {
+    show(text, error) {
+      const s = String(text);
+      const kind = opdStatusKind(s, error);
+      if (OPD_RESOLVED.has(s) && (!outstanding || outstanding.kind !== 'error')) outstanding = null;
+      if (kind === 'failure' || kind === 'conflict' || kind === 'error') {
+        outstanding = { kind, text: s, latched: false };
+        return outstanding;
+      }
+      if (outstanding && (kind === 'quiet' || kind === 'loading')) {
+        return { kind: outstanding.kind, text: outstanding.text, latched: true };
+      }
+      return { kind, text: s, latched: false };
+    },
+    get outstanding() { return outstanding ? outstanding.kind : null; },
+  };
+}
+
+/**
+ * A host's visible status note (the browser page's), by `opdStatusDisplay`: every status goes
+ * to `live` (a status live region); `note` shows what the display says, with its kind as its
+ * class (`loading`, `failure`, `conflict`, `error`, `note`), and only a plain note with no
+ * problem outstanding goes after six seconds. `timers`: { setTimeout, clearTimeout }. Returns
+ * `status(text, error)`.
+ */
+export function opdStatusNote(live, note, timers) {
+  const display = opdStatusDisplay();
+  let timer = 0;
+  return (text, error = false) => {
+    live.textContent = text;
+    timers.clearTimeout(timer);
+    const shown = display.show(text, Boolean(error));
+    if (shown.kind === 'quiet') {
+      note.hidden = true;
+      return;
+    }
+    note.textContent = shown.text;
+    note.className = shown.kind;
+    note.hidden = false;
+    // A note over an unresolved problem doesn't time out: that would hide the problem too.
+    if (shown.kind === 'note' && !display.outstanding) {
+      timer = timers.setTimeout(() => { note.hidden = true; }, 6000);
+    }
+  };
 }
 
 /** The browser environment the mount uses (timers, frames, observers, downloads, clipboard). */

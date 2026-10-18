@@ -47,6 +47,84 @@ pub struct UiState {
     pub layer_drag: Option<(NodeId, Option<LayerDrop>)>,
     /// Row rects of the last layers-panel frame (for drop targeting).
     pub layer_rows: Vec<(NodeId, egui::Rect, usize)>,
+    /// A host's opt-in layout for surfaces too narrow for both side panels beside the canvas.
+    /// Off by default (every native window): `draw` then lays out exactly as before.
+    pub narrow: NarrowLayout,
+}
+
+/// Which side panel the narrow layout shows over the canvas's room, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NarrowPanel {
+    /// Just the canvas, with the floating tools.
+    #[default]
+    Canvas,
+    Layers,
+    Design,
+}
+
+/// The narrow layout (see [`UiState::narrow`]): below `below` logical px of width the top bar
+/// spans the surface (All projects, the file's name, every menu in one, and a Layers and a
+/// Design toggle) and at most one side panel is shown, filling the room under it, instead of
+/// both beside the canvas. The same panels, commands and canvas are drawn; only where.
+///
+/// A change of arrangement (a toggle, or the surface crossing `below`) is applied only after
+/// one frame without an egui text field holding the keyboard, so a field that is about to be
+/// hidden first sees its focus go and finishes as a click elsewhere finishes it (a numeric
+/// draft, a rename), never silently dropped. While a field has the keyboard, the arrangement
+/// waits.
+#[derive(Debug, Default)]
+pub struct NarrowLayout {
+    /// The width below which the narrow layout is used; 0 (the default) never uses it.
+    pub below: f32,
+    /// The side panel the person chose for the narrow layout.
+    pub panel: NarrowPanel,
+    /// What is laid out: `None` for the ordinary layout.
+    shown: Option<NarrowPanel>,
+    laid_out: bool,
+    settling: bool,
+}
+
+impl NarrowLayout {
+    /// The narrow layout below `below` logical px of width, starting on the canvas.
+    pub fn with_threshold(below: f32) -> NarrowLayout {
+        NarrowLayout {
+            below,
+            ..Default::default()
+        }
+    }
+
+    /// What the last frame laid out: `None` for the ordinary layout, else the narrow layout
+    /// with that panel.
+    pub fn shown(&self) -> Option<NarrowPanel> {
+        self.shown
+    }
+}
+
+/// Whether an egui text field (a numeric draft, a rename, a search) has the keyboard.
+fn text_field_focused(ctx: &egui::Context) -> bool {
+    let focused = ctx.memory(|m| m.focused());
+    focused.is_some_and(|id| egui::widgets::text_edit::TextEditState::load(ctx, id).is_some())
+}
+
+/// The arrangement to lay out this frame, for a surface `width` logical px wide (see
+/// [`NarrowLayout`]).
+fn settle_narrow(ctx: &egui::Context, n: &mut NarrowLayout, width: f32) -> Option<NarrowPanel> {
+    let want = (n.below > 0.0 && width < n.below).then_some(n.panel);
+    if !n.laid_out {
+        // The first frame lays out what the surface needs at once.
+        n.laid_out = true;
+        n.shown = want;
+    } else if want == n.shown || text_field_focused(ctx) {
+        n.settling = false;
+    } else if n.settling {
+        n.settling = false;
+        n.shown = want;
+    } else {
+        // One more frame as before: a field that lost the keyboard this frame finishes in it.
+        n.settling = true;
+        ctx.request_repaint();
+    }
+    n.shown
 }
 
 /// Where a dragged layer lands relative to a row.
@@ -99,6 +177,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                     st.renaming = Some((id, n.name.clone()));
                     st.show_library = false;
                     st.hide_ui = false;
+                    // The narrow layout shows the layer rows for it (unused otherwise).
+                    st.narrow.panel = NarrowPanel::Layers;
                 }
             }
             UiEvent::ToggleUi => st.hide_ui = !st.hide_ui,
@@ -113,6 +193,10 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         let canvas = ui.available_rect_before_wrap();
         palette::draw(ui.ctx(), ed, st, canvas);
         return canvas;
+    }
+    let width = ui.available_rect_before_wrap().width();
+    if let Some(panel) = settle_narrow(ui.ctx(), &mut st.narrow, width) {
+        return draw_narrow(ui, ed, st, panel);
     }
     let p = theme::pal(ui);
     let sidebar_fill = if st.translucent_sidebar {
@@ -159,13 +243,132 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         )
         .show(ui, |ui| inspector::panel(ui, ed, st));
     let canvas = ui.available_rect_before_wrap();
-    toolbar(ui.ctx(), ed, canvas);
+    toolbar(ui.ctx(), ed, canvas, false);
     status(ui.ctx(), ed, canvas);
     palette::draw(ui.ctx(), ed, st, canvas);
     if st.show_help {
         help(ui.ctx(), st, canvas);
     }
     canvas
+}
+
+/// The narrow layout (see [`NarrowLayout`]): the top bar across the surface, then the chosen
+/// side panel filling the room under it, or the canvas with its floating tools. Panels the
+/// narrow layout opens keep their own sizes apart from the ordinary layout's.
+fn draw_narrow(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, panel: NarrowPanel) -> egui::Rect {
+    let p = theme::pal(ui);
+    let sidebar_fill = if st.translucent_sidebar {
+        Color32::TRANSPARENT
+    } else {
+        p.sidebar
+    };
+    egui::Panel::top("toolbar")
+        .exact_size(if st.native_chrome {
+            theme::TOOLBAR_H
+        } else {
+            34.0
+        })
+        .frame(
+            egui::Frame::NONE
+                .fill(p.window)
+                .inner_margin(egui::Margin::symmetric(8, 0)),
+        )
+        .show(ui, |ui| narrow_top_bar(ui, ed, st));
+    let room = ui.available_rect_before_wrap();
+    match panel {
+        NarrowPanel::Layers => {
+            egui::Panel::left("layers-narrow")
+                .resizable(false)
+                .exact_size(room.width())
+                .frame(
+                    egui::Frame::NONE
+                        .fill(sidebar_fill)
+                        .inner_margin(egui::Margin::symmetric(10, 8)),
+                )
+                .show(ui, |ui| layers(ui, ed, st));
+        }
+        NarrowPanel::Design => {
+            egui::Panel::right("design-narrow")
+                .resizable(false)
+                .exact_size(room.width())
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.inspector)
+                        .inner_margin(egui::Margin::symmetric(14, 10)),
+                )
+                .show(ui, |ui| inspector::panel(ui, ed, st));
+        }
+        NarrowPanel::Canvas => {}
+    }
+    if panel != NarrowPanel::Layers && st.narrow.panel != NarrowPanel::Layers {
+        // No layer or page rows are drawn, and none are about to be: an open rename is
+        // finished as losing focus does (as when the UI is hidden).
+        commit_rename(ed, st);
+        pages::commit_rename(ed, st);
+    }
+    let canvas = ui.available_rect_before_wrap();
+    if panel == NarrowPanel::Canvas {
+        toolbar(ui.ctx(), ed, canvas, true);
+        status(ui.ctx(), ed, canvas);
+    }
+    palette::draw(ui.ctx(), ed, st, room);
+    if st.show_help {
+        help(ui.ctx(), st, room);
+    }
+    canvas
+}
+
+/// The narrow layout's top bar: All projects, every menu under one Menu button, then the
+/// Layers and Design toggles at the right and the file's name in between.
+fn narrow_top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+    let p = theme::pal(ui);
+    ui.horizontal_centered(|ui| {
+        if theme::icon_button(ui, theme::Icon::Grid, 26.0, false)
+            .on_hover_text("All projects")
+            .clicked()
+        {
+            ed.requests.push(crate::editor::AppRequest::Home);
+        }
+        if !st.native_chrome {
+            ui.menu_button("Menu", |ui| {
+                for (title, entries) in shortcuts::menus() {
+                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
+                }
+            });
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for (panel, label) in [
+                (NarrowPanel::Design, "Design"),
+                (NarrowPanel::Layers, "Layers"),
+            ] {
+                let on = st.narrow.panel == panel;
+                let r = ui.add(
+                    egui::Label::new(
+                        RichText::new(label)
+                            .font(theme::semibold(theme::SECONDARY))
+                            .color(if on { p.text } else { p.secondary }),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if r.clicked() {
+                    st.narrow.panel = if on { NarrowPanel::Canvas } else { panel };
+                }
+                ui.add_space(6.0);
+            }
+            let title = if st.project_name.is_empty() {
+                ed.doc.name.clone()
+            } else {
+                st.project_name.clone()
+            };
+            ui.add(egui::Label::new(title_text(title)).truncate());
+        });
+    });
+    let r = ui.max_rect();
+    ui.painter().hline(
+        r.x_range(),
+        r.bottom() - 0.5,
+        egui::Stroke::new(1.0, p.separator),
+    );
 }
 
 fn menu_item(ui: &mut Ui, ed: &mut Editor, label: &str, action: Action) {
@@ -714,8 +917,12 @@ fn tool_icon(t: Tool) -> Icon {
     }
 }
 
-/// Floating tool palette at the bottom of the canvas, styled as a macOS popover.
-fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect) {
+/// The tools a separator goes before in the floating tool palette.
+const GROUP_STARTS: [Tool; 4] = [Tool::Frame, Tool::Line, Tool::Text, Tool::Pencil];
+
+/// Floating tool palette at the bottom of the canvas, styled as a macOS popover. `wrap` (the
+/// narrow layout only): the tools wrap into rows that fit the canvas, without separators.
+fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect, wrap: bool) {
     egui::Area::new("toolbar".into())
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(egui::pos2(canvas.center().x, canvas.bottom() - 16.0))
@@ -726,10 +933,10 @@ fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect) {
                 .corner_radius(10.0)
                 .inner_margin(5.0)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    let tools = |ui: &mut Ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         for t in Tool::ALL {
-                            if matches!(t, Tool::Frame | Tool::Line | Tool::Text | Tool::Pencil) {
+                            if !wrap && GROUP_STARTS.contains(&t) {
                                 let (r, _) = ui.allocate_exact_size(
                                     egui::vec2(9.0, 28.0),
                                     egui::Sense::hover(),
@@ -747,7 +954,13 @@ fn toolbar(ctx: &egui::Context, ed: &mut Editor, canvas: egui::Rect) {
                                 ed.run(Action::Tool(t));
                             }
                         }
-                    });
+                    };
+                    if wrap {
+                        ui.set_max_width((canvas.width() - 32.0).max(32.0));
+                        ui.horizontal_wrapped(tools);
+                    } else {
+                        ui.horizontal(tools);
+                    }
                 });
         });
 }

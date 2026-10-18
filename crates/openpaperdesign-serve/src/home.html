@@ -1209,9 +1209,12 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // is exactly its binding closed.
 
   const PANEL = LIBRARY && typeof opdCreatePanel === 'function' ? opdCreatePanel({ rpc }) : null;
-  // The editor's own rule for how a status shows (editor.js `opdStatusKind`, assembled into this
-  // module with the panel; the browser page uses it too). Without it every status is shown.
-  const statusKind = typeof opdStatusKind === 'function' ? opdStatusKind : (t, e) => (e ? 'error' : 'note');
+  // The editor's own rule for how its statuses show (editor.js `opdStatusDisplay`, assembled
+  // into this module with the panel; the browser page uses the same rule). One display per
+  // editor: a save failure or conflict stays shown through the retries until a save is
+  // acknowledged (R25-F2). Without the module every status is shown.
+  const newDisplay = () => (typeof opdStatusDisplay === 'function' ? opdStatusDisplay() : null);
+  let display = null;
   let panelHandle = null; // the editor mounted in the editor view, if any
   let panelBinding = null; // the binding it edits
   let leaving = false;
@@ -1220,14 +1223,19 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // replaces its text.
   let stayReason = false;
   let alertRun = 0;
-  // `kind`: 'error', 'note' or 'loading' (see `statusKind`).
-  function edAlert(text, kind) {
+  // `kind`: as `opdStatusKind` ('error', 'failure', 'conflict', 'loading', 'note'). `held`: a
+  // problem is still unresolved, so nothing here times out.
+  function edAlert(text, kind, held) {
     const run = ++alertRun;
     $('ed-alert-text').textContent = text;
-    $('ed-alert').className = { error: 'ed-alert bad', loading: 'ed-alert loading' }[kind] || 'ed-alert';
+    $('ed-alert').className = { error: 'ed-alert bad', failure: 'ed-alert bad', conflict: 'ed-alert bad',
+      loading: 'ed-alert loading' }[kind] || 'ed-alert';
     $('ed-alert').hidden = false;
-    // A note goes after a while; loading goes with the next state (Ready), a failure stays.
-    if (kind === 'note') setTimeout(() => { if (run === alertRun && !stayReason) $('ed-alert').hidden = true; }, 6000);
+    // A plain note goes after a while; loading goes with the next state (Ready); a problem
+    // stays until it is resolved.
+    if (kind === 'note' && !held) {
+      setTimeout(() => { if (run === alertRun && !stayReason) $('ed-alert').hidden = true; }, 6000);
+    }
   }
   function hideAlert() {
     alertRun += 1;
@@ -1235,19 +1243,30 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('ed-leave').hidden = true;
     $('ed-home').hidden = true;
   }
-  // Every status goes to the live region (assistive technology, checks). Stable healthy ones
-  // (Ready, Saved) show nothing more; loading shows as a small note until the next state;
-  // anything else is a note over the workspace.
+  // Every status of the editor goes to the live region (assistive technology, checks). Stable
+  // healthy ones (Ready, Saved, Saving…) show nothing more while no problem is unresolved;
+  // loading shows as a small note until the next state; a save failure, conflict or error stays
+  // shown until it is resolved; anything else is a note over the workspace.
   const edStatus = (text, error) => {
     $('ed-status').textContent = text;
     $('ed-status').className = error ? 'sr-only bad' : 'sr-only';
     if (text === 'Saved') stayReason = false;
-    const kind = statusKind(text, Boolean(error));
-    if (kind === 'quiet' || (kind === 'loading' && stayReason)) {
+    const shown = display ? display.show(text, Boolean(error))
+      : { kind: error ? 'error' : 'note', text: String(text), latched: false };
+    if (shown.kind === 'quiet' || (shown.kind === 'loading' && stayReason)) {
       if (!stayReason) hideAlert();
       return;
     }
-    edAlert(text, kind);
+    // A refused leave's reason isn't replaced by the echo of an earlier problem.
+    if (stayReason && shown.latched) return;
+    edAlert(shown.text, shown.kind, Boolean(display && display.outstanding));
+  };
+  // Why a leave was refused: shown (and announced) like a problem, but it is the view's, not
+  // the editor's, so it isn't kept once the editor saves (see `stayReason`).
+  const edReason = (text) => {
+    $('ed-status').textContent = text;
+    $('ed-status').className = 'sr-only bad';
+    edAlert(text, 'error', true);
   };
   // Diagnostics only: which renderer runs. A renderer failure is also a status error.
   const edRenderer = (text) => { $('ed-renderer').textContent = text; };
@@ -1276,6 +1295,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
     show('editor');
     panelBinding = binding;
+    display = newDisplay();
     // The file's name is the workspace's own top-bar title (from the canvas it loads); here it
     // only names the view for assistive technology.
     $('ed-title').textContent = name;
@@ -1317,12 +1337,22 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     });
   }
 
+  // A departure (Home, the explicit discard, the host's teardown) belongs to the view and the
+  // editor it started from (R25-F1): that view's generation, the editor's handle and its
+  // binding, captured once. After every await (the drain, the mount's release, the Close) it
+  // goes on only while it still owns the view: once a newer result, Home or editor took over,
+  // it changes, closes and navigates nothing more, and never touches the newer editor. Its own
+  // editor is still let go (released) before any Close, as before.
+  const departure = () => Object.freeze({ g: gen, h: panelHandle, binding: panelBinding });
+  const owns = (d) => d.g === gen;
+
   // The editor is let go only when nothing in it is left unsaved (Session.drain): input and
   // polling stop, a save under way finishes and what is left is saved. Otherwise it stays, says
-  // why, and offers to leave without saving.
-  async function leaveEditor() {
-    const h = panelHandle;
-    if (!h) return true;
+  // why, and offers to leave without saving. True only if `d`'s editor was let go and `d` still
+  // owns the view.
+  async function leaveEditor(d) {
+    const h = d.h;
+    if (!h) return false;
     if (leaving) return false;
     leaving = true;
     stayReason = false;
@@ -1335,7 +1365,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       r = 'failed';
     }
     leaving = false;
-    if (panelHandle !== h) return false;
+    if (panelHandle !== h || !owns(d)) return false;
     if (r !== 'clean') {
       h.resume();
       setEditorBusy(false);
@@ -1346,21 +1376,22 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
         unreachable: 'Still open: Codex didn\'t confirm your last save, so it may not be saved. Try again, or leave without saving.',
         error: 'Still open: the renderer stopped with a change that isn\'t saved. Leave without saving to drop it.',
       }[r] || 'Still open: your last change may not be saved. Try again, or leave without saving.';
-      edStatus(why, true);
+      edReason(why);
       stayReason = true;
       $('ed-leave').hidden = false;
       announce(why);
       return false;
     }
-    await disposePanel();
-    return true;
+    await disposePanel(h);
+    return owns(d);
   }
 
-  // For good: the editor is undone (nothing more is saved from it) and the server told so.
-  async function disposePanel() {
-    const h = panelHandle;
-    panelHandle = null;
-    if (h) await h.dispose();
+  // For good: editor `h` is undone (nothing more is saved from it) and the server told so (its
+  // mount released). Only `h`: a newer editor mounted meanwhile stays as it is.
+  async function disposePanel(h) {
+    if (!h) return;
+    if (panelHandle === h) panelHandle = null;
+    await h.dispose();
   }
 
   // Home: once the editor was saved and let go, exactly the binding it edited is closed (not
@@ -1368,26 +1399,27 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function editorBack() {
     // Without an editor, its close is already under way: a second Home waits for that answer.
     if (!panelHandle) return;
-    const binding = panelBinding;
-    if (await leaveEditor()) closeAndGoHome(binding);
+    const d = departure();
+    if (await leaveEditor(d)) closeAndGoHome(d);
   }
   // Leaving without saving: the explicit discard of what a refused leave kept.
   $('ed-leave').onclick = async () => {
     if (leaving || !panelHandle) return;
-    const binding = panelBinding;
-    await disposePanel();
-    closeAndGoHome(binding);
+    const d = departure();
+    await disposePanel(d.h);
+    if (owns(d)) closeAndGoHome(d);
   };
   $('ed-home').onclick = editorBack;
-  // The close's answer belongs to the view it started in (`act`): a result shown meanwhile
-  // keeps the view. A refusal or an unconfirmed close is said on the library, never shown as
-  // closed; the editor is gone either way, and everything was saved (or knowingly dropped)
-  // before.
-  async function closeAndGoHome(binding) {
-    panelBinding = null;
-    if (!binding) return goHome();
-    const r = await act('openpaperdesign_app_close', { binding }, 'Closing the file');
-    if (!r) return;
+  // The close's answer belongs to the view it started in (`act`, and `d`): a result or editor
+  // shown meanwhile keeps the view. A refusal or an unconfirmed close is said on the library,
+  // never shown as closed; the editor is gone either way, and everything was saved (or
+  // knowingly dropped) before.
+  async function closeAndGoHome(d) {
+    if (!owns(d)) return;
+    if (panelBinding === d.binding) panelBinding = null;
+    if (!d.binding) return goHome();
+    const r = await act('openpaperdesign_app_close', { binding: d.binding }, 'Closing the file');
+    if (!r || !owns(d)) return;
     goHome();
     if (r.ok && r.ok.action === 'closed') return;
     const said = r.refused
@@ -1408,7 +1440,9 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     } catch {
       // Gone either way.
     }
-    await disposePanel();
+    // Only the editor this teardown drained (a newer one, mounted meanwhile, is the host's
+    // next teardown's).
+    await disposePanel(h);
   }
 
   // ---- results ----
