@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.66 · Updated: 2026-10-19
+Revision: 0.67 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -354,7 +354,11 @@ engine architecture is `analysis/DESIGN.md`.
       `label_paste_text` makes line breaks `\n`, a tab a space and drops other control
       characters. The text is never decoded: JSON, SVG or anything else is not read as
       layers, foreign content or a new text layer, the internal layer clipboard isn't used,
-      and nothing happens without text. Before, the browser host's `paste` event (a label
+      and nothing happens without text. Nor while the edited arrow is locked, itself or
+      through an ancestor (`Document::is_effectively_locked` on the edit's own target, since
+      Lock empties the selection but can leave the label's edit open; R43-F1): the clipboard
+      isn't read and nothing is pasted anywhere else. Typing into such a stale edit is a
+      pre-existing gap outside this fix. Before, the browser host's `paste` event (a label
       is not an egui field) and the native Paste decoded the text, so a label's Paste added
       a text layer or pasted layers beside the arrow. Plain Paste outside a label edit, and
       a focused egui field's paste, are unchanged. Same Editor, text edit, history, clipboard

@@ -1626,6 +1626,108 @@ fn paste_while_editing_an_arrow_label_edits_that_label_as_plain_text_in_one_step
     e.doc.validate().unwrap();
 }
 
+/// R43-F1: Paste never changes the label of a locked arrow, even while that label is still
+/// being edited. Enter edits the label, Lock (⌘⇧L) locks the arrow and empties the selection
+/// while the edit stays open, and ⌘V then changes nothing: the label, the document, the
+/// selection and the undo history are as Lock left them, nothing is pasted anywhere else, and
+/// the clipboard isn't even read. The same holds when the lock is the arrow's group's. Unlocked
+/// again (control), the same keys paste into the label as before.
+#[test]
+fn paste_never_changes_the_label_of_an_arrow_locked_while_its_label_is_edited() {
+    use paper_rs::io::clipboard;
+    use std::{cell::RefCell, rc::Rc};
+    /// The clipboard's text and how many times it was read.
+    struct Board(Rc<RefCell<(Option<String>, usize)>>);
+    impl clipboard::Provider for Board {
+        fn read_text(&mut self) -> Option<String> {
+            let mut b = self.0.borrow_mut();
+            b.1 += 1;
+            b.0.clone()
+        }
+        fn write_text(&mut self, s: &str) {
+            self.0.borrow_mut().0 = Some(s.into());
+        }
+    }
+    const PASTED: &str = "PASTED INTO LOCKED LABEL";
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "protected");
+    let board = Rc::new(RefCell::new((Some(PASTED.to_string()), 0)));
+    e.clipboard_io = Some(Box::new(Board(board.clone())));
+    let reads = |board: &Rc<RefCell<(Option<String>, usize)>>| board.borrow().1;
+    // Paste with the label open and the arrow locked: nothing at all happens.
+    let refused = |e: &mut Editor, why: &str| {
+        assert!(e.doc.is_effectively_locked(arrow), "{why}: locked");
+        assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(arrow), "{why}");
+        let (doc, steps) = (e.doc.clone(), e.history.undo_len());
+        let selection = e.selection.clone();
+        let edit = e.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+        let read = reads(&board);
+        key(e, Key::Char('v'), Modifiers::cmd());
+        assert_eq!(label_of(e, arrow).as_deref(), Some("protected"), "{why}");
+        assert_eq!(e.doc, doc, "{why}: nothing pasted instead");
+        assert_eq!(e.history.undo_len(), steps, "{why}: nothing recorded");
+        assert_eq!(e.selection, selection, "{why}");
+        let after = e.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+        assert_eq!(after, edit, "{why}: the edit as it was");
+        assert_eq!(reads(&board), read, "{why}: the clipboard isn't read");
+        key(e, Key::Escape, Modifiers::NONE);
+        assert_eq!(label_of(e, arrow).as_deref(), Some("protected"), "{why}");
+        assert!(e.doc.is_effectively_locked(arrow), "{why}: still locked");
+        assert_eq!(e.doc.nodes.len(), doc.nodes.len(), "{why}: no extra node");
+    };
+    // The arrow itself, locked by the shortcut while its label is open.
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    let editing = e.text_edit.as_ref().map(|te| te.id);
+    assert_eq!(editing, Some(arrow), "Enter edits it");
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(arrow).unwrap().locked, "Lock reached the arrow");
+    assert!(e.selection.is_empty(), "Lock empties the selection");
+    refused(&mut e, "the arrow");
+    // Control: unlocked again, the same keys paste into its label (Enter selects all of it).
+    e.selection = vec![arrow];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(arrow), "unlocked");
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    let steps = e.history.undo_len();
+    key(&mut e, Key::Char('v'), Modifiers::cmd());
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some(PASTED), "pasted");
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    e.run(Action::Undo);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("protected"));
+    // Its group locked (fixture: the group and then the arrow are selected directly, as a
+    // locked group's arrow can't be picked on the canvas): Paste is refused the same way.
+    e.selection = vec![a, b, arrow];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(g).unwrap().locked, "the group is locked");
+    assert!(!e.doc.get(arrow).unwrap().locked, "the arrow itself isn't");
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    refused(&mut e, "its group");
+    // Control: the group unlocked, Paste edits the label again.
+    e.selection = vec![g];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(arrow));
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    key(&mut e, Key::Char('v'), Modifiers::cmd());
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some(PASTED));
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)), "the same bound arrow");
+    assert_eq!(e.doc.get(arrow).unwrap().parent, Some(g), "in its group");
+    e.doc.validate().unwrap();
+}
+
 fn inside_rounded(p: V2, r: Rect, radius: f64) -> bool {
     if !r.contains(p) {
         return false;

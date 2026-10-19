@@ -2191,9 +2191,16 @@ impl Editor {
     /// plain text, at the caret or over the selected characters, in the label's own edit (one
     /// undo step with it). It is never read as layers, SVG or a new text layer, whatever it
     /// looks like, and nothing else in the document changes. Without text, nothing happens.
+    /// Nor does it while that arrow is locked, itself or through a locked group (Lock can
+    /// come while its label is open): the label is kept, the clipboard isn't read, and
+    /// nothing is pasted anywhere else instead.
     pub fn paste_from_clipboard(&mut self) {
         use crate::io::clipboard::{self, Content};
         if self.editing_label() {
+            let target = self.text_edit.as_ref().map(|te| te.id);
+            if target.is_some_and(|id| self.doc.is_effectively_locked(id)) {
+                return;
+            }
             let text = self.clipboard_io.as_mut().and_then(|io| io.read_text());
             let text = text.map(|t| label_paste_text(&t)).unwrap_or_default();
             if !text.is_empty() {

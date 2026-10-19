@@ -4209,6 +4209,57 @@ fn a_browser_paste_while_editing_an_arrow_label_edits_that_label_as_plain_text()
     assert_eq!(s.ed.doc.nodes.len(), nodes.len(), "no layer pasted");
 }
 
+/// R43-F1 in the browser: Enter edits the arrow's label, Ctrl+Shift+L (as the page delivers
+/// the keys) locks the arrow while the label stays open, and the page's `paste` event then
+/// changes nothing: the label, the document, the selection and the undo history stay as Lock
+/// left them, and nothing is pasted elsewhere. Unlocked again (control), the same paste edits
+/// the label. The arrow is selected directly first (fixture, as in the test above).
+#[test]
+fn a_browser_paste_never_changes_the_label_of_an_arrow_locked_while_it_is_edited() {
+    let mut s = state();
+    let [arrow, ..] = labelled_arrow(&mut s);
+    let label = |s: &WebState| s.ed.doc.get(arrow).unwrap().kind.label().map(String::from);
+    let lock_keys = |s: &mut WebState| {
+        s.modifiers(true, true, false, false);
+        press(s, "L", "KeyL");
+        s.modifiers(false, false, false, false);
+        timed_frames(s, 1);
+    };
+    s.ed.selection = vec![arrow];
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 1);
+    assert_eq!(s.ed.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    lock_keys(&mut s);
+    assert!(
+        s.ed.doc.get(arrow).unwrap().locked,
+        "Lock reached the arrow"
+    );
+    assert!(s.ed.selection.is_empty(), "Lock empties the selection");
+    assert_eq!(s.ed.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    let (doc, steps) = (s.ed.doc.clone(), s.ed.history.undo_len());
+    s.paste("PASTED INTO LOCKED LABEL");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("sends"), "the label is kept");
+    assert_eq!(s.ed.doc, doc, "nothing pasted instead");
+    assert_eq!(s.ed.history.undo_len(), steps, "nothing recorded");
+    assert!(s.ed.selection.is_empty());
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("sends"));
+    assert!(s.ed.doc.get(arrow).unwrap().locked, "still locked");
+    // Control: unlocked with the same keys, the same paste edits the label.
+    s.ed.selection = vec![arrow];
+    lock_keys(&mut s);
+    assert!(!s.ed.doc.get(arrow).unwrap().locked, "unlocked");
+    s.ed.selection = vec![arrow];
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 1);
+    s.paste("PASTED");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("PASTED"));
+}
+
 // ---- redraw rules (from the toolbar page, kept)
 
 /// Laser points at canvas (400, 400) .. (420, 410), drawn at t = 0..20 ms, then a frame.
