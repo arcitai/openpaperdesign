@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 9 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 10 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -146,8 +146,19 @@ The principles:
       data folder, not in a Codex project." No project association is shown or implied.
     - **Search** says when nothing matches and how to clear it.
 
+12. **Diagrams from existing objects** (revision 2 slice 7, partly built). A box with its
+    label is a group of one shape and one Text layer over it.
+    - Selected, it has the "+" quick-connect knobs: a knob copies the whole group beside it
+      (label included, still ordinary text) and joins the two shapes with one arrow, one undo
+      step. Arrows always bind the shape, never the label or the group.
+    - Resizing it never scales the label's characters or font. The label stays on one line
+      while it fits, wraps at spaces within the shape otherwise, and stays centred on the
+      shape where it was. A label too tall for its shape even so overflows it; it is never
+      clipped.
+    - Other groups (several shapes, nested groups) keep ordinary group behaviour.
+
 Still open from the revision 2 plan (not built yet, and not to be described as built):
-- the diagram workflow and connector labels;
+- connector labels (attached to an arrow) and the rest of the diagram workflow;
 - the project Design system source;
 - the guide and value editor and Apply.
 

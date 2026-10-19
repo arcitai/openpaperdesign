@@ -1166,7 +1166,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   }
   // A layout the library couldn't keep still shows here, and that is said (shown and announced)
   // only while it is the latest layout choice, its home is still the view shown and nothing
-  // newer took the notice meanwhile. A later choice that is kept takes that notice back.
+  // newer took the notice meanwhile. A later choice that is kept takes that notice and its
+  // announcement back.
   let layoutUnkept = null; // the notice that said so, while it may still be shown
   async function chooseLayout(next) {
     const g = gen;
@@ -1175,7 +1176,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     if (kept === null || g !== gen || view !== 'home') return;
     const now = $('notice').textContent;
     if (kept) {
+      // Quietly: its own warning goes from the notice and the live region, wherever it is
+      // still the one shown there; a newer message in either stays.
       if (layoutUnkept !== null && now === layoutUnkept) notice('');
+      if (layoutUnkept !== null && $('live').textContent === layoutUnkept) announce('', g);
       layoutUnkept = null;
       return;
     }

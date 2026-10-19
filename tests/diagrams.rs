@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use paper_rs::editor::shortcuts::Action;
-use paper_rs::editor::{Editor, Tool};
+use paper_rs::editor::{Button, Editor, InputEvent, Tool};
 use paper_rs::geom::{Rect, V2, v2};
 use paper_rs::model::{Color, Node, NodeId, NodeKind, Route, TextAlign};
 
@@ -295,20 +295,71 @@ fn resizing_a_label_group_keeps_its_text_bytes_and_layout_and_the_arrow_follows(
     let (h, tr) = label_laid_out(&e, t);
     assert!(h <= tr.h + 0.5, "the label fits its box: {h} > {}", tr.h);
     assert!(big.contains_rect(&world(&e, t)), "still on its rectangle");
+    // A label that grew to fit its text keeps one line where it fits (its box is the text's).
+    let natural = paper_rs::text::layout(&label0.0, label0.1, None, TextAlign::Left).width;
+    let lines = |e: &Editor| {
+        paper_rs::text::layout_node(e.doc.get(t).unwrap())
+            .unwrap()
+            .lines
+    };
+    assert_eq!(lines(&e).len(), 1);
+    assert!((tr.w - natural).abs() < 0.5, "{} vs {natural}", tr.w);
     let start = conn(&e, arrow).0[0];
     assert!(on_outline(start, big), "the arrow follows: {start:?}");
     e.run(Action::Undo);
     assert_eq!(e.doc, doc0, "undo restores all of it");
-    // Shrink it to half: the text is never cut or stretched; it wraps in its narrower box.
+    // Shrink it to half: the text is never cut or stretched, and its font isn't scaled. It
+    // wraps at its space within the narrower rectangle and stays visibly on it, centred.
     ev_drag(&mut e, corner, v2(220.0, 160.0), 2000.0, true);
     let small = Rect::new(100.0, 100.0, 120.0, 60.0);
     assert_eq!(world(&e, r), small);
     assert_eq!(text_of(&e, t), label0, "the same text and font size");
+    assert!(
+        natural > small.w,
+        "the fixture's label is wider than the half-size box"
+    );
     let (h, tr) = label_laid_out(&e, t);
-    // Measured, not asserted: whether a wrapped label taller than its scaled box is the
-    // intended behaviour is the open question in the writer100 handoff.
-    eprintln!("half-size label: layout height {h}, box {tr:?}");
+    assert!(h <= tr.h + 0.5, "its box holds every line: {h} > {}", tr.h);
+    let wrapped = lines(&e);
+    assert_eq!(wrapped.len(), 2, "two lines");
+    assert_eq!(wrapped[1].start, 9, "broken at the space, before \"API\"");
+    let label = world(&e, t);
+    assert!(
+        small.contains_rect(&label),
+        "on its rectangle: {label:?} in {small:?}"
+    );
+    assert!(
+        label.center().dist(small.center()) < 0.5,
+        "centred: {label:?}"
+    );
+    assert_eq!(world(&e, g), small, "the group is still its rectangle");
     assert!(on_outline(conn(&e, arrow).0[0], small));
+    e.run(Action::Undo);
+    assert_eq!(e.doc, doc0, "one undo step");
+    // Control: a group of two shapes and a text isn't a label group, and is scaled as before
+    // (its text box scales with it; nothing is laid out again).
+    let r2 = shape(
+        &mut e,
+        NodeKind::Rect,
+        Rect::new(100.0, 400.0, 240.0, 120.0),
+        BLUE,
+    );
+    let extra = rect(&mut e, 360.0, 400.0, 60.0, 60.0);
+    let t2 = text_at(&mut e, "Two parts", v2(220.0, 460.0));
+    e.selection = vec![r2, extra, t2];
+    e.run(Action::Group);
+    let g2 = e.selection[0];
+    assert!(
+        paper_rs::layout::label_group(&e.doc, g2).is_none(),
+        "not a label group"
+    );
+    let t2_0 = world(&e, t2);
+    let b2 = world(&e, g2);
+    let c2 = v2(b2.right(), b2.bottom());
+    e.selection = vec![g2];
+    ev_drag(&mut e, c2, c2 - v2(b2.w * 0.5, b2.h * 0.5), 3000.0, true);
+    let t2_1 = world(&e, t2);
+    assert!((t2_1.w - t2_0.w * 0.5).abs() < 0.5, "{t2_0:?} -> {t2_1:?}");
     e.doc.validate().unwrap();
 }
 
@@ -557,4 +608,239 @@ fn connector_label_baseline_an_unknown_field_is_dropped_and_a_newer_page_is_refu
     let newer = serde_json::to_string(&v).unwrap();
     let refused = page_from_json(&newer);
     assert!(matches!(refused, Err(FormatError::TooNew { .. })));
+}
+
+/// A click at `p` (screen = world: zoom 1, no pan).
+fn click(e: &mut Editor, p: V2, t: f64) {
+    e.handle(InputEvent::PointerDown {
+        pos: p,
+        button: Button::Primary,
+        pressure: None,
+        time_ms: t,
+    });
+    e.handle(InputEvent::PointerUp {
+        pos: p,
+        button: Button::Primary,
+        time_ms: t + 40.0,
+    });
+}
+
+/// Quick connect on a label group (revision 2 slice 7): its "+" knobs copy the whole group
+/// beside it, through the duplicate transaction, and one arrow joins the two shapes. The label
+/// stays the group's own editable text. Only a strict label group (one shape and its text)
+/// has knobs; its label alone, free text, a group of several shapes and a group around a
+/// label group don't, and a plain shape keeps its own.
+#[test]
+fn a_label_group_quick_connects_to_a_copy_of_itself_shape_to_shape_in_one_undo_step() {
+    let mut e = editor(1400.0, 900.0);
+    e.snapping = false;
+    let r0 = Rect::new(100.0, 100.0, 200.0, 100.0);
+    let (g, r, t) = label_group(&mut e, r0, "Orders");
+    assert_eq!(paper_rs::layout::label_group(&e.doc, g), Some((r, t)));
+    // A click on the label selects its group; a double-click edits the label itself.
+    let on_label = world(&e, t).center();
+    e.selection.clear();
+    click(&mut e, on_label, 0.0);
+    assert_eq!(e.selection, vec![g], "the group, not yet entered");
+    click(&mut e, on_label, 100.0);
+    assert_eq!(
+        e.text_edit.as_ref().map(|te| te.id),
+        Some(t),
+        "the label is edited"
+    );
+    e.handle(InputEvent::Text("!".into()));
+    e.end_text_edit();
+    assert_eq!(text_of(&e, t).0.chars().count(), "Orders".len() + 1);
+    e.run(Action::Undo);
+    assert_eq!(text_of(&e, t).0, "Orders");
+
+    // Knobs: a label group has them; the controls don't (a plain shape keeps its own).
+    e.selection = vec![g];
+    assert_eq!(e.quick_knobs().len(), 4, "a label group");
+    e.selection = vec![t];
+    assert!(e.quick_knobs().is_empty(), "its label alone");
+    let free = text_at(&mut e, "Free", v2(200.0, 700.0));
+    e.selection = vec![free];
+    assert!(e.quick_knobs().is_empty(), "free text");
+    let c = rect(&mut e, 600.0, 600.0, 120.0, 80.0);
+    let d = rect(&mut e, 760.0, 600.0, 120.0, 80.0);
+    let td = text_at(&mut e, "Two", v2(660.0, 640.0));
+    e.selection = vec![c, d, td];
+    e.run(Action::Group);
+    assert!(e.quick_knobs().is_empty(), "two shapes and a text");
+    let (inner, ..) = label_group(&mut e, Rect::new(1000.0, 600.0, 160.0, 80.0), "Inner");
+    e.selection = vec![inner];
+    e.run(Action::Group);
+    assert_ne!(e.selection, vec![inner]);
+    assert!(e.quick_knobs().is_empty(), "a group around a label group");
+    let plain = rect(&mut e, 600.0, 300.0, 120.0, 80.0);
+    e.selection = vec![plain];
+    assert_eq!(e.quick_knobs().len(), 4, "control: a plain shape");
+
+    // The right knob: a copy of the group to the right, an arrow shape to shape, one step.
+    e.selection = vec![g];
+    let (dir, right) = e.quick_knobs()[0];
+    assert_eq!(dir, 0, "right");
+    let before = e.doc.clone();
+    let steps = e.history.undo_len();
+    click(&mut e, right, 1000.0);
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    let [copy] = e.selection[..] else {
+        panic!("one new selection: {:?}", e.selection)
+    };
+    assert_ne!(copy, g);
+    let (r2, t2) = paper_rs::layout::label_group(&e.doc, copy).expect("a label group copy");
+    assert_eq!(
+        text_of(&e, t2),
+        text_of(&e, t),
+        "the label is copied as it is"
+    );
+    let step = v2(r0.w + 80.0, 0.0);
+    assert_eq!(world(&e, r2), r0.translate(step));
+    assert_eq!(world(&e, t2), world(&e, t).translate(step));
+    let added: Vec<NodeId> = connectors(&e)
+        .into_iter()
+        .filter(|a| before.get(*a).is_none())
+        .collect();
+    let [arrow] = added[..] else {
+        panic!("one new arrow: {added:?}")
+    };
+    assert_eq!(
+        ends(&e, arrow),
+        (Some(r), Some(r2)),
+        "shapes, never labels or groups"
+    );
+    let pts = conn(&e, arrow).0;
+    assert!(on_outline(pts[0], world(&e, r)), "{pts:?}");
+    assert!(on_outline(last(&pts), world(&e, r2)), "{pts:?}");
+    let after = e.doc.clone();
+
+    // Moving either group reroutes the arrow, one step each.
+    e.selection = vec![g];
+    ev_drag(&mut e, v2(120.0, 120.0), v2(120.0, 320.0), 2000.0, true);
+    assert_eq!(
+        world(&e, r),
+        r0.translate(v2(0.0, 200.0)),
+        "the original moved"
+    );
+    let moved = conn(&e, arrow).0;
+    assert!(on_outline(moved[0], world(&e, r)), "{moved:?}");
+    assert_ne!(moved, pts);
+    e.selection = vec![copy];
+    let p = world(&e, r2).min() + v2(20.0, 20.0);
+    ev_drag(&mut e, p, p + v2(0.0, 300.0), 3000.0, true);
+    assert_eq!(
+        world(&e, r2),
+        r0.translate(step + v2(0.0, 300.0)),
+        "the copy moved"
+    );
+    assert_eq!(ends(&e, arrow), (Some(r), Some(r2)));
+    assert!(on_outline(last(&conn(&e, arrow).0), world(&e, r2)));
+    assert_eq!(e.history.undo_len(), steps + 3);
+    e.run(Action::Undo);
+    e.run(Action::Undo);
+    assert_eq!(e.doc, after, "the moves undo");
+    e.run(Action::Undo);
+    assert_eq!(e.doc, before, "quick connect undoes in one step");
+    e.run(Action::Redo);
+    assert_eq!(e.doc, after, "and redoes the same copy and arrow");
+
+    // Deleting the target group: the arrow stays and lets go; undo binds it again.
+    e.selection = vec![copy];
+    e.run(Action::Delete);
+    assert!(e.doc.get(r2).is_none() && e.doc.get(arrow).is_some());
+    assert_eq!(ends(&e, arrow), (Some(r), None), "the end is cleared");
+    e.run(Action::Undo);
+    assert_eq!(e.doc, after);
+    e.doc.validate().unwrap();
+}
+
+/// An agent reads back what an arrow is bound to through the existing upstream reads
+/// (`get_node_info`, `get_tree_summary`), named as `create_shape` takes them, and the reads
+/// follow edits, a deleted target and undo. A plain shape reads as before. Headless: the
+/// upstream MCP executor on a session host, no window or project files.
+#[test]
+fn an_agent_reads_the_layers_an_arrow_is_bound_to_through_edits_delete_and_undo() {
+    use paper_rs::mcp::{Out, exec};
+    use serde_json::{Value, json};
+    let root = std::env::temp_dir().join("opd-diagrams-mcp-unused");
+    let mut host = exec::SessionHost::new(paper_rs::project::Store { root });
+    let mut call = |tool: &str, args: Value| -> String {
+        match exec::call(&mut host, tool, &args) {
+            Ok(out) => match &out[..] {
+                [Out::Text(t), ..] => t.clone(),
+                o => panic!("{tool}: {o:?}"),
+            },
+            Err(e) => panic!("{tool}: {e}"),
+        }
+    };
+    let id = |out: String| -> String {
+        let v: Value = serde_json::from_str(&out).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+    let box_at =
+        |x: f64| json!({"type": "rectangle", "x": x, "y": 100, "width": 160, "height": 80});
+    let a = id(call("create_shape", box_at(100.0)));
+    let b = id(call("create_shape", box_at(500.0)));
+    let arrow = call(
+        "create_shape",
+        json!({"type": "arrow", "startNodeId": a, "endNodeId": b, "route": "elbow"}),
+    );
+    let arrow = id(arrow);
+    let mut info = |n: &str| -> Value {
+        serde_json::from_str(&call("get_node_info", json!({"nodeId": n}))).unwrap()
+    };
+    let v = info(&arrow);
+    assert_eq!(v["type"], "Arrow");
+    assert_eq!(v["startNodeId"], json!(a));
+    assert_eq!(v["endNodeId"], json!(b));
+    let anchor = json!({"x": 0.5, "y": 0.5, "inside": false});
+    assert_eq!(v["startAnchor"], anchor);
+    assert_eq!(v["endAnchor"], anchor);
+    assert_eq!(v["route"], "elbow");
+    let points = v["points"].as_array().unwrap().clone();
+    assert!(points.len() >= 2, "{points:?}");
+    // The first routed point is at Service's outline: outside its box, within the gap.
+    let p0 = v2(
+        points[0][0].as_f64().unwrap(),
+        points[0][1].as_f64().unwrap(),
+    );
+    assert!(
+        on_outline(p0, Rect::new(100.0, 100.0, 160.0, 80.0)),
+        "{p0:?}"
+    );
+    // A plain shape reads as before (control).
+    let plain = info(&a);
+    for k in ["startNodeId", "endNodeId", "startAnchor", "route", "points"] {
+        assert!(plain.get(k).is_none(), "{k} on a rectangle");
+    }
+    drop(info);
+    let tree = call("get_tree_summary", json!({"nodeId": "root"}));
+    assert!(tree.contains(&format!("from [{a}] to [{b}]")), "{tree}");
+    // An edit of the target: still bound to it, rerouted.
+    call(
+        "update_styles",
+        json!({"updates": [{"nodeIds": [b], "styles": {"height": 300}}]}),
+    );
+    let read = |call: &mut dyn FnMut(&str, Value) -> String, n: &str| -> Value {
+        serde_json::from_str(&call("get_node_info", json!({"nodeId": n}))).unwrap()
+    };
+    let v = read(&mut call, &arrow);
+    assert_eq!(v["endNodeId"], json!(b));
+    assert_ne!(v["points"], json!(points), "rerouted");
+    let edited = v["points"].clone();
+    // The target deleted: that end is free, and read so.
+    call("delete_nodes", json!({"nodeIds": [b]}));
+    let v = read(&mut call, &arrow);
+    assert_eq!(v["startNodeId"], json!(a));
+    assert_eq!(v["endNodeId"], Value::Null);
+    assert_eq!(v["endAnchor"], Value::Null);
+    let tree = call("get_tree_summary", json!({"nodeId": "root"}));
+    assert!(tree.contains(&format!("from [{a}] to free")), "{tree}");
+    // Undo: bound again, exactly as it was.
+    call("undo", json!({}));
+    let v = read(&mut call, &arrow);
+    assert_eq!(v["endNodeId"], json!(b));
+    assert_eq!(v["endAnchor"], anchor);
+    assert_eq!(v["points"], edited);
 }

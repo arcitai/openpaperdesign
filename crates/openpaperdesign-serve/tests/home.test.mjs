@@ -1359,17 +1359,41 @@ test('library home: a layout the library couldn\'t keep is said for the current 
   assert.equal(v.els.projects.className, 'files', 'the choice still applies here');
   assert.equal(v.els.notice.textContent, unkept);
   assert.equal(v.els.live.textContent, unkept);
-  // Recovery: a later choice that is kept takes the notice back, quietly.
+  // Recovery: a later choice that is kept takes the warning back from the notice and the
+  // live region, quietly (R36-F1: nothing new is announced).
   v.els['layout-grid'].onclick();
   await flush();
   await answer(v, kept('grid'), libAction(v));
   assert.equal(v.els.notice.textContent, '');
+  assert.equal(v.els.live.textContent, '', 'no obsolete warning for assistive technology');
   assert.equal(v.els.projects.className, 'files grid');
   // An unanswered keep is not kept either.
   v.els['layout-list'].onclick();
   await flush();
   await answer(v, { error: { code: -32001, message: 'lost' } }, libAction(v));
   assert.equal(v.els.notice.textContent, unkept);
+  assert.equal(v.els.live.textContent, unkept);
+  // The same choice kept on a retry recovers the same way.
+  v.els['layout-list'].onclick();
+  await flush();
+  await answer(v, kept('list'), libAction(v));
+  assert.equal(v.els.notice.textContent, '');
+  assert.equal(v.els.live.textContent, '');
+  assert.equal(v.els.projects.className, 'files');
+  // A newer announcement made while the retry is pending is not the warning: it stays.
+  v.els['layout-grid'].onclick();
+  await flush();
+  await answer(v, { refused: 'The view preferences couldn\'t be kept.' }, libAction(v));
+  assert.equal(v.els.live.textContent, unkept.replace('List', 'Grid'));
+  v.els['layout-grid'].onclick();
+  await flush();
+  const retry = libAction(v);
+  v.els.search.value = 'Missing';
+  v.els.search.onkeydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(v.els.live.textContent, 'Showing all files');
+  await answer(v, kept('grid'), retry);
+  assert.equal(v.els.notice.textContent, '', 'its own notice goes');
+  assert.equal(v.els.live.textContent, 'Showing all files', 'the newer announcement stays');
   // A late failure of an older choice says nothing once a newer one was made.
   const w = await libraryView();
   w.els['layout-list'].onclick();

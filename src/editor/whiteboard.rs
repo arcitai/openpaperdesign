@@ -73,6 +73,49 @@ pub fn set_world_points(tx: &mut Tx, id: NodeId, pts: &[V2]) {
     }
 }
 
+/// Quick connect's arrow from `from` to `to`, leaving `from` on its side in direction `d` and
+/// entering `to` on the opposite side, routed at once. Returns its id.
+fn quick_arrow(
+    tx: &mut Tx,
+    from: NodeId,
+    to: NodeId,
+    d: V2,
+    route: Route,
+    rough: Option<Rough>,
+) -> NodeId {
+    let aid = tx.alloc_id();
+    let fixed_a = v2(0.5 + d.x * 0.5, 0.5 + d.y * 0.5);
+    let fixed_b = v2(0.5 - d.x * 0.5, 0.5 - d.y * 0.5);
+    let fix = |v: V2| connector::fixed_point(v2(v.x, v.y), Rect::new(0.0, 0.0, 1.0, 1.0));
+    let mut a = Node::new(
+        aid,
+        NodeKind::Connector {
+            points: vec![V2::ZERO, V2::ZERO],
+            start: Some(Binding {
+                node: from,
+                fixed: fix(fixed_a),
+                inside: false,
+            }),
+            end: Some(Binding {
+                node: to,
+                fixed: fix(fixed_b),
+                inside: false,
+            }),
+            route,
+            start_head: Head::None,
+            end_head: Head::Arrow,
+        },
+        Rect::default(),
+    );
+    a.style.rough = rough.map(|r| Rough {
+        seed: r.seed.wrapping_add(31),
+        ..r
+    });
+    tx.insert(a, None, None);
+    update_connector(tx, aid);
+    aid
+}
+
 impl Editor {
     fn bind_dist(&self) -> f64 {
         BIND_DISTANCE_PX / self.camera.zoom
@@ -295,7 +338,20 @@ impl Editor {
 
     // ---------------------------------------------------------------------- quick connect
 
-    /// Screen positions of the quick-connect knobs around a single selected shape.
+    /// The shape quick-connect connects from for the selected layer `id`: a shape itself, or a
+    /// label group's shape (`layout::label_group`: one shape and its Text label). Free text,
+    /// frames and any other group have none.
+    fn quick_shape(&self, id: NodeId) -> Option<NodeId> {
+        let n = self.doc.get(id)?;
+        if n.is_group() {
+            return crate::layout::label_group(&self.doc, id).map(|(shape, _)| shape);
+        }
+        let plain = connector::bindable(n) && !n.is_frame();
+        (plain && !matches!(n.kind, NodeKind::Text { .. })).then_some(id)
+    }
+
+    /// Screen positions of the quick-connect knobs around a single selected shape or label
+    /// group.
     pub fn quick_knobs(&self) -> Vec<(usize, V2)> {
         if self.tool != Tool::Select || self.text_edit.is_some() || self.is_busy() {
             return vec![];
@@ -303,10 +359,7 @@ impl Editor {
         let [id] = self.selection[..] else {
             return vec![];
         };
-        let Some(n) = self.doc.get(id) else {
-            return vec![];
-        };
-        if !connector::bindable(n) || n.is_frame() || matches!(n.kind, NodeKind::Text { .. }) {
+        if self.quick_shape(id).is_none() {
             return vec![];
         }
         let Some(r) = self.doc.world_rect(id) else {
@@ -327,11 +380,15 @@ impl Editor {
             .collect()
     }
 
-    /// Duplicate the selected shape in direction `dir` and connect the two with an arrow.
+    /// Duplicate the selected shape in direction `dir` and connect the two with an arrow. A
+    /// label group is copied whole (see `quick_connect_label`).
     pub fn quick_connect(&mut self, dir: usize) -> Option<NodeId> {
         let [src] = self.selection[..] else {
             return None;
         };
+        if self.doc.get(src)?.is_group() {
+            return self.quick_connect_label(src, dir);
+        }
         let n = self.doc.get(src)?.clone();
         let wr = self.doc.world_rect(src)?;
         let d = QUICK_DIRS[dir];
@@ -356,39 +413,44 @@ impl Editor {
                 r.seed = r.seed.wrapping_add(7919);
             }
             tx.insert(c, parent, None);
-            let aid = tx.alloc_id();
-            let fixed_a = v2(0.5 + d.x * 0.5, 0.5 + d.y * 0.5);
-            let fixed_b = v2(0.5 - d.x * 0.5, 0.5 - d.y * 0.5);
-            let fix = |v: V2| connector::fixed_point(v2(v.x, v.y), Rect::new(0.0, 0.0, 1.0, 1.0));
-            let mut a = Node::new(
-                aid,
-                NodeKind::Connector {
-                    points: vec![V2::ZERO, V2::ZERO],
-                    start: Some(Binding {
-                        node: src,
-                        fixed: fix(fixed_a),
-                        inside: false,
-                    }),
-                    end: Some(Binding {
-                        node: cid,
-                        fixed: fix(fixed_b),
-                        inside: false,
-                    }),
-                    route,
-                    start_head: Head::None,
-                    end_head: Head::Arrow,
-                },
-                Rect::default(),
-            );
-            a.style.rough = rough.map(|r| Rough {
-                seed: r.seed.wrapping_add(31),
-                ..r
-            });
-            tx.insert(a, None, None);
-            update_connector(tx, aid);
+            let aid = quick_arrow(tx, src, cid, d, route, rough);
             (cid, aid)
         });
         let _ = arrow;
+        self.selection = vec![copy];
+        Some(copy)
+    }
+
+    /// Quick connect from a label group: the whole group (its shape and its label, copied as
+    /// Duplicate copies them, through `insert_subtrees_tx`) is placed beside it, and the arrow
+    /// joins the two shapes, never the labels. The label is copied, not cleared: an empty
+    /// label would be an invisible text layer; it is edited as any text. One undo step.
+    fn quick_connect_label(&mut self, group: NodeId, dir: usize) -> Option<NodeId> {
+        let (shape, _) = crate::layout::label_group(&self.doc, group)?;
+        let at = self
+            .doc
+            .get(group)?
+            .children
+            .iter()
+            .position(|c| *c == shape)?;
+        let wr = self.doc.world_rect(group)?;
+        let d = QUICK_DIRS[dir];
+        let off = v2(d.x * (wr.w + QUICK_GAP), d.y * (wr.h + QUICK_GAP));
+        let nodes: Vec<Node> = self
+            .doc
+            .subtree(group)
+            .into_iter()
+            .filter_map(|id| self.doc.get(id).cloned())
+            .collect();
+        let route = self.arrow_route;
+        let rough = self.doc.get(shape)?.style.rough;
+        let copy = self.edit("Quick connect", |tx| {
+            let copies = super::insert_subtrees_tx(tx, &nodes, &[group], &[wr], off, true);
+            let copy = *copies.first()?;
+            let to = *tx.doc().get(copy)?.children.get(at)?;
+            quick_arrow(tx, shape, to, d, route, rough);
+            Some(copy)
+        })?;
         self.selection = vec![copy];
         Some(copy)
     }

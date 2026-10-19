@@ -551,6 +551,34 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
         v["instance"] = json!(true);
     }
     v["autoLayout"] = json!(n.layout.is_some());
+    // An arrow's ends, named as create_shape takes them: the layer each end is bound to (null
+    // when the end is free), where on that layer's box it attaches (0..1 of its width and
+    // height; `inside`: on that point rather than at the outline), its route and its routed
+    // points in world space.
+    if let NodeKind::Connector {
+        points,
+        start,
+        end,
+        route,
+        ..
+    } = &n.kind
+    {
+        for (k, b) in [("start", start), ("end", end)] {
+            let b = b.filter(|b| doc.get(b.node).is_some());
+            v[format!("{k}NodeId")] = json!(b.map(|b| node_key(ed, page, b.node)));
+            v[format!("{k}Anchor")] =
+                json!(b.map(|b| {
+                    json!({"x": r2(b.fixed.x), "y": r2(b.fixed.y), "inside": b.inside})
+                }));
+        }
+        v["route"] = json!(route);
+        let o = doc.world_rect(id).unwrap_or(n.rect).min();
+        let world: Vec<Value> = points
+            .iter()
+            .map(|p| json!([r2(o.x + p.x), r2(o.y + p.y)]))
+            .collect();
+        v["points"] = json!(world);
+    }
     text(v)
 }
 
@@ -606,6 +634,14 @@ fn tree_summary(ed: &mut Editor, a: &Args) -> ToolResult {
         if let Some(t) = n.kind.text() {
             let short: String = t.chars().take(40).collect();
             line += &format!(" {:?}", short);
+        }
+        // An arrow's ends: the layer each is bound to, or "free".
+        if let NodeKind::Connector { start, end, .. } = &n.kind {
+            let end_of = |b: &Option<Binding>| match b.filter(|b| doc.get(b.node).is_some()) {
+                Some(b) => format!("[{}]", node_key(ed, page, b.node)),
+                None => "free".to_string(),
+            };
+            line += &format!(" from {} to {}", end_of(start), end_of(end));
         }
         if !n.visible {
             line += " (hidden)";

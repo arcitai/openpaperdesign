@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.59 · Updated: 2026-10-19
+Revision: 0.60 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -233,6 +233,39 @@ engine architecture is `analysis/DESIGN.md`.
       server's bounds are unchanged. `cleanName` stays the workspace view's label rule.
     - Reason: review findings on the admitted slices; same Editor, transactions, renderer,
       Session, save, binding and lease. Upstreamable as fixes.
+    - **A touch while the canvas menu or a flyout is open** (R34-F1), `src/app.rs`: native
+      touch moved into `App::touch`, whose first contact checks `UiState::captures_input` and
+      the panel edge as the mouse press does. Before, a touch that dismissed the menu also
+      drew with the active tool.
+  - Revision 2 slice 7, diagrams with existing objects (plan section 7, R15; root `DESIGN.md`).
+    Native windows change too.
+    - **One label-group rule**, `src/layout.rs` `label_group`: a group of exactly one plain
+      bindable shape and one Text layer painted over it, with the text's centre on the shape.
+      Anything else (free text, several shapes, a nested group, an instance or component) is
+      not one.
+    - **Grouped quick connect**, `src/editor/whiteboard.rs`: `quick_knobs` shows the "+"
+      knobs for a selected label group too (`quick_shape`), and `quick_connect_label` copies
+      the whole group beside it through the existing `insert_subtrees_tx` (Duplicate's
+      transaction) and joins the two shapes with one arrow, in one undo step. The arrow
+      itself is the plain quick connect's, now shared (`quick_arrow`). The label is copied
+      unchanged and stays ordinary editable text.
+    - **A scaled label is laid out again**, `src/layout.rs` `refit_label`, run by
+      `resize_children` for a label group (so for a handle resize, `update_styles` and auto
+      layout alike). Before, a half-size group left its text box scaled and wrapped through
+      its words: 72.6 px of text in a 12.1 px box. Now its characters, font and style are
+      never scaled; a label that grew to fit its text keeps one line while that fits the
+      shape and otherwise wraps at spaces within its width; a fixed-width one keeps its width,
+      narrowed to the shape's. The box is the laid-out lines, kept centred where it was and
+      moved only as far as needed to stay on the shape. A label taller than its shape even so
+      is centred on it and overflows: nothing is clipped. Other groups scale as before.
+    - **Arrow bindings read back**, `src/mcp/exec.rs`: `get_node_info` on an arrow reports
+      `startNodeId`/`endNodeId` (as `create_shape` takes them; null when free or the target
+      is gone), `startAnchor`/`endAnchor` (`x`, `y` of the target's box, `inside`), `route` and
+      its routed world `points`; `get_tree_summary` adds "from [id] to [id]" (or "free").
+      Read-only: same ids, page reads and acknowledgement rules; other nodes read as before.
+    - Reason: the plan's bounded repairs of measured gaps; same Editor, commands, document
+      format, Session, save, binding and lease, no new field. Connector labels are not built.
+      Upstreamable as fixes.
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.
