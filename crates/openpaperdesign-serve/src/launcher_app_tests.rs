@@ -2863,8 +2863,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-15.html",
-        "versioned for the editor's re-editable curve bend (a changed in-panel editor)"
+        HOME_URI, "ui://openpaperdesign/home-16.html",
+        "versioned for the editor's connector drag fenced by Lock (a changed in-panel editor)"
     );
 }
 

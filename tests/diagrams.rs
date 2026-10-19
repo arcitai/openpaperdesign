@@ -2336,6 +2336,168 @@ fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks()
     e.doc.validate().unwrap();
 }
 
+/// R51 (from the independent probe's fixture: a curve through (220,360), (400,140), (640,390)):
+/// a bend or end drag held while its arrow gets locked, itself (⌘⇧L) or through its group,
+/// or removed, changes nothing more. The gesture ends at the next move, inert: the document
+/// stays exactly as Lock (or the removal) left it, no step is added, the arrow stays locked
+/// and nothing is busy. A movement made before the Lock is kept (Lock committed it as its own
+/// step), never undone by the refusal. Controls: an unlocked re-bend moves the bend exactly,
+/// in one step with exact Undo/Redo; a press within the drag threshold changes nothing.
+#[test]
+fn a_bend_or_end_drag_held_while_its_arrow_is_locked_changes_nothing_more() {
+    use paper_rs::model::Head;
+    let fixture = |label: Option<&str>| {
+        let mut e = editor(1600.0, 1200.0);
+        e.snapping = false;
+        let pts = [v2(220.0, 360.0), v2(400.0, 140.0), v2(640.0, 390.0)];
+        let lo = v2(220.0, 140.0);
+        let kind = NodeKind::Connector {
+            points: pts.iter().map(|p| *p - lo).collect(),
+            start: None,
+            end: None,
+            route: Route::Curved,
+            start_head: Head::Dot,
+            end_head: Head::Arrow,
+            label: label.map(String::from),
+        };
+        let mut n = Node::new(NodeId(0), kind, Rect::new(220.0, 140.0, 420.0, 250.0));
+        n.style.stroke = Some(Color::INK);
+        n.style.stroke_width = 3.0;
+        let id = e.add_node(n, None);
+        e.selection = vec![id];
+        (e, id)
+    };
+    let down = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerDown {
+            pos: p,
+            button: Button::Primary,
+            pressure: None,
+            time_ms: t,
+        })
+    };
+    let mv = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerMove {
+            pos: p,
+            pressure: None,
+            time_ms: t,
+        })
+    };
+    let up = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerUp {
+            pos: p,
+            button: Button::Primary,
+            time_ms: t,
+        })
+    };
+    let lock = |e: &mut Editor| key(e, Key::Char('l'), Modifiers::cmd_shift());
+    let bend_of = |e: &Editor, id: NodeId| e.connector_points(id).unwrap()[1];
+    // Then a late move and release: nothing changes, nothing is recorded, nothing is busy.
+    let late_input_is_inert = |e: &mut Editor, id: NodeId, h: V2, why: &str| {
+        let stopped = e.doc.is_effectively_locked(id) || e.doc.get(id).is_none();
+        assert!(stopped, "{why}: locked or gone");
+        let (doc, steps) = (e.doc.clone(), e.history.undo_len());
+        mv(e, h + v2(80.0, 60.0), 1100.0);
+        up(e, h + v2(80.0, 60.0), 1200.0);
+        assert_eq!(e.doc, doc, "{why}: nothing more changed");
+        assert_eq!(e.history.undo_len(), steps, "{why}: nothing more recorded");
+        assert!(!e.is_busy(), "{why}: the gesture ended");
+    };
+
+    // Locked before the drag threshold: the bend never starts.
+    let (mut e, id) = fixture(None);
+    let h = e.connector_handles()[2].1;
+    assert!(h.dist(v2(400.0, 140.0)) < 1e-9, "the bend handle");
+    down(&mut e, h, 1000.0);
+    assert!(e.is_busy());
+    lock(&mut e);
+    assert!(e.doc.get(id).unwrap().locked, "Lock reached the arrow");
+    late_input_is_inert(&mut e, id, h, "locked before the threshold");
+    assert_eq!(bend_of(&e, id), v2(400.0, 140.0));
+    assert!(e.doc.get(id).unwrap().locked, "still locked");
+
+    // Locked after the first bend movement: that movement stays (its own step), no more.
+    let (mut e, id) = fixture(None);
+    let (doc0, n0) = (e.doc.clone(), e.history.undo_len());
+    let h = e.connector_handles()[2].1;
+    down(&mut e, h, 1000.0);
+    mv(&mut e, h + v2(40.0, 30.0), 1040.0);
+    lock(&mut e);
+    assert_eq!(bend_of(&e, id), v2(440.0, 170.0), "the first movement");
+    assert_eq!(e.history.undo_len(), n0 + 2, "the bend, then the Lock");
+    late_input_is_inert(&mut e, id, h, "locked after the first movement");
+    assert_eq!(bend_of(&e, id), v2(440.0, 170.0), "kept, not undone");
+    e.run(Action::Undo);
+    assert!(!e.doc.get(id).unwrap().locked, "Undo: the Lock");
+    e.run(Action::Undo);
+    assert_eq!(e.doc, doc0, "Undo: the bend");
+
+    // Its group locked while the bend is held (fixture: the group selected directly for
+    // ⌘⇧L): the arrow is locked through it; its sibling and the Lock stay as they are.
+    let (mut e, id) = fixture(Some("request"));
+    let sibling = rect(&mut e, 900.0, 500.0, 120.0, 80.0);
+    e.selection = vec![id, sibling];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    e.selection = vec![id];
+    let h = e.connector_handles()[2].1;
+    down(&mut e, h, 1000.0);
+    mv(&mut e, h + v2(10.0, 10.0), 1040.0);
+    e.selection = vec![g];
+    lock(&mut e);
+    assert!(e.doc.get(g).unwrap().locked, "the group is locked");
+    assert!(!e.doc.get(id).unwrap().locked, "the arrow itself isn't");
+    let sibling_then = e.doc.get(sibling).cloned();
+    late_input_is_inert(&mut e, id, h, "locked through its group");
+    assert_eq!(e.doc.get(sibling).cloned(), sibling_then, "untouched");
+    assert!(e.doc.get(g).unwrap().locked, "the group stays locked");
+    assert_eq!(label_of(&e, id).as_deref(), Some("request"));
+
+    // An end drag held while the arrow is locked: the same.
+    let (mut e, id) = fixture(None);
+    let end0 = e.connector_handles()[0].1;
+    down(&mut e, end0, 1000.0);
+    mv(&mut e, end0 + v2(-20.0, 10.0), 1040.0);
+    let moved = e.connector_points(id).unwrap()[0];
+    lock(&mut e);
+    late_input_is_inert(&mut e, id, end0, "an end drag, locked");
+    assert_eq!(e.connector_points(id).unwrap()[0], moved, "as moved");
+
+    // The arrow removed while its bend is held: late input is harmless.
+    let (mut e, id) = fixture(None);
+    let h = e.connector_handles()[2].1;
+    down(&mut e, h, 1000.0);
+    e.run(Action::Delete);
+    assert!(e.doc.get(id).is_none(), "removed");
+    late_input_is_inert(&mut e, id, h, "removed");
+
+    // Controls, unlocked: a labelled re-bend moves the bend exactly, in one step.
+    let (mut e, id) = fixture(Some("request"));
+    let (doc0, n0) = (e.doc.clone(), e.history.undo_len());
+    let h = e.connector_handles()[2].1;
+    down(&mut e, h, 1000.0);
+    for j in 1..=12 {
+        let p = h.lerp(h + v2(80.0, 60.0), j as f64 / 12.0);
+        mv(&mut e, p, 1000.0 + j as f64 * 16.0);
+    }
+    up(&mut e, h + v2(80.0, 60.0), 1300.0);
+    assert_eq!(bend_of(&e, id), v2(480.0, 200.0));
+    assert_eq!(e.history.undo_len(), n0 + 1, "one step");
+    assert_eq!(label_of(&e, id).as_deref(), Some("request"));
+    let bent = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(e.doc, doc0);
+    e.run(Action::Redo);
+    assert_eq!(e.doc, bent);
+    // A press within the drag threshold changes nothing.
+    e.selection = vec![id];
+    let h = e.connector_handles()[2].1;
+    down(&mut e, h, 2000.0);
+    mv(&mut e, h + v2(1.0, 1.0), 2040.0);
+    up(&mut e, h + v2(1.0, 1.0), 2080.0);
+    assert_eq!(e.doc, bent);
+    assert_eq!(e.history.undo_len(), n0 + 1);
+}
+
 /// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the
 /// clipboard's text replaces the selected characters or goes in at the caret, as plain text,
 /// whatever it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). It is never

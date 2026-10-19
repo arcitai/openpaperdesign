@@ -116,8 +116,10 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// editor again, HTML and layout unchanged); `home-14` carries that payload's R48 correction
 /// (a member named twice is refused; a changed in-panel WASM editor again, HTML and layout
 /// unchanged); `home-15` carries the editor whose bent curve keeps its bend handle (a changed
-/// in-panel WASM editor again, HTML and layout unchanged). No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-15.html";
+/// in-panel WASM editor again, HTML and layout unchanged); `home-16` carries the editor whose
+/// connector drag stops once its arrow is locked (a changed in-panel WASM editor again, HTML
+/// and layout unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-16.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

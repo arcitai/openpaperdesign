@@ -4473,6 +4473,46 @@ fn browser_a_bent_arrow_re_bends_from_its_bend_point_in_both_axes() {
     assert!(bend(&s)[1].dist(before) < 1e-9, "Undo takes it back");
 }
 
+/// R51 in the browser: a bent arrow's bend held (pointer down on its bend handle, not yet
+/// dragged) while Ctrl+Shift+L locks it: the later move and release, as the page delivers
+/// them, change nothing and record nothing, the arrow stays locked and nothing is busy.
+#[test]
+fn browser_a_bend_held_while_its_arrow_is_locked_changes_nothing_more() {
+    let mut s = state();
+    s.run(Action::Tool(Tool::Arrow));
+    let (from, to) = (at(&s, 400.0, 300.0), at(&s, 700.0, 300.0));
+    timed_drag(&mut s, from, to);
+    let arrow = s.ed.selection[0];
+    let handle = |s: &WebState| {
+        let handles = s.ed.connector_handles();
+        let (_, p) = handles.into_iter().find(|(i, _)| *i == 2)?;
+        Some(at(s, p.x, p.y))
+    };
+    let mid = handle(&s).expect("the straight arrow's bend handle");
+    timed_drag(&mut s, mid, (mid.0, mid.1 + 150.0));
+    let apex = handle(&s).expect("a bend handle on the curve");
+    s.tick(s.now_ms + 1000.0);
+    s.pointer_move(apex.0, apex.1, s.now_ms);
+    s.pointer_down(apex.0, apex.1, Button::Primary, s.now_ms);
+    timed_frames(&mut s, 1);
+    assert!(s.ed.is_busy(), "the bend is held");
+    lock_keys(&mut s);
+    assert!(
+        s.ed.doc.get(arrow).unwrap().locked,
+        "Lock reached the arrow"
+    );
+    let (doc, steps) = (s.ed.doc.clone(), s.ed.history.undo_len());
+    let late = (apex.0 + 80.0, apex.1 + 60.0);
+    s.pointer_move(late.0, late.1, s.now_ms + 16.0);
+    timed_frames(&mut s, 1);
+    s.pointer_up(late.0, late.1, Button::Primary, s.now_ms);
+    timed_frames(&mut s, 2);
+    assert_eq!(s.ed.doc, doc, "nothing bent after the Lock");
+    assert_eq!(s.ed.history.undo_len(), steps, "nothing recorded");
+    assert!(!s.ed.is_busy(), "the gesture ended");
+    assert!(s.ed.doc.get(arrow).unwrap().locked, "still locked");
+}
+
 /// Ctrl+Shift+L as the page delivers it, then the modifiers released.
 fn lock_keys(s: &mut WebState) {
     s.modifiers(true, true, false, false);

@@ -1325,6 +1325,14 @@ impl Editor {
                 self.pen_drag(world);
                 self.gesture = Gesture::Pen;
             }
+            // A connector locked or removed since the press: the gesture ends here, inert (it
+            // isn't put back), and only what was already recorded is committed.
+            Gesture::ConnectorEnd { id, .. } | Gesture::ConnectorMid { id, .. }
+                if self.connector_gesture_stale(id) =>
+            {
+                self.bind_hover = None;
+                self.commit();
+            }
             Gesture::ConnectorEnd { id, end, start } => {
                 let w = if self.snapping && !self.mods.command() {
                     world.round()
@@ -1526,6 +1534,10 @@ impl Editor {
             }
             Gesture::Erase => self.commit(),
             Gesture::Pen => self.pen_up(),
+            Gesture::ConnectorEnd { id, .. } if self.connector_gesture_stale(id) => {
+                self.bind_hover = None;
+                self.commit();
+            }
             Gesture::ConnectorEnd { id, start, .. } => self.connector_end_up(id, start, world),
             Gesture::ConnectorMid { .. } => self.commit(),
             Gesture::Laser => {}

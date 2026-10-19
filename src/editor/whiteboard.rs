@@ -321,6 +321,15 @@ impl Editor {
         out
     }
 
+    /// Whether a connector gesture under way (an end or a bend being dragged) must stop: its
+    /// arrow is gone, or locked since the press, itself or through an ancestor (Lock can come
+    /// while the pointer is held, and commits what the drag had recorded so far). The caller
+    /// ends the gesture there without restoring it: nothing more is changed or recorded, and
+    /// what was recorded before stays as it is, Lock included.
+    pub(super) fn connector_gesture_stale(&self, id: NodeId) -> bool {
+        self.doc.get(id).is_none() || self.doc.is_effectively_locked(id)
+    }
+
     /// Start dragging a connector handle under `pos`, if any.
     pub(super) fn connector_handle_down(&mut self, pos: V2, world: V2) -> bool {
         let Some(&(end, _)) = self

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.74 · Updated: 2026-10-19
+Revision: 0.75 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -325,6 +325,16 @@ engine architecture is `analysis/DESIGN.md`.
         never collapsed) still have none. A connector locked itself or through an ancestor
         now has no handles at all (the box resize already skipped locked layers). Same
         document, gesture and history; no format change. Upstreamable as a fix.
+      - **A connector drag held through Lock** (R51-F1; natively too), `src/editor/mod.rs`
+        `pointer_move`/`pointer_up` with `whiteboard.rs` `connector_gesture_stale`: Lock
+        (⌘⇧L) while a bend or end drag is held commits what the drag had recorded and locks
+        the arrow, but the gesture went on and the next move changed the locked arrow in a
+        step of its own (a press on the new curve handle, locked before the drag threshold,
+        then bent it; the same held after a first movement, on the earlier engine too). Now
+        a `ConnectorMid` or `ConnectorEnd` gesture whose arrow is locked (itself or through
+        an ancestor) or gone ends at the next move or release, inert: nothing more changes or
+        is recorded, and what was recorded before, the Lock included, stays. No restore of a
+        press-time state, no other gesture changed. Upstreamable as a fix.
     - **MCP.** `src/mcp/exec.rs`/`tools.rs`: `create_shape`'s `text` labels an arrow,
       `set_text_content` sets one exactly (empty removes it), `get_node_info` reports
       `label`, and `get_tree_summary` shows it. Same reads, writes, acknowledgements and
@@ -561,7 +571,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-15.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-16.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -623,6 +633,10 @@ view can't pass for this one.
 `home-15` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 editor whose bent curve keeps its bend handle (the curve re-edit above). The editor's WASM
 changed again, so `home-14` is refused and a cached `home-14` view can't pass for this one.
+
+`home-16` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+editor whose connector drag stops once its arrow is locked (R51-F1 above). The editor's WASM
+changed again, so `home-15` is refused and a cached `home-15` view can't pass for this one.
 Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
