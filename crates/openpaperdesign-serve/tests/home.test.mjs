@@ -1347,6 +1347,76 @@ test('library home: a layout read begun during a pending keep, or after a refuse
   libOnly(v);
 });
 
+test('library home: a layout the library couldn\'t keep is said for the current choice only, and a later kept one takes that back', async () => {
+  const kept = (layout) => ({ view: { home_layout: layout, background: 'none' } });
+  const unkept = 'List layout applied here, but it couldn\'t be kept for next time.';
+  const v = await libraryView();
+  // Refused: still shown here, and said in the notice and to assistive technology.
+  v.els['layout-list'].onclick();
+  await flush();
+  assert.equal(v.els.notice.textContent, '', 'quiet while it is being kept');
+  await answer(v, { refused: 'The view preferences couldn\'t be kept.' }, libAction(v));
+  assert.equal(v.els.projects.className, 'files', 'the choice still applies here');
+  assert.equal(v.els.notice.textContent, unkept);
+  assert.equal(v.els.live.textContent, unkept);
+  // Recovery: a later choice that is kept takes the notice back, quietly.
+  v.els['layout-grid'].onclick();
+  await flush();
+  await answer(v, kept('grid'), libAction(v));
+  assert.equal(v.els.notice.textContent, '');
+  assert.equal(v.els.projects.className, 'files grid');
+  // An unanswered keep is not kept either.
+  v.els['layout-list'].onclick();
+  await flush();
+  await answer(v, { error: { code: -32001, message: 'lost' } }, libAction(v));
+  assert.equal(v.els.notice.textContent, unkept);
+  // A late failure of an older choice says nothing once a newer one was made.
+  const w = await libraryView();
+  w.els['layout-list'].onclick();
+  await flush();
+  const older = libAction(w);
+  w.els['layout-grid'].onclick();
+  await flush();
+  const newer = libAction(w);
+  await answer(w, { refused: 'The view preferences couldn\'t be kept.' }, older);
+  assert.equal(w.els.notice.textContent, '', 'not the latest choice');
+  assert.doesNotMatch(w.els.live.textContent, /couldn't be kept/);
+  await answer(w, kept('grid'), newer);
+  assert.equal(w.els.projects.className, 'files grid');
+  assert.equal(w.els.notice.textContent, '');
+  // Nor over an action's own progress on the same home...
+  const x = await libraryView();
+  x.els['layout-list'].onclick();
+  await flush();
+  const keep = libAction(x);
+  row(x, 'Landing', '2 pages').open.onclick();
+  await flush();
+  assert.equal(x.els.notice.textContent, 'Opening Landing…');
+  await answer(x, { refused: 'The view preferences couldn\'t be kept.' }, keep);
+  assert.equal(x.els.notice.textContent, 'Opening Landing…', 'the action\'s own feedback stays');
+  assert.doesNotMatch(x.els.live.textContent, /couldn't be kept/);
+  // ...nor once its home is no longer the view shown.
+  const y = await libraryView();
+  y.els['layout-list'].onclick();
+  await flush();
+  const away = libAction(y);
+  y.els['menu-button'].onclick();
+  y.els['m-about'].onclick();
+  await answer(y, { refused: 'The view preferences couldn\'t be kept.' }, away);
+  assert.equal(y.els.notice.textContent, '');
+  assert.equal(y.els.live.textContent, 'About & notices');
+  for (const view of [v, w, x, y]) libOnly(view);
+});
+
+test('library home: the number of files is said in the right number', async () => {
+  const one = await libraryView({ ...LIBRARY_LIST, canvases: [LIBRARY_LIST.canvases[0]] });
+  assert.equal(one.els.live.textContent, '1 file');
+  const two = await libraryView();
+  assert.equal(two.els.live.textContent, '2 files');
+  const none = await libraryView({ ...LIBRARY_LIST, canvases: [] });
+  assert.equal(none.els.live.textContent, 'No files yet. Start one with New file.');
+});
+
 test('library home: cards carry the full name for pointer and keyboard; About & notices is in the menu, not a footer', async () => {
   // The longest legal name (file names are 1–60 characters): long enough for the card to clamp.
   const long = 'Quarterly onboarding flows, pricing and launch plan for 2026';
@@ -1567,6 +1637,62 @@ test('library home: Rename refused, unconfirmed, emptied, unchanged or cancelled
   assert.equal(x.els.home.hidden, false);
   for (const view of [v, w, x]) assert.equal(renames(view), 0);
   for (const view of [busy, lost, other, v, w, x]) libOnly(view);
+});
+
+test('library home: a name is trimmed as the server trims it; U+FEFF is part of it, NEL edges go, a lone surrogate is refused', async () => {
+  // Rust's `str::trim` keeps U+FEFF (JavaScript's own trim doesn't) and takes U+0085. These
+  // characters are given by code point, so the source holds none of them.
+  const [FEFF, NEL, NBSP, LS, IDEO] = [0xfeff, 0x85, 0xa0, 0x2028, 0x3000].map((c) => String.fromCharCode(c));
+  const bom = FEFF + 'Launch' + FEFF;
+  const start = async () => {
+    const v = await libraryView({ ...LIBRARY_LIST, canvases: [{ id: ID1, name: bom, pages: 2, modified: MAR_4_2025 }] });
+    const r = rows(v)[0];
+    r.more.onclick();
+    fileMenuOf(r).children[1].onclick();
+    return { v, r };
+  };
+  const submit = async (v, typed) => {
+    v.els['rename-name'].value = typed;
+    v.els['rename-form'].onsubmit({ preventDefault() {} });
+    await flush();
+  };
+  const renames = (v) => libCalls(v, 'openpaperdesign_app_rename');
+  // Listed, and in the Rename field, exactly as saved.
+  const { v, r } = await start();
+  assert.equal(r.name, bom);
+  assert.equal(r.open.title, bom);
+  assert.equal(r.open.getAttribute('aria-label'), bom + ', 2 pages, Edited 2025-03-04');
+  assert.equal(v.els['rename-name'].value, bom);
+  // Kept as it is: the same name, so nothing is sent.
+  await submit(v, bom);
+  assert.equal(renames(v), 0, 'the same name, exactly');
+  assert.equal(v.els.home.hidden, false);
+  // Without its U+FEFF it is another name (control).
+  const plain = await start();
+  await submit(plain.v, 'Launch');
+  assert.deepEqual(libAction(plain.v).params, { name: 'openpaperdesign_app_rename', arguments: { id: ID1, name: 'Launch' } });
+  // Typed: White_Space (NEL, NBSP, ideographic space) goes from the edges, U+FEFF stays.
+  const typed = await start();
+  await submit(typed.v, NEL + ' ' + FEFF + 'Renamed' + FEFF + NBSP + IDEO);
+  assert.deepEqual(libAction(typed.v).params, { name: 'openpaperdesign_app_rename', arguments: { id: ID1, name: FEFF + 'Renamed' + FEFF } });
+  // Only White_Space: empty after trimming.
+  const empty = await start();
+  await submit(empty.v, NEL + LS + ' ');
+  assert.equal(empty.v.els.notice.textContent, 'Name the file first.');
+  assert.equal(renames(empty.v), 0);
+  // A lone surrogate (high or low, inside or at an end) is no Unicode scalar: said, not sent.
+  for (const lone of ['A\uD800B', 'A\uDC00B', 'Name\uD83D', '\uDE00Name']) {
+    const s = await start();
+    await submit(s.v, lone);
+    assert.equal(s.v.els.notice.textContent, 'A file name can\'t contain an incomplete character. Nothing was renamed.', lone);
+    assert.equal(renames(s.v), 0, 'nothing was sent');
+    assert.equal(s.v.els['rename-form'].hidden, false, 'the form stays for a correction');
+  }
+  // A whole pair is one character of a name (control).
+  const pair = await start();
+  await submit(pair.v, 'A😀B');
+  assert.deepEqual(libAction(pair.v).params, { name: 'openpaperdesign_app_rename', arguments: { id: ID1, name: 'A😀B' } });
+  for (const view of [v, plain.v, typed.v, empty.v, pair.v]) libOnly(view);
 });
 
 test('library home: Export by id offers only that file\'s saved bytes and says what this view could not do', async () => {

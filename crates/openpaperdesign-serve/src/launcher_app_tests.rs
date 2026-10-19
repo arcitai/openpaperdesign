@@ -417,6 +417,131 @@ async fn the_kept_view_preferences_survive_a_new_process_and_touch_no_canvas() {
     task2.abort();
 }
 
+/// Two library processes keeping different view preferences at the same moment both keep
+/// theirs (R34-F2): each keep reads and replaces the record under one lock file every
+/// OpenPaperDesign process shares (`library/v1/view.lock`). Two independent launchers on one
+/// root stand for the two processes; the lock is an OS file lock on separate open files, so it
+/// excludes them as it excludes processes. Another holder of the lock (as another process
+/// would hold it) makes a keep wait, and past its bound refuses it with nothing written: a keep
+/// is never acknowledged without being kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_keeps_of_different_view_preferences_both_stay_kept() {
+    let lib = library().await;
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    let both = json!({"home_layout": "list", "background": "lines"});
+    for trial in 0..24 {
+        let reset = json!({"home_layout": "grid", "background": "none"});
+        value(call(&lib.c, app::VIEW, reset).await);
+        let (a, b) = tokio::join!(
+            call(&lib.c, app::VIEW, json!({"home_layout": "list"})),
+            call(&c2, app::VIEW, json!({"background": "lines"})),
+        );
+        assert_eq!(value(a)["view"]["home_layout"], "list", "{trial}");
+        assert_eq!(value(b)["view"]["background"], "lines", "{trial}");
+        for c in [&lib.c, &c2] {
+            let listed = value(call(c, app::LIST, json!({})).await);
+            assert_eq!(listed["view"], both, "{trial}: both acknowledged keys stay");
+        }
+    }
+    // Held by another process: a keep waits for it, then keeps on what that one left.
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(lib.root.join("library/v1/view.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let c = lib.c.clone();
+    let waiting =
+        tokio::spawn(async move { call(&c, app::VIEW, json!({"home_layout": "grid"})).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "it waits for the other keep");
+    lock.unlock().unwrap();
+    let kept = value(bounded(waiting).await.unwrap());
+    let grid_lines = json!({"home_layout": "grid", "background": "lines"});
+    assert_eq!(kept["view"], grid_lines);
+    // Held past the bound: refused, and nothing is written.
+    let file = lib.root.join("library/v1/view");
+    let before = std::fs::read(&file).unwrap();
+    lock.lock().unwrap();
+    let e = call(&lib.c, app::VIEW, json!({"background": "dots"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("wasn't kept"), "{e}");
+    assert_eq!(std::fs::read(&file).unwrap(), before, "nothing written");
+    lock.unlock().unwrap();
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(
+        listed["view"], grid_lines,
+        "the refused keep changed nothing"
+    );
+    // No canvas, lease or binding came of any of it.
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
+/// A keep that waited for the view lock while the library's root, or its `library` folder,
+/// was replaced is refused once it holds the lock, with the record's bytes as they were
+/// (R35-F1): the read under the lock checks the pinned library again, and that failure is never
+/// taken for the defaults. The lock file (the same single-link file) and every deeper folder
+/// are moved along into the replacement, so only the replaced folder can refuse the keep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_that_waited_while_the_library_was_replaced_keeps_nothing() {
+    for replaced in ["root", "library"] {
+        let lib = library().await;
+        let kept = json!({"home_layout": "grid", "background": "lines"});
+        assert_eq!(
+            value(call(&lib.c, app::VIEW, kept.clone()).await)["view"],
+            kept
+        );
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(lib.root.join("library/v1/view.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let c = lib.c.clone();
+        let waiting =
+            tokio::spawn(async move { call(&c, app::VIEW, json!({"home_layout": "list"})).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "{replaced}: it waits for the lock");
+        let aside = lib.root.with_extension("aside");
+        if replaced == "root" {
+            std::fs::rename(&lib.root, &aside).unwrap();
+            std::fs::create_dir(&lib.root).unwrap();
+            std::fs::rename(aside.join("library"), lib.root.join("library")).unwrap();
+        } else {
+            std::fs::rename(lib.root.join("library"), &aside).unwrap();
+            std::fs::create_dir(lib.root.join("library")).unwrap();
+            std::fs::rename(aside.join("v1"), lib.root.join("library/v1")).unwrap();
+        }
+        let file = lib.root.join("library/v1/view");
+        let before = std::fs::read(&file).unwrap();
+        lock.unlock().unwrap();
+        let e = bounded(waiting).await.unwrap().unwrap_err();
+        assert!(
+            e.contains("weren't kept") && e.contains("replaced"),
+            "{replaced}: {e}"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "{replaced}: nothing written"
+        );
+        assert_eq!(
+            std::fs::read_dir(lib.root.join("library/v1/locks"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&aside);
+    }
+}
+
 /// Library mode refuses every project route without admission, whatever the arguments or
 /// metadata say, and a workspace process refuses library actions without retiring anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3168,6 +3293,233 @@ async fn agent_and_person_share_the_canvas_with_strict_conflicts_and_no_forced_s
         .await
         .unwrap_err();
     assert!(e.contains("shutting down"), "{e}");
+}
+
+// ---- revision 2 slice 7: a diagram drawn by the agent on the library canvas with upstream's
+// own whiteboard tools (create_shape arrows bound with startNodeId/endNodeId), read back from
+// the saved page file. Proof of current behaviour before any repair.
+
+/// The canvas's saved page (upstream's page file format).
+fn saved_page(dir: &Path, page: &str) -> paper_rs::project::PageData {
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let text = std::fs::read_to_string(path).unwrap();
+    paper_rs::project::format::page_from_json(&text).unwrap()
+}
+
+/// The node number of a tool id (`<page prefix>:<n>`).
+fn node_num(key: &str) -> paper_rs::model::NodeId {
+    paper_rs::model::NodeId(key.rsplit(':').next().unwrap().parse().unwrap())
+}
+
+/// One `create_shape` on the open canvas's page; returns the new tool id.
+async fn agent_shape(c: &Client, b: &str, page: &str, mut args: Value) -> String {
+    args["binding"] = json!(b);
+    args["pageId"] = json!(page);
+    value(call(c, "create_shape", args).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A saved arrow: its world points and the nodes its ends are bound to.
+struct SavedArrow {
+    pts: Vec<paper_rs::geom::V2>,
+    start: Option<paper_rs::model::NodeId>,
+    end: Option<paper_rs::model::NodeId>,
+    route: paper_rs::model::Route,
+}
+
+fn saved_arrow(data: &paper_rs::project::PageData, id: &str) -> SavedArrow {
+    let doc = &data.doc;
+    let n = doc
+        .get(node_num(id))
+        .unwrap_or_else(|| panic!("no arrow {id}"));
+    let paper_rs::model::NodeKind::Connector {
+        points,
+        start,
+        end,
+        route,
+        ..
+    } = &n.kind
+    else {
+        panic!("{id} isn't an arrow: {:?}", n.kind)
+    };
+    let o = doc.world_rect(n.id).unwrap().min();
+    SavedArrow {
+        pts: points.iter().map(|p| o + *p).collect(),
+        start: start.map(|b| b.node),
+        end: end.map(|b| b.node),
+        route: *route,
+    }
+}
+
+/// An end attached to `target`'s outline in the saved file: within the binding gap of its box
+/// (5 + stroke/2, with room for rounding).
+fn near(data: &paper_rs::project::PageData, target: &str, p: paper_rs::geom::V2) -> bool {
+    let r = data.doc.world_rect(node_num(target)).unwrap();
+    r.inflate(15.0).contains(p)
+}
+
+/// The architecture an agent draws with upstream's own tools on a library canvas: User →
+/// Service → Datastore and a branch (Service → Cached? → Datastore / Fallback), each box with a
+/// text label, each arrow bound to its boxes. Saved at once, read back exactly from the file;
+/// moving, resizing and relabelling keep the arrows on their boxes; a change on a stale read
+/// is refused with nothing written; duplicate leaves the arrows on the originals; delete lets go
+/// and the agent's undo restores; close and a fresh process reopen the same drawing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_diagram_arrows_stay_bound_through_edits_stale_refusal_undo_and_reopen() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::AGENT_CREATE, json!({"name": "Architecture"})).await);
+    let b = binding(&created);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    let dir = lib.root.join("library/v1/canvases").join(&id);
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    // Boxes (rectangles and a decision diamond), then their labels, then the arrows.
+    let mut ids = Vec::new();
+    for (ty, name, x, y, h) in [
+        ("rectangle", "User", 0.0, 0.0, 80.0),
+        ("rectangle", "Service", 320.0, 0.0, 80.0),
+        ("rectangle", "Datastore", 640.0, 0.0, 80.0),
+        ("rectangle", "Fallback", 640.0, 360.0, 80.0),
+        ("diamond", "Cached?", 320.0, 200.0, 100.0),
+    ] {
+        let shape = json!({"type": ty, "name": name, "x": x, "y": y, "width": 160, "height": h});
+        ids.push(agent_shape(&lib.c, &b, &page, shape).await);
+    }
+    let [user, service, store, fallback, cached] = <[String; 5]>::try_from(ids).unwrap();
+    let mut labels = Vec::new();
+    for (text, x) in [
+        ("User", 50.0),
+        ("Orders service", 340.0),
+        ("Postgres", 680.0),
+    ] {
+        let label = json!({"type": "text", "text": text, "x": x, "y": 28});
+        labels.push(agent_shape(&lib.c, &b, &page, label).await);
+    }
+    let service_label = labels[1].clone();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    for (name, from, to, route) in [
+        ("user-service", &user, &service, "straight"),
+        ("service-store", &service, &store, "elbow"),
+        ("service-cached", &service, &cached, "straight"),
+        ("cached-store", &cached, &store, "curved"),
+        ("cached-fallback", &cached, &fallback, "elbow"),
+    ] {
+        let arrow = json!({"type": "arrow", "name": name, "startNodeId": from,
+            "endNodeId": to, "route": route});
+        let a = agent_shape(&lib.c, &b, &page, arrow).await;
+        edges.push((a, from.clone(), to.clone()));
+    }
+    let (a1, a2, a4) = (edges[0].0.clone(), edges[1].0.clone(), edges[3].0.clone());
+    // Saved at once, exactly as drawn: every end bound and attached to its box.
+    let check = |data: &paper_rs::project::PageData, why: &str| {
+        for (a, from, to) in &edges {
+            let s = saved_arrow(data, a);
+            let want = (Some(node_num(from)), Some(node_num(to)));
+            assert_eq!((s.start, s.end), want, "{why}: {a} bound");
+            let (first, last) = (s.pts[0], *s.pts.last().unwrap());
+            assert!(near(data, from, first), "{why}: {a} start {:?}", s.pts);
+            assert!(near(data, to, last), "{why}: {a} end {:?}", s.pts);
+        }
+    };
+    let data = saved_page(&dir, &page);
+    check(&data, "drawn");
+    use paper_rs::model::Route;
+    assert_eq!(saved_arrow(&data, &a2).route, Route::Elbow);
+    assert_eq!(saved_arrow(&data, &a4).route, Route::Curved);
+    let elbow = saved_arrow(&data, &a2).pts;
+    assert!(
+        elbow
+            .windows(2)
+            .all(|w| (w[0].x - w[1].x).abs() < 1e-6 || (w[0].y - w[1].y).abs() < 1e-6),
+        "{elbow:?}"
+    );
+    // Move and resize the service; relabel it. Its arrows follow, in the saved file.
+    let before = saved_arrow(&data, &a1).pts;
+    let moved = json!({"binding": b, "updates": [{"nodeIds": [service],
+        "styles": {"left": "360px", "top": "-140px"}}]});
+    call(&lib.c, "update_styles", moved).await.unwrap();
+    let data = saved_page(&dir, &page);
+    check(&data, "moved");
+    let after = saved_arrow(&data, &a1).pts;
+    assert_ne!(after, before, "the arrow was rerouted");
+    let grown = json!({"binding": b, "updates": [{"nodeIds": [service],
+        "styles": {"width": "240px", "height": "120px"}}]});
+    call(&lib.c, "update_styles", grown).await.unwrap();
+    let data = saved_page(&dir, &page);
+    let sr = data.doc.world_rect(node_num(&service)).unwrap();
+    assert_eq!((sr.x, sr.y, sr.w, sr.h), (360.0, -140.0, 240.0, 120.0));
+    check(&data, "resized");
+    let relabel = json!({"binding": b, "updates": [{"nodeId": service_label,
+        "textContent": "Orders API \"v2\""}]});
+    call(&lib.c, "set_text_content", relabel).await.unwrap();
+    let data = saved_page(&dir, &page);
+    let t = data.doc.get(node_num(&service_label)).unwrap();
+    let shown = t.kind.text().unwrap();
+    assert_eq!(shown, "Orders API \"v2\"", "the label, byte for byte");
+    check(&data, "relabelled");
+    // The person saves from a browser tab: the agent's next change is on a stale read and is
+    // refused, with nothing written and the arrows as they were.
+    let link = value(call(&lib.c, app::AGENT_EDITOR, json!({"binding": b})).await);
+    let (port, token) = url(&link);
+    browser_edit(port, &token).await;
+    let after_person = files(&dir, &page);
+    let stale = json!({"binding": b, "updates": [{"nodeIds": [user],
+        "styles": {"left": "0px", "top": "400px"}}]});
+    let e = call(&lib.c, "update_styles", stale).await.unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), after_person, "nothing written");
+    let data = saved_page(&dir, &page);
+    check(&data, "after a refused stale write");
+    // Read again; duplicate the service: the copy is free, the arrows stay on the original.
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    let dup = json!({"binding": b, "nodes": [{"id": service}]});
+    let dup = value(call(&lib.c, "duplicate_nodes", dup).await);
+    let copy = dup["duplicates"][0]["newId"].as_str().unwrap().to_string();
+    let data = saved_page(&dir, &page);
+    assert!(data.doc.get(node_num(&copy)).is_some());
+    check(&data, "duplicated");
+    let c = Some(node_num(&copy));
+    for (a, _, _) in &edges {
+        let s = saved_arrow(&data, a);
+        assert!(s.start != c && s.end != c, "{a} stays on the original");
+    }
+    // Delete the datastore: its arrows stay and let go; the agent's undo restores it all.
+    let bound = files(&dir, &page);
+    let del = json!({"binding": b, "nodeIds": [store]});
+    call(&lib.c, "delete_nodes", del).await.unwrap();
+    let data = saved_page(&dir, &page);
+    assert!(data.doc.get(node_num(&store)).is_none());
+    for a in [&a2, &a4] {
+        let s = saved_arrow(&data, a);
+        assert_eq!(s.end, None, "{a} let go of the deleted datastore");
+    }
+    let undo = json!({"binding": b, "pageId": page});
+    call(&lib.c, "undo", undo).await.unwrap();
+    let data = saved_page(&dir, &page);
+    check(&data, "undone");
+    let restored = files(&dir, &page).0;
+    assert_eq!(restored, bound.0, "the page as it was before the delete");
+    // Close (a link was given, so it is the person's view that closes), then a fresh process
+    // reopens the same drawing.
+    let kept = files(&dir, &page);
+    call(&lib.c, app::CLOSE, json!({"binding": b, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(files(&dir, &page), kept, "closing writes nothing");
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::AGENT_OPEN, json!({"id": id})).await);
+    let b2 = binding(&reopened);
+    let read = json!({"binding": b2, "nodeId": "root", "pageId": page});
+    let tree = out_text(call(&c2, "get_tree_summary", read).await);
+    for want in ["Orders API", "Postgres", "user-service", "cached-fallback"] {
+        assert!(tree.contains(want), "{want}: {tree}");
+    }
+    check(&saved_page(&dir, &page), "reopened");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
 }
 
 /// Ownership across processes stays the lease's: an agent can't open a canvas another process

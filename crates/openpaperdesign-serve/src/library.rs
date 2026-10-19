@@ -65,6 +65,17 @@ pub(crate) const APPEARANCES: [&str; 3] = ["system", "light", "dark"];
 /// background. Its own file, so the appearance's stays exactly as it is.
 const VIEW_FILE: &str = "view";
 const MAX_VIEW_BYTES: u64 = 256;
+/// The lock every OpenPaperDesign process holds while it keeps a view preference (see
+/// [`Library::set_view`]): an OS file lock on this file beside the record, created once and
+/// never removed, truncated or replaced, so every process locks the same file. No canvas,
+/// lease or binding is involved.
+const VIEW_LOCK_FILE: &str = "view.lock";
+/// A keep waits at most `VIEW_LOCK_TRIES` × `VIEW_LOCK_PAUSE` (one second) for another
+/// process's keep to finish; after that it is refused with nothing written.
+const VIEW_LOCK_TRIES: u32 = 100;
+const VIEW_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+const VIEW_BUSY: &str = "Another OpenPaperDesign window was keeping its view preferences at the \
+    same moment, so this one wasn't kept. Nothing was changed; choose it again to keep it.";
 pub(crate) const HOME_LAYOUTS: [&str; 2] = ["grid", "list"];
 pub(crate) const BACKGROUNDS: [&str; 3] = ["none", "dots", "lines"];
 
@@ -470,20 +481,26 @@ impl Library {
     /// bounded: a missing, unreadable, linked, oversized or malformed record is the defaults,
     /// and a missing or unknown key is that key's default. Nothing is created.
     pub fn view(&self) -> ViewPrefs {
+        self.read_view().unwrap_or_default()
+    }
+
+    /// [`Library::view`], except that a library whose pinned root or hierarchy no longer checks
+    /// out is that error rather than the defaults: a keep must not take those defaults for the
+    /// kept record. A missing, unreadable, linked, oversized or malformed record is still the
+    /// defaults.
+    fn read_view(&self) -> Result<ViewPrefs, String> {
         let mut out = ViewPrefs::default();
-        if self.check().is_err() {
-            return out;
-        }
+        self.check()?;
         let path = self.version_dir().join(VIEW_FILE);
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() && m.len() <= MAX_VIEW_BYTES => {}
-            _ => return out,
+            _ => return Ok(out),
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
-            return out;
+            return Ok(out);
         };
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            return out;
+            return Ok(out);
         };
         let pick = |key: &str, from: &[&'static str]| {
             let got = v.get(key).and_then(Value::as_str)?;
@@ -495,15 +512,20 @@ impl Library {
         if let Some(b) = pick("background", &BACKGROUNDS) {
             out.background = b;
         }
-        out
+        Ok(out)
     }
 
     /// Keep `home_layout` and/or `background` (each one of its known values; at least one),
     /// with the other key as it is kept now: the whole record is written to a new file beside
     /// it, made durable and renamed over the old one, so a reader sees the old or the new
-    /// record, never part of one. Touches no canvas, lease or binding. Two processes keeping
-    /// different keys at the same moment can race (the later record wins whole); each record is
-    /// still a complete, valid one.
+    /// record, never part of one. Touches no canvas, lease or binding.
+    ///
+    /// Keeps from different processes are serialized by the view lock (`VIEW_LOCK_FILE`): the
+    /// record is read and replaced while it is held, so a keep of one key never undoes another
+    /// process's acknowledged keep of the other. A keep that can't take the lock within its
+    /// bound is refused with nothing written (never acknowledged), as is one whose library root
+    /// or hierarchy no longer checks out once it holds the lock. Readers take no lock: they
+    /// see a whole record. Blocking (the bounded wait): call it off the async executor.
     pub fn set_view(
         &self,
         home_layout: Option<&str>,
@@ -530,14 +552,21 @@ impl Library {
                 "A home_layout or a background to keep is required. Nothing was changed.".into(),
             );
         }
-        let mut next = self.view();
+        self.ensure_hierarchy()?;
+        // Held until this keep returns (dropping the file releases the lock).
+        let _held = self.lock_view()?;
+        // Read under the lock: the record as the last finished keep, of any process, left it.
+        // The library is checked again first, since it may have been moved or replaced while
+        // this keep waited: then nothing is kept.
+        let mut next = self.read_view().map_err(|e| {
+            format!("The view preferences weren't kept ({e}). Nothing was changed.")
+        })?;
         if let Some(l) = layout {
             next.home_layout = l;
         }
         if let Some(b) = pattern {
             next.background = b;
         }
-        self.ensure_hierarchy()?;
         let dir = self.version_dir();
         let path = dir.join(VIEW_FILE);
         if let Ok(m) = std::fs::symlink_metadata(&path)
@@ -569,6 +598,51 @@ impl Library {
         }
         sync_dir(&dir)?;
         Ok(next)
+    }
+
+    /// Take the view lock (see `VIEW_LOCK_FILE`), waiting a bounded time for another process's
+    /// keep. As for a canvas's lease file, the opened file must be the path's own regular,
+    /// single-link file, before and after locking.
+    fn lock_view(&self) -> Result<File, String> {
+        let dir = self.version_dir();
+        let path = dir.join(VIEW_LOCK_FILE);
+        let unusable = |e: String| {
+            format!("The view preferences' lock file is unusable ({e}). Nothing was changed.")
+        };
+        let existed = plain(&path, Kind::File).map_err(unusable)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| unusable(e.to_string()))?;
+        if !existed {
+            sync_dir(&dir)?;
+        }
+        let mut tries = 0;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < VIEW_LOCK_TRIES => {
+                    tries += 1;
+                    std::thread::sleep(VIEW_LOCK_PAUSE);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(VIEW_BUSY.into()),
+                Err(std::fs::TryLockError::Error(e)) => return Err(unusable(e.to_string())),
+            }
+        }
+        let handle = file.metadata().map_err(|e| unusable(e.to_string()))?;
+        let m = std::fs::symlink_metadata(&path).map_err(|e| unusable(e.to_string()))?;
+        if m.file_type().is_symlink()
+            || !m.is_file()
+            || !handle.is_file()
+            || crate::links(&handle) != 1
+            || dev_ino(&m) != dev_ino(&handle)
+        {
+            return Err(unusable("it was replaced or linked".into()));
+        }
+        Ok(file)
     }
 
     /// A canvas's manifest, read only from a real folder on the library's file system with a

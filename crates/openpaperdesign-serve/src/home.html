@@ -588,16 +588,35 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // `cleanName` stays the workspace view's label rule.
   const MAX_NAME_CHARS = 60;
   const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+  // Trimming is Rust's `str::trim`: Unicode White_Space at either end. Unlike JavaScript's own
+  // `trim`, that takes U+0085 (NEL) and leaves U+FEFF, which is part of a name. The set is
+  // given by code point, so the source holds none of these characters (U+2028 and U+2029
+  // would end a line of script).
+  const RUST_SPACE = String.fromCharCode(0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680,
+    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+    0x2028, 0x2029, 0x202f, 0x205f, 0x3000);
+  function rustTrim(s) {
+    const t = String(s);
+    let i = 0;
+    let j = t.length;
+    while (i < j && RUST_SPACE.includes(t[i])) i += 1;
+    while (j > i && RUST_SPACE.includes(t[j - 1])) j -= 1;
+    return t.slice(i, j);
+  }
+  // A UTF-16 surrogate without its pair (a code point of its own, unlike a pair's halves) is no
+  // Unicode scalar value, so never part of a Rust name.
+  const loneSurrogate = (s) => Array.from(s).some((c) => c.length === 1 && c >= '\ud800' && c <= '\udfff');
   // A listed name as shown, tooltip and accessible name: exactly the saved one. Only an answer
   // that breaks the rule (which a valid library never sends) is bounded: its controls become
   // spaces and it is cut to 60 whole characters, never through a surrogate pair.
-  const libraryName = (s) => Array.from(String(s).replace(CONTROL_CHARS, ' ').trim()).slice(0, MAX_NAME_CHARS).join('');
+  const libraryName = (s) => Array.from(rustTrim(String(s).replace(CONTROL_CHARS, ' '))).slice(0, MAX_NAME_CHARS).join('');
   // What the person typed as a file name: `{ name }` to send (trimmed, otherwise exactly as
   // typed), or `{ why }` when it isn't a name the server takes; nothing is changed then.
   function libraryNameInput(s) {
-    const name = String(s).trim();
+    const name = rustTrim(s);
     if (!name) return { why: 'Name the file first.' };
     if (new RegExp(CONTROL_CHARS.source).test(name)) return { why: 'A file name can\'t contain control characters. Nothing was renamed.' };
+    if (loneSurrogate(name)) return { why: 'A file name can\'t contain an incomplete character. Nothing was renamed.' };
     if (Array.from(name).length > MAX_NAME_CHARS) return { why: 'A file name can have at most 60 characters. Nothing was renamed.' };
     return { name };
   }
@@ -1145,8 +1164,28 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('layout-list').setAttribute('aria-pressed', next === 'list' ? 'true' : 'false');
     $('layout-grid').setAttribute('aria-pressed', next === 'grid' ? 'true' : 'false');
   }
-  $('layout-list').onclick = () => { homeLayout.choose('list'); };
-  $('layout-grid').onclick = () => { homeLayout.choose('grid'); };
+  // A layout the library couldn't keep still shows here, and that is said (shown and announced)
+  // only while it is the latest layout choice, its home is still the view shown and nothing
+  // newer took the notice meanwhile. A later choice that is kept takes that notice back.
+  let layoutUnkept = null; // the notice that said so, while it may still be shown
+  async function chooseLayout(next) {
+    const g = gen;
+    const before = $('notice').textContent;
+    const kept = await homeLayout.choose(next);
+    if (kept === null || g !== gen || view !== 'home') return;
+    const now = $('notice').textContent;
+    if (kept) {
+      if (layoutUnkept !== null && now === layoutUnkept) notice('');
+      layoutUnkept = null;
+      return;
+    }
+    if (sending || (now !== before && now !== layoutUnkept)) return;
+    layoutUnkept = (next === 'list' ? 'List' : 'Grid') + ' layout applied here, but it couldn\'t be kept for next time.';
+    notice(layoutUnkept);
+    announce(layoutUnkept, g);
+  }
+  $('layout-list').onclick = () => { chooseLayout('list'); };
+  $('layout-grid').onclick = () => { chooseLayout('grid'); };
   setLayout(homeLayout.value);
 
   let libraryRun = 0;
@@ -1203,7 +1242,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('inventory').textContent = text;
     $('inventory').hidden = !text;
     filterFiles();
-    if (view === 'home' && g === gen) announce(text || shownCount() + ' files');
+    if (view === 'home' && g === gen) announce(text || (shownCount() === 1 ? '1 file' : shownCount() + ' files'));
   }
   const shownCount = () => rowActions.projects.length;
 

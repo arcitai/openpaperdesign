@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 8 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 9 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -126,8 +126,8 @@ The principles:
       - Menu ▸ Background, and the palette's "Background: …";
       - the grid shortcut (Ctrl/⌘+Shift+') and View ▸ Background On/Off, which toggle None
         against the last pattern.
-    - **The menu takes its own input:** while it is open, Escape and presses close it and
-      never reach the canvas. Hand, Space and middle-button panning are unchanged.
+    - **The menu takes its own input:** while it is open, Escape and presses (mouse or touch)
+      close it and never reach the canvas. Hand, Space and middle-button panning are unchanged.
     - **A view preference, never the drawing.** Switching changes nothing in the document,
       its undo or its saves, and nothing in snapping or exports.
     - **Where it is kept:** the app library keeps it with Home's layout; the standalone
@@ -135,7 +135,8 @@ The principles:
     - **Lines** use the dot grid's zoom-adaptive spacing, as 1 px lines.
 11. **A quiet Home** (revision 2 slice 5, built).
     - **Layout.** Files show as a grid of equal cards by default, and a list once List is
-      chosen; the library keeps that choice.
+      chosen; the library keeps that choice. A choice it couldn't keep still applies, and Home
+      says so while that choice is the latest and its Home is shown.
     - **Cards.** Each card has its glyph, two reserved title lines (a longer name is clamped;
       its full name is the card's tooltip and accessible name) and one line each for pages
       and the last edit.
@@ -162,7 +163,10 @@ Still open from the revision 2 plan (not built yet, and not to be described as b
   - the app library keeps it in its own data folder (`library/v1/appearance`), so it survives
     closing and reopening the view. Home's layout and the canvas background are kept beside
     it, in one small record of two keys (`library/v1/view`). Each key follows the same
-    freshness rule: a list read that overlapped an unresolved choice never replaces it;
+    freshness rule: a list read that overlapped an unresolved choice never replaces it.
+    Windows keeping a key at once take turns through an OS lock file (`library/v1/view.lock`),
+    so neither undoes the other's kept key; a keep that can't take its turn within about a
+    second, or finds the library moved or replaced, keeps nothing and says so;
   - the standalone browser page keeps it only while it is open (its origin changes per launch);
   - nothing is stored in the browser;
   - native macOS has no egui Menu, so it stays System and follows the OS.

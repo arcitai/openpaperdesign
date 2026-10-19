@@ -542,7 +542,17 @@ impl Launcher {
                 text(listed)
             }
             VIEW => {
-                let kept = lib.set_view(get("home_layout"), get("background"))?;
+                // Off the async executor: a keep may wait (bounded) for another process's.
+                let (lib, layout, background) = (
+                    lib.clone(),
+                    get("home_layout").map(String::from),
+                    get("background").map(String::from),
+                );
+                let kept = tokio::task::spawn_blocking(move || {
+                    lib.set_view(layout.as_deref(), background.as_deref())
+                })
+                .await
+                .map_err(|e| format!("The view preferences couldn't be kept ({e})."))??;
                 text(json!({
                     "view": kept.to_json(),
                     "note": "Kept as this library's view preferences. No canvas was read or \
