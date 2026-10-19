@@ -2120,6 +2120,222 @@ fn a_member_named_twice_in_a_labelled_payload_is_refused_whatever_its_order() {
     }
 }
 
+/// R15 curve re-edit (the lead's synthetic-host finding on 869: after a first bend the curve
+/// had no bend handle, and a drag on its apex resized its box, ignoring x): a selected
+/// three-point curve's bend handle is its bend point, and a diagonal drag from it moves that
+/// point in both axes, ends still bound and on their shapes, the shapes untouched, one undo
+/// step per drag (first and later ones), Undo/Redo exact; a press that stays within the drag
+/// threshold changes nothing; a moved shape still reroutes its end while the bend stays.
+#[test]
+fn a_bent_arrow_keeps_its_bend_editable_in_both_axes_one_step_per_drag() {
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 400.0, 160.0, 80.0);
+    let b = rect(&mut e, 700.0, 400.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    let handle = |e: &Editor| {
+        e.connector_handles()
+            .into_iter()
+            .find(|(i, _)| *i == 2)
+            .map(|(_, p)| p)
+    };
+    let shapes = |e: &Editor| (e.doc.get(a).cloned(), e.doc.get(b).cloned());
+    let shapes0 = shapes(&e);
+    // Control: the first bend, from the straight arrow's middle, upward (a long bend).
+    let mid = handle(&e).expect("the straight arrow's bend handle");
+    let steps = e.history.undo_len();
+    let apex = mid + v2(0.0, -250.0);
+    ev_drag(&mut e, mid, apex, 1000.0, true);
+    let (pts, s, t, route) = conn(&e, arrow);
+    assert_eq!((route, pts.len()), (Route::Curved, 3), "bent");
+    assert!(pts[1].dist(apex) < 1e-6, "{pts:?}");
+    assert_eq!((s, t), (Some(a), Some(b)));
+    assert_eq!(e.history.undo_len(), steps + 1, "one step");
+    let first = e.doc.clone();
+    // The curve, still selected, has its bend handle on the bend point (not a box handle).
+    let h = handle(&e).expect("a bend handle on the curve");
+    assert!(h.dist(apex) < 1e-6, "{h:?} {apex:?}");
+    // Diagonally from the apex (the finding): the bend point moves in x and y.
+    let target = apex + v2(80.0, 80.0);
+    ev_drag(&mut e, h, target, 2000.0, true);
+    let (pts, s, t, route) = conn(&e, arrow);
+    assert_eq!((route, pts.len()), (Route::Curved, 3), "still one bend");
+    assert!(pts[1].dist(target) < 1e-6, "moved in both axes: {pts:?}");
+    assert_eq!((s, t), (Some(a), Some(b)), "still bound");
+    assert!(on_outline(pts[0], world(&e, a)), "{pts:?}");
+    assert!(on_outline(last(&pts), world(&e, b)), "{pts:?}");
+    assert_eq!(shapes(&e), shapes0, "no box resize, the shapes untouched");
+    assert_eq!(e.history.undo_len(), steps + 2, "one step for the re-bend");
+    let second = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(e.doc, first, "Undo: the first bend");
+    e.run(Action::Redo);
+    assert_eq!(e.doc, second);
+    // Again: each later drag is its own step.
+    e.selection = vec![arrow];
+    let h = handle(&e).unwrap();
+    assert!(h.dist(target) < 1e-6);
+    let third_at = target + v2(-200.0, 60.0);
+    ev_drag(&mut e, h, third_at, 3000.0, true);
+    assert!(conn(&e, arrow).0[1].dist(third_at) < 1e-6);
+    assert_eq!(e.history.undo_len(), steps + 3);
+    e.run(Action::Undo);
+    assert_eq!(e.doc, second);
+    // A press within the drag threshold is a click: nothing changes, nothing is recorded.
+    e.selection = vec![arrow];
+    let h = handle(&e).unwrap();
+    let n = e.history.undo_len();
+    ev_drag(&mut e, h, h + v2(1.5, 1.5), 4000.0, true);
+    assert_eq!(e.doc, second);
+    assert_eq!(e.history.undo_len(), n);
+    // A bound shape moves: its end follows, the bend point stays.
+    e.selection = vec![b];
+    let p = world(&e, b).min() + v2(20.0, 20.0);
+    ev_drag(&mut e, p, p + v2(0.0, 150.0), 5000.0, true);
+    let (pts, s, t, _) = conn(&e, arrow);
+    assert_eq!((s, t), (Some(a), Some(b)));
+    assert!(on_outline(last(&pts), world(&e, b)), "rerouted: {pts:?}");
+    assert!(pts[1].dist(target) < 1e-6, "the bend stays: {pts:?}");
+    e.doc.validate().unwrap();
+}
+
+/// The re-editable bend keeps the rest of the arrow: a labelled curve keeps its label, heads
+/// and style through a re-bend, and its label stays editable (a double-click on the bend
+/// point edits it first; Enter edits it). Controls: an elbow arrow has no bend handle (it is
+/// routed automatically); a curve with more points than one bend has none either, and its
+/// points are kept, never collapsed; a locked curve, itself or through its group (fixture:
+/// selected directly, as a locked layer isn't picked on the canvas), has no handles, and a
+/// drag there changes nothing.
+#[test]
+fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks() {
+    use paper_rs::model::Head;
+    let mut e = editor(1400.0, 900.0);
+    e.snapping = false;
+    let handle = |e: &Editor| {
+        e.connector_handles()
+            .into_iter()
+            .find(|(i, _)| *i == 2)
+            .map(|(_, p)| p)
+    };
+    let a = rect(&mut e, 100.0, 400.0, 160.0, 80.0);
+    let b = rect(&mut e, 700.0, 400.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    let mid = handle(&e).unwrap();
+    ev_drag(&mut e, mid, mid + v2(0.0, -220.0), 1000.0, true);
+    type_label(&mut e, arrow, "calls");
+    // A style and heads of its own, to see that a re-bend keeps them.
+    paper_rs::ui::inspector::apply(&mut e, "stroke", &[arrow], |n| {
+        n.style.stroke_width = 4.0;
+        if let NodeKind::Connector { start_head, .. } = &mut n.kind {
+            *start_head = Head::Dot;
+        }
+    });
+    let before = e.doc.get(arrow).unwrap().clone();
+    // The labelled curve's bend handle is there; a double-click on it edits the label.
+    e.selection = vec![arrow];
+    let h = handle(&e).expect("a labelled curve keeps its bend handle");
+    let steps = e.history.undo_len();
+    click(&mut e, h, 2000.0);
+    click(&mut e, h, 2100.0);
+    let editing = e.text_edit.as_ref().map(|te| te.id);
+    assert_eq!(editing, Some(arrow), "the double-click edits the label");
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(e.doc.get(arrow).unwrap(), &before, "nothing else changed");
+    assert_eq!(e.history.undo_len(), steps);
+    // A re-bend keeps label, heads and style, in one step.
+    e.selection = vec![arrow];
+    let h = handle(&e).unwrap();
+    let target = h + v2(120.0, -40.0);
+    ev_drag(&mut e, h, target, 3000.0, true);
+    let after = e.doc.get(arrow).unwrap().clone();
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("calls"));
+    assert_eq!(after.style, before.style, "the style kept");
+    let heads = |n: &Node| match &n.kind {
+        NodeKind::Connector {
+            start_head,
+            end_head,
+            route,
+            ..
+        } => (*start_head, *end_head, *route),
+        _ => unreachable!(),
+    };
+    assert_eq!(heads(&after), heads(&before), "heads and route kept");
+    assert!(conn(&e, arrow).0[1].dist(target) < 1e-6);
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)));
+    assert_eq!(e.history.undo_len(), steps + 1);
+    // Enter still edits the label of the selected curve.
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+
+    // Control: an elbow arrow has no bend handle.
+    e.arrow_route = Route::Elbow;
+    let c = rect(&mut e, 100.0, 700.0, 120.0, 80.0);
+    let d = rect(&mut e, 700.0, 780.0, 120.0, 80.0);
+    let (from, to) = (world(&e, c).center(), world(&e, d).center());
+    let elbow = draw_arrow(&mut e, from, to, 4000.0);
+    assert_eq!(conn(&e, elbow).3, Route::Elbow);
+    assert!(handle(&e).is_none(), "an elbow is routed, not bent");
+    e.arrow_route = Route::Straight;
+    // Control: a curve with two bends (an agent's) has no bend handle, and keeps its points.
+    let pts = [
+        v2(1000.0, 100.0),
+        v2(1100.0, 40.0),
+        v2(1200.0, 160.0),
+        v2(1300.0, 100.0),
+    ];
+    let multi = free_arrow(&mut e, &pts, Route::Curved, "many");
+    e.selection = vec![multi];
+    assert!(handle(&e).is_none(), "not for two bends");
+    let kept = conn(&e, multi).0;
+    assert_eq!(kept.len(), 4, "its points kept");
+    let press = kept[1];
+    let n = e.history.undo_len();
+    ev_drag(&mut e, press, press + v2(0.0, 30.0), 5000.0, false);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    e.handle(InputEvent::PointerUp {
+        pos: press + v2(0.0, 30.0),
+        button: Button::Primary,
+        time_ms: 5300.0,
+    });
+    let after = conn(&e, multi).0;
+    assert_eq!(after.len(), 4, "never collapsed to one bend: {after:?}");
+    assert_eq!(e.history.undo_len(), n, "nothing recorded");
+
+    // Locked, itself: no handles, and a drag on its bend point changes nothing.
+    e.selection = vec![arrow];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(arrow).unwrap().locked);
+    e.selection = vec![arrow];
+    assert!(e.connector_handles().is_empty(), "no handles");
+    let locked = e.doc.clone();
+    let n = e.history.undo_len();
+    let p = conn(&e, arrow).0[1];
+    ev_drag(&mut e, p, p + v2(60.0, 60.0), 6000.0, true);
+    assert_eq!(e.doc, locked, "nothing bent, moved or resized");
+    assert_eq!(e.history.undo_len(), n);
+    e.selection = vec![arrow];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(arrow));
+    // Locked through its group: the same.
+    e.selection = vec![a, b, arrow];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(g).unwrap().locked, "the group is locked");
+    assert!(!e.doc.get(arrow).unwrap().locked, "the arrow itself isn't");
+    e.selection = vec![arrow];
+    assert!(e.connector_handles().is_empty(), "through its group");
+    let locked = e.doc.clone();
+    let p = conn(&e, arrow).0[1];
+    ev_drag(&mut e, p, p + v2(60.0, 60.0), 7000.0, true);
+    assert_eq!(e.doc, locked, "nothing bent, moved or resized");
+    e.doc.validate().unwrap();
+}
+
 /// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the
 /// clipboard's text replaces the selected characters or goes in at the caret, as plain text,
 /// whatever it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). It is never

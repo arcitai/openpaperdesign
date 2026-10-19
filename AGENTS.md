@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.73 · Updated: 2026-10-19
+Revision: 0.74 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -314,6 +314,17 @@ engine architecture is `analysis/DESIGN.md`.
         it moves past the drag threshold (`Gesture::ConnectorMid::press`, `bend_connector`),
         as a move does. A click there, such as the first half of a double-click that edits
         the label, changes nothing. A real drag bends exactly as before.
+      - **Curve re-edit** (R15; natively too; the lead's synthetic-host finding on 869: after
+        a first bend no bend handle was left, and a drag on the apex was the box resize,
+        ignoring x), `src/editor/whiteboard.rs` `connector_handles`: a three-point `Curved`
+        arrow's bend handle (index 2) is its bend point, so the existing `ConnectorMid`
+        gesture and `drag_connector_mid` move that point again (past the drag threshold, one
+        undo step per drag; endpoints rerouted to their bindings). It is offered even under
+        the label, since a double-click (checked before handles) and Enter still edit the
+        label. Elbows (routed) and curves with more points (no single bend; their points are
+        never collapsed) still have none. A connector locked itself or through an ancestor
+        now has no handles at all (the box resize already skipped locked layers). Same
+        document, gesture and history; no format change. Upstreamable as a fix.
     - **MCP.** `src/mcp/exec.rs`/`tools.rs`: `create_shape`'s `text` labels an arrow,
       `set_text_content` sets one exactly (empty removes it), `get_node_info` reports
       `label`, and `get_tree_summary` shows it. Same reads, writes, acknowledgements and
@@ -550,7 +561,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-14.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-15.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -607,7 +618,12 @@ said in the status). The editor's WASM changed again, so `home-12` is refused an
 `home-14` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 R48 correction of that payload (a member named twice refused before anything is checked or
 registered). The editor's WASM changed again, so `home-13` is refused and a cached `home-13`
-view can't pass for this one. Not installed or natively accepted.
+view can't pass for this one.
+
+`home-15` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+editor whose bent curve keeps its bend handle (the curve re-edit above). The editor's WASM
+changed again, so `home-14` is refused and a cached `home-14` view can't pass for this one.
+Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

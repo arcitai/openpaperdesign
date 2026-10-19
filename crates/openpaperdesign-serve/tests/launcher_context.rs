@@ -638,8 +638,9 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
     // in the menu, the kept home layout and canvas background, the editor's file rename);
     // `home-10` is it with the corrected editor's in-label Paste; `home-11` adds the editor's
     // guard for a text edit whose layer was locked; `home-12` its labelled clipboard payload;
-    // `home-13` that payload's R47 corrections; `home-14` its R48 correction.
-    const HOME: &str = "ui://openpaperdesign/home-14.html";
+    // `home-13` that payload's R47 corrections; `home-14` its R48 correction; `home-15` a
+    // bent curve's re-editable bend.
+    const HOME: &str = "ui://openpaperdesign/home-15.html";
     for meta in metas {
         let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
         assert!(ok, "{s}");
@@ -687,9 +688,10 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
             "the slot holds the packaged font, byte for byte"
         );
         for other in [
-            "ui://openpaperdesign/home-14.html?x",
+            "ui://openpaperdesign/home-15.html?x",
             // Earlier view URIs are no longer served, so a fresh read can't get an older view.
             // A view a host already has open isn't evicted or refreshed by this.
+            "ui://openpaperdesign/home-14.html",
             "ui://openpaperdesign/home-13.html",
             "ui://openpaperdesign/home-12.html",
             "ui://openpaperdesign/home-11.html",
@@ -722,7 +724,7 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
 /// session's workspace state alone. Every other tool keeps per-call admission and retirement.
 #[tokio::test]
 async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
-    const HOME: &str = "ui://openpaperdesign/home-14.html";
+    const HOME: &str = "ui://openpaperdesign/home-15.html";
     let f = Fixture::new();
     let c = f.host().await;
 

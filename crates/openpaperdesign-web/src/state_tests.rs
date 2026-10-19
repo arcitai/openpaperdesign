@@ -4428,6 +4428,51 @@ fn browser_copy_cut_and_paste_events_carry_labelled_arrows_with_their_labels() {
     assert_eq!(label(&t).as_deref(), Some("sends"));
 }
 
+/// R15 curve re-edit in the browser, through the page's own pointer events: a bound arrow
+/// drawn and bent from its middle has, still selected, a bend handle on its bend point, and a
+/// diagonal drag from it moves that point by the drag in both axes (before, it was a box
+/// resize that ignored x), the ends still bound, in one undo step that Undo takes back.
+#[test]
+fn browser_a_bent_arrow_re_bends_from_its_bend_point_in_both_axes() {
+    let mut s = state();
+    let a = s.ed.doc.root[0];
+    s.run(Action::Tool(Tool::Rect));
+    let (from, to) = (at(&s, 600.0, 100.0), at(&s, 760.0, 180.0));
+    timed_drag(&mut s, from, to);
+    let b = s.ed.selection[0];
+    s.run(Action::Tool(Tool::Arrow));
+    let (from, to) = (at(&s, 200.0, 150.0), at(&s, 680.0, 140.0));
+    timed_drag(&mut s, from, to);
+    let arrow = s.ed.selection[0];
+    let handle = |s: &WebState| {
+        let handles = s.ed.connector_handles();
+        let (_, p) = handles.into_iter().find(|(i, _)| *i == 2)?;
+        Some(at(s, p.x, p.y))
+    };
+    let bend = |s: &WebState| s.ed.connector_points(arrow).unwrap();
+    let ends = |s: &WebState| match &s.ed.doc.get(arrow).unwrap().kind {
+        NodeKind::Connector { start, end, .. } => (start.map(|b| b.node), end.map(|b| b.node)),
+        _ => unreachable!(),
+    };
+    assert_eq!(ends(&s), (Some(a), Some(b)), "bound to both");
+    let mid = handle(&s).expect("the straight arrow's bend handle");
+    timed_drag(&mut s, mid, (mid.0, mid.1 + 200.0));
+    assert_eq!(bend(&s).len(), 3, "bent");
+    let steps = s.ed.history.undo_len();
+    let apex = handle(&s).expect("a bend handle on the curve");
+    let before = bend(&s)[1];
+    timed_drag(&mut s, apex, (apex.0 + 80.0, apex.1 + 60.0));
+    let after = bend(&s)[1];
+    let moved = after - before;
+    assert!((moved.x - 80.0).abs() < 0.01, "x: {moved:?}");
+    assert!((moved.y - 60.0).abs() < 0.01, "y: {moved:?}");
+    assert_eq!(bend(&s).len(), 3, "still one bend");
+    assert_eq!(ends(&s), (Some(a), Some(b)), "still bound");
+    assert_eq!(s.ed.history.undo_len(), steps + 1, "one undo step");
+    s.run(Action::Undo);
+    assert!(bend(&s)[1].dist(before) < 1e-9, "Undo takes it back");
+}
+
 /// Ctrl+Shift+L as the page delivers it, then the modifiers released.
 fn lock_keys(s: &mut WebState) {
     s.modifiers(true, true, false, false);
