@@ -11,6 +11,14 @@ local build, with no packaged installer or public marketplace listing. See
 There is no protection against concurrent native or external writers, and no multiplayer
 or cloud service. The upstream README follows unchanged.
 
+## Why I built this
+
+I wanted an infinite, editable canvas inside my AI agent’s workspace, where we could work through architecture diagrams, systems and interface designs together without leaving the conversation.
+
+OpenPaperDesign is built on paper-rs by [Michael Shimeles](https://github.com/michaelshimeles). I reuse its editor, follow open standards where they exist and add only the integration the agent workspace needs. That keeps the extra code and maintenance small.
+
+In Codex, I can sketch a system and refine a layout with the agent. Project files stay local and the canvas stays editable. I’m also exploring how AI-generated images can become part of that workflow.
+
 ---
 
 # paper-rs
