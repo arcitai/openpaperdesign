@@ -2863,8 +2863,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-9.html",
-        "versioned for the kept Grid/List and background view record and the quiet Home"
+        HOME_URI, "ui://openpaperdesign/home-10.html",
+        "versioned for the corrected editor's in-label Paste (a changed in-panel editor)"
     );
 }
 

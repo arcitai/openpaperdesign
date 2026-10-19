@@ -4092,6 +4092,123 @@ fn copy_and_paste_go_through_the_page_s_clipboard_events() {
     assert!(s.dirty());
 }
 
+/// The rectangle of [`state`], a second one drawn at (600, 100), an arrow drawn from the
+/// first to the second (bound to both) and labelled "sends", the three grouped: all through
+/// the browser's input. Returns (arrow, first, second, group).
+fn labelled_arrow(s: &mut WebState) -> [crate::model::NodeId; 4] {
+    let a = s.ed.doc.root[0];
+    s.run(Action::Tool(Tool::Rect));
+    let (from, to) = (at(s, 600.0, 100.0), at(s, 760.0, 180.0));
+    timed_drag(s, from, to);
+    let b = s.ed.selection[0];
+    s.run(Action::Tool(Tool::Arrow));
+    let (from, to) = (at(s, 200.0, 150.0), at(s, 680.0, 140.0));
+    timed_drag(s, from, to);
+    let arrow = s.ed.selection[0];
+    let NodeKind::Connector { start, end, .. } = &s.ed.doc.get(arrow).unwrap().kind else {
+        panic!("an arrow")
+    };
+    let ends = (start.map(|e| e.node), end.map(|e| e.node));
+    assert_eq!(ends, (Some(a), Some(b)), "bound to both");
+    s.run(Action::EditText);
+    s.ed.handle(crate::editor::InputEvent::Text("sends".into()));
+    press(s, "Escape", "Escape");
+    s.ed.selection = vec![a, b, arrow];
+    s.run(Action::Group);
+    let g = s.ed.selection[0];
+    timed_frames(s, 2);
+    [arrow, a, b, g]
+}
+
+/// R15: the page's `paste` event while an arrow's label is being edited edits that label:
+/// its text replaces the selected characters or goes in at the caret, as plain text, whatever
+/// it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). Never layers, SVG or
+/// a new text layer: the same bound arrow in its group on the same page, nothing added, one
+/// undo step for the edit. Controls: a paste on the canvas with no label edited still makes a
+/// text layer, and a focused inspector field still takes the paste itself.
+#[test]
+fn a_browser_paste_while_editing_an_arrow_label_edits_that_label_as_plain_text() {
+    let mut s = state();
+    let [arrow, ..] = labelled_arrow(&mut s);
+    let label = |s: &WebState| s.ed.doc.get(arrow).unwrap().kind.label().map(String::from);
+    assert_eq!(label(&s).as_deref(), Some("sends"));
+    // Everything but the arrow's label: the same nodes, bindings, group and order.
+    let unlabelled = |s: &WebState| {
+        let mut nodes = s.ed.doc.nodes.clone();
+        if let NodeKind::Connector { label, .. } = &mut nodes.get_mut(&arrow).unwrap().kind {
+            *label = None;
+        }
+        nodes
+    };
+    let rest = unlabelled(&s);
+    let before = s.ed.doc.clone();
+    let steps = s.ed.history.undo_len();
+    // Enter's command edits it; Home, then Shift+→ twice selects its first two characters.
+    s.ed.selection = vec![arrow];
+    s.run(Action::EditText);
+    timed_frames(&mut s, 1);
+    press(&mut s, "Home", "Home");
+    s.modifiers(true, false, false, false);
+    press(&mut s, "ArrowRight", "ArrowRight");
+    press(&mut s, "ArrowRight", "ArrowRight");
+    s.modifiers(false, false, false, false);
+    assert_eq!(s.ed.text_selection(), Some((0, 2)));
+    assert!(
+        !s.field_has_keyboard(),
+        "the label is the editor's text, not an egui field"
+    );
+    s.paste("Ω🙂\r\nline 2");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("Ω🙂\nline 2nds"));
+    let caret = s.ed.text_edit.as_ref().map(|te| te.caret);
+    assert_eq!(
+        caret,
+        Some("Ω🙂\nline 2".chars().count()),
+        "after the pasted text"
+    );
+    // Then at the caret: a layer clipboard's JSON and SVG are only text here.
+    let json = "{\"type\":\"paper-rs/clipboard\",\"nodes\":[]}";
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"9\"/></svg>";
+    s.paste(json);
+    s.paste(svg);
+    timed_frames(&mut s, 1);
+    let editing = s.ed.text_edit.as_ref().map(|te| te.id);
+    assert_eq!(editing, Some(arrow), "still editing it");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s), Some(format!("Ω🙂\nline 2{json}{svg}nds")));
+    assert_eq!(unlabelled(&s), rest, "nothing else changed or was added");
+    assert_eq!(s.ed.pages.len(), 1);
+    assert_eq!(s.ed.page_data(0).id, "p", "the same page");
+    assert_eq!(s.ed.history.undo_len(), steps + 1, "one undo step");
+    let after = s.ed.doc.clone();
+    s.run(Action::Undo);
+    assert_eq!(s.ed.doc, before);
+    s.run(Action::Redo);
+    assert_eq!(s.ed.doc, after);
+    // Control: on the canvas, with no label edited, text still pastes as a new text layer.
+    s.ed.selection.clear();
+    let nodes = s.ed.doc.nodes.len();
+    s.paste("Ω🙂 note");
+    assert_eq!(s.ed.doc.nodes.len(), nodes + 1);
+    let [t] = s.ed.selection[..] else {
+        panic!("one pasted text layer")
+    };
+    assert!(matches!(
+        &s.ed.doc.get(t).unwrap().kind,
+        NodeKind::Text { text, .. } if text == "Ω🙂 note"
+    ));
+    assert_eq!(label(&s), Some(format!("Ω🙂\nline 2{json}{svg}nds")));
+    // Control: a focused inspector field takes the paste itself, as before.
+    let mut s = state();
+    let id = open_number_field(&mut s, "X  ");
+    let nodes = s.ed.doc.nodes.clone();
+    s.paste("-150");
+    step(&mut s);
+    assert_eq!(axis(&s, id, "X  "), -150.0, "into the field");
+    assert_eq!(s.ed.doc.nodes.len(), nodes.len(), "no layer pasted");
+}
+
 // ---- redraw rules (from the toolbar page, kept)
 
 /// Laser points at canvas (400, 400) .. (420, 410), drawn at t = 0..20 ms, then a frame.

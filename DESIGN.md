@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 12 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 13 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -175,6 +175,10 @@ The principles:
         Copy and Cut of layers holding a label, and adding them to the Library, are refused
         with a note before anything changes. Duplicate works, and a label's selected
         characters copy as plain text.
+      - **Paste while editing a label** puts the clipboard's text into that label, at the
+        caret or over the selected characters, in the same one-step edit. It is always plain
+        text (line breaks kept, tabs as spaces): whatever it looks like, it is never pasted
+        as layers or as a new text layer beside the arrow.
       - Labels are plain text: no character styles. Where a label covers a straight arrow's
         middle, there is no bend handle under it (its Type still makes it curved). A label
         beside a short arrow leaves the handle free.

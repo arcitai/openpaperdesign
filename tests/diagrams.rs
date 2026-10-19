@@ -1508,6 +1508,124 @@ fn labelled_arrows_are_refused_by_copy_cut_and_the_native_library_before_any_eff
     e.doc.validate().unwrap();
 }
 
+/// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the
+/// clipboard's text replaces the selected characters or goes in at the caret, as plain text,
+/// whatever it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). It is never
+/// read as layers, SVG or a new text layer; the arrow, its bindings, its group and every other
+/// layer stay exactly as they were, and each edit is one undo step. Controls: Paste with no
+/// label edited still pastes text as a new text layer and layers as layers.
+#[test]
+fn paste_while_editing_an_arrow_label_edits_that_label_as_plain_text_in_one_step() {
+    use paper_rs::io::clipboard;
+    use std::{cell::RefCell, rc::Rc};
+    struct Board(Rc<RefCell<Option<String>>>);
+    impl clipboard::Provider for Board {
+        fn read_text(&mut self) -> Option<String> {
+            self.0.borrow().clone()
+        }
+        fn write_text(&mut self, s: &str) {
+            *self.0.borrow_mut() = Some(s.into());
+        }
+    }
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "sends");
+    e.selection = vec![a, b, arrow];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    let board = Rc::new(RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Board(board.clone())));
+    // Everything but the arrow's label: the same nodes, bindings, group and order.
+    let unlabelled = |e: &Editor| {
+        let mut nodes = e.doc.nodes.clone();
+        if let NodeKind::Connector { label, .. } = &mut nodes.get_mut(&arrow).unwrap().kind {
+            *label = None;
+        }
+        nodes
+    };
+    let rest = unlabelled(&e);
+    let edit = |e: &mut Editor, text: &str, select: bool| {
+        *board.borrow_mut() = Some(text.into());
+        let steps = e.history.undo_len();
+        let before = e.doc.clone();
+        e.selection = vec![arrow];
+        e.run(Action::EditText);
+        if select {
+            // The first two characters.
+            key(e, Key::Home, Modifiers::NONE);
+            key(e, Key::Right, Modifiers::SHIFT);
+            key(e, Key::Right, Modifiers::SHIFT);
+        } else {
+            key(e, Key::End, Modifiers::NONE);
+        }
+        e.run(Action::Paste);
+        let editing = e.text_edit.as_ref().map(|te| te.id);
+        assert_eq!(editing, Some(arrow), "still editing it");
+        assert!(
+            e.text_selection().is_none(),
+            "the caret after the pasted text"
+        );
+        key(e, Key::Escape, Modifiers::NONE);
+        assert_eq!(e.history.undo_len(), steps + 1, "one undo step: {text:?}");
+        assert_eq!(unlabelled(e), rest, "nothing else changed: {text:?}");
+        assert_eq!(ends(e, arrow), (Some(a), Some(b)), "the same bound arrow");
+        assert_eq!(e.doc.get(arrow).unwrap().parent, Some(g), "in its group");
+        assert_eq!(e.selection, vec![arrow]);
+        let after = e.doc.clone();
+        e.run(Action::Undo);
+        assert_eq!(e.doc, before, "undo: {text:?}");
+        e.run(Action::Redo);
+        assert_eq!(e.doc, after, "redo: {text:?}");
+        label_of(e, arrow).unwrap()
+    };
+    // The selected characters replaced: Unicode over several lines (CRLF as typed Enter).
+    assert_eq!(edit(&mut e, "Ω🙂\r\nline 2", true), "Ω🙂\nline 2nds");
+    // At the caret: a layer clipboard's JSON and SVG are only text here.
+    let json = format!("{{\"type\":\"{}\",\"nodes\":[]}}", clipboard::TYPE);
+    let label = edit(&mut e, &json, false);
+    assert_eq!(label, format!("Ω🙂\nline 2nds{json}"));
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"9\"/></svg>";
+    assert_eq!(edit(&mut e, svg, false), format!("{label}{svg}"));
+    // A tab is a space and other control characters are dropped, as typed.
+    let label = label_of(&e, arrow).unwrap();
+    assert_eq!(edit(&mut e, "a\tb\u{7}c", false), format!("{label}a bc"));
+    // Nothing to paste: no change and no undo step.
+    *board.borrow_mut() = None;
+    let doc0 = e.doc.clone();
+    let steps = e.history.undo_len();
+    e.selection = vec![arrow];
+    e.run(Action::EditText);
+    e.run(Action::Paste);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!((e.doc.clone(), e.history.undo_len()), (doc0.clone(), steps));
+    // Controls, with no label edited: text pastes as a new text layer, in one step...
+    *board.borrow_mut() = Some("Ω🙂 note".into());
+    e.selection.clear();
+    e.run(Action::Paste);
+    let [t] = e.selection[..] else {
+        panic!("one pasted text layer")
+    };
+    assert_eq!(text_of(&e, t).0, "Ω🙂 note");
+    assert_eq!(e.history.undo_len(), steps + 1);
+    e.run(Action::Undo);
+    assert_eq!(e.doc, doc0);
+    // ...and an unlabelled layer copied from the canvas pastes as a layer.
+    let plain = rect(&mut e, 100.0, 500.0, 120.0, 80.0);
+    e.selection = vec![plain];
+    e.run(Action::Copy);
+    e.run(Action::Paste);
+    let [p] = e.selection[..] else {
+        panic!("one pasted layer")
+    };
+    assert_ne!(p, plain);
+    assert!(matches!(e.doc.get(p).unwrap().kind, NodeKind::Rect));
+    e.doc.validate().unwrap();
+}
+
 fn inside_rounded(p: V2, r: Rect, radius: f64) -> bool {
     if !r.contains(p) {
         return false;

@@ -2154,6 +2154,16 @@ impl Editor {
         true
     }
 
+    /// Whether the text being edited is an arrow's label.
+    fn editing_label(&self) -> bool {
+        self.text_edit.as_ref().is_some_and(|te| {
+            matches!(
+                self.doc.get(te.id).map(|n| &n.kind),
+                Some(NodeKind::Connector { .. })
+            )
+        })
+    }
+
     /// The selected characters of the arrow label being edited, if any.
     fn label_text_selection(&self) -> Option<String> {
         let te = self.text_edit.as_ref()?;
@@ -2176,8 +2186,21 @@ impl Editor {
     /// Paste from the system clipboard when it holds something newer than our own copy
     /// (layers from another window, Excalidraw JSON, SVG, an image or text); otherwise from
     /// the internal clipboard.
+    ///
+    /// While an arrow's label is being edited, the clipboard's text goes into that label as
+    /// plain text, at the caret or over the selected characters, in the label's own edit (one
+    /// undo step with it). It is never read as layers, SVG or a new text layer, whatever it
+    /// looks like, and nothing else in the document changes. Without text, nothing happens.
     pub fn paste_from_clipboard(&mut self) {
         use crate::io::clipboard::{self, Content};
+        if self.editing_label() {
+            let text = self.clipboard_io.as_mut().and_then(|io| io.read_text());
+            let text = text.map(|t| label_paste_text(&t)).unwrap_or_default();
+            if !text.is_empty() {
+                self.insert_text(&text);
+            }
+            return;
+        }
         let external = self.clipboard_io.as_mut().and_then(|io| io.read_text());
         let center = self.camera.screen_to_world(self.viewport * 0.5);
         match external {
@@ -2513,6 +2536,22 @@ fn is_desc(nodes: &[Node], id: NodeId, ancestor: NodeId) -> bool {
         cur = nodes.iter().find(|n| n.id == p).and_then(|n| n.parent);
     }
     false
+}
+
+/// Clipboard text as an arrow label takes it: line breaks become `\n` (a label is multiline,
+/// as typing Enter makes it), a tab a space, and other control characters are dropped, as
+/// they are when typed. Everything else is kept exactly.
+fn label_paste_text(t: &str) -> String {
+    t.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 fn dedup(mut v: Vec<NodeId>) -> Vec<NodeId> {

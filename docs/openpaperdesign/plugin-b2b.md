@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-19: the one-app source candidate's `home-9` view (unqualified). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-19: the one-app source candidate's `home-10` view (unqualified; `home-9` plus the corrected in-label Paste editor). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -54,11 +54,15 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-9.html` (2026-10-19 source candidate,
-  unqualified: the quiet Home, Grid first with a kept List, equal cards, About & notices in
-  More instead of a footer, and the canvas background, all kept by the library as one view
-  record through `openpaperdesign_app_view {home_layout?, background?}`, reported by the list
-  as `view`). `home-8` (2026-10-18: one System/Light/Dark appearance across the view, the
+- **View version.** `ui://openpaperdesign/home-10.html` (2026-10-19 source candidate, not
+  installed or natively accepted): `home-9`'s view, HTML and layout unchanged, with the
+  corrected in-panel editor, whose Paste while an arrow's label is edited edits that label as
+  plain text (a shared upstream Editor change). The editor's WASM changed, so a new immutable
+  key keeps a cached `home-9` view and its editor from passing for this one. `home-9`
+  (2026-10-19) introduced the quiet Home, Grid first with a kept List, equal cards, About &
+  notices in More instead of a footer, and the canvas background, all kept by the library as
+  one view record through `openpaperdesign_app_view {home_layout?, background?}`, reported by
+  the list as `view`; it is now refused too. `home-8` (2026-10-18: one System/Light/Dark appearance across the view, the
   editor's chrome and its canvas display, kept through `openpaperdesign_app_appearance`, which
   is unchanged), `home-7` (the quieter workspace whose editor first followed the view's light
   or dark theme), `home-6` (the first one-app view) and earlier are refused. No eviction of a
@@ -102,7 +106,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-8`, now `home-9`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-9`, now `home-10`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

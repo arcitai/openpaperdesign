@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.64 · Updated: 2026-10-19
+Revision: 0.66 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -347,6 +347,18 @@ engine architecture is `analysis/DESIGN.md`.
       - **Raw page version, F3.** `src/project/format.rs` `migrate` checks the raw version
         (a whole number, 1 to current; missing = 1) before narrowing it. 2^32 + 3 is refused
         rather than read as 3.
+    - **Paste into a label being edited** (R15 gap; natively too), `src/editor/mod.rs`
+      `paste_from_clipboard`: while an arrow's label is edited, Paste puts the clipboard's
+      text into that label through the text editor's own `insert_text` (over the selected
+      characters, or at the caret), inside the label's edit and so its one undo step.
+      `label_paste_text` makes line breaks `\n`, a tab a space and drops other control
+      characters. The text is never decoded: JSON, SVG or anything else is not read as
+      layers, foreign content or a new text layer, the internal layer clipboard isn't used,
+      and nothing happens without text. Before, the browser host's `paste` event (a label
+      is not an egui field) and the native Paste decoded the text, so a label's Paste added
+      a text layer or pasted layers beside the arrow. Plain Paste outside a label edit, and
+      a focused egui field's paste, are unchanged. Same Editor, text edit, history, clipboard
+      provider and its permission and failure paths. Upstreamable as a fix.
     - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer) and
       the PNG/SVG/PDF formats themselves. Upstreamable as a feature with its format guard.
 - Upstream changes in the browser host (not upstream-owned, for reference):
@@ -472,7 +484,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-9.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-10.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -504,6 +516,12 @@ choice with `openpaperdesign_app_appearance`); `home-9` (2026-10-19 source candi
 - the home layout and the editor's canvas background kept with `openpaperdesign_app_view`
   and reported by the list (`view`);
 - the editor's file rename, sent in its canvas save.
+
+`home-10` (2026-10-19 source candidate) is `home-9`'s view (HTML and layout unchanged) with the
+corrected in-panel editor: Paste while an arrow's label is edited edits that label as plain
+text (the shared Editor change above). The editor's WASM changed, so it gets a new immutable
+key: a cached `home-9` view and its editor can't pass for this one. Not installed or natively
+accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

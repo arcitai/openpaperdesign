@@ -102,8 +102,11 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// with `_app_appearance`, its list reporting it); `home-9` is revision 2's quiet Home and view
 /// preferences (Grid first, equal cards, no footer, About & notices in the menu, the storage
 /// cue, the home layout and the canvas background kept with `_app_view` and reported by the
-/// list) and the editor's file rename, sent in its canvas save. No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-9.html";
+/// list) and the editor's file rename, sent in its canvas save; `home-10` carries the corrected
+/// editor whose Paste while an arrow's label is edited edits that label as plain text (a changed
+/// in-panel WASM editor, so a new immutable key keeps a cached `home-9` view and its editor from
+/// passing for this one; the view's HTML and layout are unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-10.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's
