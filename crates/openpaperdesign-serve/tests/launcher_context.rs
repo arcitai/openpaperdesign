@@ -634,9 +634,9 @@ fn decode_base64(s: &str) -> Vec<u8> {
 /// Every pure home call, under each metadata variant: it succeeds, refuses extra arguments,
 /// serves only the exact view, and discloses neither the workspace nor the editor token.
 async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Option<&str>) {
-    // Versioned: the one-app view with one System/Light/Dark appearance (file library, editor
-    // in the view) is `home-8`.
-    const HOME: &str = "ui://openpaperdesign/home-8.html";
+    // Versioned: the revision 2 quiet Home (grid-first file cards, About & notices in the menu,
+    // the kept home layout and canvas background, the editor's file rename) is `home-9`.
+    const HOME: &str = "ui://openpaperdesign/home-9.html";
     for meta in metas {
         let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
         assert!(ok, "{s}");
@@ -684,9 +684,10 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
             "the slot holds the packaged font, byte for byte"
         );
         for other in [
-            "ui://openpaperdesign/home-8.html?x",
+            "ui://openpaperdesign/home-9.html?x",
             // Earlier view URIs are no longer served, so a fresh read can't get an older view.
             // A view a host already has open isn't evicted or refreshed by this.
+            "ui://openpaperdesign/home-8.html",
             "ui://openpaperdesign/home-7.html",
             "ui://openpaperdesign/home-6.html",
             "ui://openpaperdesign/home-5.html",
@@ -713,7 +714,7 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
 /// session's workspace state alone. Every other tool keeps per-call admission and retirement.
 #[tokio::test]
 async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
-    const HOME: &str = "ui://openpaperdesign/home-8.html";
+    const HOME: &str = "ui://openpaperdesign/home-9.html";
     let f = Fixture::new();
     let c = f.host().await;
 
