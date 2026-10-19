@@ -1966,6 +1966,160 @@ fn labelled_clipboard_images_are_checked_whole_and_a_paste_after_a_refusal_says_
     assert_eq!(other.doc, full);
 }
 
+/// R48-F1: a member named twice in a labelled payload is ambiguous and refused before anything
+/// happens, whatever its order or values: an image id twice (an invalid body first or last,
+/// or the same body twice), `assets` twice (invalid first or last), a name spelled with an
+/// escape that decodes to the same one, `assets` before `type`, another top-level member
+/// twice, and a fresh valid image beside a duplicated one. Built as raw text from the
+/// encoder's own output (a `Value` would keep only the last member and hide the case). Each
+/// is refused with a reason: no layer, no undo step, the redo kept, the selection, document
+/// stamp, revision and clipboard as they were, and no image of it registered. Controls: the
+/// payload itself, and the same payload with `assets` moved before `type`, paste whole, said.
+#[test]
+fn a_member_named_twice_in_a_labelled_payload_is_refused_whatever_its_order() {
+    use paper_rs::io::clipboard::{self, Content};
+    use paper_rs::model::{ImageMode, Paint};
+    use std::{cell::RefCell, rc::Rc};
+    let png = |seed: u8| {
+        let mut img = image::RgbaImage::new(2, 3);
+        for (i, p) in img.pixels_mut().enumerate() {
+            *p = image::Rgba([seed, 0x48, i as u8, 0xff]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let registered = |bytes: &[u8]| {
+        let id = paper_rs::assets::hash(bytes);
+        paper_rs::assets::get(&id).is_some()
+    };
+    // The source window: an image-filled rectangle (its image registered here, so cached) and
+    // a labelled arrow; their payload as the encoder writes it (`assets` last).
+    let mut e = editor(1200.0, 900.0);
+    let id = paper_rs::assets::register(&png(0xd1)).unwrap();
+    let r = Rect::new(100.0, 100.0, 120.0, 80.0);
+    let mut n = Node::new(NodeId(0), NodeKind::Rect, r);
+    n.style.fills = vec![Paint::Image {
+        asset: id.clone(),
+        mode: ImageMode::Fill,
+        opacity: 1.0,
+    }];
+    let filled = e.add_node(n, None);
+    let pts = [v2(100.0, 400.0), v2(500.0, 400.0)];
+    let arrow = free_arrow(&mut e, &pts, Route::Straight, "routes");
+    let cap = Rc::new(RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    e.selection = vec![filled, arrow];
+    e.run(Action::Copy);
+    let whole = cap.borrow().clone().unwrap();
+    let body = paper_rs::assets::base64(&paper_rs::assets::get(&id).unwrap().bytes);
+    let entry = format!("\"{id}\":\"{body}\"");
+    let assets = format!(",\"assets\":{{{entry}}}}}");
+    assert!(
+        whole.ends_with(&assets),
+        "`assets` last, one image: {whole}"
+    );
+    let head = labelled_head();
+    assert!(whole.starts_with(&head));
+    // Raw edits of that text.
+    let bad = format!("\"{id}\":\"%%% not base64 %%%\"");
+    let with_entries = |entries: &str| whole.replacen(&entry, entries, 1);
+    let (fresh_png, other_png) = (png(0xd2), png(0xd3));
+    let fresh_id = paper_rs::assets::hash(&fresh_png);
+    let fresh = format!(
+        "\"{fresh_id}\":\"{}\"",
+        paper_rs::assets::base64(&fresh_png)
+    );
+    let wrong = format!("\"{id}\":\"{}\"", paper_rs::assets::base64(&other_png));
+    // The id with its first character escaped (`\u00XX`): the same name, decoded.
+    let first = id.chars().next().unwrap();
+    let escaped = format!("\"\\u{:04x}{}\":\"{body}\"", first as u32, &id[1..]);
+    let rest = &whole[1..whole.len() - assets.len()];
+    // An image id twice: invalid first or last, the same body, another image, escaped, and
+    // a fresh valid image beside.
+    let invalid_first = with_entries(&format!("{bad},{entry}"));
+    let invalid_last = with_entries(&format!("{entry},{bad}"));
+    let same_twice = with_entries(&format!("{entry},{entry}"));
+    let wrong_first = with_entries(&format!("{wrong},{entry}"));
+    let escaped_twice = with_entries(&format!("{escaped},{entry}"));
+    let fresh_beside = with_entries(&format!("{fresh},{bad},{entry}"));
+    // `assets` twice: an invalid one before the real one (after `version`), after it, or
+    // spelled with an escape.
+    let invalid_assets = format!("\"assets\":{{{bad}}}");
+    let after_version = format!("{head}{invalid_assets},");
+    let assets_first = whole.replacen(&head, &after_version, 1);
+    let assets_last = format!("{},{invalid_assets}}}", &whole[..whole.len() - 1]);
+    let spelled = format!("{head}\"\\u0061ssets\":{{{bad}}},");
+    let assets_escaped = whole.replacen(&head, &spelled, 1);
+    // `assets` before `type`, with an id twice; and another top-level member twice.
+    let front = format!("{{\"assets\":{{{entry},{bad}}},{rest}}}");
+    let nodes = format!("{head}\"nodes\":[],");
+    let nodes_twice = whole.replacen(&head, &nodes, 1);
+    let cases: Vec<(&str, String)> = vec![
+        ("an id, invalid first", invalid_first),
+        ("an id, invalid last", invalid_last),
+        ("an id, the same body twice", same_twice),
+        ("an id, another image first", wrong_first),
+        ("an id, once escaped", escaped_twice),
+        ("a fresh image beside", fresh_beside),
+        ("`assets`, invalid first", assets_first),
+        ("`assets`, invalid last", assets_last),
+        ("`assets`, once escaped", assets_escaped),
+        ("`assets` before `type`", front),
+        ("`nodes` twice", nodes_twice),
+    ];
+    // The receiving window, with an undone step to redo.
+    let mut other = editor(1200.0, 900.0);
+    other.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    let keep = rect(&mut other, 40.0, 40.0, 50.0, 50.0);
+    let redone = rect(&mut other, 140.0, 40.0, 50.0, 50.0);
+    other.run(Action::Undo);
+    other.selection = vec![keep];
+    let doc = other.doc.clone();
+    let state = (other.history.undo_len(), other.doc_stamp, other.revision);
+    for (why, text) in &cases {
+        let read = matches!(clipboard::decode(text), Content::Refused(_));
+        assert!(read, "{why}: refused when read: {text}");
+        *cap.borrow_mut() = Some(text.clone());
+        other.status.clear();
+        other.run(Action::Paste);
+        let said = other.status.contains("can't be pasted");
+        assert!(said, "{why}: {}", other.status);
+        assert_eq!(other.doc, doc, "{why}: nothing pasted");
+        let now = (other.history.undo_len(), other.doc_stamp, other.revision);
+        assert_eq!(now, state, "{why}: no step, stamp or revision");
+        assert_eq!(other.selection, vec![keep], "{why}");
+        assert!(other.text_edit.is_none(), "{why}");
+        assert_eq!(cap.borrow().as_deref(), Some(text.as_str()), "{why}");
+    }
+    assert!(!registered(&fresh_png), "the fresh image isn't registered");
+    assert!(!registered(&other_png), "nor the other one");
+    other.run(Action::Redo);
+    assert!(other.doc.get(redone).is_some(), "the redo was kept");
+    other.run(Action::Undo);
+    assert_eq!(other.doc, doc);
+
+    // Controls: `assets` before `type` with no member twice pastes, and so does the payload
+    // as written; each says so after a refusal.
+    let moved = format!("{{\"assets\":{{{entry}}},{rest}}}");
+    for (why, text) in [("`assets` first", moved), ("as written", whole.clone())] {
+        *cap.borrow_mut() = Some(cases[0].1.clone());
+        other.run(Action::Paste);
+        let said = other.status.contains("Nothing was pasted");
+        assert!(said, "{why}: {}", other.status);
+        *cap.borrow_mut() = Some(text);
+        let steps = other.history.undo_len();
+        other.run(Action::Paste);
+        assert_eq!(other.history.undo_len(), steps + 1, "{why}: one step");
+        assert_eq!(other.status, "Pasted 2 layer(s)", "{why}");
+        let pasted = other.selection.clone();
+        let copy = arrow_in(&other, &pasted);
+        assert_eq!(label_of(&other, copy).as_deref(), Some("routes"), "{why}");
+        other.run(Action::Undo);
+        assert_eq!(other.doc, doc, "{why}: one undo step");
+    }
+}
+
 /// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the
 /// clipboard's text replaces the selected characters or goes in at the caret, as plain text,
 /// whatever it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). It is never

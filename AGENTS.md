@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.72 · Updated: 2026-10-19
+Revision: 0.73 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -359,8 +359,12 @@ engine architecture is `analysis/DESIGN.md`.
       to its claimed id. All are checked before any is registered, so a payload brings all
       its images or none, in any order; an image already registered under a claimed id
       doesn't stand in for a missing or bad body. (The unversioned legacy payload keeps its
-      earlier permissive image handling.) A payload is recognized by its top-level `type`
-      member, read key by key with serde (`Header`) as far as the text is JSON, so a cut-off one, one followed by
+      earlier permissive image handling.) Before any of that, the raw text is read once with
+      serde (`Unambiguous`, R48-F1): a member named twice in any object (names compared as
+      decoded, so escaped spellings are one name), such as `assets` or an image id, is
+      refused, whatever its order or values, because serde_json's `Value` keeps only the
+      last and what was checked could differ from what was sent. A payload is recognized by
+      its top-level `type` member, read key by key with serde (`Header`) as far as the text is JSON, so a cut-off one, one followed by
       more text, and any formatting or key order are recognized; a second top-level `type`
       or `version` is ambiguous. Text that only mentions the type stays ordinary text.
       Anything else of that type is `Content::Refused`: the editor says why and changes
@@ -546,7 +550,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-13.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-14.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -598,7 +602,12 @@ payload above). The editor's WASM changed again, so `home-11` is refused and a c
 `home-13` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 R47 corrections of that payload (whole images before any registration; a successful paste
 said in the status). The editor's WASM changed again, so `home-12` is refused and a cached
-`home-12` view can't pass for this one. Not installed or natively accepted.
+`home-12` view can't pass for this one.
+
+`home-14` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+R48 correction of that payload (a member named twice refused before anything is checked or
+registered). The editor's WASM changed again, so `home-13` is refused and a cached `home-13`
+view can't pass for this one. Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

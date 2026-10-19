@@ -260,6 +260,71 @@ fn header(t: &str) -> Header {
     read.into_inner()
 }
 
+/// One JSON value in which no object names a member twice, at any depth (names compared as
+/// decoded, so two spellings of one name are one name). serde_json's `Value` keeps only the
+/// last of repeated members, so a labelled payload is read through this first: what is
+/// checked (its images included) is then exactly what would be pasted, whatever the order.
+#[derive(Clone, Copy)]
+struct Unambiguous;
+
+impl<'de> serde::de::DeserializeSeed<'de> for Unambiguous {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Unambiguous {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(self)?.is_some() {}
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut names = std::collections::HashSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if !names.insert(name.clone()) {
+                return Err(serde::de::Error::custom(format!("{name:?} named twice")));
+            }
+            map.next_value_seed(self)?;
+        }
+        Ok(())
+    }
+}
+
+/// `t` is one whole JSON value with no member named twice (see [`Unambiguous`]); else why not.
+fn check_unambiguous(t: &str) -> Result<(), String> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_str(t);
+    let read = Unambiguous.deserialize(&mut de).and_then(|()| de.end());
+    match read {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_data() => Err(format!("they hold a member twice ({e})")),
+        Err(_) => Err("they aren't complete".into()),
+    }
+}
+
 /// A [`LABELLED_TYPE`] payload, checked whole before anything is registered: `None` when the
 /// JSON doesn't name that type at its top level (another kind of text, decoded as before).
 fn decode_labelled(t: &str) -> Option<Content> {
@@ -274,6 +339,11 @@ fn decode_labelled(t: &str) -> Option<Content> {
     };
     if head.types > 1 || head.versions > 1 {
         return refused("they name their format twice".into());
+    }
+    // Before `Value` drops repeated members: a repeated `assets`, image id or any other
+    // member is ambiguous, whatever its order or values.
+    if let Err(why) = check_unambiguous(t) {
+        return refused(why);
     }
     let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(t) else {
         return refused("they aren't complete".into());

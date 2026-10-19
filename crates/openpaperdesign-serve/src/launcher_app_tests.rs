@@ -2863,8 +2863,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-13.html",
-        "versioned for the labelled clipboard payload's R47 corrections (a changed editor)"
+        HOME_URI, "ui://openpaperdesign/home-14.html",
+        "versioned for the labelled clipboard payload's R48 correction (a changed editor)"
     );
 }
 

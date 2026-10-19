@@ -4399,6 +4399,12 @@ fn browser_copy_cut_and_paste_events_carry_labelled_arrows_with_their_labels() {
     assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
     assert_eq!(t.ed.doc, pasted, "nothing pasted");
     assert_eq!(t.ed.history.undo_len(), steps);
+    // R48-F1: a member named twice (raw text, `nodes` again after the header): refused too.
+    let twice = text.replacen(&head, &format!("{head}\"nodes\":[],"), 1);
+    t.paste(&twice);
+    assert!(t.ed.status.contains("named twice"), "{}", t.ed.status);
+    assert_eq!(t.ed.doc, pasted, "nothing pasted");
+    assert_eq!(t.ed.history.undo_len(), steps);
     // R47-F2: the next good paste says so; the refusal's note doesn't stay.
     t.paste(&text);
     assert_eq!(t.ed.status, "Pasted 1 layer(s)", "the paste is said");
