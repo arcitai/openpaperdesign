@@ -4218,3 +4218,146 @@ fn saves_follow_document_changes_only() {
     let n = saved.doc.nodes.values().next().unwrap();
     assert!(n.rect.x > 100.0 && n.rect.y > 100.0, "moved: {:?}", n.rect);
 }
+
+// ---- the Library tab's Add and its own refusal (R39-F1)
+
+/// Every text the layout painted, with its rect (CSS px).
+fn painted_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::Shape::Vec(shapes) => {
+            for s in shapes {
+                painted_texts(s, out);
+            }
+        }
+        egui::Shape::Text(t) => out.push((
+            t.galley.job.text.clone(),
+            t.galley.rect.translate(t.pos.to_vec2()),
+        )),
+        _ => {}
+    }
+}
+
+/// One frame at `t` (see [`step`]), returning what it painted as text.
+fn painted_frame(s: &mut WebState, t: &mut f64) -> Vec<(String, egui::Rect)> {
+    *t += 50.0;
+    s.tick(*t);
+    let mut l = s.layout();
+    let mut out = Vec::new();
+    for c in l.output.shapes {
+        painted_texts(&c.shape, &mut out);
+    }
+    l.output.textures_delta.clear();
+    s.drawn();
+    out
+}
+
+/// A click on the Library tab's real "+ Add selection" button, as laid out.
+fn library_add(s: &mut WebState, t: &mut f64) {
+    let shown = painted_frame(s, t);
+    let p = shown
+        .iter()
+        .find(|(text, _)| text == "+ Add selection")
+        .expect("the Library tab's Add button is laid out")
+        .1
+        .center();
+    s.pointer_down(p.x as f64, p.y as f64, Button::Primary, *t + 1.0);
+    painted_frame(s, t);
+    s.pointer_up(p.x as f64, p.y as f64, Button::Primary, *t + 1.0);
+    for _ in 0..4 {
+        painted_frame(s, t);
+    }
+}
+
+/// R39-F1: a successful Add resolves its own earlier "Nothing was added" refusal every time,
+/// not only the first time (when the browser's one-time session note replaces it). Refusals
+/// still add nothing and say so; the note isn't repeated; a newer, unrelated note survives a
+/// successful Add; the document and its Undo never change.
+#[test]
+fn a_successful_library_add_clears_its_own_earlier_refusal_on_every_retry() {
+    use crate::geom::{Rect, v2};
+    use crate::model::{Head, NodeId, Route};
+    let refused = crate::library::LABELS_REFUSED;
+    let mut doc = Document::default();
+    let mut user = Node::new(
+        NodeId(1),
+        NodeKind::Rect,
+        Rect::new(50.0, 50.0, 120.0, 60.0),
+    );
+    user.name = "User".into();
+    let kind = NodeKind::Connector {
+        points: vec![v2(0.0, 0.0), v2(78.0, 0.0)],
+        start: None,
+        end: None,
+        route: Route::Straight,
+        start_head: Head::None,
+        end_head: Head::Arrow,
+        label: Some("dispatches".into()),
+    };
+    let arrow = Node::new(NodeId(2), kind, Rect::new(346.0, 210.0, 78.0, 0.0));
+    doc.nodes.insert(user.id, user);
+    doc.nodes.insert(arrow.id, arrow);
+    doc.root = vec![NodeId(1), NodeId(2)];
+    doc.next_id = 3;
+    let p = PageData {
+        id: "r39page".into(),
+        name: "R39".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[p], "r39page"), false, W, H).unwrap();
+    let mut t = settle(&mut s, 0.0);
+    open_layers(&mut s);
+    s.ui.show_library = true;
+    for _ in 0..5 {
+        painted_frame(&mut s, &mut t);
+    }
+    let before = s.ed.doc.clone();
+    let undo = s.ed.history.undo_len();
+    let attempt = |s: &mut WebState, t: &mut f64, id: u64| {
+        s.ed.select(vec![NodeId(id)]);
+        library_add(s, t);
+        assert_eq!(s.ed.doc, before, "the document never changes");
+        assert_eq!(s.ed.history.undo_len(), undo, "nor its Undo");
+        assert!(!s.ui.library.dirty, "the change was taken by the host");
+        let shown = painted_frame(s, t);
+        let painted = shown.iter().any(|(text, _)| text == refused);
+        (
+            s.ui.library.library.items.len(),
+            s.ed.status.clone(),
+            painted,
+        )
+    };
+    // 1. Labelled: refused, said, nothing added.
+    let (items, status, painted) = attempt(&mut s, &mut t, 2);
+    assert_eq!((items, status.as_str(), painted), (0, refused, true));
+    // 2. Plain: added; the one-time session note replaces the refusal (the passing first case).
+    let (items, status, painted) = attempt(&mut s, &mut t, 1);
+    assert_eq!(
+        (items, status.as_str(), painted),
+        (1, LIBRARY_SESSION, false)
+    );
+    // 3. Labelled again: refused again, one card still.
+    let (items, status, painted) = attempt(&mut s, &mut t, 2);
+    assert_eq!((items, status.as_str(), painted), (1, refused, true));
+    // 4. Plain again: added, and its own refusal is gone (it was R39's failure), without
+    // repeating the session note.
+    let (items, status, painted) = attempt(&mut s, &mut t, 1);
+    assert_eq!(items, 2, "a second card");
+    assert_ne!(status, refused, "no stale Nothing was added");
+    assert!(!painted, "nor painted");
+    assert!(
+        status.is_empty(),
+        "the session note was said once: {status:?}"
+    );
+    // 5. A newer, unrelated note (a real command's) survives a successful Add.
+    let (items, _, _) = attempt(&mut s, &mut t, 2);
+    assert_eq!(items, 2);
+    s.run(Action::ToggleSnapping);
+    let newer = s.ed.status.clone();
+    assert!(newer.starts_with("Snapping"), "{newer:?}");
+    let (items, status, painted) = attempt(&mut s, &mut t, 1);
+    assert_eq!(items, 3);
+    assert_eq!(status, newer, "someone else's note stays");
+    assert!(!painted);
+    s.run(Action::ToggleSnapping);
+}

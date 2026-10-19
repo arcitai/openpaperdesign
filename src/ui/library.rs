@@ -89,6 +89,11 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 Some(item) => {
                     lib.library.items.push(item);
                     lib.dirty = true;
+                    // This Add succeeded: its own earlier refusal, if still shown, no longer
+                    // holds. Any other or newer note stays.
+                    if ed.status == crate::library::LABELS_REFUSED {
+                        ed.status.clear();
+                    }
                 }
                 None => {}
             }
