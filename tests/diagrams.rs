@@ -1728,6 +1728,222 @@ fn paste_never_changes_the_label_of_an_arrow_locked_while_its_label_is_edited() 
     e.doc.validate().unwrap();
 }
 
+/// A clipboard that counts how often it is read and written.
+#[derive(Default)]
+struct Clip {
+    text: Option<String>,
+    reads: usize,
+    writes: usize,
+}
+
+type SharedClip = std::rc::Rc<std::cell::RefCell<Clip>>;
+
+struct CountingBoard(SharedClip);
+
+impl paper_rs::io::clipboard::Provider for CountingBoard {
+    fn read_text(&mut self) -> Option<String> {
+        let mut c = self.0.borrow_mut();
+        c.reads += 1;
+        c.text.clone()
+    }
+    fn write_text(&mut self, s: &str) {
+        let mut c = self.0.borrow_mut();
+        c.writes += 1;
+        c.text = Some(s.into());
+    }
+}
+
+/// Every way an open edit could change its locked target's text, or fall back to the selected
+/// layers: typed text (with no modifier held, so a held command key can't make it pass for the
+/// wrong reason), Enter, Backspace, Delete, Bold (⌘B), Cut (⌘X) and Paste (⌘V). Each is
+/// refused: the document (so every selected layer too), the history, the document stamp, the
+/// selection, the edit with its caret and selected characters, and the clipboard (neither read
+/// nor written) are exactly as they were.
+fn refuses_every_change(e: &mut Editor, target: NodeId, clip: &SharedClip, why: &str) {
+    assert!(e.doc.is_effectively_locked(target), "{why}: locked");
+    let edit = |e: &Editor| e.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+    let open = edit(e);
+    assert_eq!(open.map(|o| o.0), Some(target), "{why}: the edit is open");
+    let doc = e.doc.clone();
+    let state = (e.history.undo_len(), e.doc_stamp);
+    let selection = e.selection.clone();
+    let counts = (clip.borrow().reads, clip.borrow().writes);
+    e.handle(InputEvent::Modifiers(Modifiers::NONE));
+    e.handle(InputEvent::Text("Ω🙂x".into()));
+    for k in [Key::Enter, Key::Backspace, Key::Delete] {
+        key(e, k, Modifiers::NONE);
+    }
+    for c in ['b', 'x', 'v'] {
+        key(e, Key::Char(c), Modifiers::cmd());
+    }
+    assert_eq!(e.doc, doc, "{why}: the document is unchanged");
+    let now = (e.history.undo_len(), e.doc_stamp);
+    assert_eq!(now, state, "{why}: no history step, nothing to save");
+    assert_eq!(e.selection, selection, "{why}");
+    assert_eq!(edit(e), open, "{why}: the edit as it was");
+    let after = (clip.borrow().reads, clip.borrow().writes);
+    assert_eq!(after, counts, "{why}: the clipboard isn't touched");
+}
+
+/// R18/R15: an edit left open on a layer that gets locked (Lock while editing empties the
+/// selection but not the edit) changes nothing more. Typing, Enter, Backspace, Delete, Bold, Cut
+/// and Paste are refused for an arrow locked itself (by the real shortcut) and for a text layer
+/// whose group is locked, with nothing or another layer selected; nothing is copied, deleted or
+/// pasted instead, and the edit stays open with its caret. Copy still copies. Unlocked with the
+/// edit still open, typing changes the text again; a fresh edit replaces selected characters
+/// with Unicode in one undo step (controls).
+#[test]
+fn a_text_edit_left_open_on_a_locked_layer_changes_nothing_until_it_is_unlocked() {
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "sends");
+    let other = rect(&mut e, 100.0, 600.0, 120.0, 80.0);
+    let clip = SharedClip::default();
+    e.clipboard_io = Some(Box::new(CountingBoard(clip.clone())));
+
+    // The arrow itself, locked by ⌘⇧L while Enter's edit of its label is open.
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    assert_eq!(e.text_selection(), Some((0, 5)), "Enter selects all");
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(arrow).unwrap().locked, "Lock reached the arrow");
+    assert!(e.selection.is_empty(), "Lock empties the selection");
+    refuses_every_change(&mut e, arrow, &clip, "arrow, nothing selected");
+    // Fixture: another layer selected directly while the edit stays open.
+    e.selection = vec![other];
+    refuses_every_change(&mut e, arrow, &clip, "arrow, another layer selected");
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("sends"));
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)), "still bound");
+    // Copy changes nothing and still copies the selected characters.
+    key(&mut e, Key::Char('c'), Modifiers::cmd());
+    assert_eq!(clip.borrow().text.as_deref(), Some("sends"));
+    // Unlocked (fixture: the arrow selected again for ⌘⇧L), the open edit types again.
+    e.selection = vec![arrow];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(arrow), "unlocked");
+    assert_eq!(e.text_selection(), Some((0, 5)), "its range kept");
+    e.handle(InputEvent::Text("Ω🙂".into()));
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("Ω🙂"));
+    let caret = e.text_edit.as_ref().map(|t| (t.caret, t.anchor));
+    assert_eq!(caret, Some((2, None)), "the caret after the new text");
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    // Control: a fresh edit replaces a selected character, in one undo step.
+    let before = e.doc.clone();
+    let steps = e.history.undo_len();
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    key(&mut e, Key::Home, Modifiers::NONE);
+    key(&mut e, Key::Right, Modifiers::SHIFT);
+    e.handle(InputEvent::Text("é".into()));
+    assert_eq!(e.text_edit.as_ref().map(|t| t.caret), Some(1));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("é🙂"));
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    let after = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(e.doc, before);
+    e.run(Action::Redo);
+    assert_eq!(e.doc, after);
+
+    // A text layer whose group is locked (fixture: the text, then its group, selected
+    // directly; a locked group's text isn't picked on the canvas).
+    let (g, _, t) = label_group(&mut e, Rect::new(600.0, 500.0, 200.0, 100.0), "Orders");
+    e.selection = vec![t];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    key(&mut e, Key::End, Modifiers::NONE);
+    assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(t));
+    e.selection = vec![g];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.get(g).unwrap().locked, "the group is locked");
+    assert!(!e.doc.get(t).unwrap().locked, "the text itself isn't");
+    refuses_every_change(&mut e, t, &clip, "text, nothing selected");
+    // Fixture: another layer selected directly. Cut and Paste don't fall back to it: it is
+    // neither cut (copied and deleted) nor pasted beside.
+    e.selection = vec![other];
+    refuses_every_change(&mut e, t, &clip, "text, another layer selected");
+    assert!(e.doc.get(other).is_some(), "the other layer stays");
+    assert_eq!(text_of(&e, t).0, "Orders");
+    // Unlocked, the open edit types again, at its caret.
+    e.selection = vec![g];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(t));
+    e.handle(InputEvent::Text("!".into()));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(text_of(&e, t).0, "Orders!");
+    e.doc.validate().unwrap();
+}
+
+/// R18/R15: leaving (Escape) an edit whose layer was locked while it was open changes no
+/// locked data. An emptied text layer in a locked group stays, empty, and a blank label on a
+/// locked arrow stays blank, with its bindings: Escape only ends the edit. Unlocked, Escape
+/// still removes an empty text layer and clears a blank label, as before (controls). Group
+/// and text are selected directly (fixture; a locked group's text isn't picked on the canvas).
+#[test]
+fn leaving_an_edit_on_a_locked_layer_keeps_its_empty_text_and_blank_label() {
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let empty_out = |e: &mut Editor, t: NodeId| {
+        e.selection = vec![t];
+        key(e, Key::Enter, Modifiers::NONE);
+        key(e, Key::Home, Modifiers::NONE);
+        key(e, Key::End, Modifiers::SHIFT);
+        key(e, Key::Backspace, Modifiers::NONE);
+        assert_eq!(text_of(e, t).0, "", "emptied, still a layer");
+    };
+    // An emptied text, its group locked while the edit is open.
+    let (g, _, t) = label_group(&mut e, Rect::new(100.0, 100.0, 200.0, 100.0), "Orders");
+    empty_out(&mut e, t);
+    e.selection = vec![g];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.is_effectively_locked(t), "locked through its group");
+    let editing = e.text_edit.as_ref().map(|te| te.id);
+    assert_eq!(editing, Some(t), "still edited");
+    let doc = e.doc.clone();
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert!(e.text_edit.is_none(), "Escape leaves the edit");
+    assert_eq!(e.doc, doc, "the locked empty text stays as it was");
+    assert_eq!(text_of(&e, t).0, "");
+    // Control: an unlocked emptied text is removed when the edit ends.
+    let (_, _, t2) = label_group(&mut e, Rect::new(100.0, 300.0, 200.0, 100.0), "Notes");
+    empty_out(&mut e, t2);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert!(e.doc.get(t2).is_none(), "removed, as before");
+
+    // A blank label, its arrow locked while the edit is open.
+    let a = rect(&mut e, 500.0, 500.0, 120.0, 80.0);
+    let b = rect(&mut e, 900.0, 500.0, 120.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 20_000.0);
+    e.selection = vec![arrow];
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    e.handle(InputEvent::Modifiers(Modifiers::NONE));
+    e.handle(InputEvent::Text("   ".into()));
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(e.doc.is_effectively_locked(arrow), "locked");
+    let editing = e.text_edit.as_ref().map(|te| te.id);
+    assert_eq!(editing, Some(arrow), "still edited");
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("   "));
+    let doc = e.doc.clone();
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert!(e.text_edit.is_none(), "Escape leaves the edit");
+    assert_eq!(e.doc, doc, "the locked blank label stays as it was");
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("   "));
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)), "still bound");
+    // Control: unlocked, an edit ended on the blank label clears it (the arrow stays).
+    e.selection = vec![arrow];
+    key(&mut e, Key::Char('l'), Modifiers::cmd_shift());
+    assert!(!e.doc.is_effectively_locked(arrow), "unlocked");
+    key(&mut e, Key::Enter, Modifiers::NONE);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow), None, "cleared, as before");
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)));
+    e.doc.validate().unwrap();
+}
+
 fn inside_rounded(p: V2, r: Rect, radius: f64) -> bool {
     if !r.contains(p) {
         return false;

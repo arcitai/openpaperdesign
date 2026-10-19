@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.67 · Updated: 2026-10-19
+Revision: 0.69 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -357,12 +357,33 @@ engine architecture is `analysis/DESIGN.md`.
       and nothing happens without text. Nor while the edited arrow is locked, itself or
       through an ancestor (`Document::is_effectively_locked` on the edit's own target, since
       Lock empties the selection but can leave the label's edit open; R43-F1): the clipboard
-      isn't read and nothing is pasted anywhere else. Typing into such a stale edit is a
-      pre-existing gap outside this fix. Before, the browser host's `paste` event (a label
-      is not an egui field) and the native Paste decoded the text, so a label's Paste added
+      isn't read and nothing is pasted anywhere else (now through the shared guard below).
+      Before, the browser host's `paste` event (a label is not an egui field) and the native
+      Paste decoded the text, so a label's Paste added
       a text layer or pasted layers beside the arrow. Plain Paste outside a label edit, and
       a focused egui field's paste, are unchanged. Same Editor, text edit, history, clipboard
       provider and its permission and failure paths. Upstreamable as a fix.
+    - **A text edit left open on a locked layer** (R18/R15 safety; natively too),
+      `src/editor/text_edit.rs` `Editor::text_edit_writable`: Lock (⌘⇧L) while a text layer,
+      note or arrow label is edited empties the selection but leaves the edit open, and its
+      typing, Enter, Backspace and Delete still changed the locked text. Every change an open
+      edit makes to its own text now asks this one predicate about the edit's own target
+      (it exists, has text, and `Document::is_effectively_locked` is false, ancestors
+      included; never the selection): `insert_text` (typing, Enter, label Paste),
+      `delete_text` (Backspace, Delete, Cut's deletion), `style_text_with` for the text being
+      edited (Bold, Italic, Underline, Strikethrough, size and colour of a range or of the
+      layer while it is edited), Cut and Paste in `run`/`paste_from_clipboard` (for any open
+      edit on a locked layer, before anything is copied or the clipboard is read, so neither
+      falls back to cutting the selected layers or pasting a new one; R43-F1's label Paste
+      refusal is now this one), and `end_text_edit` (asked before the edit is taken: leaving a
+      locked layer's edit neither removes an emptied text layer nor clears a blank label; an
+      unlocked one is cleaned up as before). A refused change leaves the document, history,
+      document stamp, selection, the edit with its caret and selected characters, and the
+      clipboard as they were; keys stay the edit's. The edit stays open until it is left:
+      caret moves, Copy, Escape, Undo and unlocking work as before, and unlocked it types
+      again. Not covered: changes that don't go through the open edit (inspector edits of the
+      selected layers, and layer commands such as Delete or Duplicate from a menu, keep their
+      existing rules). Upstreamable as a fix.
     - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer) and
       the PNG/SVG/PDF formats themselves. Upstreamable as a feature with its format guard.
 - Upstream changes in the browser host (not upstream-owned, for reference):
@@ -488,7 +509,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-10.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-11.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -526,6 +547,11 @@ corrected in-panel editor: Paste while an arrow's label is edited edits that lab
 text (the shared Editor change above). The editor's WASM changed, so it gets a new immutable
 key: a cached `home-9` view and its editor can't pass for this one. Not installed or natively
 accepted.
+
+`home-11` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+editor whose open text edit changes nothing once its layer is locked (the shared Editor
+change above). The editor's WASM changed again, so `home-10` is refused and a cached `home-10`
+view can't pass for this one. Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

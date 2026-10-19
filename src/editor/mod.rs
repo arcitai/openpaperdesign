@@ -1778,8 +1778,11 @@ impl Editor {
         }
     }
 
-    /// Finish text editing; empty text nodes are removed.
+    /// Finish text editing; empty text nodes are removed. A locked layer (itself or through an
+    /// ancestor) is only left: neither removed when empty nor its blank label cleared.
     pub fn end_text_edit(&mut self) {
+        // Asked of the edit's own target before the edit is taken (it needs the edit).
+        let writable = self.text_edit_writable();
         let Some(te) = self.text_edit.take() else {
             return;
         };
@@ -1787,14 +1790,15 @@ impl Editor {
             self.gesture = Gesture::None;
         }
         let empty = matches!(self.doc.get(te.id).map(|n| &n.kind), Some(NodeKind::Text { text, .. }) if text.trim().is_empty());
-        if empty {
+        if writable && empty {
             self.tx().remove(te.id);
             self.selection.retain(|s| *s != te.id);
         }
         // An arrow keeps its label exactly as typed; a blank one is no label (the arrow stays),
         // in the same undo step as the edit.
         let blank = matches!(self.doc.get(te.id).map(|n| &n.kind), Some(NodeKind::Connector { label: Some(l), .. }) if l.trim().is_empty());
-        if blank
+        if writable
+            && blank
             && let Some(n) = self.tx().node_mut(te.id)
             && let NodeKind::Connector { label, .. } = &mut n.kind
         {
@@ -1903,6 +1907,10 @@ impl Editor {
             A::Copy => {
                 self.copy();
             }
+            // While a text edit is open on a locked layer (itself or through an ancestor), Cut
+            // does nothing: no copy, no deletion of its text and no fallback to cutting the
+            // selected layers instead.
+            A::Cut if self.text_edit.is_some() && !self.text_edit_writable() => {}
             A::Cut => {
                 // An arrow label's selected characters, or the layers: nothing is deleted
                 // unless it was copied (labelled layers are refused, see `copy`).
@@ -2191,16 +2199,15 @@ impl Editor {
     /// plain text, at the caret or over the selected characters, in the label's own edit (one
     /// undo step with it). It is never read as layers, SVG or a new text layer, whatever it
     /// looks like, and nothing else in the document changes. Without text, nothing happens.
-    /// Nor does it while that arrow is locked, itself or through a locked group (Lock can
-    /// come while its label is open): the label is kept, the clipboard isn't read, and
-    /// nothing is pasted anywhere else instead.
+    /// While any text edit is open on a locked layer, itself or through a locked group (Lock
+    /// can come while the edit is open), nothing happens: the text is kept, the clipboard isn't
+    /// read, and nothing is pasted anywhere else instead.
     pub fn paste_from_clipboard(&mut self) {
         use crate::io::clipboard::{self, Content};
+        if self.text_edit.is_some() && !self.text_edit_writable() {
+            return;
+        }
         if self.editing_label() {
-            let target = self.text_edit.as_ref().map(|te| te.id);
-            if target.is_some_and(|id| self.doc.is_effectively_locked(id)) {
-                return;
-            }
             let text = self.clipboard_io.as_mut().and_then(|io| io.read_text());
             let text = text.map(|t| label_paste_text(&t)).unwrap_or_default();
             if !text.is_empty() {

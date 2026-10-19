@@ -20,11 +20,29 @@ impl Editor {
         (a != te.caret).then(|| (a.min(te.caret), a.max(te.caret)))
     }
 
-    /// Replace the selection (or insert at the caret), keeping style spans attached.
+    /// Whether the open text edit may change its text: its target still exists, has text to
+    /// edit, and isn't locked, itself or through an ancestor. Lock can come while an edit is
+    /// open (it empties the selection, not the edit), so every change an edit makes asks this
+    /// of the edit's own target, never of the selection. A refused change leaves the edit,
+    /// its caret and selected characters, the document and the history as they were.
+    pub(super) fn text_edit_writable(&self) -> bool {
+        self.text_edit.as_ref().is_some_and(|te| {
+            self.doc
+                .get(te.id)
+                .is_some_and(|n| n.kind.edit_text().is_some())
+                && !self.doc.is_effectively_locked(te.id)
+        })
+    }
+
+    /// Replace the selection (or insert at the caret), keeping style spans attached. Nothing
+    /// changes while the edit's target is locked (see [`Editor::text_edit_writable`]).
     pub fn insert_text(&mut self, s: &str) {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
+        if !self.text_edit_writable() {
+            return;
+        }
         let sel = self.text_selection();
         let n_new = s.chars().count();
         let mut caret = te.caret;
@@ -72,7 +90,7 @@ impl Editor {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
-        if a >= b {
+        if a >= b || !self.text_edit_writable() {
             return;
         }
         if let Some(n) = self.tx().node_mut(te.id)
@@ -200,7 +218,8 @@ impl Editor {
                 Some(NodeKind::Connector { .. })
             )
         });
-        if label {
+        // Nor does the text being edited take a style while it is locked.
+        if label || (self.text_edit.is_some() && !self.text_edit_writable()) {
             return;
         }
         if let (Some(te), Some((a, b))) = (self.text_edit.clone(), self.text_selection()) {

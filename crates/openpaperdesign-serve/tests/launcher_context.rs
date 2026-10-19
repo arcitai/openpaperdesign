@@ -636,8 +636,9 @@ fn decode_base64(s: &str) -> Vec<u8> {
 async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Option<&str>) {
     // Versioned: `home-9` was the revision 2 quiet Home (grid-first file cards, About & notices
     // in the menu, the kept home layout and canvas background, the editor's file rename);
-    // `home-10` is it with the corrected editor's in-label Paste.
-    const HOME: &str = "ui://openpaperdesign/home-10.html";
+    // `home-10` is it with the corrected editor's in-label Paste; `home-11` adds the editor's
+    // guard for a text edit whose layer was locked.
+    const HOME: &str = "ui://openpaperdesign/home-11.html";
     for meta in metas {
         let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
         assert!(ok, "{s}");
@@ -685,9 +686,10 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
             "the slot holds the packaged font, byte for byte"
         );
         for other in [
-            "ui://openpaperdesign/home-10.html?x",
+            "ui://openpaperdesign/home-11.html?x",
             // Earlier view URIs are no longer served, so a fresh read can't get an older view.
             // A view a host already has open isn't evicted or refreshed by this.
+            "ui://openpaperdesign/home-10.html",
             "ui://openpaperdesign/home-9.html",
             "ui://openpaperdesign/home-8.html",
             "ui://openpaperdesign/home-7.html",
@@ -716,7 +718,7 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
 /// session's workspace state alone. Every other tool keeps per-call admission and retirement.
 #[tokio::test]
 async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
-    const HOME: &str = "ui://openpaperdesign/home-10.html";
+    const HOME: &str = "ui://openpaperdesign/home-11.html";
     let f = Fixture::new();
     let c = f.host().await;
 

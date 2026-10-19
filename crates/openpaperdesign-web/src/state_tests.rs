@@ -4260,6 +4260,203 @@ fn a_browser_paste_never_changes_the_label_of_an_arrow_locked_while_it_is_edited
     assert_eq!(label(&s).as_deref(), Some("PASTED"));
 }
 
+/// R18/R15 in the browser: with the arrow locked (Ctrl+Shift+L) while Enter's edit of its
+/// label is open, typing (keys as the page delivers them, modifiers released), Enter,
+/// Backspace, Delete and the page's `cut` event change nothing: the label, the document, the
+/// undo history, the selection and the edit with its range stay as they were, and the cut
+/// event gets no text. Unlocked with the same keys, typing into the still-open edit changes
+/// the label; a fresh edit types Unicode in one undo step (controls). The arrow and another
+/// layer are selected directly (fixture).
+#[test]
+fn browser_typing_never_changes_a_label_locked_while_it_is_edited() {
+    let mut s = state();
+    let [arrow, a, ..] = labelled_arrow(&mut s);
+    let label = |s: &WebState| s.ed.doc.get(arrow).unwrap().kind.label().map(String::from);
+    let edit = |s: &WebState| s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+    let lock_keys = |s: &mut WebState| {
+        s.modifiers(true, true, false, false);
+        press(s, "L", "KeyL");
+        s.modifiers(false, false, false, false);
+        timed_frames(s, 1);
+    };
+    let type_keys = |s: &mut WebState, keys: &[(&str, &str)]| {
+        for (k, code) in keys {
+            press(s, k, code);
+            timed_frames(s, 1);
+        }
+    };
+    s.ed.selection = vec![arrow];
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 1);
+    assert_eq!(s.ed.text_selection(), Some((0, 5)), "Enter selects all");
+    lock_keys(&mut s);
+    assert!(
+        s.ed.doc.get(arrow).unwrap().locked,
+        "Lock reached the arrow"
+    );
+    assert!(s.ed.selection.is_empty(), "Lock empties the selection");
+    s.ed.selection = vec![a];
+    let open = edit(&s);
+    assert_eq!(open.map(|o| o.0), Some(arrow), "the edit is open");
+    let (doc, steps) = (s.ed.doc.clone(), s.ed.history.undo_len());
+    assert!(!s.field_has_keyboard());
+    type_keys(
+        &mut s,
+        &[
+            ("é", "KeyE"),
+            ("x", "KeyX"),
+            ("Enter", "Enter"),
+            ("Backspace", "Backspace"),
+            ("Delete", "Delete"),
+        ],
+    );
+    assert_eq!(s.copy(true), None, "the cut event gets no text");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("sends"), "the label is kept");
+    assert_eq!(s.ed.doc, doc, "nothing changed or deleted");
+    assert_eq!(s.ed.history.undo_len(), steps, "nothing recorded");
+    assert_eq!(s.ed.selection, vec![a]);
+    assert_eq!(edit(&s), open, "the edit as it was");
+    // Unlocked with the same keys, the still-open edit types again.
+    s.ed.selection = vec![arrow];
+    lock_keys(&mut s);
+    assert!(!s.ed.doc.get(arrow).unwrap().locked, "unlocked");
+    type_keys(&mut s, &[("é", "KeyE")]);
+    assert_eq!(label(&s).as_deref(), Some("é"));
+    assert_eq!(edit(&s), Some((arrow, 1, None)), "the caret after it");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    // Control: a fresh edit types Unicode over the whole label, in one undo step.
+    let before = s.ed.doc.clone();
+    let steps = s.ed.history.undo_len();
+    s.ed.selection = vec![arrow];
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 1);
+    type_keys(&mut s, &[("Ω", "KeyO"), ("🙂", "Unidentified")]);
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("Ω🙂"));
+    assert_eq!(s.ed.history.undo_len(), steps + 1, "one undo step");
+    s.run(Action::Undo);
+    assert_eq!(s.ed.doc, before);
+}
+
+/// Ctrl+Shift+L as the page delivers it, then the modifiers released.
+fn lock_keys(s: &mut WebState) {
+    s.modifiers(true, true, false, false);
+    press(s, "L", "KeyL");
+    s.modifiers(false, false, false, false);
+    timed_frames(s, 1);
+}
+
+/// R18/R15 in the browser, a text layer: locked (Ctrl+Shift+L) while its edit is open, with
+/// another layer then selected, the page's `cut` and `paste` events change nothing: no text
+/// for the cut event, the other layer neither cut nor joined by a pasted one, the document,
+/// history, selection and the edit as they were. Escape leaves the edit and keeps the text.
+/// Unlocked with the same keys, a fresh edit types again (control). The page holds one text
+/// layer and one rectangle; the text and then the rectangle are selected directly (fixture).
+#[test]
+fn browser_cut_and_paste_on_a_locked_text_edit_change_no_layer() {
+    let mut doc = Document::default();
+    let t = doc.alloc_id();
+    let kind = NodeKind::Text {
+        text: "Orders".into(),
+        font_size: 24.0,
+        auto_width: true,
+        align: crate::model::TextAlign::Left,
+    };
+    let r = crate::geom::Rect::new(100.0, 100.0, 80.0, 30.0);
+    doc.nodes.insert(t, Node::new(t, kind, r));
+    doc.root.push(t);
+    let other = doc.alloc_id();
+    let r = crate::geom::Rect::new(400.0, 300.0, 100.0, 60.0);
+    doc.nodes.insert(other, Node::new(other, NodeKind::Rect, r));
+    doc.root.push(other);
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    let text = |s: &WebState| match &s.ed.doc.get(t).unwrap().kind {
+        NodeKind::Text { text, .. } => text.clone(),
+        k => panic!("not text: {k:?}"),
+    };
+    let edit = |s: &WebState| s.ed.text_edit.as_ref().map(|e| (e.id, e.caret, e.anchor));
+    s.ed.selection = vec![t];
+    press(&mut s, "Enter", "Enter");
+    press(&mut s, "End", "End");
+    timed_frames(&mut s, 1);
+    assert_eq!(edit(&s), Some((t, 6, None)), "edited, caret at its end");
+    lock_keys(&mut s);
+    assert!(s.ed.doc.get(t).unwrap().locked, "Lock reached the text");
+    assert!(s.ed.selection.is_empty(), "Lock empties the selection");
+    s.ed.selection = vec![other];
+    let (doc, steps, open) = (s.ed.doc.clone(), s.ed.history.undo_len(), edit(&s));
+    assert_eq!(s.copy(true), None, "the cut event gets no text");
+    s.paste("PASTED");
+    timed_frames(&mut s, 1);
+    assert!(s.ed.doc.get(other).is_some(), "the other layer isn't cut");
+    assert_eq!(s.ed.doc, doc, "nothing cut, deleted or pasted");
+    assert_eq!(s.ed.history.undo_len(), steps, "nothing recorded");
+    assert_eq!(s.ed.selection, vec![other]);
+    assert_eq!(edit(&s), open, "the edit as it was");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(edit(&s), None, "Escape leaves the edit");
+    assert_eq!(s.ed.doc, doc, "and changes nothing");
+    // Control: unlocked with the same keys, a fresh edit types at its caret.
+    s.ed.selection = vec![t];
+    lock_keys(&mut s);
+    assert!(!s.ed.doc.get(t).unwrap().locked, "unlocked");
+    s.ed.selection = vec![t];
+    press(&mut s, "Enter", "Enter");
+    press(&mut s, "End", "End");
+    press(&mut s, "!", "Digit1");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(text(&s), "Orders!");
+}
+
+/// R18/R15 in the browser, an arrow's label: emptied and typed blank ("   ") through the page's
+/// keys, then locked while its edit is open, Escape leaves the edit and keeps the blank label
+/// (and the arrow's bindings): the document is as Lock left it. Unlocked, an edit ended on the
+/// blank label clears it, as before (control). The arrow is selected directly (fixture).
+#[test]
+fn browser_escape_keeps_a_blank_label_on_an_arrow_locked_while_it_is_edited() {
+    let mut s = state();
+    let [arrow, ..] = labelled_arrow(&mut s);
+    let label = |s: &WebState| s.ed.doc.get(arrow).unwrap().kind.label().map(String::from);
+    s.ed.selection = vec![arrow];
+    press(&mut s, "Enter", "Enter");
+    press(&mut s, "Backspace", "Backspace");
+    for _ in 0..3 {
+        press(&mut s, " ", "Space");
+    }
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s).as_deref(), Some("   "), "typed blank");
+    lock_keys(&mut s);
+    assert!(s.ed.doc.get(arrow).unwrap().locked, "locked");
+    let editing = s.ed.text_edit.as_ref().map(|e| e.id);
+    assert_eq!(editing, Some(arrow), "still edited");
+    let doc = s.ed.doc.clone();
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert!(s.ed.text_edit.is_none(), "Escape leaves the edit");
+    assert_eq!(s.ed.doc, doc, "the locked blank label stays as it was");
+    assert_eq!(label(&s).as_deref(), Some("   "));
+    // Control: unlocked, an edit ended on the blank label clears it.
+    s.ed.selection = vec![arrow];
+    lock_keys(&mut s);
+    assert!(!s.ed.doc.get(arrow).unwrap().locked, "unlocked");
+    press(&mut s, "Enter", "Enter");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 1);
+    assert_eq!(label(&s), None, "cleared, as before");
+}
+
 // ---- redraw rules (from the toolbar page, kept)
 
 /// Laser points at canvas (400, 400) .. (420, 410), drawn at t = 0..20 ms, then a frame.
