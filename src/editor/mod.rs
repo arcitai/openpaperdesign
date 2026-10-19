@@ -187,9 +187,12 @@ enum Gesture {
         end: usize,
         start: V2,
     },
-    /// Bending an arrow by its middle point.
+    /// Bending an arrow by its middle point. `press` (screen) while the press on the bend
+    /// handle hasn't moved past the drag threshold: nothing is bent yet, so a click (the first
+    /// half of a double-click that edits the label, say) changes nothing.
     ConnectorMid {
         id: NodeId,
+        press: Option<V2>,
     },
     Laser,
     /// Dragging a point or handle of the path being edited.
@@ -824,6 +827,19 @@ impl Editor {
 
     fn select_down(&mut self, pos: V2, world: V2, double: bool) {
         if self.path_edit.is_none() && self.text_edit.is_none() {
+            // A double-click on the selected arrow edits its label, before its handles (the
+            // label sits at the middle of the line).
+            if double
+                && let [id] = self.selection[..]
+                && matches!(
+                    self.doc.get(id).map(|n| &n.kind),
+                    Some(NodeKind::Connector { .. })
+                )
+                && hit::node_contains(&self.doc, id, world, self.camera.zoom)
+            {
+                self.start_text_edit(id, Some(world));
+                return;
+            }
             if let Some(&(dir, _)) = self.quick_knobs().iter().find(|(_, p)| p.dist(pos) <= 9.0) {
                 self.quick_connect(dir);
                 return;
@@ -925,7 +941,7 @@ impl Editor {
             self.start_marquee(world, Some(target));
             return;
         }
-        if double && node.kind.text().is_some() {
+        if double && node.kind.edit_text().is_some() {
             self.start_text_edit(target, Some(world));
             return;
         }
@@ -1318,9 +1334,17 @@ impl Editor {
                 self.drag_connector_end(id, end, w);
                 self.gesture = Gesture::ConnectorEnd { id, end, start };
             }
-            Gesture::ConnectorMid { id } => {
+            Gesture::ConnectorMid { id, press } => {
+                // The bend starts only with a real drag, as a move does.
+                if let Some(p) = press {
+                    if pos.dist(p) < DRAG_THRESHOLD {
+                        self.gesture = Gesture::ConnectorMid { id, press };
+                        return;
+                    }
+                    self.bend_connector(id, world);
+                }
                 self.drag_connector_mid(id, world);
-                self.gesture = Gesture::ConnectorMid { id };
+                self.gesture = Gesture::ConnectorMid { id, press: None };
             }
             Gesture::Laser => {
                 self.laser_point(world, time_ms);
@@ -1684,7 +1708,7 @@ impl Editor {
 
     pub fn start_text_edit(&mut self, id: NodeId, at_world: Option<V2>) {
         let Some(n) = self.doc.get(id) else { return };
-        let Some(t) = n.kind.text() else {
+        let Some(t) = n.kind.edit_text() else {
             return;
         };
         let len = t.chars().count();
@@ -1708,7 +1732,20 @@ impl Editor {
             return;
         }
         self.end_text_edit();
-        self.begin("Edit text");
+        let arrow = matches!(
+            self.doc.get(id).map(|n| &n.kind),
+            Some(NodeKind::Connector { .. })
+        );
+        self.begin(if arrow { "Edit label" } else { "Edit text" });
+        // An arrow without a label gets an empty one to type into (and loses it again if it
+        // is left empty: `end_text_edit`).
+        if arrow
+            && let Some(n) = self.tx().node_mut(id)
+            && let NodeKind::Connector { label, .. } = &mut n.kind
+            && label.is_none()
+        {
+            *label = Some(String::new());
+        }
         self.selection = vec![id];
         self.text_edit = Some(TextEdit {
             id,
@@ -1722,7 +1759,7 @@ impl Editor {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
-        let Some(text) = self.doc.get(te.id).and_then(|n| n.kind.text()) else {
+        let Some(text) = self.doc.get(te.id).and_then(|n| n.kind.edit_text()) else {
             return;
         };
         let chars: Vec<char> = text.chars().collect();
@@ -1753,6 +1790,15 @@ impl Editor {
         if empty {
             self.tx().remove(te.id);
             self.selection.retain(|s| *s != te.id);
+        }
+        // An arrow keeps its label exactly as typed; a blank one is no label (the arrow stays),
+        // in the same undo step as the edit.
+        let blank = matches!(self.doc.get(te.id).map(|n| &n.kind), Some(NodeKind::Connector { label: Some(l), .. }) if l.trim().is_empty());
+        if blank
+            && let Some(n) = self.tx().node_mut(te.id)
+            && let NodeKind::Connector { label, .. } = &mut n.kind
+        {
+            *label = None;
         }
         self.commit();
     }
@@ -1828,8 +1874,9 @@ impl Editor {
                         self.start_path_edit(id);
                     } else if matches!(
                         self.doc.get(id).map(|n| &n.kind),
-                        Some(NodeKind::Text { .. })
+                        Some(NodeKind::Text { .. } | NodeKind::Connector { .. })
                     ) {
+                        // A text layer's text, or an arrow's label.
                         self.start_text_edit(id, None);
                     } else if self.doc.get(id).is_some_and(|n| !n.children.is_empty()) {
                         self.selection = self.doc.get(id).unwrap().children.clone();

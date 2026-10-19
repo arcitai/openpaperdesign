@@ -207,6 +207,7 @@ pub fn resolve(doc: &Document, id: NodeId) -> Option<Vec<V2>> {
         route,
         start_head,
         end_head,
+        ..
     } = &n.kind
     else {
         return None;
@@ -617,6 +618,31 @@ pub fn line_path(pts: &[V2], route: Route) -> VPath {
     }
 }
 
+/// The point halfway along the connector's line as it is drawn ([`line_path`]: curves and the
+/// elbow's rounded corners included), by arc length. `pts` may be in any space; the result is
+/// in the same one. An arrow's label sits here, so it follows every reroute.
+pub fn midpoint(pts: &[V2], route: Route) -> Option<V2> {
+    let first = *pts.first()?;
+    if pts.len() < 2 {
+        return Some(first);
+    }
+    let segs: Vec<(V2, V2)> = line_path(pts, route)
+        .flatten(0.25)
+        .iter()
+        .flat_map(|p| p.pts.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>())
+        .collect();
+    let total: f64 = segs.iter().map(|(a, b)| a.dist(*b)).sum();
+    let mut left = total * 0.5;
+    for (a, b) in segs {
+        let d = a.dist(b);
+        if d > 0.0 && d >= left {
+            return Some(a.lerp(b, left / d));
+        }
+        left -= d;
+    }
+    Some(first)
+}
+
 /// Head geometry at `tip`, arriving from `from`: (stroked lines, filled polygons).
 pub fn head_shapes(
     head: Head,
@@ -727,6 +753,21 @@ mod tests {
             let m = (w[0] + w[1]) * 0.5;
             assert!(!strictly_inside(&a, m) && !strictly_inside(&b, m));
         }
+    }
+
+    #[test]
+    fn a_label_point_is_halfway_along_the_drawn_line() {
+        let m = midpoint(&[v2(0.0, 0.0), v2(100.0, 40.0)], Route::Straight).unwrap();
+        assert!(m.dist(v2(50.0, 20.0)) < 1e-6, "{m:?}");
+        // An elbow with a rounded corner: halfway is on the corner's mirror line (the route is
+        // symmetric about it), not at a point picked by index.
+        let l = [v2(0.0, 0.0), v2(100.0, 0.0), v2(100.0, 100.0)];
+        let m = midpoint(&l, Route::Elbow).unwrap();
+        assert!((m.x + m.y - 100.0).abs() < 0.5, "{m:?}");
+        // Three straight segments of 10, 80 and 10: the middle of the middle one.
+        let z = [v2(0.0, 0.0), v2(0.0, 10.0), v2(80.0, 10.0), v2(80.0, 20.0)];
+        let m = midpoint(&z, Route::Straight).unwrap();
+        assert!(m.dist(v2(40.0, 10.0)) < 1e-6, "{m:?}");
     }
 
     #[test]

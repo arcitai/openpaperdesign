@@ -355,6 +355,20 @@ pub fn label_group(doc: &Document, id: NodeId) -> Option<(NodeId, NodeId)> {
     (plain_shape && label).then_some((shape, text))
 }
 
+/// Whether a label grows to fit its text: it does (`auto_width`), or it is wrapped only because
+/// its shape is too narrow for one line, which `refit_label` records with the existing width
+/// sizing `Sizing::Hug` (the box hugs its wrapped lines; the inspector's own Hug for text, as
+/// `fit-content` is over MCP). Such a label returns to one line when its shape grows again.
+/// Every explicit width choice sets `Sizing::Fixed` and so ends it: the inspector's Fixed or
+/// W, a numeric `width` over MCP, resizing the text itself. A width the person fixed (auto
+/// width off with Fixed sizing, the default) is kept, whatever it measures.
+fn fits_its_text(t: &crate::model::Node) -> bool {
+    let NodeKind::Text { auto_width, .. } = &t.kind else {
+        return false;
+    };
+    *auto_width || t.layout_child.sizing[0] == Sizing::Hug
+}
+
 /// Lay a label group's text out again after the group was scaled (`before`: the text node as
 /// it was). Its characters, font and style are never scaled. A label that grew to fit its
 /// text keeps one line while that fits its shape's width, and otherwise wraps at spaces
@@ -367,10 +381,10 @@ fn refit_label(tx: &mut Tx, shape: NodeId, text: NodeId, before: &crate::model::
         return;
     };
     let (s, centre) = (s.rect, t.rect.center());
-    let NodeKind::Text { auto_width, .. } = &before.kind else {
+    if !matches!(before.kind, NodeKind::Text { .. }) {
         return;
-    };
-    let grew = *auto_width;
+    }
+    let grew = fits_its_text(before);
     let mut n = t.clone();
     let set_auto = |n: &mut crate::model::Node, on: bool| {
         if let NodeKind::Text { auto_width, .. } = &mut n.kind {
@@ -385,6 +399,10 @@ fn refit_label(tx: &mut Tx, shape: NodeId, text: NodeId, before: &crate::model::
         (one.width.max(1.0), one.height)
     } else {
         set_auto(&mut n, false);
+        if grew {
+            // Wrapped, still growing to fit its text (`fits_its_text`).
+            n.layout_child.sizing[0] = Sizing::Hug;
+        }
         let limit = if grew { s.w } else { before.rect.w.min(s.w) };
         n.rect.w = limit.max(1.0);
         let Some(l) = crate::text::layout_node(&n) else {
@@ -392,6 +410,7 @@ fn refit_label(tx: &mut Tx, shape: NodeId, text: NodeId, before: &crate::model::
         };
         // A grown label's box is as wide as its widest line (the lines break the same way
         // at that width); a fixed one keeps its wrap width.
+        // (Neither width is a policy: `fits_its_text` reads only the sizing.)
         let w = if grew {
             l.width.clamp(1.0, n.rect.w)
         } else {

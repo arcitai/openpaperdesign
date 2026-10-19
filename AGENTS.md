@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.60 · Updated: 2026-10-19
+Revision: 0.63 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -264,8 +264,63 @@ engine architecture is `analysis/DESIGN.md`.
       its routed world `points`; `get_tree_summary` adds "from [id] to [id]" (or "free").
       Read-only: same ids, page reads and acknowledgement rules; other nodes read as before.
     - Reason: the plan's bounded repairs of measured gaps; same Editor, commands, document
-      format, Session, save, binding and lease, no new field. Connector labels are not built.
-      Upstreamable as fixes.
+      format, Session, save, binding and lease, no new field. Upstreamable as fixes.
+  - Revision 2 slice 7, attached arrow labels (plan section 7, R15; owner-admitted). Native
+    windows change too.
+    - **The field.** `src/model/node.rs`: `NodeKind::Connector::label: Option<String>`,
+      omitted when absent. Same node, routing, anchors and history; no separate Text.
+      `NodeKind::edit_text`/`edit_text_mut` let the text editor work on a label while
+      `NodeKind::text` (typography, search, export names) still means text layers and
+      sticky notes only; `NodeKind::label` reads it.
+    - **Page version guard.** `src/project/format.rs`: `PAGE_VERSION_LABELS` (4) and
+      `page_version_for`. A page is written as v4 only when an arrow has a label, so an
+      unlabelled page keeps its v3 bytes. `check_labels` refuses a label in a page that
+      says an older version, on a node that isn't an arrow, or that isn't text; v3 → v4 is an
+      identity step. The retained old603 reader drops an unknown v3 label on save and refuses
+      v4 before editing: a labelled page deliberately doesn't open there (a downgrade limit,
+      not compatibility). `src/io/file.rs`: the version-1 `.paper-rs` writer refuses a
+      labelled document (nothing written).
+    - **Placement and drawing.** `src/connector.rs` `midpoint` (arc length along
+      `line_path`, curves and elbow corners included). `src/text.rs` `LABEL_SIZE`, and
+      `layout_node`/`text_offset` lay a label out centred on that point (so text editing,
+      the caret and hit-testing reuse the text code). `src/render/draw.rs` `label_rect`,
+      `label_ops` (an authored-white backing, which the dark canvas display adapts, and the
+      text in the arrow's stroke colour, rough arrows too) and `draw_bounds` including it, so
+      the GPU scene, SVG and PDF draw it. `src/io/svg.rs`: its `aria-label`.
+    - **Editing.** `src/editor/mod.rs`: a double-click on the selected arrow (before its
+      handles) or Enter edits its label through `start_text_edit`. An empty label is
+      created to type into, and a blank one is removed at `end_text_edit`, in the same undo
+      step. `src/editor/text_edit.rs`: typing and deleting use `edit_text_mut`; labels take
+      no character styles. `src/editor/whiteboard.rs`: no bend handle under a label.
+      `src/editor/hit.rs`: a press on a label hits its arrow.
+    - **Corrections (R37-F1 and the selected-arrow double-click).**
+      - `src/layout.rs` `fits_its_text`: the width policy is explicit, never measured. A
+        label that grew to fit its text and is wrapped by `refit_label` gets the existing
+        width sizing `Sizing::Hug` (its box hugs its lines, as the inspector's Hug and MCP's
+        `fit-content` mean for text). It counts as growing to fit its text (`auto_width` or
+        Hug), so shrinking and growing a label group back, even across save and reopen,
+        returns it to one line.
+      - Every explicit width choice already sets `Sizing::Fixed`: the inspector's Fixed and W,
+        MCP's numeric `width`, resizing the text itself. Auto width off with the default
+        Fixed sizing is a fixed width, kept whatever it measures.
+      - Data: a wrapped label's `layout_child.sizing[0]` is `"hug"` on disk (an existing
+        field, page v3). It is ignored for a text in a group outside auto layout, and
+        `get_computed_styles` reports that width as `fit-content`.
+      - `src/editor/{mod,whiteboard}.rs`: a press on an arrow's bend handle bends it only once
+        it moves past the drag threshold (`Gesture::ConnectorMid::press`, `bend_connector`),
+        as a move does. A click there, such as the first half of a double-click that edits
+        the label, changes nothing. A real drag bends exactly as before.
+    - **MCP.** `src/mcp/exec.rs`/`tools.rs`: `create_shape`'s `text` labels an arrow,
+      `set_text_content` sets one exactly (empty removes it), `get_node_info` reports
+      `label`, and `get_tree_summary` shows it. Same reads, writes, acknowledgements and
+      gates.
+    - **Library file.** `crates/openpaperdesign-serve/src/library_payload.rs` admits page
+      v3, or v4 for a labelled page. The write-back comparison still refuses an unlabelled
+      v4 page and anything else upstream wouldn't keep.
+    - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer), the
+      clipboard (labels travel with copied arrows between windows of this version; an older
+      app's paste drops them) and the PNG/SVG/PDF formats themselves. Upstreamable as a
+      feature with its format guard.
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.
@@ -513,7 +568,8 @@ preparation before the old binding retires, run in an owned task, remove only wh
 theirs (naming what stays or may not be durably removed) and are never retried; a lost reply is
 recovered from the list. The canvas file (`library_payload.rs`, version 1, canvas-only) is
 bounded and fully validated before a fresh identity is published (duplicate keys, unknown
-fields, contained manifest/page exactly `paper-rs-project` 1 / `paper-rs-page` 3 checked raw
+fields, contained manifest/page exactly `paper-rs-project` 1 / `paper-rs-page` 3 (4 only for a
+page with arrow labels) checked raw
 before any upstream parsing or migration, each page's JSON matching what upstream writes back
 from it so no nested field is silently dropped (only the writer's known omissions at their
 defaults may be explicit: page `camera: null`; node `parent: null`, `children: []`,

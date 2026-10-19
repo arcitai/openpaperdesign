@@ -17,8 +17,18 @@ pub const PAGE_FORMAT: &str = "paper-rs-page";
 pub const LEGACY_FORMAT: &str = "paper-rs";
 
 pub const PROJECT_VERSION: u32 = 1;
-/// v1: legacy single file. v2: page file inside a project. v3: fill layers (`fills`).
+/// v1: legacy single file. v2: page file inside a project. v3: fill layers (`fills`). A page is
+/// written as v3 unless it needs v4 ([`PAGE_VERSION_LABELS`]).
 pub const PAGE_VERSION: u32 = 3;
+/// v4: arrow labels (a connector's `label`). Only a page with at least one label is written as
+/// v4, so every other page keeps its v3 bytes and stays readable by older readers, and an
+/// older reader refuses a labelled page ("newer than this app supports") instead of reading it
+/// and dropping its labels on the next save, as it would an unknown field in a v3 page. That
+/// refusal is a deliberate downgrade limit: a labelled page doesn't open in a reader without
+/// labels.
+pub const PAGE_VERSION_LABELS: u32 = 4;
+/// The newest page version this build reads.
+pub const PAGE_VERSION_MAX: u32 = PAGE_VERSION_LABELS;
 
 #[derive(Debug)]
 pub enum FormatError {
@@ -129,7 +139,7 @@ struct PageFile {
 }
 
 /// Page migrations, indexed by source version: `PAGE_STEPS[0]` turns v1 into v2.
-const PAGE_STEPS: &[fn(Value) -> Value] = &[page_v1_to_v2, page_v2_to_v3];
+const PAGE_STEPS: &[fn(Value) -> Value] = &[page_v1_to_v2, page_v2_to_v3, page_v3_to_v4];
 /// Formats accepted as older versions of a page.
 const PAGE_ALIASES: &[&str] = &[LEGACY_FORMAT];
 
@@ -162,12 +172,26 @@ fn page_v2_to_v3(mut v: Value) -> Value {
     v
 }
 
+/// The page version `doc` needs: v4 when an arrow has a label, else v3.
+pub fn page_version_for(doc: &Document) -> u32 {
+    if doc.nodes.values().any(|n| n.kind.label().is_some()) {
+        PAGE_VERSION_LABELS
+    } else {
+        PAGE_VERSION
+    }
+}
+
+/// v3 → v4: v4 adds the optional arrow label only, so a v3 page is already a v4 page.
+fn page_v3_to_v4(v: Value) -> Value {
+    v
+}
+
 pub fn page_to_json(p: &PageData) -> String {
     let mut nodes: Vec<Node> = p.doc.nodes.values().cloned().collect();
     nodes.sort_by_key(|n| n.id);
     let f = PageFile {
         format: PAGE_FORMAT.into(),
-        version: PAGE_VERSION,
+        version: page_version_for(&p.doc),
         id: p.id.clone(),
         name: p.name.clone(),
         camera: p.camera,
@@ -181,7 +205,8 @@ pub fn page_to_json(p: &PageData) -> String {
 /// Parse a page file (or a legacy `.paper-rs` document) of any supported version.
 pub fn page_from_json(s: &str) -> Result<PageData, FormatError> {
     let v: Value = serde_json::from_str(s).map_err(FormatError::Json)?;
-    let v = migrate(v, PAGE_FORMAT, PAGE_VERSION, PAGE_ALIASES, PAGE_STEPS)?;
+    check_labels(&v)?;
+    let v = migrate(v, PAGE_FORMAT, PAGE_VERSION_MAX, PAGE_ALIASES, PAGE_STEPS)?;
     let f: PageFile = serde_json::from_value(v).map_err(FormatError::Json)?;
     let max_id = f.nodes.iter().map(|n| n.id.0).max().unwrap_or(0);
     let nodes: HashMap<NodeId, Node> = f.nodes.into_iter().map(|n| (n.id, n)).collect();
@@ -198,6 +223,40 @@ pub fn page_from_json(s: &str) -> Result<PageData, FormatError> {
         doc,
         camera: f.camera,
     })
+}
+
+/// A `label` is a connector field of page v4: a page that declares an older version (or none)
+/// and has one, or that has one on another kind of node, is refused rather than read, since a
+/// reader that doesn't know labels would have lost it (and this one can't tell what it was
+/// meant to be). Its value must be a string.
+fn check_labels(v: &Value) -> Result<(), FormatError> {
+    let version = v.get("version").and_then(Value::as_u64).unwrap_or(1);
+    let Some(nodes) = v.get("nodes").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for n in nodes {
+        let Some(label) = n.get("label") else {
+            continue;
+        };
+        let id = n.get("id").map_or_else(String::new, |i| format!(" {i}"));
+        if n.get("type").and_then(Value::as_str) != Some("connector") {
+            return Err(FormatError::Invalid(format!(
+                "node{id} has a label, which only an arrow can have"
+            )));
+        }
+        if version < u64::from(PAGE_VERSION_LABELS) {
+            return Err(FormatError::Invalid(format!(
+                "arrow{id} has a label, which needs page version {PAGE_VERSION_LABELS}; this \
+                 page says version {version}"
+            )));
+        }
+        if !label.is_string() {
+            return Err(FormatError::Invalid(format!(
+                "arrow{id}'s label isn't text"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check the format tag and run the migration chain up to `current`.
@@ -316,6 +375,108 @@ mod tests {
         assert_eq!(r.style.fill(), Some(crate::model::Color::rgb(255, 0, 0)));
         assert_eq!(r.style.corner_radius, 2.0);
         assert!(p.doc.get(NodeId(2)).unwrap().style.fills.is_empty());
+        assert!(page_to_json(&p).contains("\"version\": 3"));
+    }
+
+    /// One page with one arrow, labelled `label`.
+    fn arrow_page(label: Option<&str>) -> PageData {
+        use crate::geom::{Rect, V2, v2};
+        use crate::model::{Head, NodeKind, Route};
+        let id = NodeId(1);
+        let n = Node::new(
+            id,
+            NodeKind::Connector {
+                points: vec![V2::ZERO, v2(100.0, 0.0)],
+                start: None,
+                end: None,
+                route: Route::Straight,
+                start_head: Head::None,
+                end_head: Head::Arrow,
+                label: label.map(String::from),
+            },
+            Rect::new(0.0, 0.0, 100.0, 0.0),
+        );
+        // A page's document is named after the page, as every reader rebuilds it.
+        let mut doc = Document {
+            name: "P".into(),
+            ..Document::default()
+        };
+        doc.nodes.insert(id, n);
+        doc.root.push(id);
+        doc.next_id = 2;
+        PageData {
+            id: "abc".into(),
+            name: "P".into(),
+            doc,
+            camera: None,
+        }
+    }
+
+    #[test]
+    fn only_a_labelled_page_is_written_as_v4_and_reads_back_exactly() {
+        // Unlabelled: v3, no `label` key, the same bytes as before labels existed.
+        let plain = page_to_json(&arrow_page(None));
+        assert!(
+            plain.contains("\"version\": 3") && !plain.contains("\"label\""),
+            "{plain}"
+        );
+        assert_eq!(page_to_json(&page_from_json(&plain).unwrap()), plain);
+        // Labelled: v4, and the label (inner spaces and a line break kept) reads back.
+        let p = arrow_page(Some("writes  to\nqueue"));
+        let s = page_to_json(&p);
+        assert!(s.contains("\"version\": 4"), "{s}");
+        let back = page_from_json(&s).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(page_to_json(&back), s);
+        // A v4 page whose labels are gone is written back as v3 (nothing needs v4).
+        let mut cleared = back.clone();
+        for n in cleared.doc.nodes.values_mut() {
+            if let crate::model::NodeKind::Connector { label, .. } = &mut n.kind {
+                *label = None;
+            }
+        }
+        assert_eq!(page_to_json(&cleared), plain);
+    }
+
+    #[test]
+    fn a_label_an_older_reader_would_drop_is_refused_not_read() {
+        let s = page_to_json(&arrow_page(Some("writes to")));
+        let mut v: Value = serde_json::from_str(&s).unwrap();
+        // Declared v3 (as an older writer would never write it, and an older reader would lose).
+        v["version"] = json!(3);
+        let e = page_from_json(&v.to_string()).unwrap_err();
+        assert!(
+            matches!(e, FormatError::Invalid(ref m) if m.contains("version 4")),
+            "{e}"
+        );
+        // A label on something that isn't an arrow.
+        let mut w: Value = serde_json::from_str(&s).unwrap();
+        w["nodes"][0]["type"] = json!("rect");
+        assert!(matches!(
+            page_from_json(&w.to_string()),
+            Err(FormatError::Invalid(_))
+        ));
+        // A label that isn't text.
+        let mut x: Value = serde_json::from_str(&s).unwrap();
+        x["nodes"][0]["label"] = json!(7);
+        assert!(matches!(
+            page_from_json(&x.to_string()),
+            Err(FormatError::Invalid(_))
+        ));
+        // Newer than v4 is refused as before.
+        let mut y: Value = serde_json::from_str(&s).unwrap();
+        y["version"] = json!(5);
+        assert!(matches!(
+            page_from_json(&y.to_string()),
+            Err(FormatError::TooNew {
+                version: 5,
+                supported: 4
+            })
+        ));
+        // An unlabelled page that says v4 reads as before (and is written back as v3).
+        let mut z: Value = serde_json::from_str(&page_to_json(&arrow_page(None))).unwrap();
+        z["version"] = json!(4);
+        let p = page_from_json(&z.to_string()).unwrap();
         assert!(page_to_json(&p).contains("\"version\": 3"));
     }
 

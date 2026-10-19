@@ -104,6 +104,7 @@ fn quick_arrow(
             route,
             start_head: Head::None,
             end_head: Head::Arrow,
+            label: None,
         },
         Rect::default(),
     );
@@ -192,6 +193,7 @@ impl Editor {
                     route,
                     start_head: Head::None,
                     end_head: Head::Arrow,
+                    label: None,
                 },
                 Rect::new(world.x, world.y, 0.0, 0.0),
             );
@@ -284,7 +286,10 @@ impl Editor {
                 ..
             })
         );
-        if pts.len() == 2 && !elbow {
+        // A labelled arrow's middle is its label (a double-click edits it), so it has no bend
+        // handle there; it can still be curved from the inspector's Type.
+        let labelled = self.doc.get(id).is_some_and(|n| n.kind.label().is_some());
+        if pts.len() == 2 && !elbow && !labelled {
             out.push((2, s((pts[0] + pts[1]) * 0.5)));
         }
         out
@@ -301,18 +306,13 @@ impl Editor {
         };
         let id = self.selection[0];
         if end == 2 {
-            // Bend: insert a middle point and make the arrow curved.
+            // Bend, once the press turns into a drag (`bend_connector`): a click on the middle
+            // changes nothing.
             self.begin("Bend arrow");
-            let mut pts = self.connector_points(id).unwrap();
-            pts.insert(1, world);
-            let mut tx = self.tx();
-            if let Some(n) = tx.node_mut(id)
-                && let NodeKind::Connector { route, .. } = &mut n.kind
-            {
-                *route = Route::Curved;
-            }
-            set_world_points(&mut tx, id, &pts);
-            self.gesture = Gesture::ConnectorMid { id };
+            self.gesture = Gesture::ConnectorMid {
+                id,
+                press: Some(pos),
+            };
             return true;
         }
         self.begin("Move arrow end");
@@ -322,6 +322,25 @@ impl Editor {
             start: world,
         };
         true
+    }
+
+    /// Bend a two-point arrow at `world`: insert a middle point there and make it curved (the
+    /// first move of a drag from its bend handle).
+    pub(super) fn bend_connector(&mut self, id: NodeId, world: V2) {
+        let Some(mut pts) = self.connector_points(id) else {
+            return;
+        };
+        if pts.len() != 2 {
+            return;
+        }
+        pts.insert(1, world);
+        let mut tx = self.tx();
+        if let Some(n) = tx.node_mut(id)
+            && let NodeKind::Connector { route, .. } = &mut n.kind
+        {
+            *route = Route::Curved;
+        }
+        set_world_points(&mut tx, id, &pts);
     }
 
     pub(super) fn drag_connector_mid(&mut self, id: NodeId, world: V2) {

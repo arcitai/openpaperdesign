@@ -560,9 +560,12 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
         start,
         end,
         route,
+        label,
         ..
     } = &n.kind
     {
+        // Its label (null without one), set with set_text_content or create_shape's `text`.
+        v["label"] = json!(label);
         for (k, b) in [("start", start), ("end", end)] {
             let b = b.filter(|b| doc.get(b.node).is_some());
             v[format!("{k}NodeId")] = json!(b.map(|b| node_key(ed, page, b.node)));
@@ -635,7 +638,11 @@ fn tree_summary(ed: &mut Editor, a: &Args) -> ToolResult {
             let short: String = t.chars().take(40).collect();
             line += &format!(" {:?}", short);
         }
-        // An arrow's ends: the layer each is bound to, or "free".
+        // An arrow's label and its ends: the layer each is bound to, or "free".
+        if let Some(l) = n.kind.label() {
+            let short: String = l.chars().take(40).collect();
+            line += &format!(" {:?}", short);
+        }
         if let NodeKind::Connector { start, end, .. } = &n.kind {
             let end_of = |b: &Option<Binding>| match b.filter(|b| doc.get(b.node).is_some()) {
                 Some(b) => format!("[{}]", node_key(ed, page, b.node)),
@@ -2368,6 +2375,8 @@ fn create_shape(ed: &mut Editor, a: &Args) -> ToolResult {
                         route,
                         start_head,
                         end_head: if ty == "line" { head(None, Head::None)? } else { end_head },
+                        // `text` is the arrow's label (none when blank).
+                        label: (!txt.trim().is_empty()).then(|| txt.clone()),
                     };
                     n.style = style;
                     n.name = name.clone().unwrap_or_else(|| "Arrow".into());
@@ -2540,6 +2549,11 @@ fn set_text_content(ed: &mut Editor, a: &Args) -> ToolResult {
         },
         |tx, id, t| {
             let node = tx.node_mut(id).unwrap();
+            // An arrow's label, exactly as given; blank text removes it (the arrow stays).
+            if let NodeKind::Connector { label, .. } = &mut node.kind {
+                *label = (!t.trim().is_empty()).then(|| t.clone());
+                return Ok(());
+            }
             let old_len = node.kind.text().map(|s| s.chars().count()).ok_or_else(|| {
                 format!(
                     "{} is a {}, not a text layer",

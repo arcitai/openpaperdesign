@@ -9,7 +9,7 @@ impl Editor {
     fn text_len(&self, id: NodeId) -> usize {
         self.doc
             .get(id)
-            .and_then(|n| n.kind.text())
+            .and_then(|n| n.kind.edit_text())
             .map_or(0, |t| t.chars().count())
     }
 
@@ -29,7 +29,7 @@ impl Editor {
         let n_new = s.chars().count();
         let mut caret = te.caret;
         if let Some(n) = self.tx().node_mut(te.id)
-            && let Some(text) = n.kind.text_mut()
+            && let Some(text) = n.kind.edit_text_mut()
         {
             // Replacement text takes the style of the first replaced character.
             let mut inherit: Option<TextSpan> = None;
@@ -76,7 +76,7 @@ impl Editor {
             return;
         }
         if let Some(n) = self.tx().node_mut(te.id)
-            && let Some(text) = n.kind.text_mut()
+            && let Some(text) = n.kind.edit_text_mut()
         {
             let (ba, bb) = (byte_at(text, a), byte_at(text, b));
             text.replace_range(ba..bb, "");
@@ -193,6 +193,16 @@ impl Editor {
     }
 
     fn style_text_with(&mut self, field: &str, coalesce: bool, f: impl Fn(&mut TextSpan)) {
+        // An arrow's label is plain text in the arrow's style: no character styles.
+        let label = self.text_edit.as_ref().is_some_and(|te| {
+            matches!(
+                self.doc.get(te.id).map(|n| &n.kind),
+                Some(NodeKind::Connector { .. })
+            )
+        });
+        if label {
+            return;
+        }
         if let (Some(te), Some((a, b))) = (self.text_edit.clone(), self.text_selection()) {
             {
                 let mut tx = self.tx();

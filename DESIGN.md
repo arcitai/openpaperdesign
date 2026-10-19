@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 10 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 11 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -156,9 +156,26 @@ The principles:
       shape where it was. A label too tall for its shape even so overflows it; it is never
       clipped.
     - Other groups (several shapes, nested groups) keep ordinary group behaviour.
+    - **Arrow labels** (source candidate, not yet independently reviewed or qualified natively).
+      An arrow can carry its own label, part of the arrow rather than a separate text layer.
+      - A double-click on the arrow, or Enter with it selected, edits the label in place.
+        Escape or a click elsewhere keeps it; emptying it removes it. Each edit is one undo
+        step.
+      - It sits at the middle of the line as drawn (curves and elbows included), on a small
+        backing in the canvas colour, in the arrow's colour. It moves whenever the arrow
+        reroutes. Light and Dark show it as they show the canvas; the saved colours don't
+        change.
+      - It is copied, duplicated, pasted, saved, reopened and exported (SVG, PDF) with its
+        arrow. Agents set and read it through the same design tools.
+      - Labels are plain text: no character styles. A labelled straight arrow has no middle
+        bend handle (its Type still makes it curved).
+      - **Compatibility.** A page with a label is saved in a newer page version, which an
+        older OpenPaperDesign refuses to open rather than silently dropping the label. Pages
+        without labels are unchanged. A single `.paper-rs` file can't hold labels: saving one
+        is refused.
 
 Still open from the revision 2 plan (not built yet, and not to be described as built):
-- connector labels (attached to an arrow) and the rest of the diagram workflow;
+- the rest of the diagram workflow (and any native qualification of the labels);
 - the project Design system source;
 - the guide and value editor and Apply.
 

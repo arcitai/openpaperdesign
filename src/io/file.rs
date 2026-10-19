@@ -77,7 +77,18 @@ pub fn from_str(s: &str) -> Result<(Document, Option<Camera>), FileError> {
 }
 
 /// Write atomically (temp file + rename) so a crash never leaves a truncated document.
+///
+/// This single-file format is version 1, which has no arrow labels: a document with a label is
+/// refused (nothing is written) rather than saved where a reader would read past its labels or
+/// refuse them. Projects keep labels (page version 4).
 pub fn save(path: &Path, doc: &Document, camera: Option<&Camera>) -> Result<(), FileError> {
+    if doc.nodes.values().any(|n| n.kind.label().is_some()) {
+        return Err(FileError::Invalid(
+            "arrow labels can't be saved in a single .paper-rs file; keep the canvas in a \
+             project instead. Nothing was written."
+                .into(),
+        ));
+    }
     let tmp = path.with_extension("paper-rs.tmp");
     std::fs::write(&tmp, to_string(doc, camera)).map_err(FileError::Io)?;
     std::fs::rename(&tmp, path).map_err(FileError::Io)

@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use paper_rs::editor::shortcuts::Action;
-use paper_rs::editor::{Button, Editor, InputEvent, Tool};
+use paper_rs::editor::{Button, Editor, InputEvent, Key, Modifiers, Tool};
 use paper_rs::geom::{Rect, V2, v2};
 use paper_rs::model::{Color, Node, NodeId, NodeKind, Route, TextAlign};
 
@@ -572,14 +572,17 @@ fn a_grouped_diagram_saves_reopens_and_exports_with_its_labels_and_bindings() {
     assert_ne!(paper_rs::io::pdf::export(&pages2), pdf);
 }
 
-/// Connector labels don't exist yet (see the writer100 handoff). This pins, on a disposable
-/// page, the two facts a future label must be designed around: today's reader accepts an
-/// unknown connector field and silently drops it on its next save (optional-field acceptance
-/// is no safety), and it refuses a newer page version outright (the existing admission a
-/// labelled page can use). A label implementation must change this test deliberately.
+/// Arrow labels and the page format (changed deliberately with the labels: until then this test
+/// pinned that a reader without labels accepts a `label` on a v3 connector and drops it on its
+/// next save, as the retained old603 production reader does, and refuses a newer version).
+/// Now: an unlabelled page keeps exactly its v3 bytes; a labelled one is written as v4, which
+/// that old reader refuses before editing instead of losing the label; and this reader refuses
+/// a label in a page that says v3, rather than reading what an older reader would have lost.
 #[test]
-fn connector_label_baseline_an_unknown_field_is_dropped_and_a_newer_page_is_refused() {
-    use paper_rs::project::format::{FormatError, PAGE_VERSION, page_from_json, page_to_json};
+fn connector_label_format_an_unlabelled_page_stays_v3_and_a_label_needs_v4() {
+    use paper_rs::project::format::{
+        FormatError, PAGE_VERSION, PAGE_VERSION_LABELS, page_from_json, page_to_json,
+    };
     let mut e = editor(1000.0, 700.0);
     let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
     let b = rect(&mut e, 500.0, 100.0, 160.0, 80.0);
@@ -588,6 +591,7 @@ fn connector_label_baseline_an_unknown_field_is_dropped_and_a_newer_page_is_refu
     let saved = page_to_json(&e.page_data(0));
     let mut v: serde_json::Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(v["version"], serde_json::json!(PAGE_VERSION));
+    assert!(!saved.contains("\"label\""), "no label key without a label");
     let nodes = v["nodes"].as_array_mut().unwrap();
     let c = nodes
         .iter_mut()
@@ -595,19 +599,30 @@ fn connector_label_baseline_an_unknown_field_is_dropped_and_a_newer_page_is_refu
         .unwrap();
     assert_eq!(c["type"], "connector");
     c["label"] = serde_json::json!("writes to");
-    let with_label = serde_json::to_string(&v).unwrap();
-    let read = page_from_json(&with_label).unwrap();
-    assert_eq!(
-        read.doc.nodes, e.doc.nodes,
-        "everything else reads as before"
-    );
+    // A label in a page that says v3: refused, never read and never dropped.
+    let v3 = serde_json::to_string(&v).unwrap();
+    assert!(matches!(page_from_json(&v3), Err(FormatError::Invalid(_))));
+    // At v4 it is read, and written back exactly.
+    v["version"] = serde_json::json!(PAGE_VERSION_LABELS);
+    let v4 = serde_json::to_string(&v).unwrap();
+    let read = page_from_json(&v4).unwrap();
+    assert_eq!(read.doc.get(arrow).unwrap().kind.label(), Some("writes to"));
     let again = page_to_json(&read);
-    assert!(!again.contains("writes to"), "the unknown label is dropped");
-    // A newer page version is refused, not misread.
-    v["version"] = serde_json::json!(PAGE_VERSION + 1);
+    assert!(again.contains("\"version\": 4") && again.contains("\"label\": \"writes to\""));
+    assert_eq!(page_to_json(&page_from_json(&again).unwrap()), again);
+    // Everything else reads as the unlabelled page did.
+    let mut unlabelled = read.doc.nodes.clone();
+    if let NodeKind::Connector { label, .. } = &mut unlabelled.get_mut(&arrow).unwrap().kind {
+        *label = None;
+    }
+    assert_eq!(unlabelled, e.doc.nodes);
+    // A newer page version is still refused, not misread.
+    v["version"] = serde_json::json!(PAGE_VERSION_LABELS + 1);
     let newer = serde_json::to_string(&v).unwrap();
-    let refused = page_from_json(&newer);
-    assert!(matches!(refused, Err(FormatError::TooNew { .. })));
+    assert!(matches!(
+        page_from_json(&newer),
+        Err(FormatError::TooNew { .. })
+    ));
 }
 
 /// A click at `p` (screen = world: zoom 1, no pan).
@@ -843,4 +858,582 @@ fn an_agent_reads_the_layers_an_arrow_is_bound_to_through_edits_delete_and_undo(
     assert_eq!(v["endNodeId"], json!(b));
     assert_eq!(v["endAnchor"], anchor);
     assert_eq!(v["points"], edited);
+}
+
+// ---- arrow labels: text attached to the arrow itself (the Connector's `label`) ----
+
+fn label_of(e: &Editor, id: NodeId) -> Option<String> {
+    e.doc.get(id)?.kind.label().map(String::from)
+}
+
+/// The centre of an arrow's label box (world), if it has a label.
+fn label_centre(e: &Editor, id: NodeId) -> Option<V2> {
+    let n = e.doc.get(id)?;
+    paper_rs::render::draw::label_rect(n, world(e, id)).map(|r| r.center())
+}
+
+/// The middle of an arrow's line as drawn (world).
+fn line_middle(e: &Editor, id: NodeId) -> V2 {
+    let (pts, _, _, route) = conn(e, id);
+    paper_rs::connector::midpoint(&pts, route).unwrap()
+}
+
+/// Type `text` as an arrow's label through the editor's own text editing (Enter's command,
+/// typing, Escape).
+fn type_label(e: &mut Editor, arrow: NodeId, text: &str) {
+    e.selection = vec![arrow];
+    e.run(Action::EditText);
+    assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    e.handle(InputEvent::Text(text.into()));
+    key(e, Key::Escape, Modifiers::NONE);
+}
+
+/// A label is typed on the canvas into the arrow itself: a double-click on the arrow, typing,
+/// Escape; one undo step, the same bound arrow. It sits on the middle of the line, is part of
+/// the arrow for a press, and follows the line when its target moves. Enter edits it; clearing
+/// it removes the label (the arrow stays) in one undo step.
+#[test]
+fn an_arrow_label_is_typed_on_the_canvas_follows_its_line_and_clears_in_one_step() {
+    use paper_rs::editor::hit::hit_test;
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)));
+    let mid = line_middle(&e, arrow);
+    let above = mid + v2(0.0, -9.0);
+    assert_eq!(
+        hit_test(&e.doc, above, 1.0),
+        None,
+        "control: nothing there yet"
+    );
+    e.selection = vec![arrow];
+    let bend = |e: &Editor| e.connector_handles().iter().any(|(i, _)| *i == 2);
+    assert!(bend(&e), "control: an unlabelled arrow's bend handle");
+    // A double-click on the arrow, typing and Escape.
+    e.selection.clear();
+    let steps = e.history.undo_len();
+    click(&mut e, mid, 1000.0);
+    assert_eq!(e.selection, vec![arrow]);
+    click(&mut e, mid, 1100.0);
+    assert_eq!(
+        e.text_edit.as_ref().map(|te| te.id),
+        Some(arrow),
+        "its label is edited"
+    );
+    e.handle(InputEvent::Text("writes to".into()));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert!(e.text_edit.is_none());
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("writes to"));
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)), "the same arrow, bound");
+    assert!(
+        label_centre(&e, arrow).unwrap().dist(mid) < 1e-6,
+        "on the middle"
+    );
+    assert_eq!(
+        hit_test(&e.doc, above, 1.0),
+        Some(arrow),
+        "part of the arrow"
+    );
+    e.selection = vec![arrow];
+    assert!(!bend(&e), "no bend handle under the label");
+    // The target moves: the arrow reroutes and the label follows the new middle.
+    e.selection = vec![b];
+    let p = world(&e, b).min() + v2(20.0, 20.0);
+    ev_drag(&mut e, p, p + v2(0.0, 240.0), 2000.0, true);
+    let moved = line_middle(&e, arrow);
+    assert!(moved.dist(mid) > 50.0, "{mid:?} -> {moved:?}");
+    assert!(label_centre(&e, arrow).unwrap().dist(moved) < 1e-6);
+    e.run(Action::Undo);
+    assert!(
+        label_centre(&e, arrow).unwrap().dist(mid) < 1e-6,
+        "undo: back with its line"
+    );
+    // Enter edits it with all of it selected, so typing replaces it.
+    type_label(&mut e, arrow, "reads");
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("reads"));
+    // Cleared: the label goes, the arrow stays, one undo step; Undo and Redo are exact.
+    let labelled = e.doc.clone();
+    let steps = e.history.undo_len();
+    e.selection = vec![arrow];
+    e.run(Action::EditText);
+    key(&mut e, Key::Backspace, Modifiers::NONE);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow), None);
+    assert_eq!(ends(&e, arrow), (Some(a), Some(b)), "the arrow stays");
+    assert_eq!(e.history.undo_len(), steps + 1);
+    let cleared = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(e.doc, labelled);
+    e.run(Action::Redo);
+    assert_eq!(e.doc, cleared);
+    // An edit begun and left empty leaves the arrow as it was.
+    e.selection = vec![arrow];
+    e.run(Action::EditText);
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(e.doc, cleared);
+    e.doc.validate().unwrap();
+}
+
+/// A labelled arrow is an ordinary node for every copy: Duplicate copies it with its label and
+/// rebinds it to the copied shapes; a paste on another page keeps the label. Saved, the page
+/// is v4 and reopens with the label, which still follows a move; SVG and PDF draw it.
+#[test]
+fn a_labelled_arrow_is_copied_saved_reopened_and_exported_with_its_label() {
+    use paper_rs::project::format::{page_from_json, page_to_json};
+    let mut e = editor(1400.0, 900.0);
+    e.snapping = false;
+    let (ga, ra, _) = label_group(&mut e, Rect::new(100.0, 100.0, 200.0, 100.0), "Service");
+    let (gb, rb, _) = label_group(&mut e, Rect::new(600.0, 100.0, 200.0, 100.0), "Queue");
+    let (from, to) = (world(&e, ra).center(), world(&e, rb).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "publishes");
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("publishes"));
+    // Duplicate the whole diagram: the copied arrow has the label and binds the copies.
+    e.selection = vec![ga, gb, arrow];
+    e.run(Action::Duplicate);
+    let copy = arrow_in(&e, &e.selection.clone());
+    assert_ne!(copy, arrow);
+    assert_eq!(label_of(&e, copy).as_deref(), Some("publishes"));
+    let (s, en) = ends(&e, copy);
+    assert!(
+        s.is_some_and(|x| x != ra) && en.is_some_and(|x| x != rb),
+        "{s:?} {en:?}"
+    );
+    assert!(label_centre(&e, copy).unwrap().dist(line_middle(&e, copy)) < 1e-6);
+    e.run(Action::Undo);
+    // Copy to another page: the label goes with it (the end not copied is let go).
+    e.selection = vec![ga, arrow];
+    e.run(Action::Copy);
+    let first = e.active_page;
+    e.add_page();
+    e.run(Action::Paste);
+    let pasted = arrow_in(&e, &e.selection.clone());
+    assert_eq!(label_of(&e, pasted).as_deref(), Some("publishes"));
+    assert_eq!(ends(&e, pasted).1, None);
+    e.switch_page(first);
+
+    // Saved as v4; reopened, the label is there and follows a move.
+    let saved = page_to_json(&e.page_data(first));
+    assert!(saved.contains("\"version\": 4"), "a labelled page");
+    let back = page_from_json(&saved).unwrap();
+    assert_eq!(back.doc.nodes, e.doc.nodes, "every node, exactly");
+    let mut r = editor(1400.0, 900.0);
+    r.open_pages(vec![back], None);
+    r.camera = e.camera;
+    r.snapping = false;
+    assert_eq!(label_of(&r, arrow).as_deref(), Some("publishes"));
+    let before = label_centre(&r, arrow).unwrap();
+    r.selection = vec![gb];
+    ev_drag(&mut r, v2(620.0, 120.0), v2(620.0, 420.0), 0.0, true);
+    let after = label_centre(&r, arrow).unwrap();
+    assert!(after.dist(before) > 50.0);
+    assert!(after.dist(line_middle(&r, arrow)) < 1e-6);
+
+    // SVG: the arrow's own element names the label and draws it (a backing and glyph outlines
+    // besides its line and head); without the label it doesn't.
+    let svg = paper_rs::io::svg::export(&e.doc, None, None).unwrap();
+    assert!(svg.contains("aria-label=\"publishes\""));
+    let element = |svg: &str| {
+        let at = svg.find(&format!("<g id=\"n{}\"", arrow.0)).unwrap();
+        let end = at + svg[at..].find("</g>").unwrap();
+        svg[at..end].to_string()
+    };
+    let mut plain = e.doc.clone();
+    if let NodeKind::Connector { label, .. } = &mut plain.nodes.get_mut(&arrow).unwrap().kind {
+        *label = None;
+    }
+    let svg_plain = paper_rs::io::svg::export(&plain, None, None).unwrap();
+    let (with, without) = (element(&svg), element(&svg_plain));
+    assert!(with.contains("fill=\"#ffffff\""), "the backing: {with}");
+    assert!(
+        with.matches("<path").count() >= without.matches("<path").count() + 2,
+        "the backing and the glyphs: {with}\n{without}"
+    );
+    assert!(!without.contains("aria-label"));
+    // PDF draws the same ops: the label changes the file.
+    let pdf = |doc: &paper_rs::model::Document| {
+        let pages = paper_rs::io::pdf::pages_for(doc, None, false, None);
+        paper_rs::io::pdf::export(&pages)
+    };
+    assert_ne!(pdf(&e.doc), pdf(&plain));
+    e.doc.validate().unwrap();
+}
+
+/// An agent sets and reads an arrow's label with the existing upstream tools: create_shape's
+/// `text`, get_node_info's `label`, get_tree_summary, set_text_content (exact text; empty
+/// removes it) and undo. A rectangle still isn't a text layer (control).
+#[test]
+fn an_agent_creates_reads_sets_and_clears_an_arrow_label() {
+    use paper_rs::mcp::{Out, exec};
+    use serde_json::{Value, json};
+    let root = std::env::temp_dir().join("opd-diagrams-mcp-labels-unused");
+    let mut host = exec::SessionHost::new(paper_rs::project::Store { root });
+    let mut call = |tool: &str, args: Value| -> String {
+        match exec::call(&mut host, tool, &args) {
+            Ok(out) => match &out[..] {
+                [Out::Text(t), ..] => t.clone(),
+                o => panic!("{tool}: {o:?}"),
+            },
+            Err(e) => panic!("{tool}: {e}"),
+        }
+    };
+    let id = |out: String| -> String {
+        let v: Value = serde_json::from_str(&out).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+    let box_at =
+        |x: f64| json!({"type": "rectangle", "x": x, "y": 100, "width": 160, "height": 80});
+    let a = id(call("create_shape", box_at(100.0)));
+    let b = id(call("create_shape", box_at(500.0)));
+    let arrow = id(call(
+        "create_shape",
+        json!({"type": "arrow", "startNodeId": a, "endNodeId": b, "text": "writes to"}),
+    ));
+    let info = |call: &mut dyn FnMut(&str, Value) -> String, n: &str| -> Value {
+        serde_json::from_str(&call("get_node_info", json!({"nodeId": n}))).unwrap()
+    };
+    let v = info(&mut call, &arrow);
+    assert_eq!(v["label"], "writes to");
+    assert_eq!(v["startNodeId"], json!(a));
+    assert_eq!(v["endNodeId"], json!(b));
+    let tree = call("get_tree_summary", json!({"nodeId": "root"}));
+    assert!(
+        tree.contains(&format!("\"writes to\" from [{a}] to [{b}]")),
+        "{tree}"
+    );
+    let set = |call: &mut dyn FnMut(&str, Value) -> String, t: &str| {
+        call(
+            "set_text_content",
+            json!({"updates": [{"nodeId": arrow, "textContent": t}]}),
+        );
+    };
+    set(&mut call, "  reads  ");
+    assert_eq!(info(&mut call, &arrow)["label"], "  reads  ", "exactly");
+    set(&mut call, "");
+    let v = info(&mut call, &arrow);
+    assert_eq!(v["label"], Value::Null, "removed");
+    assert_eq!(v["type"], "Arrow", "the arrow stays");
+    assert_eq!(v["endNodeId"], json!(b));
+    call("undo", json!({}));
+    assert_eq!(info(&mut call, &arrow)["label"], "  reads  ");
+    drop(call);
+    let e = exec::call(
+        &mut host,
+        "set_text_content",
+        &json!({"updates": [{"nodeId": a, "textContent": "x"}]}),
+    )
+    .unwrap_err();
+    assert!(e.contains("not a text layer"), "{e}");
+}
+
+/// R37-F1: shrinking a label group and growing it back, with no Undo in between, gives the
+/// label its one line again every time: a label that grew to fit its text keeps that policy
+/// while it is wrapped. One undo step per resize; the text, font and style never change. A
+/// width the person chose stays chosen through the same cycles (control).
+#[test]
+fn a_label_shrunk_and_grown_again_without_undo_returns_to_one_line_every_cycle() {
+    let mut e = editor(1400.0, 1000.0);
+    e.snapping = false;
+    let r0 = Rect::new(100.0, 100.0, 240.0, 120.0);
+    let small = Rect::new(100.0, 100.0, 120.0, 60.0);
+    let (g, r, t) = label_group(&mut e, r0, "Payments API");
+    let fresh = e.doc.get(t).unwrap().clone();
+    let text0 = text_of(&e, t);
+    let lines = |e: &Editor, t: NodeId| {
+        paper_rs::text::layout_node(e.doc.get(t).unwrap())
+            .unwrap()
+            .lines
+            .len()
+    };
+    let resize = |e: &mut Editor, g: NodeId, size: V2, at: f64| {
+        e.selection = vec![g];
+        let b = world(e, g);
+        ev_drag(e, v2(b.right(), b.bottom()), b.min() + size, at, true);
+    };
+    for cycle in 0..3 {
+        let at = 10_000.0 * cycle as f64;
+        let steps = e.history.undo_len();
+        resize(&mut e, g, v2(120.0, 60.0), at);
+        assert_eq!(world(&e, r), small, "{cycle}");
+        assert_eq!(lines(&e, t), 2, "{cycle}: wrapped at its space");
+        assert!(small.contains_rect(&world(&e, t)), "{cycle}: on its shape");
+        resize(&mut e, g, v2(240.0, 120.0), at + 1000.0);
+        assert_eq!(world(&e, r), r0, "{cycle}");
+        assert_eq!(
+            e.history.undo_len(),
+            steps + 2,
+            "{cycle}: one step per resize"
+        );
+        assert_eq!(lines(&e, t), 1, "{cycle}: one line again");
+        let n = e.doc.get(t).unwrap();
+        assert_eq!(text_of(&e, t), text0, "{cycle}");
+        assert_eq!(n.text_style, fresh.text_style, "{cycle}");
+        assert!(
+            matches!(
+                n.kind,
+                NodeKind::Text {
+                    auto_width: true,
+                    ..
+                }
+            ),
+            "{cycle}: it grows to fit its text again"
+        );
+        assert!(
+            (n.rect.w - fresh.rect.w).abs() < 0.5,
+            "{cycle}: {:?}",
+            n.rect
+        );
+        assert!(
+            world(&e, t).center().dist(r0.center()) < 0.5,
+            "{cycle}: centred"
+        );
+    }
+    // Undo and Redo of the last grow are exact (the wrapped state, then one line).
+    let big = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(lines(&e, t), 2);
+    e.run(Action::Redo);
+    assert_eq!(e.doc, big);
+    // Control: a width the person chose (here 100) is kept through shrink and grow alike.
+    let (g2, r2, t2) = label_group(
+        &mut e,
+        Rect::new(500.0, 100.0, 240.0, 120.0),
+        "Payments API",
+    );
+    paper_rs::ui::inspector::apply(&mut e, "fixed width", &[t2], |n| {
+        n.rect.w = 100.0;
+        if let NodeKind::Text { auto_width, .. } = &mut n.kind {
+            *auto_width = false;
+        }
+    });
+    let chosen = e.doc.get(t2).unwrap().clone();
+    for cycle in 0..2 {
+        let at = 100_000.0 + 10_000.0 * cycle as f64;
+        resize(&mut e, g2, v2(120.0, 60.0), at);
+        assert!(
+            (world(&e, t2).w - 100.0).abs() < 0.01,
+            "{cycle}: kept when shrunk"
+        );
+        resize(&mut e, g2, v2(360.0, 180.0), at + 1000.0);
+        assert_eq!(world(&e, r2).w, 360.0);
+        assert!(
+            (world(&e, t2).w - 100.0).abs() < 0.01,
+            "{cycle}: kept when grown"
+        );
+        let n = e.doc.get(t2).unwrap();
+        assert!(matches!(
+            n.kind,
+            NodeKind::Text {
+                auto_width: false,
+                ..
+            }
+        ));
+        assert_eq!(n.text_style, chosen.text_style);
+    }
+    e.doc.validate().unwrap();
+}
+
+/// A label's width policy is its explicit sizing, never its measured width. A width the
+/// person fixed is kept even at exactly its natural width or its widest wrapped line; an
+/// automatic wrap is recorded as the existing `Sizing::Hug` (it hugs its lines), survives save
+/// and reopen, and grows back to one line; explicit Fixed and Hug choices after a wrap, and a
+/// numeric width over MCP, take effect.
+#[test]
+fn a_label_s_width_policy_is_its_explicit_sizing_through_wraps_saves_and_choices() {
+    use paper_rs::model::Sizing;
+    use paper_rs::project::format::{page_from_json, page_to_json};
+    use paper_rs::ui::inspector::apply;
+    let resize = |e: &mut Editor, g: NodeId, size: V2, at: f64| {
+        e.selection = vec![g];
+        let b = world(e, g);
+        ev_drag(e, v2(b.right(), b.bottom()), b.min() + size, at, true);
+    };
+    let lines = |e: &Editor, t: NodeId| {
+        paper_rs::text::layout_node(e.doc.get(t).unwrap())
+            .unwrap()
+            .lines
+            .len()
+    };
+    let auto = |e: &Editor, t: NodeId| {
+        matches!(
+            e.doc.get(t).unwrap().kind,
+            NodeKind::Text {
+                auto_width: true,
+                ..
+            }
+        )
+    };
+    let sizing = |e: &Editor, t: NodeId| e.doc.get(t).unwrap().layout_child.sizing[0];
+    let fixed = |n: &mut Node| {
+        n.layout_child.sizing[0] = Sizing::Fixed;
+        if let NodeKind::Text { auto_width, .. } = &mut n.kind {
+            *auto_width = false;
+        }
+    };
+    let mut e = editor(1400.0, 1000.0);
+    e.snapping = false;
+
+    // Fixed at its natural width (the inspector's Fixed, nothing else changed): kept.
+    let (g, r, t) = label_group(
+        &mut e,
+        Rect::new(100.0, 100.0, 240.0, 120.0),
+        "Payments API",
+    );
+    let natural = world(&e, t).w;
+    apply(&mut e, "Fixed", &[t], fixed);
+    resize(&mut e, g, v2(480.0, 240.0), 0.0);
+    assert_eq!(world(&e, r).w, 480.0);
+    assert!(
+        (world(&e, t).w - natural).abs() < 0.01,
+        "kept at the chosen width"
+    );
+    assert!(!auto(&e, t) && sizing(&e, t) == Sizing::Fixed);
+
+    // An automatic wrap is recorded as Hug, and is saved and reopened as such.
+    let (g2, _, t2) = label_group(
+        &mut e,
+        Rect::new(100.0, 500.0, 240.0, 120.0),
+        "Payments API",
+    );
+    resize(&mut e, g2, v2(120.0, 60.0), 1000.0);
+    assert_eq!(lines(&e, t2), 2);
+    assert!(
+        !auto(&e, t2) && sizing(&e, t2) == Sizing::Hug,
+        "wrapped, still fitting"
+    );
+    let saved = page_to_json(&e.page_data(0));
+    assert!(
+        saved.contains("\"version\": 3"),
+        "an existing field: no new version"
+    );
+    let back = page_from_json(&saved).unwrap();
+    assert_eq!(back.doc.nodes, e.doc.nodes, "exactly, sizing included");
+    let mut re = editor(1400.0, 1000.0);
+    re.open_pages(vec![back], None);
+    re.camera = e.camera;
+    re.snapping = false;
+    resize(&mut re, g2, v2(240.0, 120.0), 0.0);
+    assert_eq!(lines(&re, t2), 1, "reopened, it grows back to one line");
+    assert!(auto(&re, t2));
+
+    // After a wrap, an explicit Fixed at the wrapped width (its widest line) is kept.
+    let widest = world(&e, t2).w;
+    apply(&mut e, "Fixed", &[t2], fixed);
+    resize(&mut e, g2, v2(240.0, 120.0), 2000.0);
+    assert!(
+        (world(&e, t2).w - widest).abs() < 0.01,
+        "kept at its widest line"
+    );
+    assert_eq!(lines(&e, t2), 2);
+    assert!(!auto(&e, t2) && sizing(&e, t2) == Sizing::Fixed);
+    // ...and an explicit Hug (the inspector's: hug, auto width) makes it fit its text again.
+    apply(&mut e, "Hug", &[t2], |n| {
+        n.layout_child.sizing[0] = Sizing::Hug;
+        if let NodeKind::Text { auto_width, .. } = &mut n.kind {
+            *auto_width = true;
+        }
+    });
+    resize(&mut e, g2, v2(260.0, 130.0), 3000.0);
+    assert_eq!(lines(&e, t2), 1);
+    assert!((world(&e, t2).w - natural).abs() < 0.5);
+    e.doc.validate().unwrap();
+
+    // A numeric width over MCP is an explicit Fixed too, after a wrap.
+    use paper_rs::mcp::exec;
+    use serde_json::json;
+    let root = std::env::temp_dir().join("opd-diagrams-label-policy-unused");
+    let mut h = exec::SessionHost::new(paper_rs::project::Store { root });
+    h.ed = editor(1400.0, 1000.0);
+    h.ed.snapping = false;
+    let (g3, _, t3) = label_group(
+        &mut h.ed,
+        Rect::new(100.0, 100.0, 240.0, 120.0),
+        "Payments API",
+    );
+    resize(&mut h.ed, g3, v2(120.0, 60.0), 0.0);
+    assert_eq!(sizing(&h.ed, t3), Sizing::Hug);
+    exec::call(
+        &mut h,
+        "update_styles",
+        &json!({"updates": [{"nodeIds": [t3.0.to_string()], "styles": {"width": 100}}]}),
+    )
+    .unwrap();
+    assert!(!auto(&h.ed, t3) && sizing(&h.ed, t3) == Sizing::Fixed);
+    resize(&mut h.ed, g3, v2(240.0, 120.0), 1000.0);
+    assert!(
+        (world(&h.ed, t3).w - 100.0).abs() < 0.01,
+        "the agent's width is kept"
+    );
+}
+
+/// A double-click on the middle of an arrow that is already selected edits its label: the
+/// first click lands on the bend handle, and a press there bends nothing until it becomes a
+/// drag. Only the label changes, in one undo step. A real drag from the handle still bends the
+/// arrow (control), and a press that moves less than the drag threshold doesn't.
+#[test]
+fn a_double_click_on_a_selected_arrow_edits_its_label_without_bending_it_and_a_drag_still_bends() {
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    assert_eq!(e.selection, vec![arrow], "drawing leaves it selected");
+    let before = conn(&e, arrow);
+    let steps = e.history.undo_len();
+    let mid = line_middle(&e, arrow);
+    let handle = |e: &Editor| {
+        e.connector_handles()
+            .into_iter()
+            .find(|(i, _)| *i == 2)
+            .map(|(_, p)| p)
+    };
+    assert!(
+        handle(&e).unwrap().dist(mid) < 1e-6,
+        "the bend handle is the middle"
+    );
+    click(&mut e, mid, 1000.0);
+    assert_eq!(
+        conn(&e, arrow),
+        before,
+        "a click on the middle bends nothing"
+    );
+    assert_eq!(e.history.undo_len(), steps, "and records nothing");
+    click(&mut e, mid, 1100.0);
+    assert_eq!(e.text_edit.as_ref().map(|te| te.id), Some(arrow));
+    e.handle(InputEvent::Text("writes".into()));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("writes"));
+    assert_eq!(conn(&e, arrow), before, "only the label changed");
+    assert_eq!(e.history.undo_len(), steps + 1, "one label edit");
+    // Control: a drag from an unlabelled arrow's bend handle still bends it, in one step.
+    let c = rect(&mut e, 100.0, 500.0, 160.0, 80.0);
+    let d = rect(&mut e, 600.0, 500.0, 160.0, 80.0);
+    let (from, to) = (world(&e, c).center(), world(&e, d).center());
+    let other = draw_arrow(&mut e, from, to, 2000.0);
+    let straight = conn(&e, other);
+    let h = handle(&e).unwrap();
+    let steps = e.history.undo_len();
+    ev_drag(&mut e, h, h + v2(0.0, -80.0), 3000.0, true);
+    let (pts, s, en, route) = conn(&e, other);
+    assert_eq!((route, pts.len()), (Route::Curved, 3), "bent");
+    assert!(
+        pts[1].dist(h + v2(0.0, -80.0)) < 1e-6,
+        "through the drag's end"
+    );
+    assert_eq!((s, en), (Some(c), Some(d)));
+    assert_eq!(e.history.undo_len(), steps + 1, "one bend step");
+    e.run(Action::Undo);
+    assert_eq!(conn(&e, other), straight);
+    // A press that stays within the drag threshold is a click: nothing bends.
+    e.selection = vec![other];
+    let steps = e.history.undo_len();
+    ev_drag(&mut e, h, h + v2(1.5, 1.5), 4000.0, true);
+    assert_eq!(conn(&e, other), straight);
+    assert_eq!(e.history.undo_len(), steps);
+    e.doc.validate().unwrap();
 }

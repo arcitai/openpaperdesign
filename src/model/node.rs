@@ -239,6 +239,12 @@ pub enum NodeKind {
         start_head: Head,
         #[serde(default = "arrow_head")]
         end_head: Head,
+        /// Text attached to the arrow, drawn at the middle of its line (`connector::midpoint`)
+        /// and moving with it. Absent when the arrow has none. A page with a label is written
+        /// as page version 4 (`project::format`), so readers that don't know labels refuse it
+        /// instead of dropping the label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Sticky note: a colored square whose text wraps inside it.
     Sticky {
@@ -333,6 +339,30 @@ impl NodeKind {
     pub fn text_mut(&mut self) -> Option<&mut String> {
         match self {
             NodeKind::Text { text, .. } | NodeKind::Sticky { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+    /// What the canvas's text editing works on: a text layer's or sticky note's text, or an
+    /// arrow's label (empty while it has none). Only text editing uses this; everything that
+    /// treats a layer as text ([`NodeKind::text`]: the inspector's typography, search, export
+    /// names) still sees text layers and sticky notes only.
+    pub fn edit_text(&self) -> Option<&str> {
+        match self {
+            NodeKind::Connector { label, .. } => Some(label.as_deref().unwrap_or("")),
+            k => k.text().map(String::as_str),
+        }
+    }
+    /// [`NodeKind::edit_text`], to change it. An arrow without a label gets an empty one.
+    pub fn edit_text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            NodeKind::Connector { label, .. } => Some(label.get_or_insert_with(String::new)),
+            k => k.text_mut(),
+        }
+    }
+    /// An arrow's label, if it has one.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            NodeKind::Connector { label, .. } => label.as_deref(),
             _ => None,
         }
     }

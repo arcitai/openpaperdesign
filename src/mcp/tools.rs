@@ -336,13 +336,14 @@ pub fn definitions() -> Vec<Value> {
              sketch, roughness (0 architect, 1 artist, 2 cartoonist), fillStyle (hachure, \
              cross-hatch, solid, zigzag, dots), strokeStyle (solid, dashed, dotted). Arrows also \
              take route (straight, curved, elbow) and startHead/endHead (none, arrow, triangle, \
-             dot, bar, diamond).",
+             dot, bar, diamond), and `text` as their label (drawn at the middle of the line and \
+             moving with it; get_node_info reports it as `label`).",
             json!({
                 "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "triangle", "polygon", "star", "line", "arrow", "sticky", "text"]},
                 "x": {"type": "number"}, "y": {"type": "number"},
                 "width": {"type": "number"}, "height": {"type": "number"},
                 "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
-                "text": {"type": "string", "description": "Text for sticky and text."},
+                "text": {"type": "string", "description": "Text for sticky and text; an arrow's label."},
                 "name": {"type": "string"},
                 "parentId": {"type": "string", "description": "Frame to place the shape in."},
                 "startNodeId": {"type": "string"}, "endNodeId": {"type": "string"},
@@ -373,7 +374,8 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "set_text_content",
-            "Set the text of one or more Text or Sticky nodes (batch).",
+            "Set the text of one or more Text or Sticky nodes, or the label of arrows (batch). An \
+             empty textContent removes an arrow's label (the arrow stays).",
             json!({"updates": {"type": "array", "items": {
                 "type": "object",
                 "properties": {"nodeId": {"type": "string"}, "textContent": {"type": "string"}},

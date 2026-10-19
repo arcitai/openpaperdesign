@@ -15,7 +15,8 @@
 //! partly imported. Import validates the whole file before anything is written. No record
 //! names a path: page files are `pages/<checked page id>.json` and images
 //! `assets/<content hash>.<ext>`. The contained manifest and pages must be exactly the current
-//! upstream formats (`paper-rs-project` version 1, `paper-rs-page` version 3), checked on the
+//! upstream formats (`paper-rs-project` version 1, `paper-rs-page` version 3, or 4 for a page
+//! with arrow labels, as upstream writes it), checked on the
 //! raw JSON before any upstream parsing or migration; older or legacy versions aren't
 //! supported in canvas files. Each page must also say nothing upstream's parser would drop:
 //! its JSON must match what upstream writes back from it (numbers by value, node order by id,
@@ -38,7 +39,8 @@
 use super::{MAX_ASSET_BYTES, MAX_ASSETS, MAX_MANIFEST_BYTES, MAX_PAGES, NewDocument, valid_id};
 use crate::{Kind, page_prefix, plain, valid_page_id};
 use paper_rs::project::format::{
-    PAGE_FORMAT, PAGE_VERSION, PROJECT_FORMAT, PROJECT_VERSION, page_from_json, page_to_json,
+    PAGE_FORMAT, PAGE_VERSION, PAGE_VERSION_LABELS, PROJECT_FORMAT, PROJECT_VERSION,
+    page_from_json, page_to_json,
 };
 use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData, PageRef};
 use serde_json::{Map, Value, json};
@@ -206,6 +208,25 @@ fn check_file_version(v: &Value, format: &str, version: u32, what: &str) -> Resu
         return Err(format!(
             "{what} must have version {version}, the current {format} version (older, newer or \
              malformed versions aren't supported in canvas files)"
+        ));
+    }
+    Ok(())
+}
+
+/// A contained page's raw `format` and `version`, as [`check_file_version`]: `paper-rs-page` 3,
+/// or 4, the version upstream writes only for a page with arrow labels. The write-back
+/// comparison then refuses a v4 page without a label (upstream writes it back as v3), and
+/// upstream itself refuses a label in a page that says v3, so neither kind of page is
+/// misread or loses anything.
+fn check_page_version(v: &Value, what: &str) -> Result<(), String> {
+    if v.get("format").and_then(Value::as_str) != Some(PAGE_FORMAT) {
+        return Err(format!("{what} isn't a {PAGE_FORMAT:?} file"));
+    }
+    let version = v.get("version").and_then(Value::as_u64);
+    if version != Some(u64::from(PAGE_VERSION)) && version != Some(u64::from(PAGE_VERSION_LABELS)) {
+        return Err(format!(
+            "{what} must have version {PAGE_VERSION}, or {PAGE_VERSION_LABELS} for a page with \
+             arrow labels (older, newer or malformed versions aren't supported in canvas files)"
         ));
     }
     Ok(())
@@ -407,7 +428,7 @@ fn page_record(i: usize, v: &Value, want: &PageRef, total: &mut usize) -> Result
             want.id
         ));
     }
-    check_file_version(v, PAGE_FORMAT, PAGE_VERSION, &format!("page record {i}"))?;
+    check_page_version(v, &format!("page record {i}"))?;
     count_nodes(v, &want.id, total)?;
     let mut page = page_from_json(&v.to_string()).map_err(|e| format!("page {}: {e}", want.id))?;
     check_tree(&page)?;
@@ -665,7 +686,7 @@ pub(crate) fn export(dir: &Path) -> Result<Exported, String> {
             let raw: Value =
                 serde_json::from_str(&text).map_err(|e| format!("page {}: {e}", r.id))?;
             check_keys(&text).map_err(|e| format!("page {}: {e}", r.id))?;
-            check_file_version(&raw, PAGE_FORMAT, PAGE_VERSION, &format!("page {}", r.id))?;
+            check_page_version(&raw, &format!("page {}", r.id))?;
             count_nodes(&raw, &r.id, &mut nodes)?;
             page_from_json(&text).map_err(|e| format!("page {}: {e}", r.id))?
         } else {
@@ -1048,11 +1069,12 @@ mod tests {
     fn contained_file_versions_must_be_the_current_ones_before_any_parsing() {
         let (_t, _dir, v) = exported();
         // Page versions upstream's migration would mis-handle (zero underflows, 2^32 + 2
-        // narrows to 2, a string or float would count as 1), older and newer ones alike.
+        // narrows to 2, a string or float would count as 1), older and newer ones alike. (4 is
+        // the labelled-page version: see the next test.)
         for bad in [
             json!(0),
             json!(2),
-            json!(4),
+            json!(5),
             json!(4_294_967_298_u64),
             json!("3"),
             json!(3.0),
@@ -1074,6 +1096,95 @@ mod tests {
         let mut x = v.clone();
         x["manifest"]["format"] = json!("paper-rs-page");
         refused(&x, "isn't a \"paper-rs-project\" file");
+    }
+
+    /// Arrow labels (page version 4): a labelled page is imported whole, label included; the
+    /// same label in a page that says version 3 (which an older reader would drop) and an
+    /// unlabelled page that says 4 (which upstream never writes) are refused, not rewritten.
+    #[test]
+    fn a_page_with_arrow_labels_is_version_4_and_nothing_else_is() {
+        use paper_rs::geom::{Rect, V2, v2};
+        use paper_rs::model::{Head, Node, NodeId, NodeKind, Route};
+        let (_t, _dir, v) = exported();
+        let with_arrow = |label: Option<&str>, version: u64| {
+            let mut x = v.clone();
+            let next = x["pages"][0]["next_id"].as_u64().unwrap();
+            let kind = NodeKind::Connector {
+                points: vec![V2::ZERO, v2(80.0, 0.0)],
+                start: None,
+                end: None,
+                route: Route::Straight,
+                start_head: Head::None,
+                end_head: Head::Arrow,
+                label: label.map(String::from),
+            };
+            let n = Node::new(NodeId(next), kind, Rect::new(10.0, 10.0, 80.0, 0.0));
+            let node = serde_json::to_value(&n).unwrap();
+            x["pages"][0]["nodes"].as_array_mut().unwrap().push(node);
+            x["pages"][0]["root"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(next));
+            x["pages"][0]["next_id"] = json!(next + 1);
+            x["pages"][0]["version"] = json!(version);
+            x
+        };
+        let doc = validate(&with_arrow(Some("writes  to"), 4).to_string()).unwrap();
+        let label = doc.pages[0]
+            .doc
+            .nodes
+            .values()
+            .find_map(|n| n.kind.label().map(String::from));
+        assert_eq!(label.as_deref(), Some("writes  to"), "the label, exactly");
+        refused(&with_arrow(Some("writes to"), 3), "needs page version 4");
+        refused(&with_arrow(None, 4), "version");
+        // Control: the same unlabelled arrow at version 3.
+        validate(&with_arrow(None, 3).to_string()).unwrap();
+        // A labelled canvas saved by upstream exports as version 4 and imports back whole.
+        let (_t2, dir, _) = canvas();
+        let p = paper_rs::project::Project::open(&dir).unwrap();
+        let id = p.manifest.pages[0].id.clone();
+        let mut page = p.load_page(&id).unwrap();
+        let aid = page.doc.alloc_id();
+        let kind = NodeKind::Connector {
+            points: vec![V2::ZERO, v2(60.0, 0.0)],
+            start: None,
+            end: None,
+            route: Route::Straight,
+            start_head: Head::None,
+            end_head: Head::Arrow,
+            label: Some("reads".into()),
+        };
+        page.doc
+            .nodes
+            .insert(aid, Node::new(aid, kind, Rect::new(0.0, 50.0, 60.0, 0.0)));
+        page.doc.root.push(aid);
+        p.save_page(&page).unwrap();
+        let e = export(&dir).unwrap();
+        let back = validate(&e.text).unwrap();
+        let labelled = back
+            .pages
+            .iter()
+            .find(|q| q.id == id)
+            .and_then(|q| q.doc.get(aid))
+            .and_then(|n| n.kind.label().map(String::from));
+        assert_eq!(labelled.as_deref(), Some("reads"));
+        let v: Value = serde_json::from_str(&e.text).unwrap();
+        let record = v["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == json!(id))
+            .unwrap();
+        assert_eq!(record["version"], json!(4), "only the labelled page");
+        assert!(
+            v["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["id"] != json!(id))
+                .all(|r| r["version"] == json!(3))
+        );
     }
 
     #[test]

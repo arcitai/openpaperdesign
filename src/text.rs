@@ -449,17 +449,45 @@ pub fn glyph_svg_path(gid: u16, origin: V2, font_size: f64) -> String {
 
 /// Inner padding of sticky notes.
 pub const STICKY_PAD: f64 = 16.0;
+/// Font size of an arrow's label.
+pub const LABEL_SIZE: f64 = 16.0;
 
-/// Where a node's text box starts inside the node.
+/// Where a node's text box starts inside the node. An arrow's label box is centred on the
+/// middle of its line (`connector::midpoint`), in the arrow's own (node-local) space.
 pub fn text_offset(n: &crate::model::Node) -> V2 {
-    match n.kind {
+    match &n.kind {
         crate::model::NodeKind::Sticky { .. } => v2(STICKY_PAD, STICKY_PAD),
+        crate::model::NodeKind::Connector {
+            points,
+            route,
+            label: Some(_),
+            ..
+        } => match (crate::connector::midpoint(points, *route), layout_node(n)) {
+            (Some(m), Some(l)) => m - v2(l.width * 0.5, l.height * 0.5),
+            _ => V2::ZERO,
+        },
         _ => V2::ZERO,
     }
 }
 
-/// Layout of a text node's (or sticky note's) content in its box (None for other kinds).
+/// Layout of a text node's (or sticky note's) content in its box, or of an arrow's label
+/// (centred lines, unwrapped, in the arrow's stroke colour); None for other kinds and for an
+/// arrow without a label.
 pub fn layout_node(n: &crate::model::Node) -> Option<TextLayout> {
+    if let crate::model::NodeKind::Connector {
+        label: Some(label), ..
+    } = &n.kind
+    {
+        let color = n.style.stroke.unwrap_or(Color::INK);
+        return Some(layout_rich(
+            label,
+            LABEL_SIZE,
+            color,
+            &n.text_style,
+            None,
+            TextAlign::Center,
+        ));
+    }
     if let crate::model::NodeKind::Sticky { text, font_size } = &n.kind {
         // Shrink the font (down to 12) until the text fits, like Excalidraw's sticky notes.
         let w = (n.rect.w - 2.0 * STICKY_PAD).max(10.0);
