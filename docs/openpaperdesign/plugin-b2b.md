@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-19: the one-app source candidate's `home-12` view (unqualified; `home-11`'s view plus the editor's labelled clipboard payload). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-19: the one-app source candidate's `home-13` view (unqualified; `home-12`'s view plus the labelled clipboard payload's R47 corrections). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -54,12 +54,14 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-12.html` (2026-10-19 source candidate, not
-  installed or natively accepted): the same view, HTML and layout unchanged, with the editor
-  that copies, cuts and pastes arrows with their labels through the clipboard, in a
-  versioned labelled layer payload an earlier reader only takes as plain text (a shared
-  upstream Editor change). The editor's WASM changed, so `home-11` is refused and a cached
-  `home-11` view can't pass for this one. `home-11` (2026-10-19) carried the editor whose
+- **View version.** `ui://openpaperdesign/home-13.html` (2026-10-19 source candidate, not
+  installed or natively accepted): the same view, HTML and layout unchanged, with the R47
+  corrections of the labelled clipboard payload (its images checked whole before any is
+  registered; a successful paste said in the status; a shared upstream Editor change). The
+  editor's WASM changed, so `home-12` is refused and a cached `home-12` view can't pass for
+  this one. `home-12` (2026-10-19) carried the editor that copies, cuts and pastes arrows
+  with their labels through the clipboard, in a versioned labelled layer payload an earlier
+  reader only takes as plain text. `home-11` (2026-10-19) carried the editor whose
   open text edit changes nothing once its layer is locked (typing, Enter, Backspace, Delete,
   styles, Cut and Paste refused there, and leaving it keeps an empty text or a blank label).
   `home-10` (2026-10-19) carried the corrected in-panel editor whose Paste while an arrow's
@@ -111,7 +113,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-11`, now `home-12`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-12`, now `home-13`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

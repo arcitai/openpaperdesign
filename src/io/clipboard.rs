@@ -302,8 +302,47 @@ fn decode_labelled(t: &str) -> Option<Content> {
     if let Err(why) = check_tree(&p) {
         return refused(why);
     }
-    register_assets(&p);
+    let images = match check_images(&p) {
+        Ok(images) => images,
+        Err(why) => return refused(why),
+    };
+    // Every image checked: only now is any registered (all of them, or none above).
+    for bytes in &images {
+        let _ = crate::assets::register(bytes);
+    }
     Some(Content::Layers(p))
+}
+
+/// The payload's images: every one its layers use is in it, and every one it holds is whole
+/// (its base64 exactly as `assets::base64` writes it, its bytes an image that decodes, their
+/// `assets::hash` the id it names). Checked for all of them before any is registered, so a
+/// payload is taken with all its images or refused with none, whatever their order; an image
+/// already registered under a claimed id never stands in for a bad or missing body. Returns
+/// the checked bytes.
+fn check_images(p: &Payload) -> Result<Vec<Vec<u8>>, String> {
+    for n in &p.nodes {
+        for f in &n.style.fills {
+            if let Paint::Image { asset, .. } = f
+                && !p.assets.contains_key(asset)
+            {
+                return Err(format!("an image they use isn't with them ({asset})"));
+            }
+        }
+    }
+    let mut images = Vec::with_capacity(p.assets.len());
+    for (id, b64) in &p.assets {
+        let bytes = crate::assets::base64_decode(b64)
+            .filter(|b| crate::assets::base64(b) == *b64)
+            .ok_or_else(|| format!("an image isn't valid base64 ({id})"))?;
+        if crate::assets::hash(&bytes) != *id {
+            return Err(format!("an image isn't the one it names ({id})"));
+        }
+        if image::load_from_memory(&bytes).is_err() {
+            return Err(format!("an image can't be read ({id})"));
+        }
+        images.push(bytes);
+    }
+    Ok(images)
 }
 
 /// The payload's layers are one whole forest: every id once, each root present (with its

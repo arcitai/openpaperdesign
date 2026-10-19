@@ -111,8 +111,10 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// blank label; a changed in-panel WASM editor again, HTML and layout unchanged); `home-12`
 /// carries the editor that copies, cuts and pastes arrows with their labels through the
 /// clipboard, in a versioned labelled payload (a changed in-panel WASM editor again, HTML and
-/// layout unchanged). No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-12.html";
+/// layout unchanged); `home-13` carries that payload's corrections (its images checked whole
+/// before any is registered, a successful paste said in the status; a changed in-panel WASM
+/// editor again, HTML and layout unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-13.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

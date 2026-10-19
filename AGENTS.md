@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.71 · Updated: 2026-10-19
+Revision: 0.72 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -353,15 +353,23 @@ engine architecture is `analysis/DESIGN.md`.
       before anything is registered or inserted: exactly version 1, only its known fields,
       readable `Payload`, and one consistent layer forest (every id once, roots present with
       their positions, children present and naming their parent, nothing left over; walked
-      iteratively). A payload is recognized by its top-level `type` member, read key by key
-      with serde (`Header`) as far as the text is JSON, so a cut-off one, one followed by
+      iteratively), and whole images (R47-F1, `check_images`): every image a layer's fill
+      uses is in the payload, and every image it holds has base64 exactly as
+      `assets::base64` writes it, bytes that decode as an image, and an `assets::hash` equal
+      to its claimed id. All are checked before any is registered, so a payload brings all
+      its images or none, in any order; an image already registered under a claimed id
+      doesn't stand in for a missing or bad body. (The unversioned legacy payload keeps its
+      earlier permissive image handling.) A payload is recognized by its top-level `type`
+      member, read key by key with serde (`Header`) as far as the text is JSON, so a cut-off one, one followed by
       more text, and any formatting or key order are recognized; a second top-level `type`
       or `version` is ambiguous. Text that only mentions the type stays ordinary text.
       Anything else of that type is `Content::Refused`: the editor says why and changes
       nothing (no layer, no text layer, no undo step, no image).
       An accepted payload pastes through the existing `insert_subtrees` (one undo step;
       bindings to copied shapes remapped, others let go of outside the same page, as for
-      every paste), so labels, groups and geometry are kept. Cut is the existing Cut: the
+      every paste), so labels, groups and geometry are kept, and says "Pasted N layer(s)" in
+      the editor status as every paste does (R47-F2: an earlier refusal's note no longer
+      stays after a successful paste; a pasted text says "Pasted text"). Cut is the existing Cut: the
       layers stay on the internal clipboard and Undo brings them back; the system clipboard
       write is the Provider's (not acknowledged, as for every Cut). Upstreamable as a feature
       with its format guard: upstream would have to adopt the labelled type and its label
@@ -538,7 +546,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-12.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-13.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -585,7 +593,12 @@ view can't pass for this one.
 `home-12` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 editor that copies, cuts and pastes labelled arrows through the clipboard (the labelled
 payload above). The editor's WASM changed again, so `home-11` is refused and a cached
-`home-11` view can't pass for this one. Not installed or natively accepted.
+`home-11` view can't pass for this one.
+
+`home-13` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+R47 corrections of that payload (whole images before any registration; a successful paste
+said in the status). The editor's WASM changed again, so `home-12` is refused and a cached
+`home-12` view can't pass for this one. Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

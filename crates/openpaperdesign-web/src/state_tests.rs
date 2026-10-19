@@ -4399,6 +4399,12 @@ fn browser_copy_cut_and_paste_events_carry_labelled_arrows_with_their_labels() {
     assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
     assert_eq!(t.ed.doc, pasted, "nothing pasted");
     assert_eq!(t.ed.history.undo_len(), steps);
+    // R47-F2: the next good paste says so; the refusal's note doesn't stay.
+    t.paste(&text);
+    assert_eq!(t.ed.status, "Pasted 1 layer(s)", "the paste is said");
+    assert_eq!(t.ed.history.undo_len(), steps + 1);
+    t.run(Action::Undo);
+    assert_eq!(t.ed.doc, pasted);
     // An edit left open on the pasted arrow, locked by the keys: no paste, no cut.
     t.ed.selection = vec![copy];
     press(&mut t, "Enter", "Enter");

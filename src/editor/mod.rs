@@ -2232,6 +2232,8 @@ impl Editor {
                             v2(d, d),
                             false,
                         );
+                        // Said as every paste says it (so an earlier refusal's note goes).
+                        self.status = format!("Pasted {} layer(s)", ids.len());
                         self.selection = ids;
                     }
                     Content::Foreign(nodes, what) => {
@@ -2259,6 +2261,7 @@ impl Editor {
                             .take(24)
                             .collect();
                         let id = self.add_node(n, None);
+                        self.status = "Pasted text".into();
                         self.selection = vec![id];
                     }
                     Content::Text(_) => {}

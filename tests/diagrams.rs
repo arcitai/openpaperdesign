@@ -1818,6 +1818,154 @@ fn labelled_clipboard_payloads_are_checked_whole_and_keep_their_labels_exactly()
     }
 }
 
+/// R47-F1/F2: a labelled clipboard payload's images are checked whole before any is registered
+/// or anything is pasted. A missing body, base64 that isn't exactly as written, bytes that
+/// aren't an image (the original failure: two layers pasted with a missing fill), bytes that
+/// aren't the image the id names (the original failure: unrelated content registered; here
+/// even with that id already registered) and a valid image beside an invalid one are each
+/// refused with a reason: no layer, no undo step, the redo kept, the selection, document
+/// stamp, revision and clipboard as they were, and no image of the payload registered. A whole
+/// payload pastes with its image fill exactly (one step, exact Undo/Redo), and after a refusal
+/// its success is said, not the refusal's note (the original F2 failure).
+#[test]
+fn labelled_clipboard_images_are_checked_whole_and_a_paste_after_a_refusal_says_so() {
+    use paper_rs::io::clipboard::{self, Content};
+    use paper_rs::model::{ImageMode, Paint};
+    use serde_json::{Value, json};
+    use std::{cell::RefCell, rc::Rc};
+    let png = |seed: u8| {
+        let mut img = image::RgbaImage::new(2, 2);
+        for (i, p) in img.pixels_mut().enumerate() {
+            *p = image::Rgba([seed, 0xc3, i as u8, 0xff]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let registered = |bytes: &[u8]| {
+        let id = paper_rs::assets::hash(bytes);
+        paper_rs::assets::get(&id).is_some()
+    };
+    // The source window: a rectangle filled with an image (registered here, so its id is
+    // cached in this process) and a labelled arrow.
+    let mut e = editor(1200.0, 900.0);
+    let id = paper_rs::assets::register(&png(0xb1)).unwrap();
+    let r = Rect::new(100.0, 100.0, 120.0, 80.0);
+    let mut n = Node::new(NodeId(0), NodeKind::Rect, r);
+    n.style.fills = vec![Paint::Image {
+        asset: id.clone(),
+        mode: ImageMode::Fill,
+        opacity: 1.0,
+    }];
+    let filled = e.add_node(n, None);
+    let pts = [v2(100.0, 400.0), v2(500.0, 400.0)];
+    let arrow = free_arrow(&mut e, &pts, Route::Straight, "loads");
+    let cap = Rc::new(RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    e.selection = vec![filled, arrow];
+    e.run(Action::Copy);
+    let whole = cap.borrow().clone().unwrap();
+    let parsed: Value = serde_json::from_str(&whole).unwrap();
+    assert!(parsed["assets"][&id].is_string(), "its image goes along");
+    let mutate = |f: &dyn Fn(&mut Value)| {
+        let mut v = parsed.clone();
+        f(&mut v);
+        v.to_string()
+    };
+    let b64 = |bytes: &[u8]| json!(paper_rs::assets::base64(bytes));
+    let hash = |bytes: &[u8]| paper_rs::assets::hash(bytes);
+    // Bodies no case may register: a junk "image", another real image, a fresh valid one.
+    let junk = b"not an image at all, R47".to_vec();
+    let (other_png, fresh_png) = (png(0xb2), png(0xb3));
+    let missing = mutate(&|v| {
+        v["assets"].as_object_mut().unwrap().remove(&id);
+    });
+    let bad_base64 = mutate(&|v| v["assets"][&id] = json!("%%% not base64 %%%"));
+    let loose_base64 = mutate(&|v| {
+        let s = v["assets"][&id].as_str().unwrap().replace('+', "-");
+        v["assets"][&id] = json!(format!("{s}\n"));
+    });
+    // The fill names the junk's own hash (so only its bytes are wrong), and it is the body.
+    let junk_id = hash(&junk);
+    let mut unreadable: Value = serde_json::from_str(&whole.replace(&id, &junk_id)).unwrap();
+    unreadable["assets"][&junk_id] = b64(&junk);
+    let unreadable = unreadable.to_string();
+    let wrong_hash = mutate(&|v| v["assets"][&id] = b64(&other_png));
+    let mixed = mutate(&|v| {
+        v["assets"][hash(&fresh_png)] = b64(&fresh_png);
+        v["assets"][hash(&junk)] = b64(&junk);
+    });
+    let cases = [
+        ("a missing body", missing),
+        ("base64 that isn't valid", bad_base64),
+        ("base64 not as written", loose_base64),
+        ("bytes that aren't an image", unreadable),
+        ("another image under a cached id", wrong_hash),
+        ("a valid image beside a bad one", mixed),
+    ];
+    // The receiving window, with an undone step to redo.
+    let mut other = editor(1200.0, 900.0);
+    other.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    let keep = rect(&mut other, 40.0, 40.0, 50.0, 50.0);
+    let redone = rect(&mut other, 140.0, 40.0, 50.0, 50.0);
+    other.run(Action::Undo);
+    other.selection = vec![keep];
+    let doc = other.doc.clone();
+    let state = (other.history.undo_len(), other.doc_stamp, other.revision);
+    for (why, text) in &cases {
+        let read = matches!(clipboard::decode(text), Content::Refused(_));
+        assert!(read, "{why}: refused when read");
+        *cap.borrow_mut() = Some(text.clone());
+        other.status.clear();
+        other.run(Action::Paste);
+        let said = other.status.contains("can't be pasted");
+        assert!(said, "{why}: {}", other.status);
+        assert_eq!(other.doc, doc, "{why}: nothing pasted");
+        let now = (other.history.undo_len(), other.doc_stamp, other.revision);
+        assert_eq!(now, state, "{why}: no step, stamp or revision");
+        assert_eq!(other.selection, vec![keep], "{why}");
+        assert_eq!(cap.borrow().as_deref(), Some(text.as_str()), "{why}");
+    }
+    for (what, bytes) in [
+        ("junk", &junk),
+        ("other", &other_png),
+        ("fresh", &fresh_png),
+    ] {
+        assert!(!registered(bytes), "{what}: not registered");
+    }
+    other.run(Action::Redo);
+    assert!(other.doc.get(redone).is_some(), "the redo was kept");
+    other.run(Action::Undo);
+    assert_eq!(other.doc, doc);
+
+    // A refusal, then the whole payload: pasted with its image fill, and said so.
+    *cap.borrow_mut() = Some(mutate(&|v| v["version"] = json!(2)));
+    other.run(Action::Paste);
+    let said = other.status.contains("Nothing was pasted");
+    assert!(said, "{}", other.status);
+    *cap.borrow_mut() = Some(whole.clone());
+    let steps = other.history.undo_len();
+    other.run(Action::Paste);
+    assert_eq!(other.history.undo_len(), steps + 1, "one step");
+    assert_eq!(other.status, "Pasted 2 layer(s)", "the paste is said");
+    let pasted = other.selection.clone();
+    let copy = *pasted
+        .iter()
+        .find(|p| matches!(other.doc.get(**p).unwrap().kind, NodeKind::Rect))
+        .expect("the filled rectangle");
+    let style = &e.doc.get(filled).unwrap().style;
+    let pasted_style = &other.doc.get(copy).unwrap().style;
+    assert_eq!(pasted_style, style, "its image fill, exactly");
+    assert!(paper_rs::assets::get(&id).is_some(), "its image");
+    let arrow_copy = arrow_in(&other, &pasted);
+    assert_eq!(label_of(&other, arrow_copy).as_deref(), Some("loads"));
+    let full = other.doc.clone();
+    other.run(Action::Undo);
+    assert_eq!(other.doc, doc, "one undo step");
+    other.run(Action::Redo);
+    assert_eq!(other.doc, full);
+}
+
 /// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the
 /// clipboard's text replaces the selected characters or goes in at the caret, as plain text,
 /// whatever it looks like (Unicode, several lines, a layer clipboard's JSON, SVG). It is never
