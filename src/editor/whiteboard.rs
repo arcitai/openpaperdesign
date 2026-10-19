@@ -268,10 +268,11 @@ impl Editor {
         }
     }
 
-    /// Screen-space handles of the selected connector: (end index, position). Index 2 is the
-    /// "bend" handle: the midpoint of a two-point connector (a drag bends it into a curve), or
-    /// the bend point of a three-point curve (a drag moves it again, as the first bend did:
-    /// `drag_connector_mid`). A locked connector (itself or through an ancestor) has none.
+    /// Screen-space handles of the selected connector: (end index, position). 0 and 1 are its
+    /// ends. From 2 up are "bend" handles: the midpoint of a two-point connector (2; a drag
+    /// bends it into a curve), or each interior point of a curve (2 + k for its point k + 1;
+    /// a drag moves that point alone, as the first bend did: `drag_connector_mid`). A locked
+    /// connector (itself or through an ancestor) has none.
     pub fn connector_handles(&self) -> Vec<(usize, V2)> {
         let [id] = self.selection[..] else {
             return vec![];
@@ -304,10 +305,10 @@ impl Editor {
         if pts.len() == 2 && !elbow && !under_label {
             out.push((2, s(mid)));
         }
-        // A curve bent once keeps its bend editable: the handle is its bend point, on the
-        // line, even under its label (a double-click there still edits the label first, and
-        // Enter does too; this is the only way to re-bend it). Other point counts (curves an
-        // agent gave more points, polylines) and elbows (routed automatically) have none.
+        // A curve keeps its bends editable: one handle on each interior point, on the line,
+        // even under its label (a double-click there still edits the label first, and Enter
+        // does too; this is the only way to re-bend it). Straight polylines and elbows (routed
+        // automatically) have none. Where two handles meet, the first one listed is pressed.
         let curve = matches!(
             self.doc.get(id).map(|n| &n.kind),
             Some(NodeKind::Connector {
@@ -315,8 +316,10 @@ impl Editor {
                 ..
             })
         );
-        if pts.len() == 3 && curve {
-            out.push((2, s(pts[1])));
+        if pts.len() >= 3 && curve {
+            for (k, p) in pts[1..pts.len() - 1].iter().enumerate() {
+                out.push((2 + k, s(*p)));
+            }
         }
         out
     }
@@ -340,12 +343,15 @@ impl Editor {
             return false;
         };
         let id = self.selection[0];
-        if end == 2 {
-            // Bend, once the press turns into a drag (`bend_connector`): a click on the middle
-            // changes nothing.
+        if end >= 2 {
+            // Bend, once the press turns into a drag (`bend_connector`): a click changes
+            // nothing. Handle 2 + k is point k + 1 (a straight arrow's 2 is its new point 1).
+            let count = self.connector_points(id).map_or(0, |p| p.len());
             self.begin("Bend arrow");
             self.gesture = Gesture::ConnectorMid {
                 id,
+                point: end - 1,
+                count,
                 press: Some(pos),
             };
             return true;
@@ -378,16 +384,26 @@ impl Editor {
         set_world_points(&mut tx, id, &pts);
     }
 
-    /// Move the bend point (`pts[1]`) of a bent arrow to `world`: the rest of a first bend's
-    /// drag, or a later drag from a three-point curve's bend handle. Endpoints are rerouted
-    /// to their bindings; nothing else changes.
-    pub(super) fn drag_connector_mid(&mut self, id: NodeId, world: V2) {
+    /// Move interior point `point` of a bent arrow to `world`: the rest of a first bend's
+    /// drag, or a later drag from a curve's bend handle. Every other point keeps its place in
+    /// the world (endpoints are rerouted to their bindings); nothing else changes. Only while
+    /// the arrow is still a curve with the `count` points the drag began with, and `point` is
+    /// one of its interior points: otherwise (a stale drag) nothing is changed or recorded.
+    pub(super) fn drag_connector_mid(&mut self, id: NodeId, point: usize, count: usize, world: V2) {
         let Some(mut pts) = self.connector_points(id) else {
             return;
         };
-        if pts.len() >= 3 {
-            pts[1] = world;
+        let curve = matches!(
+            self.doc.get(id).map(|n| &n.kind),
+            Some(NodeKind::Connector {
+                route: Route::Curved,
+                ..
+            })
+        );
+        if !curve || pts.len() != count || point == 0 || point + 1 >= pts.len() {
+            return;
         }
+        pts[point] = world;
         let mut tx = self.tx();
         set_world_points(&mut tx, id, &pts);
         update_connector(&mut tx, id);

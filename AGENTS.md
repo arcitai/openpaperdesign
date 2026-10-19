@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.75 · Updated: 2026-10-19
+Revision: 0.76 · Updated: 2026-10-20
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -321,10 +321,10 @@ engine architecture is `analysis/DESIGN.md`.
         gesture and `drag_connector_mid` move that point again (past the drag threshold, one
         undo step per drag; endpoints rerouted to their bindings). It is offered even under
         the label, since a double-click (checked before handles) and Enter still edit the
-        label. Elbows (routed) and curves with more points (no single bend; their points are
-        never collapsed) still have none. A connector locked itself or through an ancestor
-        now has no handles at all (the box resize already skipped locked layers). Same
-        document, gesture and history; no format change. Upstreamable as a fix.
+        label. Elbows (routed) still have none. (Curves with more points first had none
+        either; see the multi-bend entry below.) A connector locked itself or through an
+        ancestor now has no handles at all (the box resize already skipped locked layers).
+        Same document, gesture and history; no format change. Upstreamable as a fix.
       - **A connector drag held through Lock** (R51-F1; natively too), `src/editor/mod.rs`
         `pointer_move`/`pointer_up` with `whiteboard.rs` `connector_gesture_stale`: Lock
         (⌘⇧L) while a bend or end drag is held commits what the drag had recorded and locks
@@ -335,6 +335,22 @@ engine architecture is `analysis/DESIGN.md`.
         an ancestor) or gone ends at the next move or release, inert: nothing more changes or
         is recorded, and what was recorded before, the Lock included, stays. No restore of a
         press-time state, no other gesture changed. Upstreamable as a fix.
+      - **Multi-bend re-edit** (R15; natively too; the lead's synthetic-host finding on 27a:
+        a four-point curve had no bend handles, so a drag on its first bend moved the whole
+        arrow, both bends at once, and let go of its shapes), `src/editor/whiteboard.rs`
+        `connector_handles`/`connector_handle_down`/`drag_connector_mid`, `src/editor/mod.rs`
+        `Gesture::ConnectorMid { point, count }`, `src/render/scene.rs` (the bend glyph for
+        every handle from 2 up): a curve has one bend handle per interior point (handle
+        2 + k is point k + 1, so a three-point curve's is still 2), and the existing
+        `ConnectorMid` gesture carries the point it was pressed on and the point count it
+        began with. A drag moves that point alone; every other point keeps its world place
+        (the ends rerouted to their bindings by `update_connector`), in one undo step. It
+        moves nothing (and records nothing) if the arrow is no longer a curve with that many
+        points, or the point isn't an interior one, so a changed arrow never gets a wrong
+        point moved. The threshold, Escape, label editing, end handles, Undo and the R51
+        Lock fence are as before. Not built: adding or removing bends, straight polylines'
+        corners and elbows (routed). Where two handles overlap, the first listed is taken.
+        Same document and format. Upstreamable as a fix.
     - **MCP.** `src/mcp/exec.rs`/`tools.rs`: `create_shape`'s `text` labels an arrow,
       `set_text_content` sets one exactly (empty removes it), `get_node_info` reports
       `label`, and `get_tree_summary` shows it. Same reads, writes, acknowledgements and
@@ -571,7 +587,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-16.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-17.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -637,7 +653,11 @@ changed again, so `home-14` is refused and a cached `home-14` view can't pass fo
 `home-16` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 editor whose connector drag stops once its arrow is locked (R51-F1 above). The editor's WASM
 changed again, so `home-15` is refused and a cached `home-15` view can't pass for this one.
-Not installed or natively accepted.
+
+`home-17` (2026-10-20 source candidate) is the same view (HTML and layout unchanged) with the
+editor whose curves have a bend handle per bend (the multi-bend re-edit above). The editor's
+WASM changed again, so `home-16` is refused and a cached `home-16` view can't pass for this
+one. Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

@@ -187,11 +187,16 @@ enum Gesture {
         end: usize,
         start: V2,
     },
-    /// Bending an arrow by its middle point. `press` (screen) while the press on the bend
-    /// handle hasn't moved past the drag threshold: nothing is bent yet, so a click (the first
-    /// half of a double-click that edits the label, say) changes nothing.
+    /// Bending an arrow at one of its interior points, `point` (its index in the arrow's
+    /// points; 1 for a straight arrow's first bend), of an arrow with `count` points (3 once
+    /// a straight arrow's first bend has inserted its point): a drag moves that point only
+    /// while the arrow still has that many. `press` (screen) while the press on the bend
+    /// handle hasn't moved past the drag threshold: nothing is bent yet, so a click (the
+    /// first half of a double-click that edits the label, say) changes nothing.
     ConnectorMid {
         id: NodeId,
+        point: usize,
+        count: usize,
         press: Option<V2>,
     },
     Laser,
@@ -1342,17 +1347,36 @@ impl Editor {
                 self.drag_connector_end(id, end, w);
                 self.gesture = Gesture::ConnectorEnd { id, end, start };
             }
-            Gesture::ConnectorMid { id, press } => {
+            Gesture::ConnectorMid {
+                id,
+                point,
+                mut count,
+                press,
+            } => {
                 // The bend starts only with a real drag, as a move does.
                 if let Some(p) = press {
                     if pos.dist(p) < DRAG_THRESHOLD {
-                        self.gesture = Gesture::ConnectorMid { id, press };
+                        self.gesture = Gesture::ConnectorMid {
+                            id,
+                            point,
+                            count,
+                            press,
+                        };
                         return;
                     }
-                    self.bend_connector(id, world);
+                    // A straight arrow's first bend inserts its bend point.
+                    if count == 2 {
+                        self.bend_connector(id, world);
+                        count = 3;
+                    }
                 }
-                self.drag_connector_mid(id, world);
-                self.gesture = Gesture::ConnectorMid { id, press: None };
+                self.drag_connector_mid(id, point, count, world);
+                self.gesture = Gesture::ConnectorMid {
+                    id,
+                    point,
+                    count,
+                    press: None,
+                };
             }
             Gesture::Laser => {
                 self.laser_point(world, time_ms);

@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 16 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 17 · 2026-10-20 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -188,11 +188,13 @@ The principles:
       - Labels are plain text: no character styles. Where a label covers a straight arrow's
         middle, there is no bend handle under it (its Type still makes it curved). A label
         beside a short arrow leaves the handle free.
-      - **A bend stays editable.** A curve bent once keeps a bend handle on its bend point,
+      - **A bend stays editable.** A curve keeps a bend handle on each of its bend points,
         even under its label (a double-click there still edits the label, and Enter does
-        too), so dragging it bends the curve again in any direction, one undo step per drag.
-        Elbows are routed automatically and have none; neither does a curve with more than
-        one bend (made by an agent), whose points are kept as they are. A locked arrow has no
+        too), so dragging one bends the curve again there in any direction, every other bend
+        staying where it is, one undo step per drag. That holds for a curve bent once and for
+        one with several bends (made by an agent). Elbows are routed automatically and have
+        none; neither do straight lines with corners. Bends can't be added or removed this
+        way, and where two handles overlap the first one is taken. A locked arrow has no
         handles, and a bend or end drag held while it gets locked stops there: what it did
         before the Lock stays, nothing more changes.
       - **Compatibility.** A page with a label is saved in a newer page version, which an

@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-19: the one-app source candidate's `home-16` view (unqualified; `home-15`'s view plus the editor's connector drag fenced by Lock). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-20: the one-app source candidate's `home-17` view (unqualified; `home-16`'s view plus the editor's bend handle per curve bend). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -54,12 +54,13 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-16.html` (2026-10-19 source candidate, not
+- **View version.** `ui://openpaperdesign/home-17.html` (2026-10-20 source candidate, not
   installed or natively accepted): the same view, HTML and layout unchanged, with the editor
-  whose connector drag (a bend or an end) stops, changing nothing more, once its arrow is
-  locked while the drag is held (a shared upstream Editor change). The editor's WASM
-  changed, so `home-15` is refused and a cached `home-15` view can't pass for this one.
-  `home-15` (2026-10-19) carried the editor whose bent curve keeps a bend handle on its bend
+  whose curves have a bend handle on each bend, a drag moving that bend alone (a shared
+  upstream Editor change). The editor's WASM changed, so `home-16` is refused and a cached
+  `home-16` view can't pass for this one. `home-16` (2026-10-19) carried the editor whose
+  connector drag (a bend or an end) stops, changing nothing more, once its arrow is locked
+  while the drag is held. `home-15` (2026-10-19) carried the editor whose bent curve keeps a bend handle on its bend
   point, so it can be bent again. `home-14` (2026-10-19) carried the R48 correction
   of the labelled clipboard payload (a member named twice, such as `assets` or an image id,
   refused before anything is checked or registered). `home-13` (2026-10-19) carried the R47 corrections (its images checked whole
@@ -118,7 +119,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-15`, now `home-16`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-16`, now `home-17`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

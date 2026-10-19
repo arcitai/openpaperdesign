@@ -697,7 +697,8 @@ fn whiteboard_overlay(mb: &mut MeshBuilder, ed: &Editor, v: &View, accent: [f32;
     }
     for (end, p) in ed.connector_handles() {
         let p = p + off;
-        if end == 2 {
+        // Bend handles (2 and up: a straight arrow's middle, or a curve's interior points).
+        if end >= 2 {
             mb.circle(p, 4.0, [accent[0], accent[1], accent[2], 0.5]);
         } else {
             mb.circle(p, 5.5, accent);

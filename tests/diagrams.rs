@@ -2203,10 +2203,10 @@ fn a_bent_arrow_keeps_its_bend_editable_in_both_axes_one_step_per_drag() {
 /// The re-editable bend keeps the rest of the arrow: a labelled curve keeps its label, heads
 /// and style through a re-bend, and its label stays editable (a double-click on the bend
 /// point edits it first; Enter edits it). Controls: an elbow arrow has no bend handle (it is
-/// routed automatically); a curve with more points than one bend has none either, and its
-/// points are kept, never collapsed; a locked curve, itself or through its group (fixture:
-/// selected directly, as a locked layer isn't picked on the canvas), has no handles, and a
-/// drag there changes nothing.
+/// routed automatically); a curve with two bends has one bend handle per bend, and a drag
+/// cancelled with Escape keeps its points exactly; a locked curve, itself or through its
+/// group (fixture: selected directly, as a locked layer isn't picked on the canvas), has no
+/// handles, and a drag there changes nothing.
 #[test]
 fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks() {
     use paper_rs::model::Head;
@@ -2280,7 +2280,8 @@ fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks()
     assert_eq!(conn(&e, elbow).3, Route::Elbow);
     assert!(handle(&e).is_none(), "an elbow is routed, not bent");
     e.arrow_route = Route::Straight;
-    // Control: a curve with two bends (an agent's) has no bend handle, and keeps its points.
+    // A curve with two bends (an agent's) has a bend handle on each (see the multi-bend test
+    // below); a drag from one cancelled with Escape keeps all its points.
     let pts = [
         v2(1000.0, 100.0),
         v2(1100.0, 40.0),
@@ -2289,9 +2290,10 @@ fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks()
     ];
     let multi = free_arrow(&mut e, &pts, Route::Curved, "many");
     e.selection = vec![multi];
-    assert!(handle(&e).is_none(), "not for two bends");
     let kept = conn(&e, multi).0;
     assert_eq!(kept.len(), 4, "its points kept");
+    let bends: Vec<(usize, V2)> = e.connector_handles().into_iter().skip(2).collect();
+    assert_eq!(bends, vec![(2, kept[1]), (3, kept[2])], "one per bend");
     let press = kept[1];
     let n = e.history.undo_len();
     ev_drag(&mut e, press, press + v2(0.0, 30.0), 5000.0, false);
@@ -2302,7 +2304,7 @@ fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks()
         time_ms: 5300.0,
     });
     let after = conn(&e, multi).0;
-    assert_eq!(after.len(), 4, "never collapsed to one bend: {after:?}");
+    assert_eq!(after, kept, "Escape: never collapsed or moved");
     assert_eq!(e.history.undo_len(), n, "nothing recorded");
 
     // Locked, itself: no handles, and a drag on its bend point changes nothing.
@@ -2334,6 +2336,243 @@ fn a_re_bend_keeps_labels_and_style_and_respects_elbows_point_counts_and_locks()
     ev_drag(&mut e, p, p + v2(60.0, 60.0), 7000.0, true);
     assert_eq!(e.doc, locked, "nothing bent, moved or resized");
     e.doc.validate().unwrap();
+}
+
+/// A bound, labelled curve through `interiors` (world), its ends on the centres of `a` and
+/// `b`, selected. Its ends are routed to the shapes' outlines by the first edit, as for any
+/// bound arrow.
+fn bound_curve(e: &mut Editor, a: NodeId, b: NodeId, interiors: &[V2]) -> NodeId {
+    use paper_rs::model::{Binding, Head};
+    let bind = |node: NodeId| {
+        Some(Binding {
+            node,
+            fixed: v2(0.5, 0.5),
+            inside: false,
+        })
+    };
+    let mut pts = vec![world(e, a).center()];
+    pts.extend_from_slice(interiors);
+    pts.push(world(e, b).center());
+    let lo = pts
+        .iter()
+        .fold(pts[0], |m, p| v2(m.x.min(p.x), m.y.min(p.y)));
+    let hi = pts
+        .iter()
+        .fold(pts[0], |m, p| v2(m.x.max(p.x), m.y.max(p.y)));
+    let kind = NodeKind::Connector {
+        points: pts.iter().map(|p| *p - lo).collect(),
+        start: bind(a),
+        end: bind(b),
+        route: Route::Curved,
+        start_head: Head::Dot,
+        end_head: Head::Arrow,
+        label: Some("flows".into()),
+    };
+    let r = Rect::new(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y);
+    let mut n = Node::new(NodeId(0), kind, r);
+    n.style.stroke = Some(Color::INK);
+    n.style.stroke_width = 3.0;
+    let id = e.add_node(n, None);
+    e.selection = vec![id];
+    id
+}
+
+/// R15 multi-bend re-edit (the lead's synthetic-host finding on 27a: a four-point curve had
+/// no bend handles, so a drag on its first bend moved the whole arrow, both bends at once,
+/// and let go of its shapes): every interior point of a curve with several bends has its own
+/// bend handle (2 + k for point k + 1), and a drag from one moves that point alone in both
+/// axes, at any zoom and pan: every other bend stays where it was in the world, the point
+/// count and order, the route, the label, heads, style and both bindings stay (the ends on
+/// their shapes), in one undo step, Undo/Redo exact. For four- and five-point curves, each
+/// bend in turn (the first and the later ones).
+#[test]
+fn every_bend_of_a_curve_with_several_bends_moves_alone_in_both_axes() {
+    use paper_rs::geom::Camera;
+    for (interiors, zoom, pan) in [
+        (
+            vec![v2(300.0, 150.0), v2(600.0, 450.0)],
+            0.91,
+            v2(-80.0, 30.0),
+        ),
+        (
+            vec![v2(250.0, 150.0), v2(450.0, 450.0), v2(700.0, 150.0)],
+            2.0,
+            v2(120.0, -40.0),
+        ),
+    ] {
+        let count = interiors.len() + 2;
+        for which in 1..count - 1 {
+            let why = format!("{count} points, bend {which}, zoom {zoom}");
+            let mut e = editor(1400.0, 1000.0);
+            e.snapping = false;
+            e.camera = Camera { pan, zoom };
+            let a = rect(&mut e, 0.0, 300.0, 120.0, 80.0);
+            let b = rect(&mut e, 900.0, 300.0, 120.0, 80.0);
+            let id = bound_curve(&mut e, a, b, &interiors);
+            let handles = e.connector_handles();
+            assert_eq!(handles.len(), count, "{why}: two ends and each bend");
+            let pts0 = conn(&e, id).0;
+            for (k, p) in pts0[1..count - 1].iter().enumerate() {
+                let at = e.camera.world_to_screen(*p);
+                assert!(handles[2 + k].1.dist(at) < 1e-9, "{why}: handle {}", 2 + k);
+            }
+            let before = e.doc.clone();
+            let node0 = e.doc.get(id).unwrap().clone();
+            let steps = e.history.undo_len();
+            let h = handles[which + 1].1;
+            let target = h + v2(70.0, 45.0);
+            ev_drag(&mut e, h, target, 1000.0, true);
+            let (pts, s, t, route) = conn(&e, id);
+            assert_eq!((pts.len(), route), (count, Route::Curved), "{why}");
+            let want = e.camera.screen_to_world(target);
+            assert!(pts[which].dist(want) < 1e-6, "{why}: moved: {pts:?}");
+            for k in (1..count - 1).filter(|k| *k != which) {
+                assert!(
+                    pts[k].dist(pts0[k]) < 1e-9,
+                    "{why}: bend {k} stays: {pts:?}"
+                );
+            }
+            assert_eq!((s, t), (Some(a), Some(b)), "{why}: still bound");
+            assert!(on_outline(pts[0], world(&e, a)), "{why}: {pts:?}");
+            assert!(on_outline(last(&pts), world(&e, b)), "{why}: {pts:?}");
+            let node = e.doc.get(id).unwrap();
+            assert_eq!(node.style, node0.style, "{why}: style");
+            assert_eq!(label_of(&e, id).as_deref(), Some("flows"), "{why}");
+            assert_eq!(e.history.undo_len(), steps + 1, "{why}: one step");
+            let after = e.doc.clone();
+            e.run(Action::Undo);
+            assert_eq!(e.doc, before, "{why}: Undo");
+            e.run(Action::Redo);
+            assert_eq!(e.doc, after, "{why}: Redo");
+            e.doc.validate().unwrap();
+        }
+    }
+}
+
+/// The multi-bend handles keep every existing guard: a press within the drag threshold
+/// changes nothing; Escape during a drag puts every point back; a drag held while the arrow
+/// is locked (before the threshold, after a first movement, or through its group) or deleted
+/// changes nothing more (the pre-Lock movement stays, as its own step); and a drag whose
+/// arrow changed under it (its points or route, changed directly here as a fixture for an
+/// outside edit) moves no point at all rather than a wrong one. Nothing is busy afterwards.
+#[test]
+fn a_multi_bend_drag_keeps_the_threshold_escape_lock_and_stale_guards() {
+    let fixture = || {
+        let mut e = editor(1400.0, 1000.0);
+        e.snapping = false;
+        let a = rect(&mut e, 0.0, 300.0, 120.0, 80.0);
+        let b = rect(&mut e, 900.0, 300.0, 120.0, 80.0);
+        let interiors = [v2(250.0, 150.0), v2(450.0, 450.0), v2(700.0, 150.0)];
+        let id = bound_curve(&mut e, a, b, &interiors);
+        let h = e.connector_handles()[3].1;
+        assert!(h.dist(v2(450.0, 450.0)) < 1e-9, "the second bend's handle");
+        (e, id, h)
+    };
+    let down = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerDown {
+            pos: p,
+            button: Button::Primary,
+            pressure: None,
+            time_ms: t,
+        })
+    };
+    let mv = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerMove {
+            pos: p,
+            pressure: None,
+            time_ms: t,
+        })
+    };
+    let up = |e: &mut Editor, p: V2, t: f64| {
+        e.handle(InputEvent::PointerUp {
+            pos: p,
+            button: Button::Primary,
+            time_ms: t,
+        })
+    };
+    let lock = |e: &mut Editor| key(e, Key::Char('l'), Modifiers::cmd_shift());
+    let late_input_is_inert = |e: &mut Editor, h: V2, why: &str| {
+        let (doc, steps) = (e.doc.clone(), e.history.undo_len());
+        mv(e, h + v2(80.0, 60.0), 1100.0);
+        up(e, h + v2(80.0, 60.0), 1200.0);
+        assert_eq!(e.doc, doc, "{why}: nothing more changed");
+        assert_eq!(e.history.undo_len(), steps, "{why}: nothing more recorded");
+        assert!(!e.is_busy(), "{why}: the gesture ended");
+    };
+
+    // Within the drag threshold: nothing.
+    let (mut e, _, h) = fixture();
+    let (doc, steps) = (e.doc.clone(), e.history.undo_len());
+    down(&mut e, h, 1000.0);
+    mv(&mut e, h + v2(1.0, 1.0), 1040.0);
+    up(&mut e, h + v2(1.0, 1.0), 1080.0);
+    assert_eq!((e.doc.clone(), e.history.undo_len()), (doc, steps));
+    // Escape during a drag: every point back, late input inert.
+    let (mut e, _, h) = fixture();
+    let (doc, steps) = (e.doc.clone(), e.history.undo_len());
+    down(&mut e, h, 1000.0);
+    mv(&mut e, h + v2(50.0, 40.0), 1040.0);
+    assert_ne!(e.doc, doc, "it moved");
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(e.doc, doc, "Escape: back");
+    late_input_is_inert(&mut e, h, "after Escape");
+    assert_eq!(e.history.undo_len(), steps);
+    // Locked before the threshold: nothing at all.
+    let (mut e, id, h) = fixture();
+    down(&mut e, h, 1000.0);
+    lock(&mut e);
+    assert!(e.doc.get(id).unwrap().locked);
+    let bends = conn(&e, id).0;
+    late_input_is_inert(&mut e, h, "locked before the threshold");
+    assert_eq!(conn(&e, id).0, bends);
+    // Locked after a first movement: that movement stays, as its own step.
+    let (mut e, id, h) = fixture();
+    let steps = e.history.undo_len();
+    down(&mut e, h, 1000.0);
+    mv(&mut e, h + v2(40.0, 30.0), 1040.0);
+    lock(&mut e);
+    let first = v2(490.0, 480.0);
+    assert!(conn(&e, id).0[2].dist(first) < 1e-9, "the first movement");
+    assert_eq!(e.history.undo_len(), steps + 2, "the bend, then the Lock");
+    late_input_is_inert(&mut e, h, "locked after a movement");
+    assert!(conn(&e, id).0[2].dist(first) < 1e-9, "kept");
+    // Its group locked while held (fixture: the group selected directly for ⌘⇧L).
+    let (mut e, id, h) = fixture();
+    let other = rect(&mut e, 400.0, 700.0, 80.0, 60.0);
+    e.selection = vec![id, other];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    e.selection = vec![id];
+    down(&mut e, h, 1000.0);
+    e.selection = vec![g];
+    lock(&mut e);
+    assert!(e.doc.is_effectively_locked(id), "locked through its group");
+    assert!(!e.doc.get(id).unwrap().locked, "not itself");
+    let sibling = e.doc.get(other).cloned();
+    late_input_is_inert(&mut e, h, "locked through its group");
+    assert_eq!(e.doc.get(other).cloned(), sibling, "the sibling untouched");
+    assert!(e.doc.get(g).unwrap().locked);
+    // Deleted while held: harmless.
+    let (mut e, id, h) = fixture();
+    down(&mut e, h, 1000.0);
+    e.run(Action::Delete);
+    assert!(e.doc.get(id).is_none());
+    late_input_is_inert(&mut e, h, "deleted");
+    // Its points changed under the drag (fixture: one bend fewer, as an outside edit): no
+    // point is moved, not even a wrong one, and nothing is recorded.
+    let (mut e, id, h) = fixture();
+    down(&mut e, h, 1000.0);
+    if let NodeKind::Connector { points, .. } = &mut e.doc.nodes.get_mut(&id).unwrap().kind {
+        points.remove(1);
+    }
+    late_input_is_inert(&mut e, h, "fewer points");
+    // Its route changed under the drag (fixture: to an elbow): no point moved either.
+    let (mut e, id, h) = fixture();
+    down(&mut e, h, 1000.0);
+    if let NodeKind::Connector { route, .. } = &mut e.doc.nodes.get_mut(&id).unwrap().kind {
+        *route = Route::Elbow;
+    }
+    late_input_is_inert(&mut e, h, "now an elbow");
 }
 
 /// R51 (from the independent probe's fixture: a curve through (220,360), (400,140), (640,390)):

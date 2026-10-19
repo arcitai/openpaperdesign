@@ -4473,6 +4473,61 @@ fn browser_a_bent_arrow_re_bends_from_its_bend_point_in_both_axes() {
     assert!(bend(&s)[1].dist(before) < 1e-9, "Undo takes it back");
 }
 
+/// R15 multi-bend re-edit in the browser, through the page's own pointer events: a selected
+/// curve with two bends (made directly here, as an agent's would be) has a bend handle on
+/// each, and a drag from the second moves that bend alone by the drag in both axes; the
+/// first bend, the ends, the point count and the label stay, in one undo step that Undo
+/// takes back.
+#[test]
+fn browser_each_bend_of_a_two_bend_curve_moves_alone() {
+    use crate::model::{Head, Route};
+    let mut s = state();
+    let pts = [
+        crate::geom::v2(400.0, 300.0),
+        crate::geom::v2(500.0, 220.0),
+        crate::geom::v2(600.0, 380.0),
+        crate::geom::v2(700.0, 300.0),
+    ];
+    let lo = crate::geom::v2(400.0, 220.0);
+    let kind = NodeKind::Connector {
+        points: pts.iter().map(|p| *p - lo).collect(),
+        start: None,
+        end: None,
+        route: Route::Curved,
+        start_head: Head::None,
+        end_head: Head::Arrow,
+        label: Some("flows".into()),
+    };
+    let r = crate::geom::Rect::new(400.0, 220.0, 300.0, 160.0);
+    let arrow =
+        s.ed.add_node(Node::new(crate::model::NodeId(0), kind, r), None);
+    s.ed.selection = vec![arrow];
+    timed_frames(&mut s, 1);
+    let points = |s: &WebState| s.ed.connector_points(arrow).unwrap();
+    let handles = s.ed.connector_handles();
+    assert_eq!(handles.len(), 4, "two ends and two bends");
+    let (_, second) = handles[3];
+    assert!(second.dist(pts[2]) < 1e-9, "the second bend's handle");
+    let steps = s.ed.history.undo_len();
+    let from = at(&s, second.x, second.y);
+    timed_drag(&mut s, from, (from.0 + 60.0, from.1 + 40.0));
+    let after = points(&s);
+    assert_eq!(after.len(), 4, "still two bends");
+    let moved = after[2] - pts[2];
+    assert!((moved.x - 60.0).abs() < 0.01, "x: {moved:?}");
+    assert!((moved.y - 40.0).abs() < 0.01, "y: {moved:?}");
+    assert!(
+        after[1].dist(pts[1]) < 1e-6,
+        "the first bend stays: {after:?}"
+    );
+    assert!(after[0].dist(pts[0]) < 1e-6 && after[3].dist(pts[3]) < 1e-6);
+    let label = s.ed.doc.get(arrow).unwrap().kind.label().map(String::from);
+    assert_eq!(label.as_deref(), Some("flows"));
+    assert_eq!(s.ed.history.undo_len(), steps + 1, "one undo step");
+    s.run(Action::Undo);
+    assert_eq!(points(&s), pts.to_vec(), "Undo takes it back");
+}
+
 /// R51 in the browser: a bent arrow's bend held (pointer down on its bend handle, not yet
 /// dragged) while Ctrl+Shift+L locks it: the later move and release, as the page delivers
 /// them, change nothing and record nothing, the arrow stays locked and nothing is busy.
