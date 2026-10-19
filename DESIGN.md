@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 13 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 14 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -170,11 +170,17 @@ The principles:
         direction and the whole label stay visible.
       - It is duplicated, saved, reopened and exported (SVG, PDF) with its arrow. Agents set
         and read it through the same design tools.
-      - **Not yet transferable.** The clipboard's layer format and the native Library file
-        have no version, so an older OpenPaperDesign would take them without their labels.
-        Copy and Cut of layers holding a label, and adding them to the Library, are refused
-        with a note before anything changes. Duplicate works, and a label's selected
-        characters copy as plain text.
+      - **Copy, Cut and Paste keep labels.** Layers holding a label go on the clipboard in
+        a labelled, versioned layer format, and paste with their labels into another
+        canvas or window of this OpenPaperDesign (one undo step, as any paste). An older
+        OpenPaperDesign doesn't read that format as layers: it can only paste it as plain
+        text, never as arrows without their labels. A labelled clipboard it can't read (a
+        newer version, damaged) is refused with a note and nothing is pasted. Layers without
+        labels copy exactly as before. Duplicate works, and a label's selected characters
+        copy as plain text.
+      - **Not yet transferable through the Library.** The native Library file has no version,
+        so an older OpenPaperDesign would take labelled items without their labels: adding
+        them to the Library is refused with a note before anything changes.
       - **Paste while editing a label** puts the clipboard's text into that label, at the
         caret or over the selected characters, in the same one-step edit. It is always plain
         text (line breaks kept, tabs as spaces): whatever it looks like, it is never pasted

@@ -4341,6 +4341,81 @@ fn browser_typing_never_changes_a_label_locked_while_it_is_edited() {
     assert_eq!(s.ed.doc, before);
 }
 
+/// R15 through the page's own clipboard events: the `copy` and `cut` events of a group holding
+/// a labelled, bound arrow get the labelled payload (never the unversioned `paper-rs/clipboard`),
+/// and its `paste` event in another canvas puts the group back with its label and bindings, in
+/// one undo step. A payload of another version is refused there with a reason, nothing pasted
+/// (no text layer either). An edit left open on a locked layer still takes neither the `paste`
+/// nor the `cut` event (R45), with this payload too. The arrow is selected directly (fixture).
+#[test]
+fn browser_copy_cut_and_paste_events_carry_labelled_arrows_with_their_labels() {
+    use crate::io::clipboard::{LABELLED_TYPE, LABELLED_VERSION, TYPE};
+    let head = format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{LABELLED_VERSION},");
+    let mut s = state();
+    let [arrow, .., g] = labelled_arrow(&mut s);
+    s.ed.selection = vec![g];
+    let doc0 = s.ed.doc.clone();
+    let text = s.copy(false).expect("the copy event gets the payload");
+    assert!(text.starts_with(&head), "{text}");
+    assert!(!text.contains(&format!("\"type\":\"{TYPE}\"")));
+    assert_eq!(s.ed.doc, doc0, "copying changes nothing");
+    // Cut: the same payload, the group gone in one step, Undo brings it back.
+    let steps = s.ed.history.undo_len();
+    let cut = s.copy(true).expect("the cut event gets the payload");
+    assert!(cut.starts_with(&head));
+    assert!(s.ed.doc.get(g).is_none() && s.ed.doc.get(arrow).is_none());
+    assert_eq!(s.ed.history.undo_len(), steps + 1);
+    s.run(Action::Undo);
+    assert_eq!(s.ed.doc, doc0);
+    // Pasted in another canvas: the group, its label and its bindings, in one step.
+    let mut t = state();
+    let (before, steps) = (t.ed.doc.clone(), t.ed.history.undo_len());
+    t.paste(&text);
+    assert_eq!(t.ed.history.undo_len(), steps + 1, "one undo step");
+    let [pg] = t.ed.selection[..] else {
+        panic!("the group, pasted")
+    };
+    let inside = t.ed.doc.subtree(pg);
+    let copy = *inside
+        .iter()
+        .find(|id| t.ed.doc.get(**id).unwrap().kind.label().is_some())
+        .expect("the labelled arrow");
+    let label = |t: &WebState| t.ed.doc.get(copy).unwrap().kind.label().map(String::from);
+    assert_eq!(label(&t).as_deref(), Some("sends"));
+    let NodeKind::Connector { start, end, .. } = &t.ed.doc.get(copy).unwrap().kind else {
+        panic!("an arrow")
+    };
+    let bound = |b: &Option<crate::model::Binding>| b.is_some_and(|b| inside.contains(&b.node));
+    assert!(bound(start) && bound(end), "bound to the pasted shapes");
+    let pasted = t.ed.doc.clone();
+    t.run(Action::Undo);
+    assert_eq!(t.ed.doc, before);
+    t.run(Action::Redo);
+    assert_eq!(t.ed.doc, pasted);
+    // Another version: refused with a reason, nothing pasted, no text layer.
+    let newer = text.replacen("\"version\":1,", "\"version\":2,", 1);
+    let steps = t.ed.history.undo_len();
+    t.paste(&newer);
+    assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
+    assert_eq!(t.ed.doc, pasted, "nothing pasted");
+    assert_eq!(t.ed.history.undo_len(), steps);
+    // An edit left open on the pasted arrow, locked by the keys: no paste, no cut.
+    t.ed.selection = vec![copy];
+    press(&mut t, "Enter", "Enter");
+    timed_frames(&mut t, 1);
+    lock_keys(&mut t);
+    assert!(t.ed.doc.get(copy).unwrap().locked, "Lock reached the arrow");
+    let editing = t.ed.text_edit.as_ref().map(|e| e.id);
+    assert_eq!(editing, Some(copy), "still edited");
+    let (doc, steps) = (t.ed.doc.clone(), t.ed.history.undo_len());
+    t.paste(&text);
+    assert_eq!(t.copy(true), None, "the cut event gets no text");
+    timed_frames(&mut t, 1);
+    assert_eq!(t.ed.doc, doc, "nothing pasted or cut");
+    assert_eq!(t.ed.history.undo_len(), steps);
+    assert_eq!(label(&t).as_deref(), Some("sends"));
+}
+
 /// Ctrl+Shift+L as the page delivers it, then the modifiers released.
 fn lock_keys(s: &mut WebState) {
     s.modifiers(true, true, false, false);

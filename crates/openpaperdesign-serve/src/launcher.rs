@@ -108,9 +108,11 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// passing for this one; the view's HTML and layout are unchanged); `home-11` carries the
 /// editor whose open text edit changes nothing once its layer is locked (typing, Enter,
 /// Backspace, Delete, styles, Cut and Paste refused there, and leaving it keeps an empty text or
-/// blank label; a changed in-panel WASM editor again, HTML and layout unchanged). No earlier
-/// URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-11.html";
+/// blank label; a changed in-panel WASM editor again, HTML and layout unchanged); `home-12`
+/// carries the editor that copies, cuts and pastes arrows with their labels through the
+/// clipboard, in a versioned labelled payload (a changed in-panel WASM editor again, HTML and
+/// layout unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-12.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

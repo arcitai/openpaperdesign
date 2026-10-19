@@ -1912,8 +1912,9 @@ impl Editor {
             // selected layers instead.
             A::Cut if self.text_edit.is_some() && !self.text_edit_writable() => {}
             A::Cut => {
-                // An arrow label's selected characters, or the layers: nothing is deleted
-                // unless it was copied (labelled layers are refused, see `copy`).
+                // An arrow label's selected characters, or the layers (labelled ones too, in
+                // the labelled payload): nothing is deleted unless it was copied. The cut
+                // layers stay on the internal clipboard and Undo brings them back, as before.
                 if self.label_text_selection().is_some() {
                     let sel = self.text_selection();
                     if self.copy()
@@ -2129,10 +2130,10 @@ impl Editor {
     /// whether something was copied.
     ///
     /// While an arrow's label is edited with characters selected, those characters are copied
-    /// as plain text. Layers holding an arrow label are refused, visibly and before anything
-    /// is copied: the clipboard's layer format (`paper-rs/clipboard`) has no version, so an
-    /// older OpenPaperDesign would paste them without their labels. The internal and system
-    /// clipboards keep what they had. Duplicate is not a transfer and still copies them.
+    /// as plain text. Layers holding an arrow label go on the system clipboard in the labelled
+    /// payload (`io::clipboard::LABELLED_TYPE`, versioned), which a reader of the unversioned
+    /// `paper-rs/clipboard` alone doesn't take for layers, so their labels are never dropped
+    /// on the way; other layers are written as before.
     fn copy(&mut self) -> bool {
         if let Some(text) = self.label_text_selection() {
             if let Some(io) = &mut self.clipboard_io {
@@ -2140,10 +2141,6 @@ impl Editor {
             }
             self.status = "Copied text".into();
             return true;
-        }
-        if self.selection_has_labels() {
-            self.status = crate::io::clipboard::LABELS_REFUSED.into();
-            return false;
         }
         self.copy_internal();
         if self.clipboard_roots.is_empty() {
@@ -2193,7 +2190,8 @@ impl Editor {
 
     /// Paste from the system clipboard when it holds something newer than our own copy
     /// (layers from another window, Excalidraw JSON, SVG, an image or text); otherwise from
-    /// the internal clipboard.
+    /// the internal clipboard. Labelled layers keep their labels; a labelled payload this
+    /// reader refuses (another version, a broken layer tree) changes nothing and says why.
     ///
     /// While an arrow's label is being edited, the clipboard's text goes into that label as
     /// plain text, at the caret or over the selected characters, in the label's own edit (one
@@ -2220,6 +2218,9 @@ impl Editor {
         match external {
             Some(t) if self.clipboard_written.as_deref() != Some(t.as_str()) => {
                 match clipboard::decode(&t) {
+                    // Layers of a format this reader doesn't take: said, and nothing changes
+                    // (no layer, no text layer instead, no image registered).
+                    Content::Refused(why) => self.status = why,
                     Content::Layers(p) => {
                         let same = p.page.as_deref() == Some(self.active_page_id());
                         let d = if same { PASTE_OFFSET } else { 0.0 };

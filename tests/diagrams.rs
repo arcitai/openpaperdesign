@@ -1005,17 +1005,39 @@ fn a_labelled_arrow_is_copied_saved_reopened_and_exported_with_its_label() {
     );
     assert!(label_centre(&e, copy).unwrap().dist(line_middle(&e, copy)) < 1e-6);
     e.run(Action::Undo);
-    // Copy is refused for labelled layers (R38-F1: the clipboard's layer format has no version,
-    // so an older app would drop the label); this used to paste the labelled arrow on another
-    // page. Nothing is copied, and the other page gets nothing.
+    // Copied (in the labelled clipboard payload) and pasted on another page: the arrow keeps
+    // its label, its end on the copied group's shape binds the copy, its end on the group left
+    // behind is let go of, and the group keeps its place; one undo step, the first page as it
+    // was. (R38-F1 refused this copy; the labelled payload replaces that refusal.)
+    let cap = std::rc::Rc::new(std::cell::RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    let kept = e.doc.clone();
+    let place = world(&e, ga);
     e.selection = vec![ga, arrow];
     e.run(Action::Copy);
-    assert_eq!(e.status, paper_rs::io::clipboard::LABELS_REFUSED);
+    let payload = cap.borrow().clone().expect("a payload");
+    assert!(payload.starts_with(&labelled_head()), "{payload}");
+    assert_eq!(e.doc, kept, "copying changes nothing");
     let first = e.active_page;
     e.add_page();
+    let steps = e.history.undo_len();
     e.run(Action::Paste);
-    assert!(e.doc.nodes.is_empty(), "nothing to paste");
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    let pasted = e.selection.clone();
+    assert_eq!(pasted.len(), 2, "the group and the arrow");
+    let copy = arrow_in(&e, &pasted);
+    assert_eq!(label_of(&e, copy).as_deref(), Some("publishes"));
+    let g2 = *pasted.iter().find(|id| **id != copy).unwrap();
+    let (s, en) = ends(&e, copy);
+    let bound = s.is_some_and(|x| e.doc.subtree(g2).contains(&x));
+    assert!(bound, "bound to the copied group's shape");
+    assert_eq!(en, None, "the group left behind is let go of");
+    assert_eq!(world(&e, g2), place, "another page: the same place");
+    assert!(label_centre(&e, copy).unwrap().dist(line_middle(&e, copy)) < 1e-6);
+    e.run(Action::Undo);
+    assert!(e.doc.nodes.is_empty(), "Undo takes it back");
     e.switch_page(first);
+    assert_eq!(e.doc, kept, "the first page as it was");
 
     // Saved as v4; reopened, the label is there and follows a move.
     let saved = page_to_json(&e.page_data(first));
@@ -1371,25 +1393,37 @@ fn a_label_s_width_policy_is_its_explicit_sizing_through_wraps_saves_and_choices
     );
 }
 
-/// R38-F1: layers holding an arrow label are refused, visibly, by Copy and Cut (nested in a
-/// group too) and by the native Library's save, before anything changes: the clipboard keeps
-/// what it had, nothing is cut, no undo step, the library file stays. Duplicate (not a
-/// transfer), unlabelled layers and a label's own selected characters (plain text) are
-/// controls. The refusal is a transfer limit, not label transfer support.
+/// A clipboard shared by editors (windows, documents), as text.
+struct Capture(std::rc::Rc<std::cell::RefCell<Option<String>>>);
+
+impl paper_rs::io::clipboard::Provider for Capture {
+    fn read_text(&mut self) -> Option<String> {
+        self.0.borrow().clone()
+    }
+    fn write_text(&mut self, s: &str) {
+        *self.0.borrow_mut() = Some(s.into());
+    }
+}
+
+/// The start of a labelled clipboard payload, as `clipboard::encode` writes it.
+fn labelled_head() -> String {
+    use paper_rs::io::clipboard::{LABELLED_TYPE, LABELLED_VERSION};
+    format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{LABELLED_VERSION},")
+}
+
+/// R15 (replacing R38-F1's clipboard refusal): layers holding an arrow label are copied and cut
+/// in the labelled clipboard payload, never the unversioned `paper-rs/clipboard` a reader
+/// without labels would take, and paste with their labels into another document (bindings to
+/// the copied shapes, a target left behind let go of) and back into the same one after a Cut,
+/// each in one undo step; Cut and Undo/Redo are exact. Unlabelled layers are copied exactly as
+/// before (controls). Still refused, before any effect: the native Library's save and the
+/// single-file format, which have no version an older reader would refuse. Duplicate and a
+/// label's own selected characters (plain text) are unchanged.
 #[test]
-fn labelled_arrows_are_refused_by_copy_cut_and_the_native_library_before_any_effect() {
+fn labelled_arrows_copy_cut_and_paste_with_their_labels_and_the_native_library_refuses_them() {
     use paper_rs::io::{clipboard, file};
     use paper_rs::library::{LibItem, Library};
     use std::{cell::RefCell, rc::Rc};
-    struct Capture(Rc<RefCell<Option<String>>>);
-    impl clipboard::Provider for Capture {
-        fn read_text(&mut self) -> Option<String> {
-            self.0.borrow().clone()
-        }
-        fn write_text(&mut self, s: &str) {
-            *self.0.borrow_mut() = Some(s.into());
-        }
-    }
     let mut e = editor(1200.0, 900.0);
     e.snapping = false;
     let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
@@ -1400,48 +1434,105 @@ fn labelled_arrows_are_refused_by_copy_cut_and_the_native_library_before_any_eff
     let plain = rect(&mut e, 100.0, 500.0, 120.0, 80.0);
     let cap = Rc::new(RefCell::new(None));
     e.clipboard_io = Some(Box::new(Capture(cap.clone())));
-    // Something already on the clipboard: an unlabelled copy (control).
+    let text = |cap: &Rc<RefCell<Option<String>>>| cap.borrow().clone().expect("a payload");
+    let head = labelled_head();
+    // Control: an unlabelled copy is the unversioned payload, as before.
     e.selection = vec![plain];
     e.run(Action::Copy);
-    let earlier = cap.borrow().clone();
-    assert!(
-        earlier
-            .as_deref()
-            .is_some_and(|t| t.contains(clipboard::TYPE))
-    );
-    // The arrow alone, and the whole diagram: refused, unchanged, said.
+    let legacy = text(&cap);
+    let unversioned = format!("{{\"type\":\"{}\",\"nodes\":", clipboard::TYPE);
+    assert!(legacy.starts_with(&unversioned), "{legacy}");
+    // The arrow alone, then the whole diagram: the labelled payload; nothing else changes.
     let doc0 = e.doc.clone();
     let steps = e.history.undo_len();
     for sel in [vec![arrow], vec![a, b, arrow]] {
-        for action in [Action::Copy, Action::Cut] {
-            e.selection = sel.clone();
-            e.status.clear();
-            e.run(action);
-            assert_eq!(e.status, clipboard::LABELS_REFUSED, "{action:?} {sel:?}");
-            assert_eq!(*cap.borrow(), earlier, "the clipboard keeps what it had");
-            assert_eq!(e.doc, doc0, "nothing cut");
-            assert_eq!(e.history.undo_len(), steps, "no undo step");
-        }
+        e.selection = sel.clone();
+        e.run(Action::Copy);
+        let payload = text(&cap);
+        assert!(payload.starts_with(&head), "{sel:?}: {payload}");
+        let legacy_type = format!("\"type\":\"{}\"", clipboard::TYPE);
+        assert!(!payload.contains(&legacy_type), "{sel:?}");
+        let clipboard::Content::Layers(p) = clipboard::decode(&payload) else {
+            panic!("{sel:?}: read back as layers")
+        };
+        let labels: Vec<&str> = p.nodes.iter().filter_map(|n| n.kind.label()).collect();
+        assert_eq!(labels, ["sends"], "{sel:?}");
+        assert_eq!(p.roots, sel, "{sel:?}: the copied layers");
+        assert_eq!(e.doc, doc0, "{sel:?}: copying changes nothing");
+        assert_eq!(e.history.undo_len(), steps, "{sel:?}");
     }
-    // Nested: a group holding the labelled arrow is refused the same way.
+    // Into another document (another window), through the same clipboard: one commit, the
+    // label kept, the arrow bound to the copies of its shapes, the geometry kept.
+    let mut other = editor(1200.0, 900.0);
+    other.snapping = false;
+    other.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    let empty = other.doc.clone();
+    other.run(Action::Paste);
+    assert_eq!(other.history.undo_len(), 1, "one commit");
+    let pasted = other.selection.clone();
+    assert_eq!(pasted.len(), 3, "the three layers");
+    let copy = arrow_in(&other, &pasted);
+    assert_eq!(label_of(&other, copy).as_deref(), Some("sends"));
+    let (ca, cb) = ends(&other, copy);
+    let (ca, cb) = (ca.expect("bound"), cb.expect("bound"));
+    assert!(
+        pasted.contains(&ca) && pasted.contains(&cb),
+        "to the copies"
+    );
+    assert_ne!(ca, cb);
+    let d = world(&other, ca).min() - world(&e, a).min();
+    let moved = world(&e, b).translate(d);
+    assert_eq!(world(&other, cb), moved, "the shapes keep their places");
+    let (old, new) = (conn(&e, arrow).0, conn(&other, copy).0);
+    assert_eq!(old.len(), new.len());
+    for (p, q) in old.iter().zip(&new) {
+        assert!(q.dist(*p + d) < 1e-6, "geometry: {old:?} {new:?}");
+    }
+    let full = other.doc.clone();
+    other.run(Action::Undo);
+    assert_eq!(other.doc, empty, "one undo step");
+    other.run(Action::Redo);
+    assert_eq!(other.doc, full);
+    // A target left behind: that end is let go of, as for every paste elsewhere.
+    e.selection = vec![a, arrow];
+    e.run(Action::Copy);
+    other.run(Action::Paste);
+    let pasted = other.selection.clone();
+    let copy = arrow_in(&other, &pasted);
+    let (start, end) = ends(&other, copy);
+    let bound = start.is_some_and(|s| pasted.contains(&s));
+    assert!(bound, "bound to the copied shape");
+    assert_eq!(end, None, "the shape left behind is let go of");
+    assert_eq!(label_of(&other, copy).as_deref(), Some("sends"));
+    // Nested in a group: Cut takes the whole group in one step, Undo and Redo are exact, and
+    // Paste puts it back (from the cut) with its label and bindings, in one more step.
     e.selection = vec![a, b, arrow];
     e.run(Action::Group);
     let g = e.selection[0];
     let grouped = e.doc.clone();
     let steps = e.history.undo_len();
     e.run(Action::Cut);
-    assert_eq!(e.status, clipboard::LABELS_REFUSED);
-    assert_eq!(
-        (e.doc.clone(), e.history.undo_len()),
-        (grouped.clone(), steps)
-    );
-    assert_eq!(*cap.borrow(), earlier);
-    // The internal clipboard kept its earlier layers too: Paste gives the rectangle back.
+    assert!(e.doc.get(g).is_none() && e.doc.get(arrow).is_none(), "cut");
+    assert_eq!(e.history.undo_len(), steps + 1, "one undo step");
+    assert!(text(&cap).starts_with(&head), "the labelled payload");
+    let cut = e.doc.clone();
+    e.run(Action::Undo);
+    assert_eq!(e.doc, grouped, "Undo brings the group back");
+    e.run(Action::Redo);
+    assert_eq!(e.doc, cut);
     e.run(Action::Paste);
-    let [pasted] = e.selection[..] else {
-        panic!("one pasted layer")
+    assert_eq!(e.history.undo_len(), steps + 2, "one paste step");
+    let [g2] = e.selection[..] else {
+        panic!("the group, pasted")
     };
-    assert!(matches!(e.doc.get(pasted).unwrap().kind, NodeKind::Rect));
+    let inside = e.doc.subtree(g2);
+    let copy = arrow_in(&e, &inside);
+    assert_eq!(label_of(&e, copy).as_deref(), Some("sends"));
+    let (s, t) = ends(&e, copy);
+    assert!(s.is_some_and(|x| inside.contains(&x)), "bound inside");
+    assert!(t.is_some_and(|x| inside.contains(&x)), "bound inside");
+    e.run(Action::Undo);
+    assert_eq!(e.doc, cut);
     e.run(Action::Undo);
     assert_eq!(e.doc, grouped);
     // Control: Duplicate copies the labelled arrow exactly, inside the document.
@@ -1506,6 +1597,225 @@ fn labelled_arrows_are_refused_by_copy_cut_and_the_native_library_before_any_eff
     // The single-file format's checked encoder refuses labels as `save` does.
     assert!(file::to_string_checked(&e.doc, None).is_err());
     e.doc.validate().unwrap();
+}
+
+/// R15: a labelled clipboard payload is checked whole before anything happens. Another version,
+/// no version, an unknown field, a cut-off text, a node twice, a child or root missing, a layer
+/// outside the copied tree, a cycle, positions that don't match the layers or no layers at all
+/// are refused with a reason: no layer, no text layer instead, no undo step, the selection and
+/// the clipboard as they were, and no image of the payload registered. A whole payload pastes,
+/// its image registered (controls). Labels are kept exactly (Unicode over lines, blank, empty).
+/// And what a reader of `paper-rs/clipboard` alone does with it, step by step in this tree's
+/// own code of that path: its type isn't that one, it isn't an Excalidraw scene and it isn't
+/// SVG, so such a reader can only take the whole JSON as plain text (an earlier OpenPaperDesign
+/// pastes it as one text layer holding that JSON), never as arrows without their labels.
+#[test]
+fn labelled_clipboard_payloads_are_checked_whole_and_keep_their_labels_exactly() {
+    use paper_rs::io::clipboard::{self, Content};
+    use serde_json::{Value, json};
+    use std::{cell::RefCell, rc::Rc};
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "sends");
+    e.selection = vec![a, b, arrow];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    let cap = Rc::new(RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    e.run(Action::Copy);
+    let whole = cap.borrow().clone().unwrap();
+    let parsed: Value = serde_json::from_str(&whole).unwrap();
+    assert_eq!(parsed["roots"], json!([g.0]));
+    // An image only the payload holds (a unique 3×1 PNG), to see whether it is registered.
+    let png = |seed: u8| {
+        let mut img = image::RgbaImage::new(3, 1);
+        for (i, p) in img.pixels_mut().enumerate() {
+            *p = image::Rgba([seed, 0x5a, i as u8, 0xff]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    let (refused_png, kept_png) = (png(0xa7), png(0xa8));
+    let with_image = |mut v: Value, bytes: &[u8]| {
+        let id = paper_rs::assets::hash(bytes);
+        v["assets"][id] = json!(paper_rs::assets::base64(bytes));
+        v
+    };
+    let mutate = |f: &dyn Fn(&mut Value)| {
+        let mut v = with_image(parsed.clone(), &refused_png);
+        f(&mut v);
+        v.to_string()
+    };
+    let node_of = |v: &Value, id: u64| {
+        let nodes = v["nodes"].as_array().unwrap();
+        nodes.iter().position(|n| n["id"] == json!(id)).unwrap()
+    };
+    let no_version = mutate(&|v| {
+        v.as_object_mut().unwrap().remove("version");
+    });
+    let twice = mutate(&|v| {
+        let n = v["nodes"][0].clone();
+        v["nodes"].as_array_mut().unwrap().push(n);
+    });
+    let child_missing = mutate(&|v| {
+        let i = node_of(v, arrow.0);
+        v["nodes"].as_array_mut().unwrap().remove(i);
+    });
+    let outside = mutate(&|v| {
+        let mut n = v["nodes"][node_of(v, a.0)].clone();
+        n["id"] = json!(g.0 + 1000);
+        v["nodes"].as_array_mut().unwrap().push(n);
+    });
+    let cycle = mutate(&|v| {
+        let i = node_of(v, a.0);
+        v["nodes"][i]["children"] = json!([g.0]);
+    });
+    let root_missing = mutate(&|v| v["roots"] = json!([g.0 + 1000]));
+    let no_layers = mutate(&|v| {
+        v["roots"] = json!([]);
+        v["world"] = json!([]);
+    });
+    let mut cases: Vec<(&str, String)> = vec![
+        ("version 2", mutate(&|v| v["version"] = json!(2))),
+        ("version 0", mutate(&|v| v["version"] = json!(0))),
+        ("version \"1\"", mutate(&|v| v["version"] = json!("1"))),
+        ("no version", no_version),
+        ("unknown field", mutate(&|v| v["comments"] = json!([]))),
+        ("a node twice", twice),
+        ("a child missing", child_missing),
+        ("a root missing", root_missing),
+        ("a layer outside the tree", outside),
+        ("a cycle", cycle),
+        ("positions", mutate(&|v| v["world"] = json!([]))),
+        ("no layers", no_layers),
+        ("unreadable nodes", mutate(&|v| v["nodes"] = json!(5))),
+    ];
+    // As the encoder writes it (its type first), cut off or followed by more text.
+    let half: String = whole.chars().take(whole.chars().count() / 2).collect();
+    cases.push(("cut off", half));
+    cases.push(("trailing text", format!("{whole} and more")));
+    // Recognized whatever the formatting or key order: the lead's probes, verbatim.
+    let pretty_cut =
+        "{\n  \"type\": \"openpaperdesign/clipboard\",\n  \"version\": 1,\n  \"nodes\": [";
+    cases.push(("pretty, cut off", pretty_cut.to_string()));
+    let reordered = "{\"version\":1,\"type\":\"openpaperdesign/clipboard\",\"nodes\":[],\
+        \"roots\":[],\"world\":[],\"assets\":{}} trailing";
+    cases.push(("reordered, trailing", reordered.to_string()));
+    // Pretty with an image, cut off just after its type: no image registered either.
+    let v = with_image(parsed.clone(), &refused_png);
+    let pretty = serde_json::to_string_pretty(&v).unwrap();
+    let at = pretty.find("\"version\"").unwrap();
+    let cut = pretty[..at].to_string();
+    cases.push(("pretty with an image, cut off", cut));
+    // The type or the version twice (either order): ambiguous, never the legacy layers.
+    let ours = format!("{{\"type\":\"{}\",", clipboard::LABELLED_TYPE);
+    let legacy = format!("{{\"type\":\"{}\",", clipboard::TYPE);
+    let both = format!("{ours}\"type\":\"{}\",", clipboard::TYPE);
+    cases.push(("ours, then legacy", whole.replacen(&ours, &both, 1)));
+    let both = format!("{legacy}\"type\":\"{}\",", clipboard::LABELLED_TYPE);
+    cases.push(("legacy, then ours", whole.replacen(&ours, &both, 1)));
+    let version = format!("\"version\":{},", clipboard::LABELLED_VERSION);
+    let twice_version = format!("{ours}{version}");
+    cases.push(("version twice", whole.replacen(&ours, &twice_version, 1)));
+    // Pasted in another document: refused, said, and nothing at all happens.
+    let mut other = editor(1200.0, 900.0);
+    other.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    let rect0 = rect(&mut other, 40.0, 40.0, 50.0, 50.0);
+    other.selection = vec![rect0];
+    let (doc, steps) = (other.doc.clone(), other.history.undo_len());
+    for (why, text) in &cases {
+        assert!(
+            matches!(clipboard::decode(text), Content::Refused(_)),
+            "{why}: refused when read"
+        );
+        *cap.borrow_mut() = Some(text.clone());
+        other.status.clear();
+        other.run(Action::Paste);
+        let said = other.status.contains("can't be pasted");
+        assert!(said, "{why}: {}", other.status);
+        assert_eq!(other.doc, doc, "{why}: no layer, no text layer");
+        assert_eq!(other.history.undo_len(), steps, "{why}: no undo step");
+        assert_eq!(other.selection, vec![rect0], "{why}");
+        assert_eq!(cap.borrow().as_deref(), Some(text.as_str()), "{why}");
+    }
+    let refused_id = paper_rs::assets::hash(&refused_png);
+    let registered = paper_rs::assets::get(&refused_id).is_some();
+    assert!(!registered, "no image of a refused payload registered");
+    // Control: the whole payload, with its image, pastes in one step and registers the image.
+    let kept = with_image(parsed.clone(), &kept_png).to_string();
+    *cap.borrow_mut() = Some(kept);
+    other.run(Action::Paste);
+    assert_eq!(other.history.undo_len(), steps + 1);
+    let [pg] = other.selection[..] else {
+        panic!("the group, pasted")
+    };
+    let copy = arrow_in(&other, &other.doc.subtree(pg));
+    assert_eq!(label_of(&other, copy).as_deref(), Some("sends"));
+    let kept_id = paper_rs::assets::hash(&kept_png);
+    let registered = paper_rs::assets::get(&kept_id).is_some();
+    assert!(registered, "its image registered");
+    // Controls: text that only mentions the type (not as the top-level `type`) is ordinary
+    // text, pasted as one text layer as before.
+    let ty = clipboard::LABELLED_TYPE;
+    for prose in [
+        format!("Copy {{\"type\":\"{ty}\"}} into the docs"),
+        format!("{{\"note\": \"its type is {ty}\"}}"),
+        format!("{{\"meta\": {{\"type\": \"{ty}\"}}}}"),
+        format!("{{ \"type\" is {ty} }}"),
+    ] {
+        assert!(
+            matches!(clipboard::decode(&prose), Content::Text(_)),
+            "{prose}: text"
+        );
+        let steps = other.history.undo_len();
+        *cap.borrow_mut() = Some(prose.clone());
+        other.run(Action::Paste);
+        assert_eq!(other.history.undo_len(), steps + 1, "{prose}");
+        let [t] = other.selection[..] else {
+            panic!("{prose}: one text layer")
+        };
+        assert_eq!(text_of(&other, t).0, prose, "{prose}: as written");
+    }
+
+    // A reader of `paper-rs/clipboard` alone (no labels), step by step in this tree's code.
+    let p: clipboard::Payload = serde_json::from_str(&whole).unwrap();
+    assert_ne!(p.kind, clipboard::TYPE, "not the type it pastes");
+    let scene = paper_rs::io::excalidraw::import_scene(&whole);
+    assert!(scene.is_err(), "not an Excalidraw scene");
+    assert!(!whole.trim_start().starts_with('<'), "not SVG");
+    // Control: the unversioned payload is still exactly the type such a reader takes.
+    other.selection = vec![rect0];
+    other.run(Action::Copy);
+    let legacy = cap.borrow().clone().unwrap();
+    let p: clipboard::Payload = serde_json::from_str(&legacy).unwrap();
+    assert_eq!((p.kind.as_str(), p.version), (clipboard::TYPE, None));
+    assert!(!legacy.contains("\"version\""), "written as before");
+
+    // Labels kept exactly: Unicode over lines, blank, empty (fixtures built directly).
+    for label in ["Ω🙂\nzwei Zeilen", "   ", ""] {
+        let mut src = editor(1200.0, 900.0);
+        let pts = [v2(100.0, 300.0), v2(500.0, 300.0)];
+        let id = free_arrow(&mut src, &pts, Route::Straight, label);
+        let want = label_of(&src, id);
+        src.clipboard_io = Some(Box::new(Capture(cap.clone())));
+        src.selection = vec![id];
+        src.run(Action::Copy);
+        let payload = cap.borrow().clone().unwrap();
+        assert!(payload.starts_with(&labelled_head()), "{label:?}");
+        let mut dst = editor(1200.0, 900.0);
+        dst.clipboard_io = Some(Box::new(Capture(cap.clone())));
+        dst.run(Action::Paste);
+        let [copy] = dst.selection[..] else {
+            panic!("{label:?}: one arrow")
+        };
+        assert_eq!(label_of(&dst, copy), want, "{label:?}: exactly");
+        assert_eq!(dst.history.undo_len(), 1, "{label:?}");
+    }
 }
 
 /// R15: Paste while an arrow's label is edited (a bound, grouped arrow) edits that label: the

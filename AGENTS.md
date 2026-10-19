@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.69 · Updated: 2026-10-19
+Revision: 0.71 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -326,9 +326,8 @@ engine architecture is `analysis/DESIGN.md`.
         `paper-rs-library` 1 have no version that an older reader refuses: the R37 source
         pasted, loaded and saved them without labels, and an older Library replaces a file
         it can't read with its starter items.
-        - `src/editor/mod.rs`: Copy and Cut of layers holding a label anywhere in them are
-          refused before anything changes, with `io::clipboard::LABELS_REFUSED` in the
-          editor status. Both clipboards and the document are untouched, with no undo step.
+        - The clipboard refusal of this correction (Copy and Cut of labelled layers) is
+          replaced by the labelled clipboard payload below.
         - While a label is edited, Copy and Cut take its selected characters as plain text.
         - Duplicate (internal) is unchanged.
         - `src/library.rs`: `LibItem::has_labels`; `Library::save` refuses any labelled item
@@ -336,7 +335,37 @@ engine architecture is `analysis/DESIGN.md`.
           library changes.
         - `src/io/file.rs`: `to_string_checked` (`save` uses it). `to_string` stays
           unchecked and documented.
-        - This is a refusal, not label transfer support.
+        - For the Library and the single-file format this stays a refusal, not label
+          transfer support.
+    - **Labelled clipboard payload** (R15; natively too), `src/io/clipboard.rs`,
+      `src/editor/mod.rs` `copy`/`paste_from_clipboard`: Copy and Cut of layers holding an
+      arrow label write them in `LABELLED_TYPE` (`openpaperdesign/clipboard`) with `version`
+      1: the same `Payload` fields and `Node` serialization, a type the unversioned
+      `paper-rs/clipboard` readers (upstream paper-rs and every earlier OpenPaperDesign; both
+      pinned readers' `decode` take layers only for exactly that type) don't take for layers.
+      Such a reader falls through its Excalidraw check (a type of its own), and its SVG check,
+      to plain text: it pastes the whole JSON as one text layer, never the arrows without
+      their labels. That is the actual compatibility, not an explicit refusal in the old UI
+      (lead check 2026-10-19: the literal pinned `0b1b91da` and `8da0f9f` clipboard modules,
+      compiled against this library, decode a labelled payload as the exact text).
+      Layers without labels are written exactly as before (no `version` key), so upstream and
+      earlier readers keep pasting them. Reading a `LABELLED_TYPE` payload checks it whole
+      before anything is registered or inserted: exactly version 1, only its known fields,
+      readable `Payload`, and one consistent layer forest (every id once, roots present with
+      their positions, children present and naming their parent, nothing left over; walked
+      iteratively). A payload is recognized by its top-level `type` member, read key by key
+      with serde (`Header`) as far as the text is JSON, so a cut-off one, one followed by
+      more text, and any formatting or key order are recognized; a second top-level `type`
+      or `version` is ambiguous. Text that only mentions the type stays ordinary text.
+      Anything else of that type is `Content::Refused`: the editor says why and changes
+      nothing (no layer, no text layer, no undo step, no image).
+      An accepted payload pastes through the existing `insert_subtrees` (one undo step;
+      bindings to copied shapes remapped, others let go of outside the same page, as for
+      every paste), so labels, groups and geometry are kept. Cut is the existing Cut: the
+      layers stay on the internal clipboard and Undo brings them back; the system clipboard
+      write is the Provider's (not acknowledged, as for every Cut). Upstreamable as a feature
+      with its format guard: upstream would have to adopt the labelled type and its label
+      field together, which is upstream's decision.
       - **Short arrows, F2.** `src/connector.rs` `label_centre` is the one placement
         (through `text::text_offset`, so drawing, bounds, hit testing, the caret and
         SVG/PDF follow). The label is centred on the middle unless its box would cover the
@@ -509,7 +538,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-11.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-12.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -551,7 +580,12 @@ accepted.
 `home-11` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
 editor whose open text edit changes nothing once its layer is locked (the shared Editor
 change above). The editor's WASM changed again, so `home-10` is refused and a cached `home-10`
-view can't pass for this one. Not installed or natively accepted.
+view can't pass for this one.
+
+`home-12` (2026-10-19 source candidate) is the same view (HTML and layout unchanged) with the
+editor that copies, cuts and pastes labelled arrows through the clipboard (the labelled
+payload above). The editor's WASM changed again, so `home-11` is refused and a cached
+`home-11` view can't pass for this one. Not installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

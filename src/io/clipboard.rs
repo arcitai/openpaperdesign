@@ -1,23 +1,37 @@
 //! System clipboard interop.
 //!
-//! Copying writes a `paper-rs/clipboard` JSON payload (layers, their world rects and the
-//! images they use) as text, so layers paste between windows, projects and app restarts.
-//! Pasting accepts that payload, Excalidraw clipboard/scene JSON, SVG markup, images and
-//! plain text (which becomes a text layer).
+//! Copying writes a JSON payload (layers, their world rects and the images they use) as text,
+//! so layers paste between windows, projects and app restarts. Pasting accepts that payload,
+//! Excalidraw clipboard/scene JSON, SVG markup, images and plain text (which becomes a text
+//! layer).
+//!
+//! Two layer payloads, the same fields: layers without arrow labels are written exactly as
+//! before, as `paper-rs/clipboard` (unversioned; upstream paper-rs and every earlier
+//! OpenPaperDesign read it). Layers holding an arrow label are written as [`LABELLED_TYPE`]
+//! with `version` [`LABELLED_VERSION`]: a reader that only knows `paper-rs/clipboard` (no
+//! labels) doesn't take it for layers, so it can't paste the arrows without their labels. Such
+//! a reader decodes it as plain text, the whole JSON (see `decode` there). A labelled payload
+//! of another version, or one that isn't a whole, consistent layer tree, is refused before
+//! anything happens ([`Content::Refused`]). It is recognized by its top-level `type` member,
+//! read with serde as far as the text is JSON, so a cut-off or trailing-text payload in any
+//! formatting or key order is refused too, never pasted as a text layer instead.
 
 use crate::geom::{Rect, V2};
 use crate::model::{Node, NodeId, Paint};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// The layer payload without arrow labels (unversioned, shared with upstream paper-rs).
 pub const TYPE: &str = "paper-rs/clipboard";
-
-/// Why layers holding an arrow label aren't put on the clipboard (`Editor`'s Copy and Cut
-/// refuse them before anything is copied or deleted): this layer format has no version, so an
-/// older OpenPaperDesign would accept them and paste the arrows without their labels.
-pub const LABELS_REFUSED: &str = "Arrows with labels can't be copied to the clipboard yet: an \
-    older OpenPaperDesign would paste them without their labels. Nothing was copied or cut. \
-    Duplicate keeps them.";
+/// The layer payload with arrow labels. Not `TYPE`, so no reader of `TYPE` alone takes it.
+pub const LABELLED_TYPE: &str = "openpaperdesign/clipboard";
+/// The only version of [`LABELLED_TYPE`] this reader understands. A change of what it holds
+/// gets a new version, which earlier readers refuse.
+pub const LABELLED_VERSION: u64 = 1;
+/// The fields of a labelled payload: anything else is from a writer this reader doesn't know.
+const LABELLED_FIELDS: [&str; 7] = [
+    "type", "version", "nodes", "roots", "world", "page", "assets",
+];
 
 /// Platform clipboard access, injected into the editor (tests use an in-memory one).
 pub trait Provider {
@@ -85,6 +99,9 @@ impl Provider for System {
 pub struct Payload {
     #[serde(rename = "type")]
     pub kind: String,
+    /// [`LABELLED_TYPE`]'s version; absent from `TYPE` payloads (written exactly as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
     pub nodes: Vec<Node>,
     pub roots: Vec<NodeId>,
     pub world: Vec<Rect>,
@@ -96,7 +113,15 @@ pub struct Payload {
     pub assets: HashMap<String, String>,
 }
 
+/// The payload for these layers: [`LABELLED_TYPE`] (version [`LABELLED_VERSION`]) when one of
+/// them is an arrow with a label, otherwise `TYPE`, byte for byte as before.
 pub fn encode(nodes: &[Node], roots: &[NodeId], world: &[Rect], page: Option<&str>) -> String {
+    let labelled = nodes.iter().any(|n| n.kind.label().is_some());
+    let (kind, version) = if labelled {
+        (LABELLED_TYPE, Some(LABELLED_VERSION))
+    } else {
+        (TYPE, None)
+    };
     let mut assets = HashMap::new();
     for n in nodes {
         for p in &n.style.fills {
@@ -108,7 +133,8 @@ pub fn encode(nodes: &[Node], roots: &[NodeId], world: &[Rect], page: Option<&st
         }
     }
     serde_json::to_string(&Payload {
-        kind: TYPE.into(),
+        kind: kind.into(),
+        version,
         nodes: nodes.to_vec(),
         roots: roots.to_vec(),
         world: world.to_vec(),
@@ -124,22 +150,23 @@ pub enum Content {
     /// Layers from another app (Excalidraw JSON or SVG), in their own coordinates.
     Foreign(Vec<Node>, &'static str),
     Text(String),
+    /// OpenPaperDesign layers this reader won't paste (another version of
+    /// [`LABELLED_TYPE`], or not a whole layer tree), with the reason to show. Nothing was
+    /// registered for it: no image, no layer.
+    Refused(String),
 }
 
 /// Interpret clipboard text.
 pub fn decode(text: &str) -> Content {
     let t = text.trim_start();
     if t.starts_with('{') {
+        if let Some(c) = decode_labelled(t) {
+            return c;
+        }
         if let Ok(p) = serde_json::from_str::<Payload>(t)
             && p.kind == TYPE
         {
-            for (id, b64) in &p.assets {
-                if crate::assets::get(id).is_none()
-                    && let Some(bytes) = crate::assets::base64_decode(b64)
-                {
-                    let _ = crate::assets::register(&bytes);
-                }
-            }
+            register_assets(&p);
             return Content::Layers(p);
         }
         if let Ok(doc) = crate::io::excalidraw::import_scene(t) {
@@ -160,6 +187,171 @@ pub fn decode(text: &str) -> Content {
         return Content::Foreign(nodes, "SVG");
     }
     Content::Text(text.to_string())
+}
+
+fn register_assets(p: &Payload) {
+    for (id, b64) in &p.assets {
+        if crate::assets::get(id).is_none()
+            && let Some(bytes) = crate::assets::base64_decode(b64)
+        {
+            let _ = crate::assets::register(&bytes);
+        }
+    }
+}
+
+/// What the top level of a JSON object says about its format, read key by key with serde as
+/// far as the text is JSON: a cut-off text, or one followed by more text, still says what it
+/// began as, whatever its formatting or key order. Only a top-level `type` member counts;
+/// text that merely mentions the type (in another member, or not as JSON) doesn't.
+#[derive(Default)]
+struct Header {
+    /// A top-level `type` is [`LABELLED_TYPE`].
+    labelled: bool,
+    /// How many top-level `type` and `version` members it has (more than one is ambiguous).
+    types: usize,
+    versions: usize,
+}
+
+#[derive(Clone, Copy)]
+struct HeaderProbe<'a>(&'a std::cell::RefCell<Header>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for HeaderProbe<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for HeaderProbe<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        use serde::de::IgnoredAny;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => {
+                    self.0.borrow_mut().types += 1;
+                    let v = map.next_value::<serde_json::Value>()?;
+                    if v.as_str() == Some(LABELLED_TYPE) {
+                        self.0.borrow_mut().labelled = true;
+                    }
+                }
+                "version" => {
+                    self.0.borrow_mut().versions += 1;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`Header`] of `t`: as much of its top-level object as is there (its errors only end it).
+fn header(t: &str) -> Header {
+    use serde::de::DeserializeSeed;
+    let read = std::cell::RefCell::new(Header::default());
+    let mut de = serde_json::Deserializer::from_str(t);
+    let _ = HeaderProbe(&read).deserialize(&mut de);
+    read.into_inner()
+}
+
+/// A [`LABELLED_TYPE`] payload, checked whole before anything is registered: `None` when the
+/// JSON doesn't name that type at its top level (another kind of text, decoded as before).
+fn decode_labelled(t: &str) -> Option<Content> {
+    let head = header(t);
+    if !head.labelled {
+        return None;
+    }
+    let refused = |why: String| {
+        Some(Content::Refused(format!(
+            "The clipboard's OpenPaperDesign layers can't be pasted: {why}. Nothing was pasted."
+        )))
+    };
+    if head.types > 1 || head.versions > 1 {
+        return refused("they name their format twice".into());
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(t) else {
+        return refused("they aren't complete".into());
+    };
+    match fields.get("version").and_then(|v| v.as_u64()) {
+        Some(LABELLED_VERSION) => {}
+        Some(v) => {
+            return refused(format!(
+                "they are in format version {v}, which this OpenPaperDesign doesn't read"
+            ));
+        }
+        None => return refused("they have no valid format version".into()),
+    }
+    if let Some(k) = fields
+        .keys()
+        .find(|k| !LABELLED_FIELDS.contains(&k.as_str()))
+    {
+        return refused(format!(
+            "they hold a field this version doesn't know ({k:?})"
+        ));
+    }
+    let p = match serde_json::from_value::<Payload>(serde_json::Value::Object(fields)) {
+        Ok(p) => p,
+        Err(e) => return refused(format!("they aren't readable ({e})")),
+    };
+    if let Err(why) = check_tree(&p) {
+        return refused(why);
+    }
+    register_assets(&p);
+    Some(Content::Layers(p))
+}
+
+/// The payload's layers are one whole forest: every id once, each root present (with its
+/// position) and not inside another copied layer, each child present and naming its parent,
+/// and nothing left over. Walked iteratively from the roots, so a cycle is found, not followed.
+fn check_tree(p: &Payload) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut by_id: HashMap<NodeId, &Node> = HashMap::with_capacity(p.nodes.len());
+    for n in &p.nodes {
+        if by_id.insert(n.id, n).is_some() {
+            return Err(format!("layer {} appears twice", n.id));
+        }
+    }
+    if p.roots.is_empty() {
+        return Err("they hold no layers".into());
+    }
+    if p.world.len() != p.roots.len() {
+        return Err("their positions don't match their layers".into());
+    }
+    let mut todo: Vec<(NodeId, Option<NodeId>)> = Vec::new();
+    for r in &p.roots {
+        let n = by_id
+            .get(r)
+            .ok_or_else(|| format!("layer {r} is missing"))?;
+        if n.parent.is_some_and(|q| by_id.contains_key(&q)) {
+            return Err(format!(
+                "layer {r} is listed twice, inside another copied layer"
+            ));
+        }
+        todo.push((*r, None));
+    }
+    let mut seen = HashSet::with_capacity(p.nodes.len());
+    while let Some((id, parent)) = todo.pop() {
+        if !seen.insert(id) {
+            return Err(format!("layer {id} appears twice"));
+        }
+        let n = by_id
+            .get(&id)
+            .ok_or_else(|| format!("layer {id} is missing"))?;
+        if parent.is_some_and(|q| n.parent != Some(q)) {
+            return Err(format!("layer {id} doesn't name its group"));
+        }
+        todo.extend(n.children.iter().map(|c| (*c, Some(id))));
+    }
+    if seen.len() != by_id.len() {
+        return Err("some layers aren't inside the copied ones".into());
+    }
+    Ok(())
 }
 
 /// Root ids and world rects of a node list whose roots have no parent in the list.
