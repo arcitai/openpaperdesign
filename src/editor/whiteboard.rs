@@ -286,11 +286,18 @@ impl Editor {
                 ..
             })
         );
-        // A labelled arrow's middle is its label (a double-click edits it), so it has no bend
-        // handle there; it can still be curved from the inspector's Type.
-        let labelled = self.doc.get(id).is_some_and(|n| n.kind.label().is_some());
-        if pts.len() == 2 && !elbow && !labelled {
-            out.push((2, s((pts[0] + pts[1]) * 0.5)));
+        // Where a label sits on the middle (a double-click there edits it), there is no bend
+        // handle under it; the inspector's Type can still curve the arrow. A label placed
+        // beside a short arrow's line leaves the handle free.
+        let mid = (pts[0] + *pts.last().unwrap()) * 0.5;
+        let under_label = match (self.doc.get(id), self.doc.world_rect(id)) {
+            (Some(n), Some(wr)) => {
+                crate::render::draw::label_rect(n, wr).is_some_and(|r| r.inflate(4.0).contains(mid))
+            }
+            _ => false,
+        };
+        if pts.len() == 2 && !elbow && !under_label {
+            out.push((2, s(mid)));
         }
         out
     }

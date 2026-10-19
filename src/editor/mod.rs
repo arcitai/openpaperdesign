@@ -1900,10 +1900,22 @@ impl Editor {
                     .filter(|id| self.doc.get(*id).unwrap().visible)
                     .collect();
             }
-            A::Copy => self.copy(),
-            A::Cut => {
+            A::Copy => {
                 self.copy();
-                self.delete_selection();
+            }
+            A::Cut => {
+                // An arrow label's selected characters, or the layers: nothing is deleted
+                // unless it was copied (labelled layers are refused, see `copy`).
+                if self.label_text_selection().is_some() {
+                    let sel = self.text_selection();
+                    if self.copy()
+                        && let Some((a, b)) = sel
+                    {
+                        self.delete_text(a, b);
+                    }
+                } else if self.copy() {
+                    self.delete_selection();
+                }
             }
             A::Paste => self.paste_from_clipboard(),
             A::Duplicate => {
@@ -2105,11 +2117,29 @@ impl Editor {
         self.selection.clear();
     }
 
-    /// Copy to the internal clipboard and, when available, the system clipboard.
-    fn copy(&mut self) {
+    /// Copy to the internal clipboard and, when available, the system clipboard. Returns
+    /// whether something was copied.
+    ///
+    /// While an arrow's label is edited with characters selected, those characters are copied
+    /// as plain text. Layers holding an arrow label are refused, visibly and before anything
+    /// is copied: the clipboard's layer format (`paper-rs/clipboard`) has no version, so an
+    /// older OpenPaperDesign would paste them without their labels. The internal and system
+    /// clipboards keep what they had. Duplicate is not a transfer and still copies them.
+    fn copy(&mut self) -> bool {
+        if let Some(text) = self.label_text_selection() {
+            if let Some(io) = &mut self.clipboard_io {
+                io.write_text(&text);
+            }
+            self.status = "Copied text".into();
+            return true;
+        }
+        if self.selection_has_labels() {
+            self.status = crate::io::clipboard::LABELS_REFUSED.into();
+            return false;
+        }
         self.copy_internal();
         if self.clipboard_roots.is_empty() {
-            return;
+            return false;
         }
         if let Some(io) = &mut self.clipboard_io {
             let text = crate::io::clipboard::encode(
@@ -2121,6 +2151,26 @@ impl Editor {
             io.write_text(&text);
             self.clipboard_written = Some(text);
         }
+        true
+    }
+
+    /// The selected characters of the arrow label being edited, if any.
+    fn label_text_selection(&self) -> Option<String> {
+        let te = self.text_edit.as_ref()?;
+        let n = self.doc.get(te.id)?;
+        if !matches!(n.kind, NodeKind::Connector { .. }) {
+            return None;
+        }
+        let (a, b) = self.text_selection()?;
+        Some(n.kind.edit_text()?.chars().skip(a).take(b - a).collect())
+    }
+
+    /// Whether the selected layers (or anything inside them) hold an arrow label.
+    pub fn selection_has_labels(&self) -> bool {
+        self.top_selection()
+            .into_iter()
+            .flat_map(|r| self.doc.subtree(r))
+            .any(|id| self.doc.get(id).is_some_and(|n| n.kind.label().is_some()))
     }
 
     /// Paste from the system clipboard when it holds something newer than our own copy

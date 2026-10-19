@@ -275,13 +275,30 @@ fn migrate(
     if tag != format && !aliases.contains(&tag.as_str()) {
         return Err(FormatError::WrongFormat(tag));
     }
-    let mut version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
-    if version > current {
-        return Err(FormatError::TooNew {
-            version,
-            supported: current,
+    // The raw version is checked before it is narrowed or migrated: a missing one is v1 (the
+    // first files had none), anything else must be a whole number from 1 to `current`. A
+    // larger one would otherwise be cut to 32 bits (2^32 + 3 read as 3) and rewritten as
+    // supported data.
+    let raw = match v.get("version") {
+        None => 1,
+        Some(x) => x.as_u64().filter(|n| *n >= 1).ok_or_else(|| {
+            FormatError::Invalid(format!(
+                "the file's version {x} isn't a whole number from 1"
+            ))
+        })?,
+    };
+    if raw > u64::from(current) {
+        return Err(match u32::try_from(raw) {
+            Ok(version) => FormatError::TooNew {
+                version,
+                supported: current,
+            },
+            Err(_) => FormatError::Invalid(format!(
+                "file version {raw} is newer than this app supports ({current})"
+            )),
         });
     }
+    let mut version = raw as u32;
     while version < current {
         let step = steps
             .get(version as usize - 1)
@@ -478,6 +495,53 @@ mod tests {
         z["version"] = json!(4);
         let p = page_from_json(&z.to_string()).unwrap();
         assert!(page_to_json(&p).contains("\"version\": 3"));
+    }
+
+    /// R38-F3: the raw version is checked before it is narrowed. A labelled v4 page whose version
+    /// is 2^32 + 3 was read as 3, migrated to 4 and accepted.
+    #[test]
+    fn a_raw_page_version_is_checked_before_it_is_narrowed_or_migrated() {
+        let s = page_to_json(&arrow_page(Some("writes")));
+        let with = |version: Value| {
+            let mut v: Value = serde_json::from_str(&s).unwrap();
+            v["version"] = version;
+            page_from_json(&v.to_string())
+        };
+        assert!(with(json!(4)).is_ok(), "control: the labelled page itself");
+        for bad in [
+            json!(4_294_967_299_u64),
+            json!(4_294_967_300_u64),
+            json!(8_589_934_596_u64),
+            json!(u64::MAX),
+            json!(5),
+            json!(0),
+            json!(-1),
+            json!(3.0),
+            json!("4"),
+            Value::Null,
+        ] {
+            assert!(with(bad.clone()).is_err(), "{bad} must be refused");
+        }
+        assert!(matches!(
+            with(json!(5)),
+            Err(FormatError::TooNew {
+                version: 5,
+                supported: 4
+            })
+        ));
+        // Legitimate older pages still migrate: an unlabelled v3, and v1/v2 through their steps.
+        let plain = page_to_json(&arrow_page(None));
+        for old in [1, 2, 3] {
+            let mut v: Value = serde_json::from_str(&plain).unwrap();
+            v["version"] = json!(old);
+            let p = page_from_json(&v.to_string()).unwrap();
+            assert_eq!(p.doc.nodes, arrow_page(None).doc.nodes, "v{old}");
+            assert_eq!(page_to_json(&p), plain, "v{old} is written back as v3");
+        }
+        // A manifest goes through the same check.
+        let mut m: Value = serde_json::from_str(&Manifest::new("M").to_json()).unwrap();
+        m["version"] = json!(4_294_967_297_u64);
+        assert!(Manifest::from_json(&m.to_string()).is_err());
     }
 
     #[test]

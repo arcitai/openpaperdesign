@@ -10,6 +10,12 @@ pub const FORMAT: &str = "paper-rs-library";
 pub const VERSION: u32 = 1;
 pub const FILE: &str = "library.json";
 
+/// Why an item with an arrow label isn't kept: this file is version 1, which an older
+/// OpenPaperDesign loads and saves without the labels. A newer version is no answer either: an
+/// older app replaces a library it can't read with its starter items on its next save.
+pub const LABELS_REFUSED: &str = "Arrows with labels can't be kept in the library yet: an older \
+    OpenPaperDesign would load them without their labels. Nothing was added.";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibItem {
     pub id: String,
@@ -49,6 +55,11 @@ impl LibItem {
         }
         d.root = self.roots.clone();
         d
+    }
+
+    /// Whether any of the item's nodes is an arrow with a label (see [`LABELS_REFUSED`]).
+    pub fn has_labels(&self) -> bool {
+        self.nodes.iter().any(|n| n.kind.label().is_some())
     }
 
     pub fn bounds(&self) -> Option<Rect> {
@@ -101,7 +112,15 @@ impl Library {
         lib
     }
 
+    /// Write the library. One holding an arrow label is refused before anything is written
+    /// (whoever built it), so the file on disk stays as it was.
     pub fn save(&self) -> std::io::Result<()> {
+        if self.items.iter().any(LibItem::has_labels) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                LABELS_REFUSED,
+            ));
+        }
         let Some(p) = &self.path else { return Ok(()) };
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;

@@ -68,7 +68,7 @@ impl Editor {
         self.fit_text(te.id);
     }
 
-    fn delete_text(&mut self, a: usize, b: usize) {
+    pub(super) fn delete_text(&mut self, a: usize, b: usize) {
         let Some(te) = self.text_edit.clone() else {
             return;
         };

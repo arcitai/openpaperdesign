@@ -49,6 +49,9 @@ impl std::fmt::Display for FileError {
 
 impl std::error::Error for FileError {}
 
+/// The single-file text of `doc`, unchecked. Version 1 has no arrow labels: for a labelled
+/// document this gives a file this reader refuses (and an older one would read without its
+/// labels). Use [`to_string_checked`], which [`save`] does, for anything that leaves the app.
 pub fn to_string(doc: &Document, camera: Option<&Camera>) -> String {
     let mut nodes: Vec<Node> = doc.nodes.values().cloned().collect();
     nodes.sort_by_key(|n| n.id);
@@ -76,12 +79,9 @@ pub fn from_str(s: &str) -> Result<(Document, Option<Camera>), FileError> {
     }
 }
 
-/// Write atomically (temp file + rename) so a crash never leaves a truncated document.
-///
-/// This single-file format is version 1, which has no arrow labels: a document with a label is
-/// refused (nothing is written) rather than saved where a reader would read past its labels or
-/// refuse them. Projects keep labels (page version 4).
-pub fn save(path: &Path, doc: &Document, camera: Option<&Camera>) -> Result<(), FileError> {
+/// [`to_string`], refusing a document with an arrow label: version 1 has no labels, so the
+/// file would lose them in an older reader and be refused by this one.
+pub fn to_string_checked(doc: &Document, camera: Option<&Camera>) -> Result<String, FileError> {
     if doc.nodes.values().any(|n| n.kind.label().is_some()) {
         return Err(FileError::Invalid(
             "arrow labels can't be saved in a single .paper-rs file; keep the canvas in a \
@@ -89,8 +89,18 @@ pub fn save(path: &Path, doc: &Document, camera: Option<&Camera>) -> Result<(), 
                 .into(),
         ));
     }
+    Ok(to_string(doc, camera))
+}
+
+/// Write atomically (temp file + rename) so a crash never leaves a truncated document.
+///
+/// This single-file format is version 1, which has no arrow labels: a document with a label is
+/// refused (nothing is written) rather than saved where a reader would read past its labels or
+/// refuse them. Projects keep labels (page version 4).
+pub fn save(path: &Path, doc: &Document, camera: Option<&Camera>) -> Result<(), FileError> {
+    let text = to_string_checked(doc, camera)?;
     let tmp = path.with_extension("paper-rs.tmp");
-    std::fs::write(&tmp, to_string(doc, camera)).map_err(FileError::Io)?;
+    std::fs::write(&tmp, text).map_err(FileError::Io)?;
     std::fs::rename(&tmp, path).map_err(FileError::Io)
 }
 

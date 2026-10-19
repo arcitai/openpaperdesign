@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 11 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
+Revision: 12 · 2026-10-19 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -165,10 +165,19 @@ The principles:
         backing in the canvas colour, in the arrow's colour. It moves whenever the arrow
         reroutes. Light and Dark show it as they show the canvas; the saved colours don't
         change.
-      - It is copied, duplicated, pasted, saved, reopened and exported (SVG, PDF) with its
-        arrow. Agents set and read it through the same design tools.
-      - Labels are plain text: no character styles. A labelled straight arrow has no middle
-        bend handle (its Type still makes it curved).
+      - Where that would hide the arrow's ends or heads (a short arrow, a long label), it sits
+        just beside the middle instead, above the line (left of a vertical one). The arrow's
+        direction and the whole label stay visible.
+      - It is duplicated, saved, reopened and exported (SVG, PDF) with its arrow. Agents set
+        and read it through the same design tools.
+      - **Not yet transferable.** The clipboard's layer format and the native Library file
+        have no version, so an older OpenPaperDesign would take them without their labels.
+        Copy and Cut of layers holding a label, and adding them to the Library, are refused
+        with a note before anything changes. Duplicate works, and a label's selected
+        characters copy as plain text.
+      - Labels are plain text: no character styles. Where a label covers a straight arrow's
+        middle, there is no bend handle under it (its Type still makes it curved). A label
+        beside a short arrow leaves the handle free.
       - **Compatibility.** A page with a label is saved in a newer page version, which an
         older OpenPaperDesign refuses to open rather than silently dropping the label. Pages
         without labels are unchanged. A single `.paper-rs` file can't hold labels: saving one

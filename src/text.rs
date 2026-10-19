@@ -452,20 +452,33 @@ pub const STICKY_PAD: f64 = 16.0;
 /// Font size of an arrow's label.
 pub const LABEL_SIZE: f64 = 16.0;
 
-/// Where a node's text box starts inside the node. An arrow's label box is centred on the
-/// middle of its line (`connector::midpoint`), in the arrow's own (node-local) space.
+/// Where a node's text box starts inside the node. An arrow's label box is placed by
+/// `connector::label_centre` (on the middle of its line, or beside it where it would hide the
+/// arrow's ends or heads), in the arrow's own (node-local) space, with the backing padding
+/// `render::draw::LABEL_PAD` counted in.
 pub fn text_offset(n: &crate::model::Node) -> V2 {
     match &n.kind {
         crate::model::NodeKind::Sticky { .. } => v2(STICKY_PAD, STICKY_PAD),
         crate::model::NodeKind::Connector {
             points,
             route,
+            start_head,
+            end_head,
             label: Some(_),
             ..
-        } => match (crate::connector::midpoint(points, *route), layout_node(n)) {
-            (Some(m), Some(l)) => m - v2(l.width * 0.5, l.height * 0.5),
-            _ => V2::ZERO,
-        },
+        } => {
+            let Some(l) = layout_node(n) else {
+                return V2::ZERO;
+            };
+            let pad = crate::render::draw::LABEL_PAD;
+            let size = v2(l.width.max(1.0) + 2.0 * pad, l.height + 2.0 * pad);
+            let heads = [*start_head, *end_head];
+            let stroke = n.style.stroke_width.max(0.5);
+            match crate::connector::label_centre(points, *route, heads, stroke, size) {
+                Some(c) => c - v2(l.width.max(1.0) * 0.5, l.height * 0.5),
+                None => V2::ZERO,
+            }
+        }
         _ => V2::ZERO,
     }
 }

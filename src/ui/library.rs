@@ -81,9 +81,16 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 .first()
                 .and_then(|id| ed.doc.get(*id))
                 .map_or("Item".to_string(), |n| n.name.clone());
-            if let Some(item) = LibItem::from_selection(&ed.doc, &ids, &name) {
-                lib.library.items.push(item);
-                lib.dirty = true;
+            match LibItem::from_selection(&ed.doc, &ids, &name) {
+                // Refused before the library changes (see `library::LABELS_REFUSED`).
+                Some(item) if item.has_labels() => {
+                    ed.status = crate::library::LABELS_REFUSED.into();
+                }
+                Some(item) => {
+                    lib.library.items.push(item);
+                    lib.dirty = true;
+                }
+                None => {}
             }
         }
     });

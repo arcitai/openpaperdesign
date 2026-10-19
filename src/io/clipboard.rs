@@ -12,6 +12,13 @@ use std::collections::HashMap;
 
 pub const TYPE: &str = "paper-rs/clipboard";
 
+/// Why layers holding an arrow label aren't put on the clipboard (`Editor`'s Copy and Cut
+/// refuse them before anything is copied or deleted): this layer format has no version, so an
+/// older OpenPaperDesign would accept them and paste the arrows without their labels.
+pub const LABELS_REFUSED: &str = "Arrows with labels can't be copied to the clipboard yet: an \
+    older OpenPaperDesign would paste them without their labels. Nothing was copied or cut. \
+    Duplicate keeps them.";
+
 /// Platform clipboard access, injected into the editor (tests use an in-memory one).
 pub trait Provider {
     fn read_text(&mut self) -> Option<String>;

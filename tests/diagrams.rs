@@ -1005,15 +1005,16 @@ fn a_labelled_arrow_is_copied_saved_reopened_and_exported_with_its_label() {
     );
     assert!(label_centre(&e, copy).unwrap().dist(line_middle(&e, copy)) < 1e-6);
     e.run(Action::Undo);
-    // Copy to another page: the label goes with it (the end not copied is let go).
+    // Copy is refused for labelled layers (R38-F1: the clipboard's layer format has no version,
+    // so an older app would drop the label); this used to paste the labelled arrow on another
+    // page. Nothing is copied, and the other page gets nothing.
     e.selection = vec![ga, arrow];
     e.run(Action::Copy);
+    assert_eq!(e.status, paper_rs::io::clipboard::LABELS_REFUSED);
     let first = e.active_page;
     e.add_page();
     e.run(Action::Paste);
-    let pasted = arrow_in(&e, &e.selection.clone());
-    assert_eq!(label_of(&e, pasted).as_deref(), Some("publishes"));
-    assert_eq!(ends(&e, pasted).1, None);
+    assert!(e.doc.nodes.is_empty(), "nothing to paste");
     e.switch_page(first);
 
     // Saved as v4; reopened, the label is there and follows a move.
@@ -1368,6 +1369,324 @@ fn a_label_s_width_policy_is_its_explicit_sizing_through_wraps_saves_and_choices
         (world(&h.ed, t3).w - 100.0).abs() < 0.01,
         "the agent's width is kept"
     );
+}
+
+/// R38-F1: layers holding an arrow label are refused, visibly, by Copy and Cut (nested in a
+/// group too) and by the native Library's save, before anything changes: the clipboard keeps
+/// what it had, nothing is cut, no undo step, the library file stays. Duplicate (not a
+/// transfer), unlabelled layers and a label's own selected characters (plain text) are
+/// controls. The refusal is a transfer limit, not label transfer support.
+#[test]
+fn labelled_arrows_are_refused_by_copy_cut_and_the_native_library_before_any_effect() {
+    use paper_rs::io::{clipboard, file};
+    use paper_rs::library::{LibItem, Library};
+    use std::{cell::RefCell, rc::Rc};
+    struct Capture(Rc<RefCell<Option<String>>>);
+    impl clipboard::Provider for Capture {
+        fn read_text(&mut self) -> Option<String> {
+            self.0.borrow().clone()
+        }
+        fn write_text(&mut self, s: &str) {
+            *self.0.borrow_mut() = Some(s.into());
+        }
+    }
+    let mut e = editor(1200.0, 900.0);
+    e.snapping = false;
+    let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
+    let b = rect(&mut e, 600.0, 100.0, 160.0, 80.0);
+    let (from, to) = (world(&e, a).center(), world(&e, b).center());
+    let arrow = draw_arrow(&mut e, from, to, 0.0);
+    type_label(&mut e, arrow, "sends");
+    let plain = rect(&mut e, 100.0, 500.0, 120.0, 80.0);
+    let cap = Rc::new(RefCell::new(None));
+    e.clipboard_io = Some(Box::new(Capture(cap.clone())));
+    // Something already on the clipboard: an unlabelled copy (control).
+    e.selection = vec![plain];
+    e.run(Action::Copy);
+    let earlier = cap.borrow().clone();
+    assert!(
+        earlier
+            .as_deref()
+            .is_some_and(|t| t.contains(clipboard::TYPE))
+    );
+    // The arrow alone, and the whole diagram: refused, unchanged, said.
+    let doc0 = e.doc.clone();
+    let steps = e.history.undo_len();
+    for sel in [vec![arrow], vec![a, b, arrow]] {
+        for action in [Action::Copy, Action::Cut] {
+            e.selection = sel.clone();
+            e.status.clear();
+            e.run(action);
+            assert_eq!(e.status, clipboard::LABELS_REFUSED, "{action:?} {sel:?}");
+            assert_eq!(*cap.borrow(), earlier, "the clipboard keeps what it had");
+            assert_eq!(e.doc, doc0, "nothing cut");
+            assert_eq!(e.history.undo_len(), steps, "no undo step");
+        }
+    }
+    // Nested: a group holding the labelled arrow is refused the same way.
+    e.selection = vec![a, b, arrow];
+    e.run(Action::Group);
+    let g = e.selection[0];
+    let grouped = e.doc.clone();
+    let steps = e.history.undo_len();
+    e.run(Action::Cut);
+    assert_eq!(e.status, clipboard::LABELS_REFUSED);
+    assert_eq!(
+        (e.doc.clone(), e.history.undo_len()),
+        (grouped.clone(), steps)
+    );
+    assert_eq!(*cap.borrow(), earlier);
+    // The internal clipboard kept its earlier layers too: Paste gives the rectangle back.
+    e.run(Action::Paste);
+    let [pasted] = e.selection[..] else {
+        panic!("one pasted layer")
+    };
+    assert!(matches!(e.doc.get(pasted).unwrap().kind, NodeKind::Rect));
+    e.run(Action::Undo);
+    assert_eq!(e.doc, grouped);
+    // Control: Duplicate copies the labelled arrow exactly, inside the document.
+    e.selection = vec![g];
+    e.run(Action::Duplicate);
+    let copy = e.selection[0];
+    let labels: Vec<String> = e
+        .doc
+        .subtree(copy)
+        .into_iter()
+        .filter_map(|id| label_of(&e, id))
+        .collect();
+    assert_eq!(labels, vec!["sends".to_string()]);
+    e.run(Action::Undo);
+    // Control: unlabelled layers cut as before.
+    e.selection = vec![plain];
+    e.run(Action::Cut);
+    assert!(e.doc.get(plain).is_none());
+    e.run(Action::Undo);
+    // A label's own selected characters are copied as plain text; Cut takes only them, in the
+    // label's edit (one undo step).
+    e.selection = vec![arrow];
+    e.run(Action::EditText);
+    key(&mut e, Key::Home, Modifiers::NONE);
+    key(&mut e, Key::Right, Modifiers::SHIFT);
+    key(&mut e, Key::Right, Modifiers::SHIFT);
+    e.run(Action::Copy);
+    assert_eq!(cap.borrow().as_deref(), Some("se"), "plain text, no layers");
+    let steps = e.history.undo_len();
+    e.run(Action::Cut);
+    assert_eq!(cap.borrow().as_deref(), Some("se"));
+    key(&mut e, Key::Escape, Modifiers::NONE);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("nds"));
+    assert!(e.doc.get(arrow).is_some(), "the arrow stays");
+    assert_eq!(e.history.undo_len(), steps + 1);
+    e.run(Action::Undo);
+    assert_eq!(label_of(&e, arrow).as_deref(), Some("sends"));
+
+    // Native Library: a labelled item is refused by save (whoever built it); the file stays.
+    let item = LibItem::from_selection(&e.doc, &[g], "Flow").unwrap();
+    assert!(item.has_labels());
+    let path = std::env::temp_dir().join(format!("opd-label-library-{}.json", std::process::id()));
+    std::fs::write(&path, b"existing library").unwrap();
+    let lib = Library {
+        items: vec![item],
+        path: Some(path.clone()),
+        ..Library::default()
+    };
+    let err = lib.save().unwrap_err();
+    assert_eq!(err.to_string(), paper_rs::library::LABELS_REFUSED);
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing library");
+    // Control: an unlabelled item saves and loads.
+    let boxed = LibItem::from_selection(&e.doc, &[plain], "Box").unwrap();
+    let lib = Library {
+        items: vec![boxed],
+        path: Some(path.clone()),
+        ..Library::default()
+    };
+    lib.save().unwrap();
+    assert_eq!(Library::load(&path).items, lib.items);
+    std::fs::remove_file(&path).ok();
+    // The single-file format's checked encoder refuses labels as `save` does.
+    assert!(file::to_string_checked(&e.doc, None).is_err());
+    e.doc.validate().unwrap();
+}
+
+fn inside_rounded(p: V2, r: Rect, radius: f64) -> bool {
+    if !r.contains(p) {
+        return false;
+    }
+    let x = p.x.clamp(r.x + radius, r.right() - radius);
+    let y = p.y.clamp(r.y + radius, r.bottom() - radius);
+    p.dist(v2(x, y)) <= radius + 1e-9
+}
+
+/// Points sampled along polylines, and around them at a stroke's half width.
+fn stroke_samples(lines: &[Vec<V2>], width: f64) -> Vec<V2> {
+    let mut out = Vec::new();
+    for line in lines {
+        for seg in line.windows(2) {
+            for i in 0..=100 {
+                let at = seg[0].lerp(seg[1], i as f64 / 100.0);
+                for j in 0..36 {
+                    let a = j as f64 / 36.0 * std::f64::consts::TAU;
+                    out.push(at + v2(a.cos(), a.sin()) * (width / 2.0));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A free arrow through world points `pts`, 2 px, an Arrow end and a label.
+fn free_arrow(e: &mut Editor, pts: &[V2], route: Route, label: &str) -> NodeId {
+    use paper_rs::model::Head;
+    let lo = pts
+        .iter()
+        .fold(pts[0], |m, p| v2(m.x.min(p.x), m.y.min(p.y)));
+    let hi = pts
+        .iter()
+        .fold(pts[0], |m, p| v2(m.x.max(p.x), m.y.max(p.y)));
+    let kind = NodeKind::Connector {
+        points: pts.iter().map(|p| *p - lo).collect(),
+        start: None,
+        end: None,
+        route,
+        start_head: Head::None,
+        end_head: Head::Arrow,
+        label: Some(label.into()),
+    };
+    let mut n = Node::new(
+        NodeId(0),
+        kind,
+        Rect::new(lo.x, lo.y, hi.x - lo.x, hi.y - lo.y),
+    );
+    n.style.stroke = Some(Color::INK);
+    n.style.stroke_width = 2.0;
+    e.add_node(n, None)
+}
+
+/// R38-F2: a short arrow with a longer label keeps both its direction and its readable label.
+/// The R38 browser fixture's arrow (78 px, (346,210)→(424,210), 2 px Arrow end, "dispatches")
+/// and other orientations: no sampled point of the head's stroke (nor, for straight arrows, of
+/// the whole line) is under the label's backing, in the very ops every renderer draws. One
+/// shared placement serves drawing, hit testing and text editing; a long arrow keeps its
+/// label centred on the line. The short arrow's bend handle is free again, and a double-click
+/// on its label still edits it.
+#[test]
+fn a_short_arrow_keeps_its_direction_visible_beside_a_longer_label() {
+    use paper_rs::model::Head;
+    use paper_rs::render::draw;
+    let s = |x: f64, y: f64| v2(x, y);
+    let cases: Vec<(Vec<V2>, Route)> = vec![
+        (vec![s(346.0, 210.0), s(424.0, 210.0)], Route::Straight),
+        (vec![s(424.0, 210.0), s(346.0, 210.0)], Route::Straight),
+        (vec![s(400.0, 150.0), s(400.0, 228.0)], Route::Straight),
+        (vec![s(400.0, 228.0), s(400.0, 150.0)], Route::Straight),
+        (vec![s(350.0, 150.0), s(405.0, 205.0)], Route::Straight),
+        (
+            vec![s(346.0, 210.0), s(385.0, 185.0), s(424.0, 210.0)],
+            Route::Curved,
+        ),
+        (
+            vec![
+                s(346.0, 210.0),
+                s(385.0, 210.0),
+                s(385.0, 240.0),
+                s(424.0, 240.0),
+            ],
+            Route::Elbow,
+        ),
+    ];
+    for (k, (pts, route)) in cases.into_iter().enumerate() {
+        let mut e = editor(1200.0, 900.0);
+        let id = free_arrow(&mut e, &pts, route, "dispatches");
+        let n = e.doc.get(id).unwrap().clone();
+        let wr = world(&e, id);
+        let lr = draw::label_rect(&n, wr).unwrap();
+        let world_pts = conn(&e, id).0;
+        let (tip, from) = (last(&world_pts), world_pts[world_pts.len() - 2]);
+        let (heads, _) =
+            paper_rs::connector::head_shapes(Head::Arrow, tip, from, 2.0, tip.dist(from));
+        let covered = stroke_samples(&heads, 2.0)
+            .into_iter()
+            .filter(|p| inside_rounded(*p, lr, 4.0))
+            .count();
+        assert_eq!(covered, 0, "{k}: the head is visible beside {lr:?}");
+        if route == Route::Straight {
+            let line = stroke_samples(&[world_pts.clone()], 2.0);
+            assert!(
+                line.iter().all(|p| !inside_rounded(*p, lr, 4.0)),
+                "{k}: the whole line is clear of the label"
+            );
+        }
+        // The ops every renderer draws (GPU scene, SVG, PDF): the backing is that rect, the
+        // glyphs are inside it, and nothing of the arrow is drawn after them.
+        let ops = draw::node_draw(&n, wr, 1.0).ops;
+        let white = |op: &draw::DrawOp| matches!(op, draw::DrawOp::Fill { paint: draw::PaintSpec::Solid(c), .. } if *c == [1.0; 4]);
+        let backing = ops.iter().position(white).expect("a backing");
+        let draw::DrawOp::Fill { path, .. } = &ops[backing] else {
+            unreachable!()
+        };
+        let bb = path.bounds().unwrap();
+        assert!(
+            (bb.x - lr.x).abs() < 1e-6 && (bb.w - lr.w).abs() < 1e-6,
+            "{k}"
+        );
+        for op in &ops[backing + 1..] {
+            let draw::DrawOp::Glyphs { glyphs, .. } = op else {
+                panic!("{k}: only glyphs after the backing: {op:?}")
+            };
+            assert!(glyphs.iter().all(|(_, p)| lr.contains(*p)), "{k}");
+        }
+        assert!(
+            draw::draw_bounds(&n, wr).contains_rect(&lr),
+            "{k}: bounds and culling"
+        );
+        // Hit testing and text editing use the same place.
+        assert_eq!(
+            paper_rs::editor::hit::hit_test(&e.doc, lr.center(), 1.0),
+            Some(id)
+        );
+        e.selection.clear();
+        click(&mut e, lr.center(), 1000.0);
+        click(&mut e, lr.center(), 1100.0);
+        assert_eq!(
+            e.text_edit.as_ref().map(|te| te.id),
+            Some(id),
+            "{k}: edited"
+        );
+        key(&mut e, Key::Escape, Modifiers::NONE);
+        assert_eq!(label_of(&e, id).as_deref(), Some("dispatches"));
+        assert_eq!(e.doc.get(id).unwrap(), &n, "{k}: nothing else changed");
+    }
+    // The fixture arrow's bend handle is free beside the label, and a drag still bends it.
+    let mut e = editor(1200.0, 900.0);
+    let id = free_arrow(
+        &mut e,
+        &[s(346.0, 210.0), s(424.0, 210.0)],
+        Route::Straight,
+        "dispatches",
+    );
+    e.selection = vec![id];
+    let mid = e
+        .connector_handles()
+        .into_iter()
+        .find(|(i, _)| *i == 2)
+        .expect("a bend handle beside the label")
+        .1;
+    ev_drag(&mut e, mid, mid + v2(0.0, 50.0), 2000.0, true);
+    let (bent, _, _, route) = conn(&e, id);
+    assert_eq!((route, bent.len()), (Route::Curved, 3));
+    assert_eq!(label_of(&e, id).as_deref(), Some("dispatches"));
+    // Control: a long arrow keeps its label centred on the line, under which there is no
+    // bend handle.
+    let mut e = editor(1200.0, 900.0);
+    let id = free_arrow(
+        &mut e,
+        &[s(100.0, 210.0), s(700.0, 210.0)],
+        Route::Straight,
+        "dispatches",
+    );
+    assert!(label_centre(&e, id).unwrap().dist(line_middle(&e, id)) < 1e-6);
+    e.selection = vec![id];
+    assert!(!e.connector_handles().iter().any(|(i, _)| *i == 2));
 }
 
 /// A double-click on the middle of an arrow that is already selected edits its label: the

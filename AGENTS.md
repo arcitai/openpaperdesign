@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.63 · Updated: 2026-10-19
+Revision: 0.64 · Updated: 2026-10-19
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -300,9 +300,13 @@ engine architecture is `analysis/DESIGN.md`.
         `fit-content` mean for text). It counts as growing to fit its text (`auto_width` or
         Hug), so shrinking and growing a label group back, even across save and reopen,
         returns it to one line.
-      - Every explicit width choice already sets `Sizing::Fixed`: the inspector's Fixed and W,
-        MCP's numeric `width`, resizing the text itself. Auto width off with the default
-        Fixed sizing is a fixed width, kept whatever it measures.
+      - Every explicit width choice sets `Sizing::Fixed`: MCP's numeric `width`, resizing the
+        text itself, and the inspector's W field (R38 drove the actual egui field: 100 is kept
+        after a wrap). The inspector's Fixed/Hug combo isn't shown for a label in a group
+        (`child_layout` shows it only for layout containers and auto-layout children). The
+        tests that write Fixed or Hug through `inspector::apply` exercise the field's meaning,
+        not that combo. Auto width off with the default Fixed sizing is a fixed width, kept
+        whatever it measures.
       - Data: a wrapped label's `layout_child.sizing[0]` is `"hug"` on disk (an existing
         field, page v3). It is ignored for a text in a group outside auto layout, and
         `get_computed_styles` reports that width as `fit-content`.
@@ -317,10 +321,34 @@ engine architecture is `analysis/DESIGN.md`.
     - **Library file.** `crates/openpaperdesign-serve/src/library_payload.rs` admits page
       v3, or v4 for a labelled page. The write-back comparison still refuses an unlabelled
       v4 page and anything else upstream wouldn't keep.
-    - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer), the
-      clipboard (labels travel with copied arrows between windows of this version; an older
-      app's paste drops them) and the PNG/SVG/PDF formats themselves. Upstreamable as a
-      feature with its format guard.
+    - **R38 corrections.**
+      - **Transfer refusal, F1.** The clipboard's `paper-rs/clipboard` and the native
+        `paper-rs-library` 1 have no version that an older reader refuses: the R37 source
+        pasted, loaded and saved them without labels, and an older Library replaces a file
+        it can't read with its starter items.
+        - `src/editor/mod.rs`: Copy and Cut of layers holding a label anywhere in them are
+          refused before anything changes, with `io::clipboard::LABELS_REFUSED` in the
+          editor status. Both clipboards and the document are untouched, with no undo step.
+        - While a label is edited, Copy and Cut take its selected characters as plain text.
+        - Duplicate (internal) is unchanged.
+        - `src/library.rs`: `LibItem::has_labels`; `Library::save` refuses any labelled item
+          before writing (`LABELS_REFUSED`), and `src/ui/library.rs` Add refuses before the
+          library changes.
+        - `src/io/file.rs`: `to_string_checked` (`save` uses it). `to_string` stays
+          unchecked and documented.
+        - This is a refusal, not label transfer support.
+      - **Short arrows, F2.** `src/connector.rs` `label_centre` is the one placement
+        (through `text::text_offset`, so drawing, bounds, hit testing, the caret and
+        SVG/PDF follow). The label is centred on the middle unless its box would cover the
+        line's ends or a head; then it moves beside the middle, across the line (up, or left
+        of a vertical line), just past every end and head point. Nothing is drawn over the
+        glyphs.
+        - `src/editor/whiteboard.rs`: the bend handle is hidden only where a label covers it.
+      - **Raw page version, F3.** `src/project/format.rs` `migrate` checks the raw version
+        (a whole number, 1 to current; missing = 1) before narrowing it. 2^32 + 3 is refused
+        rather than read as 3.
+    - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer) and
+      the PNG/SVG/PDF formats themselves. Upstreamable as a feature with its format guard.
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.

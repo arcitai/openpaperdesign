@@ -622,9 +622,14 @@ pub fn line_path(pts: &[V2], route: Route) -> VPath {
 /// elbow's rounded corners included), by arc length. `pts` may be in any space; the result is
 /// in the same one. An arrow's label sits here, so it follows every reroute.
 pub fn midpoint(pts: &[V2], route: Route) -> Option<V2> {
+    middle(pts, route).map(|(m, _)| m)
+}
+
+/// [`midpoint`] and the line's unit direction there.
+fn middle(pts: &[V2], route: Route) -> Option<(V2, V2)> {
     let first = *pts.first()?;
     if pts.len() < 2 {
-        return Some(first);
+        return Some((first, v2(1.0, 0.0)));
     }
     let segs: Vec<(V2, V2)> = line_path(pts, route)
         .flatten(0.25)
@@ -636,11 +641,59 @@ pub fn midpoint(pts: &[V2], route: Route) -> Option<V2> {
     for (a, b) in segs {
         let d = a.dist(b);
         if d > 0.0 && d >= left {
-            return Some(a.lerp(b, left / d));
+            return Some((a.lerp(b, left / d), (b - a) / d));
         }
         left -= d;
     }
-    Some(first)
+    Some((first, v2(1.0, 0.0)))
+}
+
+/// Where an arrow's label box of `size` (its text and backing) is centred, in the space of
+/// `pts`. The one placement drawing, bounds, hit testing and text editing all use.
+///
+/// It sits on the middle of the line ([`midpoint`]) when the box there leaves both ends of the
+/// line and its heads (`heads`, start and end, drawn with `stroke`) visible. Otherwise, as
+/// for a short arrow with a longer label, it sits beside the middle, across the line on its
+/// upper side (left of a vertical line): just far enough that the whole line through the
+/// middle, both ends and every head point are outside the box. The line keeps its direction
+/// and the text stays whole and readable; nothing is drawn over the glyphs.
+pub fn label_centre(
+    pts: &[V2],
+    route: Route,
+    heads: [Head; 2],
+    stroke: f64,
+    size: V2,
+) -> Option<V2> {
+    let (m, dir) = middle(pts, route)?;
+    let (first, last) = (*pts.first()?, *pts.last()?);
+    let mut keep = vec![first, last];
+    if pts.len() >= 2 {
+        let ends = [
+            (heads[0], first, pts[1]),
+            (heads[1], last, pts[pts.len() - 2]),
+        ];
+        for (head, tip, from) in ends {
+            let (lines, polys) = head_shapes(head, tip, from, stroke, tip.dist(from));
+            keep.extend(lines.into_iter().chain(polys).flatten());
+        }
+    }
+    let half = size * 0.5;
+    let clear = stroke * 0.5 + 1.0;
+    let covers = |p: &V2| (p.x - m.x).abs() < half.x + clear && (p.y - m.y).abs() < half.y + clear;
+    if !keep.iter().any(covers) {
+        return Some(m);
+    }
+    // Across the line, toward the top (or the left of a vertical line).
+    let mut n = v2(-dir.y, dir.x);
+    if n.y > 1e-9 || (n.y.abs() <= 1e-9 && n.x > 0.0) {
+        n = v2(-n.x, -n.y);
+    }
+    let extent = half.x * n.x.abs() + half.y * n.y.abs();
+    let reach = keep
+        .iter()
+        .map(|p| (p.x - m.x) * n.x + (p.y - m.y) * n.y)
+        .fold(0.0, f64::max);
+    Some(m + n * (reach + clear + extent))
 }
 
 /// Head geometry at `tip`, arriving from `from`: (stroked lines, filled polygons).
