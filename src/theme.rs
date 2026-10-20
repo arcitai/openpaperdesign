@@ -24,6 +24,8 @@ pub const TOOLBAR_H: f32 = 40.0;
 pub const TRAFFIC_LIGHTS: (f64, f64) = (14.0, TOOLBAR_H as f64);
 /// Horizontal room the traffic lights need from the window's left edge.
 pub const TRAFFIC_LIGHTS_W: f32 = 76.0;
+/// The corner of controls, rows and toggles in the chrome (floating surfaces use 10).
+pub const RADIUS: f32 = 6.0;
 
 static ACCENT: AtomicU32 = AtomicU32::new(u32::from_be_bytes([0x00, 0x7a, 0xff, 0xff]));
 
@@ -83,9 +85,10 @@ pub struct Palette {
     pub popover: Color32,
 }
 
-/// The chrome is one calm surface around the canvas (see DESIGN.md): the top bar and both
-/// side panels share one panel colour, separated by hairlines; fields are softly filled
-/// rather than outlined; secondary text keeps enough contrast to read at 11pt.
+/// The chrome is one calm surface around the canvas (see DESIGN.md): both full-height side
+/// panels share one panel colour, separated from the canvas by one vertical hairline each;
+/// fields are softly filled rather than outlined; secondary text keeps enough contrast to read
+/// at 11pt.
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
@@ -248,7 +251,8 @@ fn style_for(s: &mut egui::Style, dark: bool) {
     v.interact_cursor = None;
     v.collapsing_header_frame = false;
 
-    let r6 = CornerRadius::same(7);
+    // One corner for controls, rows and toggles alike (`RADIUS`).
+    let r6 = CornerRadius::same(RADIUS as u8);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.inspector;
     w.noninteractive.weak_bg_fill = p.inspector;
@@ -320,6 +324,8 @@ pub enum Icon {
     Plus,
     Minus,
     Sidebar,
+    /// [`Icon::Sidebar`] mirrored: the right panel's toggle.
+    SidebarRight,
     Export,
     Grid,
     Trash,
@@ -508,14 +514,15 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         Icon::Minus => {
             line(&[pt(3.0, 8.0), pt(13.0, 8.0)]);
         }
-        Icon::Sidebar => {
+        Icon::Sidebar | Icon::SidebarRight => {
             painter.rect_stroke(
                 Rect::from_min_max(pt(1.5, 3.0), pt(14.5, 13.0)),
                 2.0 * u,
                 st,
                 egui::StrokeKind::Middle,
             );
-            line(&[pt(6.0, 3.0), pt(6.0, 13.0)]);
+            let x = if icon == Icon::Sidebar { 6.0 } else { 10.0 };
+            line(&[pt(x, 3.0), pt(x, 13.0)]);
         }
         Icon::Group => {
             let dash = |a: Pos2, b: Pos2| {
@@ -815,15 +822,30 @@ fn arc(c: Pos2, r: f32, a0: f32, a1: f32, n: usize) -> Vec<Pos2> {
         .collect()
 }
 
-/// An icon button for permanent chrome (the top bar): drawn in the secondary colour and only
-/// in the text colour while hovered, so the bar stays quiet around the canvas. `on` (an open
-/// toggle) is the accent tint of `selected_fill`, not a solid accent: the canvas's selected
-/// tool stays the one strong accent.
+/// The keyboard focus ring of a custom-drawn control: the accent, inside its `rect` (white on
+/// a solid accent fill), so Tab shows where it is without moving anything.
+pub fn focus_ring(ui: &egui::Ui, rect: Rect, resp: &egui::Response, on_accent: bool) {
+    if resp.has_focus() {
+        let c = if on_accent { Color32::WHITE } else { accent() };
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            RADIUS,
+            Stroke::new(1.5, c),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// An icon button for permanent chrome (the panels' top rows and the canvas's floating
+/// controls): drawn in the secondary colour and only in the text colour while hovered or
+/// focused, so the chrome stays quiet around the canvas. `on` (an open toggle) is the accent
+/// tint of `selected_fill`, not a solid accent: the canvas's selected tool stays the one strong
+/// accent.
 pub fn quiet_icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, on: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let p = pal(ui);
-        let hovered = resp.hovered() && ui.is_enabled();
+        let hovered = (resp.hovered() || resp.has_focus()) && ui.is_enabled();
         let fill = if on {
             selected_fill(ui)
         } else if resp.is_pointer_button_down_on() {
@@ -833,7 +855,7 @@ pub fn quiet_icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, on: bool) -> 
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, 6.0, fill);
+        ui.painter().rect_filled(rect, RADIUS, fill);
         let color = if !ui.is_enabled() {
             p.tertiary
         } else if on {
@@ -845,6 +867,7 @@ pub fn quiet_icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, on: bool) -> 
         };
         let inset = (size * 0.22).round();
         paint_icon(ui.painter(), rect.shrink(inset), icon, color);
+        focus_ring(ui, rect, &resp, false);
     }
     resp
 }
@@ -864,7 +887,7 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, selected: bool) -> 
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, 6.0, fill);
+        ui.painter().rect_filled(rect, RADIUS, fill);
         let color = if selected {
             Color32::WHITE
         } else if !enabled {
@@ -874,6 +897,7 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, size: f32, selected: bool) -> 
         };
         let inset = (size * 0.22).round();
         paint_icon(ui.painter(), rect.shrink(inset), icon, color);
+        focus_ring(ui, rect, &resp, selected);
     }
     resp
 }

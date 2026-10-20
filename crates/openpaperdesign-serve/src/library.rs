@@ -876,6 +876,9 @@ impl Library {
     }
 }
 
+/// The first page's name in a new library file (`NewDocument::blank`).
+pub(crate) const FIRST_PAPER: &str = "Paper 1";
+
 /// The content of a new canvas: a checked manifest, its pages (in manifest order) and the
 /// image files under `assets/` (file name, bytes).
 pub(crate) struct NewDocument {
@@ -885,10 +888,13 @@ pub(crate) struct NewDocument {
 }
 
 impl NewDocument {
-    /// An empty canvas with one blank page, as upstream `Store::create` makes it. No design
+    /// An empty canvas with one blank page, as upstream `Store::create` makes it, except that
+    /// its page is named [`FIRST_PAPER`] (people see a canvas's pages as Papers). Only a new
+    /// file's name: existing files, imports and upstream's own projects keep theirs. No design
     /// system, direction or token is applied.
     pub(crate) fn blank(name: &str) -> NewDocument {
-        let manifest = Manifest::new(name);
+        let mut manifest = Manifest::new(name);
+        manifest.pages[0].name = FIRST_PAPER.to_string();
         let page = PageData {
             id: manifest.pages[0].id.clone(),
             name: manifest.pages[0].name.clone(),

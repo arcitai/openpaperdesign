@@ -33,7 +33,8 @@
   with the in-panel editor, when its build has one: the packaged renderer glue, session.js,
   page.js, editor.js and panel.js from crates/openpaperdesign-web/static, in that order. New,
   Open, Import and Open current file then mount it right here on the result's binding (no link
-  is asked for or given); the workspace's own top bar names the file and its "All projects"
+  is asked for or given); the workspace's own identity (its left panel's top, or the controls
+  floating over the canvas while that panel is closed) names the file, and its "All projects"
   button goes back to the library, which saves what is left and closes exactly that binding.
   Without the module the slot stays `null`, and a library canvas is handed to its one loopback
   web editor instead: the result's own link (checked against the loopback pattern), asked to
@@ -152,7 +153,12 @@
   .lib-bar { margin-bottom: 12px; }
   .lib-context { margin: 0 0 10px; font-size: 12px; color: var(--opd-muted); }
   .lib-tools { display: flex; align-items: center; gap: 8px; }
-  .lib-tools input[type="search"] { flex: 1 1 auto; width: auto; min-width: 0; }
+  /* Search reads as one at rest: the field's soft surface inside a visible hairline, with a
+     magnifier before the text. The same input filters as before; focus shows the ring. */
+  .search-field { position: relative; display: flex; flex: 1 1 auto; align-items: center; min-width: 0; }
+  .search-icon { position: absolute; left: 10px; color: var(--opd-muted); pointer-events: none; }
+  .search-field input[type="search"] { width: 100%; min-width: 0; padding-left: 32px; border-color: var(--opd-line-strong); }
+  .search-field input[type="search"]:hover { border-color: var(--opd-muted); }
   .seg { display: flex; flex: none; gap: 2px; }
   /* Selected toggles: the workspace's accent tint (its layer rows and Layers/Design toggles). */
   .icon-btn[aria-pressed="true"] { border-color: transparent; background: var(--opd-selected); color: var(--opd-accent); }
@@ -173,8 +179,8 @@
   .files.grid .more { position: absolute; top: 6px; right: 2px; }
   .files.grid .file-menu { right: 0; }
 
-  /* The editor: upstream's workspace fills the view. Its own top bar names the file and leads
-     back to the library; this view adds no header, frame or footer around it. A keyboard Back
+  /* The editor: upstream's workspace fills the view. Its own identity names the file and its
+     Home leads back to the library; this view adds no header, frame or footer around it. A keyboard Back
      appears only when focused. Healthy states stay in a status live region; a failure,
      conflict or refusal shows as one note over the workspace. */
   main[data-view="editor"] { max-width: none; min-height: 0; height: 100vh; padding: 0; }
@@ -232,7 +238,7 @@
     <div id="lib-bar" class="lib-bar" hidden>
       <p id="lib-context" class="lib-context">New files are kept in the OpenPaperDesign library, this app's own data folder, not in a Codex project.</p>
       <div class="lib-tools">
-        <input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off">
+        <div class="search-field"><svg class="search-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M10.5 10.5 14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off"></div>
         <div class="seg" role="group" aria-label="Layout">
           <button id="layout-list" class="btn icon-btn" type="button" aria-pressed="true" aria-label="List"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M3 4.5h10M3 8h10M3 11.5h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
           <button id="layout-grid" class="btn icon-btn" type="button" aria-pressed="false" aria-label="Grid"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button>
@@ -1093,14 +1099,14 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     const open = node('button', undefined, 'row-main');
     open.type = 'button';
     const text = node('span', undefined, 'row-text');
-    text.append(node('span', name, 'row-name'), node('span', pages(c.pages) + (c.open ? ' · open here' : ''), 'row-hint'));
+    text.append(node('span', name, 'row-name'), node('span', papers(c.pages) + (c.open ? ' · open here' : ''), 'row-hint'));
     const when = edited(c.modified);
     if (when) text.append(node('span', when, 'row-time'));
     open.append(glyph('file'), text);
     // A long name is clamped in the grid: its full name stays the button's tooltip and part of
     // its accessible name, for pointer and keyboard alike.
     open.title = name;
-    open.setAttribute('aria-label', [name, pages(c.pages) + (c.open ? ', open here' : ''), when].filter(Boolean).join(', '));
+    open.setAttribute('aria-label', [name, papers(c.pages) + (c.open ? ', open here' : ''), when].filter(Boolean).join(', '));
     open.onclick = () => openLibrary(c.id, name, false);
     open.disabled = sending;
     rowActions.projects.push(open);
@@ -1649,7 +1655,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       h.resume();
       setEditorBusy(false);
       const why = {
-        conflict: 'Still open: this canvas was changed elsewhere (a page, the page list or the active page), so your last change isn\'t saved. Reload from the banner (that drops your change), or leave without saving.',
+        conflict: 'Still open: this canvas was changed elsewhere (a Paper, the list of Papers or the shown Paper), so your last change isn\'t saved. Reload from the banner (that drops your change), or leave without saving.',
         busy: 'Still open: an edit is still under way. Finish it, then try again.',
         failed: 'Still open: your last change couldn\'t be saved yet; it is being retried. Try again, or leave without saving.',
         unreachable: 'Still open: Codex didn\'t confirm your last save, so it may not be saved. Try again, or leave without saving.',
@@ -1735,7 +1741,9 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('result-meta').hidden = false;
     $('result-details').hidden = false;
   };
-  const pages = (n) => (n === 1 ? '1 page' : (Number.isInteger(n) ? n : '?') + ' pages');
+  // A canvas's page count, as people see pages (Papers). Presentation only: the server's
+  // `pages` count and every stored name are as they were.
+  const papers = (n) => (n === 1 ? '1 Paper' : (Number.isInteger(n) ? n : '?') + ' Papers');
 
   // Every result (or cancellation) replaces the last: no old link stays actionable.
   function reset(title) {
@@ -1826,7 +1834,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       opened: 'Opening the canvas…',
       reopened: 'Opening the canvas…',
     }[v.action] || 'The canvas is ready to open.';
-    if (v.canvas && typeof v.canvas.name === 'string') field('Canvas', v.canvas.name + ' (' + pages(v.canvas.pages) + ')');
+    if (v.canvas && typeof v.canvas.name === 'string') field('Canvas', v.canvas.name + ' (' + papers(v.canvas.pages) + ')');
     if (typeof v.workspace === 'string') field('Folder', base(v.workspace));
     if (typeof v.project === 'string') meta('Project', v.project);
     if (typeof v.workspace === 'string') meta('Folder path', v.workspace);
@@ -1849,7 +1857,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     }
     editorCanvas = id;
     editorBinding = typeof v.binding === 'string' && BINDING.test(v.binding) ? v.binding : null;
-    field('Canvas', name + ' (' + pages(v.canvas.pages) + ')');
+    field('Canvas', name + ' (' + papers(v.canvas.pages) + ')');
     field('Stored in', 'OpenPaperDesign library');
     meta('Canvas id', id);
     if (typeof v.location === 'string') meta('Location', v.location);
@@ -1941,7 +1949,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     list.forEach((c, i) => {
       const name = (c.canvas && c.canvas.name) || c.project;
       // `bound` means bound in this session, not loaded in a browser.
-      const hint = pages(c.canvas && c.canvas.pages) + (c.bound ? ' · current' : '');
+      const hint = papers(c.canvas && c.canvas.pages) + (c.bound ? ' · current' : '');
       $('result-list').append(projectRow('result-list', 'canvas-' + i, name, hint, 'folder', c.project,
         () => openCanvas(v.workspace, c.project, cleanName(name), false),
         [['Project', c.project], ['Canvas id', String(c.canvas && c.canvas.id)]]));

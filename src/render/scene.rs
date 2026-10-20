@@ -206,7 +206,8 @@ impl View<'_> {
 
 /// The interactive canvas's background pattern (DESIGN.md): a view preference, never part of
 /// the document, its history, its saves, snapping or any export. A plain surface (`None`) by
-/// default; `Dots` is the zoom-adaptive dot grid; `Lines` the same spacing as thin lines.
+/// default; `Dots` is the zoom-adaptive dot grid; `Lines` the same spacing as thin lines, shown
+/// to people as "Grid" (its stored name stays `lines`, so kept preferences still load).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Background {
     #[default]
@@ -231,12 +232,13 @@ impl Background {
         Background::ALL.into_iter().find(|b| b.name() == name)
     }
 
-    /// The label menus show.
+    /// The label every menu, the inspector and the palette show: None, Dots or Grid. A view
+    /// pattern, never something on the Paper.
     pub fn label(self) -> &'static str {
         match self {
             Background::None => "None",
             Background::Dots => "Dots",
-            Background::Lines => "Lines",
+            Background::Lines => "Grid",
         }
     }
 }

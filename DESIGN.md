@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 17 · 2026-10-20 · The one canonical visual and interaction direction for the OPD app
+Revision: 18 · 2026-10-20 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -22,6 +22,27 @@ The owner's explicit priority governs every choice below, and wins where a refer
 - The same restraint applies to Home, the editor, the tools, the inspector, type and spacing,
   in light, dark and narrow layouts. Airiness never shrinks the drawing room below usable.
 
+## Owner UX revision (revision 18, 2026-10-20)
+
+The owner's 20 October revision, as built in source (not yet rendered, reviewed or qualified
+natively; see AGENTS.md for what was checked):
+- **No full-width editor header.** Both panels run the surface's full height, each with its
+  own top row in the safe area (principle 2). A closed panel's top row floats over the
+  canvas's top corner instead.
+- **Vocabulary.** The **Canvas** is the saved file; its **Papers** are its pages. Visible
+  text, tooltips and accessibility names say Rename Canvas, Rename Paper, Duplicate Paper, Add
+  Paper, Delete Paper, Papers, Next/Previous Paper, "Go to Paper: …", and the export scopes
+  This Paper / All Papers; Home counts a file's Papers ("1 Paper", "3 Papers"). New names
+  follow it: a Paper a person adds is "Paper N", and a new library file's first Paper is
+  "Paper 1". Existing names stay exactly as stored ("Page 1" included); agents' unnamed pages
+  keep upstream's "Page N", and upstream's own new projects keep theirs. Ids, JSON keys,
+  file extensions, upstream's `page` code and schemas, the server's `pages` count, and
+  Home's Files, Search files and New file are unchanged.
+- **The Paper web app, as observed live** (organization and state evidence only, no hover
+  proof and no Paper semantics copied): a full-height left panel with the file's identity at
+  its top; no global top bar; with nothing selected the right panel shows the page's context,
+  and a click on empty canvas returns to it.
+
 ## Direction: a calm workbench around the canvas
 
 The canvas is the product. The chrome is one quiet surface around it, the same in Home and the
@@ -39,35 +60,66 @@ themes copied):
 The principles:
 1. **Drawing room first.** Panels give way before the canvas does (see Layout). The tool rail
    and zoom float over the canvas's edges, never over panels.
-2. **One header, one way home** (revision 2, built). The header's safe area is laid out before
-   the panels, across the whole surface, at every width:
-   - left: All projects (the grid icon, the only way back to Home), one compact menu (`···`,
-     holding every upstream menu and Appearance; native macOS keeps its menu bar instead) and
-     the Layers toggle (pages and layers);
-   - centre: the file's real name over its page and save state, centred on the surface and
-     truncated, never overlapped (revision 2 slice 6, built):
-     - in the web editor (browser page and Home's in-view editor) the name is an inline rename:
-       a click opens it, Enter or a click elsewhere keeps it, Escape drops it. Until then it is
-       an unfinished draft, so a clean reload or leave waits for it;
+2. **Full-height panels, one way home** (revision 18, replacing revision 2's header). There
+   is no header across the surface: both panels start at its top, each with its own top row
+   (38 px, 40 with native chrome, which holds the traffic lights at the left), separated from
+   the canvas by one vertical hairline each.
+   - **The left panel's top row:** All projects (the grid icon, the only way back to Home),
+     the compact menu (`···`, a bare glyph at rest with hover, pressed and focus feedback;
+     native macOS keeps its menu bar instead) and its own toggle. Under it, the **Canvas's
+     identity** (revision 2 slice 6, moved here), then the Papers, the Layers and the Library.
+   - **The right panel's top row:** its title (Design) and its own toggle at the end.
+   - **A closed panel's top row floats** over the canvas's top corner instead: on the left the
+     way home, the menu, the toggle and a compact identity (the name and the Paper line in one
+     row); on the right the toggle. Each control sits exactly where it is in the open panel's
+     row, so nothing jumps when a panel opens or closes. The rail and the zoom keep to the room
+     under the floating left row; the canvas rectangle itself never changes for them.
+   - **A sheet** (narrow) covers the canvas, so its top row carries the way home and both
+     toggles, under its "← Canvas".
+   - **The identity:**
+     - the Canvas's name over the shown Paper's line (its name and save state), in slots of
+       fixed height (and, floating, of a width taken from the kept name), truncated, never
+       overlapped. A rename field opens in the name's own slot: nothing moves or resizes;
+     - in the web editor (browser page and Home's in-view editor) the name renames inline: a
+       click (or Enter once Tab reached it), Rename Canvas… in the compact menu, or the name's
+       secondary-click menu opens it; Enter or a click elsewhere keeps it, Escape drops it, an
+       empty or over-long name is refused with a note. Until then it is an unfinished draft,
+       so a clean reload or leave waits for it, and the arrangement waits while it has the
+       keyboard (a hidden identity finishes it as a click elsewhere does);
      - a kept name is the file's name in the library and Home. It is saved in the same canvas
        save as the drawing (one commit, one acknowledgement). A rename made elsewhere while
        this editor has unsaved changes is a conflict, as for any change;
-     - native windows have no such save, so their title stays a label;
-     - the page line opens the shown page's own actions: Rename page… (the pages list's own
-       rename field), Duplicate page, Add page and Delete page.
-   - right: the Design toggle.
+     - native windows have no such save, so their name stays a label;
+     - the Paper line opens the **Paper navigation**: every Paper of the Canvas (choosing one
+       shows it, as its row does), then Rename Canvas…, Rename Paper… and the shown Paper's
+       Duplicate Paper, Add Paper and Delete Paper. The name's secondary click and the compact
+       menu offer the same renames and actions;
+     - **Rename Paper…** from anywhere (these menus, the inspector) opens the Papers list's own
+       rename field for the shown Paper, showing that list if needed: one field, one path, one
+       page-list change, always on the Paper it was opened for.
+   - **The toggles** are one mirrored pair: the sidebar glyph and its mirror image, the same
+     26 px size, quiet colours, tooltip style, focus ring and pressed (open) tint, named for
+     assistive technology. The left one says "Papers and layers", the right one "Properties".
+     Collapse Panels and Hide UI stay separate modes.
 
    Undo/redo, help and every other command stay in the menu, the command palette and their
-   shortcuts; zoom is at the canvas's lower left. Nothing is duplicated outside the header, so
-   there is no outer title, stage or action bar. Its controls are quiet and only an open
-   toggle is tinted.
+   shortcuts; zoom is at the canvas's lower left. There is no outer title, stage or action bar.
 3. **One strong accent.** The canvas's selected tool family is the only solid accent control.
    Selected rows, open toggles and Home's pressed layout buttons use the accent tint, and their
-   labels keep their colour.
-4. **Contextual properties stay in the inspector** (Design), pages and layers in the left
-   panel. Arrange (bring forward and send backward) shows in the layers header only while
-   something is selected. Every command keeps its menu entry and keyboard binding wherever a
-   button moves or hides.
+   labels keep their colour. The shown Paper's row is the current one, not a selection: a grey
+   (pressed) fill. Layer symbols are secondary grey; only components and instances keep the
+   accent. Keyboard focus on a custom control is a 1.5 px accent ring inside it (white on a
+   solid accent).
+4. **Contextual properties stay in the inspector** (Design); the Canvas's identity, Papers,
+   Layers and the Library in the left panel. Arrange (bring forward and send backward) shows in
+   the layers header only while something is selected. Every command keeps its menu entry and
+   keyboard binding wherever a button moves or hides.
+   - **Linked hover** (revision 18): the pointer over a layer on the canvas lights that layer's
+     row with the ordinary hover fill, and its row's own hover still outlines the layer on the
+     canvas. It is only a highlight: no selection, document, history or scroll change. It
+     follows the canvas's own hit, only while the pointer is in the canvas and over no floating
+     control, so it clears the moment the pointer leaves. Inside a collapsed group the group's
+     row (the one shown) is lit; the tree is never expanded for a hover.
 5. **One tool rail** (revision 2, built). A slim vertical rail at the canvas's left edge holds
    all sixteen tools in six families:
 
@@ -80,9 +132,13 @@ The principles:
    | Text | Text, Sticky note (a note, not a neutral box) |
    | Draw | Pencil, Pen (vector path), Eraser |
 
-   - A family's main button runs its current member. Its own chevron (a separate 24 × 32 px
-     target, always visible) opens a flyout of whole-row choices: icon, name and the real
-     shortcut.
+   - A family's main button runs its current member. Its own small arrow (a separate 12 × 32 px
+     target beside it, revision 18) opens a flyout of whole-row choices: icon, name and the
+     real shortcut. The arrow's target is always laid out, so nothing moves when it shows; it
+     is drawn while its row is hovered or has the keyboard focus, while its flyout is open, and
+     always for the current tool's family. A surface without hover (touch) chooses the family
+     first, then its arrow. Opening a flyout never chooses a tool. (TradingView's 52 px toolbar
+     with a hover-only arrow was a reference for the size only.)
    - Choosing a tool, by row or shortcut, makes it the family's member.
    - Escape closes an open flyout first; Escape outside it returns to Select, and every family
      keeps its member.
@@ -91,10 +147,19 @@ The principles:
      focused one and never reaches the canvas.
    - Tool keys typed into a field stay the field's.
    - There is no bottom tool palette.
-6. **A quiet, contextual inspector** (revision 2, built):
-   - **Nothing selected, Select/Hand/Laser:** the page and a one-line hint.
-   - **A creation tool:** only that tool's defaults, titled "For new …"; they never edit the
-     selection.
+6. **A quiet, contextual inspector** (revision 2, built; its states audited in revision 18).
+   Under the panel's own top row (Design and its toggle):
+   - **Nothing selected** (also after a click on empty canvas), any tool: the shown Paper's
+     context, in two kinds that are never mixed up:
+     - **Paper**, the document's: its name (read-only, with Rename Paper…, which opens the
+       Papers list's one rename field), what it holds ("n layers") and its place ("2 of 3").
+       A Paper has no fill or size of its own, so none is shown or invented;
+     - **View**, the viewer's: Grid (None, Dots, Grid), the same view preference as the
+       canvas's menu, never part of the Paper, its undo or its exports.
+     There is no always-editable Paper name here any more (it renamed on every keystroke, apart
+     from the Papers list's save and history).
+   - **A creation tool:** its defaults for the NEXT object first, titled "For new …"; they
+     never edit the selection or existing layers. The Paper and View sections follow.
    - **A selection:** the sections every selected layer has. A value they share is shown and
      editable for all. One interaction with a field (typing a value key by key, or dragging
      it) is one undo step, sealed when the field is released or loses focus; a later
@@ -106,10 +171,15 @@ The principles:
        never a shared size.
      - Independent corners are compared corner by corner: equal corners show as the four
        corner fields for every selected layer.
+     - One layer, several of one kind and several of different kinds are the three selection
+       states: the second and third say Mixed where values differ, and the third shows only
+       what every kind has, with a word on why.
    - **Folded by default:** Sketch (the optional hand-drawn style, with a plain explanation;
-     clean geometry unless turned on, and existing sketchy drawings keep it) and Export.
-7. **Quiet surfaces, clear state.** Panels and header share one colour, separated by hairlines.
-   Fields are softly filled.
+     clean geometry unless turned on, and existing sketchy drawings keep it) and Export, which
+     stays available in every state but secondary.
+7. **Quiet surfaces, clear state.** Both panels share one colour and run the surface's full
+   height, each separated from the canvas by one vertical hairline; there is no horizontal
+   rule under a top row and no rounded window. Fields are softly filled.
 8. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
    neatness (see the status rules in AGENTS.md). The status line sits at the canvas's lower
    edge, right of each control laid out there that reaches the canvas's lower half: the zoom,
@@ -118,7 +188,9 @@ The principles:
 9. **Light and dark are one design** (see Appearance below): Home, the chrome, the rail and
    zoom, menus, the inspector and the canvas itself share one resolved appearance.
 10. **A plain canvas by default** (revision 2 slice 4, built). The background is None, Dots
-    or Lines.
+    or Grid (revision 18's name for the line pattern, the same in every menu, the inspector's
+    View and the palette; its stored name stays `lines`, so kept preferences still load). It
+    is the viewer's grid over the canvas, never content on a Paper.
     - **Where to choose it:**
       - the canvas's own menu: a secondary click, without a drag, on blank canvas, never over
         an object, a panel or a popup. It holds Background, Zoom to Fit and
@@ -132,7 +204,7 @@ The principles:
       its undo or its saves, and nothing in snapping or exports.
     - **Where it is kept:** the app library keeps it with Home's layout; the standalone
       browser page and native windows keep it for that window only.
-    - **Lines** use the dot grid's zoom-adaptive spacing, as 1 px lines.
+    - **Grid** uses the dot grid's zoom-adaptive spacing, as 1 px lines.
 11. **A quiet Home** (revision 2 slice 5, built).
     - **Layout.** Files show as a grid of equal cards by default, and a list once List is
       chosen; the library keeps that choice. A choice it couldn't keep still applies, and Home
@@ -144,7 +216,10 @@ The principles:
       (the editor's `···` menu has the same).
     - **Storage cue:** "New files are kept in the OpenPaperDesign library, this app's own
       data folder, not in a Codex project." No project association is shown or implied.
-    - **Search** says when nothing matches and how to clear it.
+    - **Search** looks like a search field at rest (revision 18): the field's soft surface
+      inside a visible hairline, with a magnifier before the text; focus shows the ring. It is
+      the same one input: it filters as before, Escape clears it, and it says when nothing
+      matches and how to clear it. The grid/list choice and the narrow layout are unchanged.
 
 12. **Diagrams from existing objects** (revision 2 slice 7, partly built). A box with its
     label is a group of one shape and one Text layer over it.
@@ -256,9 +331,9 @@ Still open from the revision 2 plan (not built yet, and not to be described as b
 
 | Width | Arrangement | A fresh view |
 |---|---|---|
-| ≥ 1024 | Wide: header across; layers/pages left (240) and inspector right (260), each optional and resizable, beside the canvas. | Layers closed; the quiet Design inspector open |
-| 600–1023 | Docked: header across; the canvas plus at most ONE panel at its usual width (Layers left, Design right). | Canvas only |
-| < 600 | Sheet: header across; a chosen panel is an opaque sheet filling the room under the header, with "← Canvas" back (no canvas sliver, no input behind it). | Canvas only |
+| ≥ 1024 | Wide: no header; layers/pages left (240) and inspector right (260), full height, each optional and resizable, beside the canvas; a closed one's top row floats over the canvas. | Layers closed; the quiet Design inspector open |
+| 600–1023 | Docked: no header; the canvas plus at most ONE full-height panel at its usual width (Layers left, Design right); the other's top row floats. | Canvas only |
+| < 600 | Sheet: no header; a chosen panel is an opaque sheet filling the surface, with "← Canvas" back and both toggles and the way home in its top row (no canvas sliver, no input behind it). | Canvas only |
 
 Rules that apply to every tier:
 - **Layers and Design toggles** mean the same panel at every width. On a wide surface the two
@@ -267,14 +342,16 @@ Rules that apply to every tier:
   fresh default.
 - **Collapse panels** (menu View ▸ Collapse / Restore Panels, and the palette) hides both and
   keeps the arrangement, so Restore brings it back. Opening a panel while collapsed ends the
-  collapse, with that panel only. The header, rail and zoom stay. **Hide UI** (Ctrl/⌘+\) is a
+  collapse, with that panel only. Both floating top rows (the way home, the menu, the toggles
+  and the compact identity), the rail and the zoom stay. **Hide UI** (Ctrl/⌘+\) is a
   separate mode that hides everything. Collapse has no shortcut yet: one is added only after
   the hosts' key handling has been checked.
 - **Arrangement changes wait for fields.** A change waits while an egui text field has the
   keyboard, then lags one frame. A hidden field finishes as a click elsewhere finishes it.
   Docked ↔ sheet is the same panel, so its fields keep focus.
 - **One canvas rectangle** (what the panels leave) is used for rendering, clipping and pointer
-  input.
+  input. The floating top rows, the rail and the zoom are floating UI over it: a press there is
+  theirs, never the canvas's, and they never change the rectangle.
 - **A panel's edge is the panel's.** A wide panel's resize handle reaches a few pixels into
   the canvas. A press egui gives that handle (its own rect widened by egui's interact radius)
   only resizes the panel: both hosts keep it from the editor, so nothing behind the edge is
@@ -286,11 +363,21 @@ Rules that apply to every tier:
 These are the values in `src/ui/rail.rs`. They are design calculations, not proof of how they
 render.
 
-- **Rail:** 64 px wide (32 px main button plus 24 px chevron plus 2 × 4 padding; the plan's
-  52 px is widened so the chevron is a real target). Six 32 px rows with 2 px gaps, 210 px tall,
+- **Rail:** 52 px wide (32 px main button plus the arrow's 12 px target plus 2 × 4 padding;
+  revision 2's 24 px chevron column made it 64). Six 32 px rows with 2 px gaps, 210 px tall,
   8 px from the canvas's edges.
-- **Placement:** vertically centred in the room above a 48 px zoom reservation. Below a 270 px
-  canvas height it is anchored at the top, with the zoom beside it.
+- **Placement:** in the tools' room (the canvas under the floating left top row while the left
+  panel is closed, else the whole canvas), vertically centred above a 48 px zoom reservation.
+  Below a 270 px room height it is anchored at the room's top, with the zoom beside it.
+- **A short room** (too low for six 32 px rows between its 8 px insets, e.g. 320 × 240 under
+  the floating row) gets rows of the whole pixels that fit, down to 24 px (main buttons
+  square, arrows as high), so the rail never runs past its room. Before, egui moved the
+  overflowing rail up under the floating row. Rooms of the canonical 270 px surface and
+  taller keep 32 px rows; below about 217 px of canvas even 24 px rows don't fit.
+- **Floating top rows:** a 4 px padded floating surface (radius 10) whose controls sit where
+  they are in the open panel's top row (10 px from the left edge, after the traffic lights
+  with native chrome; 14 px from the right edge). The compact identity takes the room left
+  up to the right row and the rail's inset; below 60 px it isn't drawn (a draft then finishes).
 - **Flyout:** 220 px wide, opening inward at rail.right + 4. Where that leaves less than
   180 px it opens over the rail instead. Its height is clamped to the canvas (it scrolls).
 - **Zoom:** −, the level (a menu with Zoom to Fit, Zoom to Selection and Zoom to 100%) and +,
@@ -307,7 +394,7 @@ under the host's MCP Apps style variables.
 
 | Token | Light | Dark |
 |---|---|---|
-| surface (bar, panels) | #fbfbfc | #1f1f22 |
+| surface (panels, top rows) | #fbfbfc | #1f1f22 |
 | field / hover surface | #f1f1f3 | #2a2a2e |
 | control | #ffffff | #2c2c30 |
 | text | #1d1d1f | #ececef |
@@ -315,26 +402,35 @@ under the host's MCP Apps style variables.
 | tertiary / disabled | #b4b4ba | #5f5f66 |
 | hairline | #e6e6ea | #333338 |
 | accent | system accent, else #007aff | system accent, else #007aff (Home: #4c9bff) |
-| selected | accent tint over surface (≈13% light, 27% dark) | |
+| selected (selection, open toggle) | accent tint over surface (≈13% light, 27% dark) | |
+| current (the shown Paper's row) | the pressed fill (black 8%) | the pressed fill (white 10%) |
+| hover | black 4% | white 5% |
+| focus ring | accent, 1.5 px inside (white on a solid accent) | |
 | canvas work surface | #eeeef0 | #18181b |
 | canvas grid dot | #cfcfd6 | #34343a |
-| canvas grid line (Lines) | the grid dot at 60% opacity | the grid dot at 60% opacity |
+| canvas grid line (Grid) | the grid dot at 60% opacity | the grid dot at 60% opacity |
+
+The revision 18 audit (toolbar, sidebar and inspector together, Light and Dark): hover is one
+fill everywhere (rows, icon buttons, the rail's arrows, flyout rows); the accent tint is only a
+selection or an open toggle; the solid accent only the active tool (and the palette's keyboard
+row); the current Paper is grey; layer symbols are grey but for components and instances.
+Home's search uses the stronger hairline (#d4d4da / #46464c) at rest.
 
 - **Type:** Inter. 13 body, 11 secondary and section labels (semibold), 13 semibold titles.
 - **Shape:**
-  - control radius 7;
-  - rows and icon buttons 6;
-  - toggles 7;
-  - menus 10, windows and popovers 12;
+  - controls, rows, icon buttons and toggles 6 (one radius, `theme::RADIUS`);
+  - floating surfaces (the rail, the zoom, the floating top rows, menus, the canvas's menu)
+    10, windows and popovers 12;
   - Home cards 12.
 - **Spacing:**
-  - header 38 (40 with native chrome);
+  - a panel's top row 38 (40 with native chrome);
   - 24 interactive height;
-  - 26 icon buttons in the header and zoom; rail rows 32 × 32 plus a 24 × 32 chevron;
+  - 26 icon buttons in the top rows and zoom; rail rows 32 × 32 plus a 12 × 32 arrow;
   - 16-unit icon grid, about 1.25 stroke.
-- **Shadow:** only floating things (the rail, zoom, menus, popovers). Panels are flat.
-- **Borders:** hairlines between regions only. Controls in bars and rows are borderless until
-  hovered.
+- **Shadow:** only floating things (the rail, zoom, the floating top rows, menus, popovers).
+  Panels are flat.
+- **Borders:** hairlines between regions only (one vertical one per open panel). Controls in
+  top rows and rows are borderless until hovered or focused.
 
 ## Not in scope
 

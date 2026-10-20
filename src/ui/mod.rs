@@ -1,5 +1,6 @@
-//! egui chrome: menu bar, layers panel, design (properties) panel, floating toolbar, and the
-//! projects home screen.
+//! egui chrome: the full-height left panel (navigation, the Canvas's identity, Papers, layers
+//! and library), the full-height design (properties) panel, the floating tool rail and the
+//! controls that float over the canvas while a panel is closed, and the projects home screen.
 
 pub mod home;
 pub mod inspector;
@@ -23,9 +24,10 @@ pub struct UiState {
     /// tell keyboard focus in this field from focus in another one.
     pub rename_field: Option<egui::Id>,
     pub show_help: bool,
-    /// The canvas's background pattern (DESIGN.md: None by default; Dots or Lines from the
-    /// canvas's menu, View and the palette). A view preference: never the document, its undo,
-    /// its saves, snapping or an export. Set it with [`UiState::set_background`].
+    /// The canvas's background pattern (DESIGN.md: None by default; Dots or Grid from the
+    /// canvas's menu, the menu's Background, the inspector's View, View and the palette). A view
+    /// preference: never the document, its undo, its saves, snapping or an export. Set it with
+    /// [`UiState::set_background`].
     pub background: crate::render::scene::Background,
     /// The last pattern other than None, which the grid shortcut turns back on (kept by
     /// `set_background`; public only so hosts can build a `UiState` with `..Default::default()`).
@@ -43,19 +45,21 @@ pub struct UiState {
     pub translucent_sidebar: bool,
     /// When set, the projects home screen is shown instead of the editor.
     pub home: Option<home::HomeView>,
-    /// Name of the open project (shown in the toolbar).
+    /// Name of the open project: the Canvas's name in its identity (the left panel's top, or
+    /// the compact identity over the canvas while that panel is closed).
     pub project_name: String,
     /// A host that saves the file's name (the web editor, through its canvas save) opts in:
-    /// the centred title is then an inline rename field. Off by default: a native window has
-    /// no such save, so its title stays a label rather than suggesting a rename it can't keep.
+    /// the Canvas's name then renames inline (Rename Canvas). Off by default: a native window
+    /// has no such save, so its name stays a label rather than suggesting a rename it can't
+    /// keep.
     pub file_rename: bool,
-    /// The title's unfinished rename: Enter or a click elsewhere finishes it into
+    /// The Canvas name's unfinished rename: Enter or a click elsewhere finishes it into
     /// `project_name`, Escape drops it. Not the file's name until then.
     pub file_title_draft: Option<String>,
-    /// The title field's widget id, as of the last frame it was drawn (like
+    /// The Canvas name field's widget id, as of the last frame it was drawn (like
     /// `UiState::rename_field`): lets a host judge exactly that field by its draft.
     pub file_title_field: Option<egui::Id>,
-    /// Autosave state for the toolbar subtitle, e.g. "Saved" or "Saving…".
+    /// Autosave state for the identity's Paper line, e.g. "Saved" or "Saving…".
     pub save_state: String,
     pub pages: pages::PagesUi,
     pub library: library::LibraryUi,
@@ -77,8 +81,8 @@ pub struct UiState {
     pub panels: Panels,
     /// The tool rail: each family's current member and the open flyout.
     pub rail: rail::Rail,
-    /// Where the header's controls and the zoom were laid out in the last frame (no
-    /// behaviour; for hosts' checks and tests, like `PaletteUi::search_id`).
+    /// Where the panels' top-row controls, the identity and the zoom were laid out in the last
+    /// frame (no behaviour; for hosts' checks and tests, like `PaletteUi::search_id`).
     pub chrome: Chrome,
     /// The person's appearance: System (the default, following the OS appearance as
     /// `theme::apply` set it), Light or Dark (Menu ▸ Appearance). A view preference, never part
@@ -148,7 +152,7 @@ pub enum Tier {
     Wide,
     /// At most one panel, docked beside the canvas at its usual width.
     Docked,
-    /// At most one panel, as an opaque sheet filling the room under the header.
+    /// At most one panel, as an opaque sheet filling the surface.
     Sheet,
 }
 
@@ -234,7 +238,8 @@ impl Panels {
         }
     }
 
-    /// The header's toggle for `side` on a surface of tier `tier`.
+    /// The toggle for `side` (in its panel's top row, or floating over the canvas while that
+    /// panel is closed) on a surface of tier `tier`.
     pub fn toggle(&mut self, side: NarrowPanel, tier: Tier) {
         let other = match side {
             NarrowPanel::Layers => NarrowPanel::Design,
@@ -285,7 +290,7 @@ impl Panels {
 
 /// The width tiers (see [`UiState::narrow`]): below `below` logical px of width the surface has
 /// room for one side panel at a time, docked beside the canvas from `dock_from` px and a sheet
-/// under the header below that. The same panels, commands and canvas are drawn; only where.
+/// filling the surface below that. The same panels, commands and canvas are drawn; only where.
 ///
 /// A change of arrangement (a toggle, Collapse panels, or the surface crossing a tier) is
 /// applied only after one frame without an egui text field holding the keyboard, so a field
@@ -379,15 +384,28 @@ fn settle(ctx: &egui::Context, n: &mut NarrowLayout, want: Arrangement) -> Arran
     n.shown.unwrap_or(want)
 }
 
-/// Where the header's controls and the zoom were laid out (see [`UiState::chrome`]).
+/// Where the chrome's controls and the zoom were laid out (see [`UiState::chrome`]).
 #[derive(Debug, Clone, Default)]
 pub struct Chrome {
     pub home: Option<egui::Rect>,
     pub menu: Option<egui::Rect>,
+    /// The left panel's toggle ("Papers and layers").
     pub layers: Option<egui::Rect>,
+    /// The right panel's toggle ("Properties").
     pub design: Option<egui::Rect>,
-    /// The file's name and page line, centred in the header.
+    /// The Canvas's name over its Paper line: at the left panel's top, or the compact identity
+    /// floating over the canvas while that panel is closed.
     pub identity: Option<egui::Rect>,
+    /// The canvas rectangle (`draw`'s result).
+    pub canvas: Option<egui::Rect>,
+    /// While the left panel is closed: its top row's controls floating at the canvas's top
+    /// left (home, menu, toggle and the compact identity).
+    pub left_float: Option<egui::Rect>,
+    /// While the right panel is closed: its toggle floating at the canvas's top right.
+    pub right_float: Option<egui::Rect>,
+    /// The layer row that shows the canvas's hover (see `canvas_hover_row`): highlighted only,
+    /// never selected, scrolled to or expanded.
+    pub hover_row: Option<NodeId>,
     /// The zoom group (−, percentage, +) at the canvas's lower left.
     pub zoom: Option<egui::Rect>,
     pub zoom_out: Option<egui::Rect>,
@@ -464,6 +482,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         home::draw(ui, hv, st.native_chrome, st.translucent_sidebar);
         return egui::Rect::NOTHING;
     }
+    // The canvas the last frame laid out: where a canvas hover can be (`canvas_hover_row`).
+    let last_canvas = st.chrome.canvas;
     st.chrome = Chrome::default();
     let tier = st.narrow.tier(ui.available_rect_before_wrap().width());
     for ev in std::mem::take(&mut ed.ui_events) {
@@ -489,10 +509,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         // No layer or page rows are drawn: an open rename is finished as losing focus does.
         commit_rename(ed, st);
         pages::commit_rename(ed, st);
-        // The header isn't drawn either: the title's draft is finished as losing focus does.
-        if let Some(n) = st.file_title_draft.take().as_deref().and_then(file_name) {
-            st.project_name = n;
-        }
+        // The identity isn't drawn either: the name's draft is finished as losing focus does.
+        finish_title_draft(st);
         st.rail.close();
         st.canvas_menu = None;
         let canvas = ui.available_rect_before_wrap();
@@ -507,26 +525,27 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
     } else {
         p.sidebar
     };
-    // The header's safe area comes first, across the whole surface; the panels start below it.
-    egui::Panel::top("toolbar")
-        .exact_size(if st.native_chrome {
-            theme::TOOLBAR_H
-        } else {
-            BAR_H
-        })
-        .frame(
-            egui::Frame::NONE
-                .fill(p.window)
-                .inner_margin(egui::Margin::symmetric(8, 0)),
-        )
-        .show(ui, |ui| top_bar(ui, ed, st, shown));
+    // No header across the surface (DESIGN.md, revision 18): both panels run its full height,
+    // each with its own top row in the safe area; a closed panel's controls float over the
+    // canvas instead.
     let room = ui.available_rect_before_wrap();
+    st.chrome.hover_row = canvas_hover_row(ui.ctx(), ed, st, last_canvas);
     let layers_frame = egui::Frame::NONE
         .fill(sidebar_fill)
-        .inner_margin(egui::Margin::symmetric(10, 8));
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 0,
+            bottom: 8,
+        });
     let design_frame = egui::Frame::NONE
         .fill(p.inspector)
-        .inner_margin(egui::Margin::symmetric(14, 10));
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 0,
+            bottom: 10,
+        });
     match shown.tier {
         Tier::Wide => {
             if shown.layers {
@@ -535,7 +554,7 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                     .default_size(240.0)
                     .size_range(180.0..=420.0)
                     .frame(layers_frame)
-                    .show(ui, |ui| layers(ui, ed, st));
+                    .show(ui, |ui| left_panel(ui, ed, st, shown, false));
                 st.chrome.panel_edges.extend(panel_edge(ui, "layers"));
             }
             if shown.design {
@@ -544,14 +563,14 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                     .default_size(260.0)
                     .size_range(220.0..=420.0)
                     .frame(design_frame)
-                    .show(ui, |ui| inspector::panel(ui, ed, st));
+                    .show(ui, |ui| right_panel(ui, ed, st, shown, false));
                 st.chrome.panel_edges.extend(panel_edge(ui, "design"));
             }
         }
         Tier::Docked | Tier::Sheet => {
             // Docked: the panel at its usual width, the canvas keeps the rest. A sheet fills
-            // the room under the header (opaque; it takes its own input) and says how to get
-            // back to the canvas.
+            // the surface (opaque; it takes its own input), carries both toggles and the way
+            // home, and says how to get back to the canvas.
             let sheet = shown.tier == Tier::Sheet;
             let width = |usual: f32| if sheet { room.width() } else { usual };
             // The panel's own widgets get the same ids in both tiers whether or not the sheet's
@@ -568,7 +587,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                             if sheet {
                                 sheet_back(ui, st, NarrowPanel::Layers, tier);
                             }
-                            ui.scope_builder(body(ui), |ui| layers(ui, ed, st));
+                            let add = |ui: &mut Ui| left_panel(ui, ed, st, shown, sheet);
+                            ui.scope_builder(body(ui), add);
                         });
                 }
                 NarrowPanel::Design => {
@@ -580,7 +600,8 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
                             if sheet {
                                 sheet_back(ui, st, NarrowPanel::Design, tier);
                             }
-                            ui.scope_builder(body(ui), |ui| inspector::panel(ui, ed, st));
+                            let add = |ui: &mut Ui| right_panel(ui, ed, st, shown, sheet);
+                            ui.scope_builder(body(ui), add);
                         });
                 }
                 NarrowPanel::Canvas => {}
@@ -593,13 +614,25 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         commit_rename(ed, st);
         pages::commit_rename(ed, st);
     }
-    // The one canvas rectangle: rendering, clipping and pointer input all use it.
+    // The one canvas rectangle: rendering, clipping and pointer input all use it. The floating
+    // controls lie over it and never change it.
     let canvas = ui.available_rect_before_wrap();
+    st.chrome.canvas = Some(canvas);
     if canvas.width() > 1.0 && canvas.height() > 1.0 {
         // Before the rail: a flyout open in the last frame keeps the press its own.
         let opened = open_canvas_menu(ui.ctx(), ed, st, canvas);
-        rail::draw(ui.ctx(), ed, &mut st.rail, canvas);
-        zoom_controls(ui.ctx(), ed, st, canvas);
+        // A closed panel's top row, over the canvas's top corners; the rail and the zoom keep
+        // to the room under the left one.
+        let mut tools = canvas;
+        if !shown.layers {
+            let r = float_left(ui.ctx(), ed, st, canvas, shown);
+            tools.min.y = r.bottom().clamp(canvas.top(), canvas.bottom());
+        }
+        if !shown.design {
+            float_right(ui.ctx(), st, canvas, shown);
+        }
+        rail::draw(ui.ctx(), ed, &mut st.rail, tools);
+        zoom_controls(ui.ctx(), ed, st, tools);
         status(ui.ctx(), ed, canvas, [st.chrome.zoom, st.rail.rects.rail]);
         canvas_menu(ui.ctx(), ed, st, canvas, opened);
     } else {
@@ -607,6 +640,11 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         st.rail.close();
         st.rail.rects = Default::default();
         st.canvas_menu = None;
+    }
+    if st.chrome.identity.is_none() {
+        // No identity is drawn (the Design sheet covers the surface): the name's draft is
+        // finished as losing focus does, as when the UI is hidden.
+        finish_title_draft(st);
     }
     palette::draw(ui.ctx(), ed, st, room);
     if st.show_help {
@@ -664,7 +702,7 @@ fn canvas_menu_layer() -> egui::LayerId {
     egui::LayerId::new(egui::Order::Foreground, CANVAS_MENU.into())
 }
 
-/// The canvas's own menu (DESIGN.md): Background (None, Dots, Lines), Zoom to Fit and
+/// The canvas's own menu (DESIGN.md): Background (None, Dots, Grid), Zoom to Fit and
 /// Collapse or Restore Panels. A choice, Escape or a press anywhere else closes it; while it is
 /// open, the hosts keep presses and Escape from the editor (`UiState::captures_input`).
 fn canvas_menu(
@@ -690,7 +728,7 @@ fn canvas_menu(
             let p = theme::pal(ui);
             egui::Frame::popup(ui.style())
                 .fill(p.popover)
-                .corner_radius(8.0)
+                .corner_radius(10.0)
                 .inner_margin(6.0)
                 .show(ui, |ui| {
                     ui.set_min_width(180.0);
@@ -789,8 +827,10 @@ fn about(ctx: &egui::Context, st: &mut UiState, room: egui::Rect) {
     }
 }
 
-/// A sheet's first row: the way back to the canvas (the header's toggle does the same).
+/// A sheet's first row: the way back to the canvas (its panel's toggle does the same).
 fn sheet_back(ui: &mut Ui, st: &mut UiState, side: NarrowPanel, tier: Tier) {
+    // The panel's frame has no top margin (its top row is the safe area); this row has its own.
+    ui.add_space(6.0);
     let r = ui
         .add(egui::Button::new("← Canvas").frame(false))
         .on_hover_text("Close this panel and return to the canvas");
@@ -851,7 +891,7 @@ fn zoom_controls(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas:
             let p = theme::pal(ui);
             egui::Frame::popup(ui.style())
                 .fill(p.popover)
-                .corner_radius(8.0)
+                .corner_radius(10.0)
                 .inner_margin(2.0)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -892,35 +932,29 @@ fn zoom_controls(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas:
     (st.chrome.zoom_out, st.chrome.zoom_level, st.chrome.zoom_in) = parts;
 }
 
-/// The top bar's height without native chrome.
+/// The panels' top row height without native chrome (with it, `theme::TOOLBAR_H`, the
+/// traffic lights' bar).
 const BAR_H: f32 = 38.0;
+/// The chrome's icon controls (home, menu, the panel toggles).
+const CONTROL: f32 = 26.0;
+/// The left panel's content inset (its frame's margin), where its top row's first control is.
+const LEFT_INSET: f32 = 10.0;
+/// The right panel's content inset, where its toggle ends.
+const RIGHT_INSET: f32 = 14.0;
+/// A floating top row's padding (its frame's stroke adds one more point).
+const FLOAT_PAD: f32 = 4.0;
+/// The identity's Canvas name and Paper line slots: fixed heights, so a rename field opens in
+/// the name's own place and nothing below moves.
+const NAME_H: f32 = 24.0;
+const PAPER_H: f32 = 18.0;
 
-/// A text toggle of the top bar (the narrow layout's Layers and Design): a soft accent tint
-/// when on, a hover fill otherwise.
-fn pill(ui: &mut Ui, label: &str, on: bool) -> egui::Response {
-    let p = theme::pal(ui);
-    let color = if on { p.text } else { p.secondary };
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        theme::medium(theme::SECONDARY + 1.0),
-        color,
-    );
-    let size = galley.size() + egui::vec2(16.0, 10.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let fill = if on {
-        theme::selected_fill(ui)
-    } else if resp.hovered() {
-        p.hover
+/// The height of a panel's top row (the surface's safe area).
+fn top_h(st: &UiState) -> f32 {
+    if st.native_chrome {
+        theme::TOOLBAR_H
     } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, 7.0, fill);
-    ui.painter().galley(
-        rect.center() - galley.size() / 2.0,
-        galley,
-        Color32::PLACEHOLDER,
-    );
-    resp
+        BAR_H
+    }
 }
 
 fn menu_item(ui: &mut Ui, ed: &mut Editor, label: &str, action: Action) {
@@ -991,115 +1025,201 @@ fn action_button(
     r.rect
 }
 
-/// The header (DESIGN.md: the top safe area, laid out before the panels and across the whole
-/// surface, at every width). Left: All projects (the way home), one compact menu holding every
-/// upstream menu (platforms without a native menu bar) and the Layers toggle. Centre: the
-/// file's real name over its page and save state, centred on the surface and truncated rather
-/// than overlapped. Right: the Design toggle. Undo, redo, zoom and help stay in the menu, the
-/// palette and their shortcuts (zoom also at the canvas's lower left). Its controls are quiet
-/// and only an open toggle is tinted, so the header recedes around the canvas.
-fn top_bar(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement) {
-    let p = theme::pal(ui);
-    let bar = ui.max_rect();
-    let tier = shown.tier;
-    // Left group (after the traffic lights where the window has native chrome).
-    let left_start = bar.left()
-        + if st.native_chrome {
-            theme::TRAFFIC_LIGHTS_W
+/// The left panel (DESIGN.md, revision 18), from the surface's top: its top row (the way
+/// home, the compact menu and its own toggle; on a sheet, which covers the canvas, the right
+/// panel's toggle too), the Canvas's identity, then the Papers, Layers and Library. Undo, redo,
+/// zoom and help stay in the menu, the palette and their shortcuts (zoom also at the canvas's
+/// lower left). Its controls are quiet and only an open toggle is tinted.
+fn left_panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement, sheet: bool) {
+    top_row(ui, top_h(st), |ui| {
+        if st.native_chrome && !sheet {
+            // The traffic lights sit at the window's top left, in this row.
+            ui.add_space(theme::TRAFFIC_LIGHTS_W - LEFT_INSET);
+        }
+        nav(ui, ed, st, shown);
+        if sheet {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                design_toggle(ui, st, shown)
+            });
+        }
+    });
+    identity(ui, ed, st);
+    ui.add_space(6.0);
+    layers(ui, ed, st);
+}
+
+/// The right panel, from the surface's top: its top row (its title, or on a sheet the way home
+/// and the left panel's toggle; its own toggle at the end) over the inspector.
+fn right_panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement, sheet: bool) {
+    top_row(ui, top_h(st), |ui| {
+        if sheet {
+            nav(ui, ed, st, shown);
         } else {
-            0.0
-        };
-    let left = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(
-                    egui::pos2(left_start, bar.top()),
-                    bar.max,
-                ))
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let home = theme::quiet_icon_button(ui, theme::Icon::Grid, 26.0, false)
-                    .on_hover_text("All projects");
-                st.chrome.home = Some(home.rect);
-                if home.clicked() {
-                    ed.requests.push(crate::editor::AppRequest::Home);
-                }
-                if !st.native_chrome {
-                    let menu = ui
-                        .menu_button(
-                            RichText::new("···")
-                                .font(theme::semibold(theme::BODY))
-                                .color(p.secondary),
-                            |ui| {
-                                for (title, entries) in shortcuts::menus() {
-                                    ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
-                                }
-                                ui.separator();
-                                ui.menu_button("Appearance", |ui| appearance_menu(ui, st));
-                                ui.menu_button("Background", |ui| background_menu(ui, st));
-                                ui.separator();
-                                if ui.button("About & notices").clicked() {
-                                    st.show_about = true;
-                                    ui.close();
-                                }
-                            },
-                        )
-                        .response
-                        .on_hover_text("Menu");
-                    st.chrome.menu = Some(menu.rect);
-                }
-                let layers = theme::quiet_icon_button(ui, theme::Icon::Sidebar, 26.0, shown.layers)
-                    .on_hover_text("Layers and pages");
-                st.chrome.layers = Some(layers.rect);
-                if layers.clicked() {
-                    st.panels.toggle(NarrowPanel::Layers, tier);
-                }
-                ui.min_rect().right()
-            },
-        )
-        .inner;
-    // Right group.
-    let right = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(bar)
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let design = pill(ui, "Design", shown.design).on_hover_text("Design inspector");
-                st.chrome.design = Some(design.rect);
-                if design.clicked() {
-                    st.panels.toggle(NarrowPanel::Design, tier);
-                }
-                ui.min_rect().left()
-            },
-        )
-        .inner;
-    // Centre: on the surface's centre while that leaves room on both sides, else in the room
-    // between the two groups.
-    let gap = 8.0;
-    let (lo, hi) = (left + gap, right - gap);
-    let half = (bar.center().x - lo).min(hi - bar.center().x);
-    let (x0, x1) = if half >= 60.0 {
-        (bar.center().x - half, bar.center().x + half)
+            section(ui, "Design");
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            design_toggle(ui, st, shown)
+        });
+    });
+    inspector::panel(ui, ed, st);
+}
+
+/// A panel's top row: the surface's safe area, `h` high, laid out left to right.
+fn top_row(ui: &mut Ui, h: f32, add: impl FnOnce(&mut Ui)) {
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), h));
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(layout), |ui| {
+        ui.set_min_size(rect.size());
+        ui.spacing_mut().item_spacing.x = 2.0;
+        add(ui);
+    });
+}
+
+/// The way home, the compact menu (where the window has no native menu bar) and the left
+/// panel's toggle, in that order wherever they are (the left panel's top row, or floating over
+/// the canvas while that panel is closed), so each keeps its place when the panel opens.
+fn nav(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement) {
+    let home =
+        theme::quiet_icon_button(ui, Icon::Grid, CONTROL, false).on_hover_text("All projects");
+    st.chrome.home = Some(home.rect);
+    if home.clicked() {
+        ed.requests.push(crate::editor::AppRequest::Home);
+    }
+    if !st.native_chrome {
+        let menu = app_menu(ui, ed, st);
+        st.chrome.menu = Some(menu.rect);
+    }
+    let layers = sidebar_toggle(ui, Icon::Sidebar, shown.layers, "Papers and layers");
+    st.chrome.layers = Some(layers.rect);
+    if layers.clicked() {
+        st.panels.toggle(NarrowPanel::Layers, shown.tier);
+    }
+}
+
+/// The right panel's toggle (its top row's end, or floating at the canvas's top right).
+fn design_toggle(ui: &mut Ui, st: &mut UiState, shown: Arrangement) {
+    let design = sidebar_toggle(ui, Icon::SidebarRight, shown.design, "Properties");
+    st.chrome.design = Some(design.rect);
+    if design.clicked() {
+        st.panels.toggle(NarrowPanel::Design, shown.tier);
+    }
+}
+
+/// A side panel's toggle. The left and right ones are one mirrored pair: the sidebar glyph and
+/// its mirror image at the same size, in the same quiet colours, with the same tooltip style,
+/// focus ring and pressed tint (an open panel's toggle is tinted), and its name for assistive
+/// technology.
+fn sidebar_toggle(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> egui::Response {
+    let r = theme::quiet_icon_button(ui, icon, CONTROL, on).on_hover_text(tip);
+    r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tip));
+    r
+}
+
+/// The compact menu (platforms without a native menu bar): the Canvas and Paper renames and the
+/// shown Paper's actions, every upstream menu, Appearance, Background and About & notices. Its
+/// "···" is a bare glyph at rest, with the hover, pressed and focus feedback of other controls.
+fn app_menu(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Response {
+    let p = theme::pal(ui);
+    ui.scope(|ui| {
+        // Bare at rest: no fill or outline until hovered, pressed, focused or open.
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+        for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            v.bg_stroke = egui::Stroke::NONE;
+        }
+        let glyph = RichText::new("···")
+            .font(theme::semibold(theme::BODY))
+            .color(p.secondary);
+        ui.menu_button(glyph, |ui| {
+            identity_menu(ui, ed, st);
+            ui.separator();
+            for (title, entries) in shortcuts::menus() {
+                ui.menu_button(title, |ui| menu_entries(ui, ed, &entries));
+            }
+            ui.separator();
+            ui.menu_button("Appearance", |ui| appearance_menu(ui, st));
+            ui.menu_button("Background", |ui| background_menu(ui, st));
+            ui.separator();
+            if ui.button("About & notices").clicked() {
+                st.show_about = true;
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Menu")
+    })
+    .inner
+}
+
+/// While the left panel is closed, its top row floats over the canvas's top-left corner (there
+/// is no header across the surface): the way home, the menu and the toggle, each where it is in
+/// the open panel's row, then the Canvas's compact identity in the room up to the right
+/// toggle. Returns where it lies (the rail and the zoom keep below it).
+fn float_left(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    st: &mut UiState,
+    canvas: egui::Rect,
+    shown: Arrangement,
+) -> egui::Rect {
+    let inset = if st.native_chrome && canvas.left() < theme::TRAFFIC_LIGHTS_W {
+        theme::TRAFFIC_LIGHTS_W
     } else {
-        (lo, hi.max(lo))
+        LEFT_INSET
     };
-    let id_rect = egui::Rect::from_min_max(egui::pos2(x0, bar.top()), egui::pos2(x1, bar.bottom()));
-    st.chrome.identity = Some(id_rect);
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(id_rect)
-            .layout(egui::Layout::top_down(egui::Align::Center)),
-        |ui| file_identity(ui, ed, st, tier),
-    );
-    // 1px separator under the header.
-    ui.painter().hline(
-        bar.x_range(),
-        bar.bottom() - 0.5,
-        egui::Stroke::new(1.0, p.separator),
-    );
+    // The frame's padding and stroke lie around the controls.
+    let edge = FLOAT_PAD + 1.0;
+    let top = canvas.top() + (top_h(st) - CONTROL) / 2.0 - edge;
+    let pos = egui::pos2(canvas.left() + inset - edge, top);
+    let right_room = if shown.design {
+        rail::INSET
+    } else {
+        RIGHT_INSET + CONTROL + 2.0 * edge + rail::INSET
+    };
+    let r = egui::Area::new("chrome-left".into())
+        .order(egui::Order::Middle)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            let p = theme::pal(ui);
+            egui::Frame::popup(ui.style())
+                .fill(p.popover)
+                .corner_radius(10.0)
+                .inner_margin(FLOAT_PAD)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        nav(ui, ed, st, shown);
+                        let used = ui.min_rect().right();
+                        let room = canvas.right() - right_room - used - edge - 6.0;
+                        if room >= 60.0 {
+                            ui.add_space(6.0);
+                            compact_identity(ui, ed, st, room);
+                        }
+                    });
+                });
+        });
+    st.chrome.left_float = Some(r.response.rect);
+    r.response.rect
+}
+
+/// While the right panel is closed, its toggle floats at the canvas's top right, where it is
+/// in the open panel's top row.
+fn float_right(ctx: &egui::Context, st: &mut UiState, canvas: egui::Rect, shown: Arrangement) {
+    let edge = FLOAT_PAD + 1.0;
+    let top = canvas.top() + (top_h(st) - CONTROL) / 2.0 - edge;
+    let r = egui::Area::new("chrome-right".into())
+        .order(egui::Order::Middle)
+        .pivot(Align2::RIGHT_TOP)
+        .fixed_pos(egui::pos2(canvas.right() - RIGHT_INSET + edge, top))
+        .show(ctx, |ui| {
+            let p = theme::pal(ui);
+            egui::Frame::popup(ui.style())
+                .fill(p.popover)
+                .corner_radius(10.0)
+                .inner_margin(FLOAT_PAD)
+                .show(ui, |ui| design_toggle(ui, st, shown));
+        });
+    st.chrome.right_float = Some(r.response.rect);
 }
 
 /// The longest file name, in characters (the app library's rename and canvas-save rule).
@@ -1114,21 +1234,212 @@ pub fn file_name(draft: &str) -> Option<String> {
     ok.then(|| n.to_string())
 }
 
-/// The title's inline rename field. Enter or a click elsewhere (losing focus) finishes it:
-/// a valid changed name becomes the file's name in this view (the host saves it with the
-/// canvas); Escape, an empty or invalid name drop it, and the name stays as it was.
-fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+/// Finish the Canvas name's draft as losing focus does, where its field isn't drawn.
+fn finish_title_draft(st: &mut UiState) {
+    if let Some(n) = st.file_title_draft.take().as_deref().and_then(file_name) {
+        st.project_name = n;
+    }
+}
+
+/// The Canvas's name: the file's real name (upstream's project title), else the document's.
+fn canvas_title(ed: &Editor, st: &UiState) -> String {
+    if st.project_name.is_empty() {
+        ed.doc.name.clone()
+    } else {
+        st.project_name.clone()
+    }
+}
+
+/// Rename Canvas… (the identity's menus, the compact menu): the name's field opens in the
+/// name's own place, wherever the identity is. Only where the host saves the name.
+fn start_canvas_rename(ed: &Editor, st: &mut UiState) {
+    if st.file_rename && st.file_title_draft.is_none() {
+        st.file_title_draft = Some(canvas_title(ed, st));
+    }
+}
+
+/// Rename Paper… (the identity's menus, the compact menu, the inspector): the shown Paper's one
+/// rename field, in its row of the Papers list, which is shown for it. Every entry point opens
+/// that same field, so the name is saved one way and once, and never on another Paper.
+fn start_paper_rename(ed: &Editor, st: &mut UiState) {
+    let tier = st.narrow.shown().map_or(Tier::Wide, |a| a.tier);
+    st.pages.collapsed = false;
+    st.panels.open(NarrowPanel::Layers, tier);
+    st.pages.renaming = Some((ed.active_page, ed.page_name().to_string()));
+}
+
+/// Lay `add` out in the fixed slot `rect` (already allocated by the caller), left to right and
+/// vertically centred, in a child ui (`salt` names it) that allocates nothing in `ui`. Only the
+/// slot takes room, so whatever it holds (a label, or a rename field, which egui makes at least
+/// its interact height) never moves or resizes what follows it.
+fn in_slot<R>(ui: &mut Ui, rect: egui::Rect, salt: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    let slot = egui::UiBuilder::new()
+        .id_salt(salt)
+        .max_rect(rect)
+        .layout(layout);
+    let mut child = ui.new_child(slot);
+    add(&mut child)
+}
+
+/// The Canvas's identity at the top of the left panel (DESIGN.md, revision 18): its name over
+/// the shown Paper's line, in slots of fixed height across the panel (a rename opens in the
+/// name's own place, so nothing moves or resizes).
+fn identity(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+    let w = ui.available_width();
+    let (name, _) = ui.allocate_exact_size(egui::vec2(w, NAME_H), egui::Sense::hover());
+    canvas_name(ui, ed, st, name);
+    let (paper, _) = ui.allocate_exact_size(egui::vec2(w, PAPER_H), egui::Sense::hover());
+    paper_line(ui, ed, st, paper);
+    st.chrome.identity = Some(name.union(paper));
+}
+
+/// The identity in one row, while the left panel is closed: the name, then the Paper line, in
+/// slots sized from the name as it is (not the draft) within `room`, so a rename opens in
+/// place and the row keeps its size while it is typed.
+fn compact_identity(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, room: f32) {
+    let width = |ui: &Ui, text: String, font: egui::FontId| {
+        let g = ui
+            .painter()
+            .layout_no_wrap(text, font, Color32::PLACEHOLDER);
+        g.size().x + 8.0
+    };
+    let title = width(ui, canvas_title(ed, st), theme::semibold(theme::BODY));
+    let line = width(
+        ui,
+        paper_text(ed, st),
+        egui::FontId::proportional(theme::SECONDARY),
+    );
+    let name_w = title.max(60.0).min((room * 0.6).min(200.0));
+    let paper_w = (line + 10.0).min(room - name_w - 4.0).clamp(0.0, 200.0);
+    let (name, _) = ui.allocate_exact_size(egui::vec2(name_w, CONTROL), egui::Sense::hover());
+    canvas_name(ui, ed, st, name);
+    ui.add_space(4.0);
+    let (paper, _) = ui.allocate_exact_size(egui::vec2(paper_w, CONTROL), egui::Sense::hover());
+    paper_line(ui, ed, st, paper);
+    st.chrome.identity = Some(name.union(paper));
+}
+
+/// The Canvas's name in its slot: a label, or while it is renamed its field in the same
+/// place. Where the host saves the name (`UiState::file_rename`), a click (or Enter, once Tab
+/// has reached it) starts Rename Canvas; a secondary click offers both renames and the shown
+/// Paper's actions.
+fn canvas_name(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::Rect) {
+    if st.file_title_draft.is_some() {
+        file_title_field(ui, ed, st, rect);
+        return;
+    }
+    let title = canvas_title(ed, st);
+    let r = in_slot(ui, rect, "canvas-name", |ui| {
+        let label = egui::Label::new(title_text(title.clone())).truncate();
+        ui.add(label.sense(egui::Sense::click()))
+    });
+    let r = r.on_hover_text(if st.file_rename {
+        "Rename Canvas"
+    } else {
+        title.as_str()
+    });
+    if st.file_rename && r.clicked() {
+        st.file_title_draft = Some(title.clone());
+    }
+    r.context_menu(|ui| identity_menu(ui, ed, st));
+}
+
+/// The Paper line's text: the shown Paper's name and the save state.
+fn paper_text(ed: &Editor, st: &UiState) -> String {
+    let state = if !st.save_state.is_empty() {
+        st.save_state.clone()
+    } else if ed.is_dirty() {
+        "Edited".into()
+    } else {
+        String::new()
+    };
+    if state.is_empty() {
+        ed.page_name().to_string()
+    } else {
+        format!("{} — {state}", ed.page_name())
+    }
+}
+
+/// The shown Paper's line, under the Canvas's name: a click (or Enter) opens the Paper
+/// navigation (every Paper of the Canvas) with the renames and the Paper's own actions.
+fn paper_line(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::Rect) {
+    let p = theme::pal(ui);
+    let text = RichText::new(paper_text(ed, st))
+        .size(theme::SECONDARY)
+        .color(p.secondary);
+    let r = in_slot(ui, rect, "paper-line", |ui| {
+        ui.add(
+            egui::Label::new(text)
+                .truncate()
+                .sense(egui::Sense::click()),
+        )
+    })
+    .on_hover_text("Paper navigation and actions");
+    // A small chevron after the text says it opens a menu, where there is room for it.
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(r.rect.right() + 7.0, r.rect.center().y),
+        egui::vec2(8.0, 8.0),
+    );
+    if rect.contains_rect(glyph) {
+        theme::paint_icon(ui.painter(), glyph, Icon::ChevronDown, p.secondary);
+    }
+    egui::Popup::menu(&r).show(|ui| paper_menu(ui, ed, st));
+}
+
+/// The Paper line's menu: the Canvas's Papers (choosing one shows it, as its row in the Papers
+/// list does), then the renames and the shown Paper's own actions.
+fn paper_menu(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+    let active = ed.active_page;
+    let mut chosen = None;
+    for (i, page) in ed.pages.iter().enumerate() {
+        if ui
+            .add(egui::Button::selectable(i == active, page.name.as_str()))
+            .clicked()
+        {
+            chosen = Some(i);
+        }
+    }
+    if let Some(i) = chosen {
+        if i != active {
+            pages::run_action(ui.ctx(), ed, st, pages::PageAction::Switch(i));
+        }
+        ui.close();
+    }
+    ui.separator();
+    identity_menu(ui, ed, st);
+}
+
+/// Rename Canvas… (where the host saves the name) and Rename Paper…, then the shown Paper's
+/// own actions: what the identity's menus and the compact menu offer.
+fn identity_menu(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+    if st.file_rename && ui.button("Rename Canvas…").clicked() {
+        start_canvas_rename(ed, st);
+        ui.close();
+    }
+    if ui.button("Rename Paper…").clicked() {
+        start_paper_rename(ed, st);
+        ui.close();
+    }
+    ui.separator();
+    paper_actions(ui, ed, st);
+}
+
+/// The Canvas name's inline field, in the name's own slot `rect`. Enter or a click elsewhere
+/// (losing focus) finishes it: a valid changed name becomes the file's name in this view (the
+/// host saves it with the canvas, one change); Escape, an empty or invalid name drop it, and
+/// the name stays as it was.
+fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::Rect) {
     let Some(draft) = st.file_title_draft.as_mut() else {
         return;
     };
-    let width = ui.available_width().clamp(80.0, 360.0);
-    let r = ui.add(
-        egui::TextEdit::singleline(draft)
-            .char_limit(MAX_FILE_NAME)
-            .desired_width(width)
-            .horizontal_align(egui::Align::Center)
-            .font(theme::semibold(theme::BODY)),
-    );
+    // The whole slot (NAME_H, or CONTROL when floating, both at least egui's 24 px interact
+    // height a single-line field takes), in a child that allocates nothing outside it.
+    let field = egui::TextEdit::singleline(draft)
+        .char_limit(MAX_FILE_NAME)
+        .desired_width(rect.width())
+        .font(theme::semibold(theme::BODY));
+    let r = in_slot(ui, rect, "canvas-name", |ui| ui.add(field));
     st.file_title_field = Some(r.id);
     // As the layer and page renames: the loss is checked before focus is asked for again.
     if r.lost_focus() {
@@ -1141,7 +1452,7 @@ fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             Some(_) => {}
             None => {
                 ed.status = format!(
-                    "A file name has 1 to {MAX_FILE_NAME} characters, without control \
+                    "A Canvas name has 1 to {MAX_FILE_NAME} characters, without control \
                      characters. The name wasn't changed."
                 )
             }
@@ -1151,81 +1462,25 @@ fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     }
 }
 
-/// The page line's menu: the shown page's own actions from the pages panel, run the same way
-/// (open fields are finished first). Rename opens that page's rename in the pages list.
-fn page_actions(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, tier: Tier) {
+/// The shown Paper's own actions from the Papers list, run the same way (open fields are
+/// finished first).
+fn paper_actions(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     let active = ed.active_page;
-    if ui.button("Rename page…").clicked() {
-        st.pages.collapsed = false;
-        st.panels.open(NarrowPanel::Layers, tier);
-        st.pages.renaming = Some((active, ed.page_name().to_string()));
-        ui.close();
-    }
-    if ui.button("Duplicate page").clicked() {
+    if ui.button("Duplicate Paper").clicked() {
         pages::run_action(ui.ctx(), ed, st, pages::PageAction::Duplicate(active));
         ui.close();
     }
-    if ui.button("Add page").clicked() {
+    if ui.button("Add Paper").clicked() {
         pages::run_action(ui.ctx(), ed, st, pages::PageAction::Add);
         ui.close();
     }
     if ui
-        .add_enabled(ed.pages.len() > 1, egui::Button::new("Delete page"))
+        .add_enabled(ed.pages.len() > 1, egui::Button::new("Delete Paper"))
         .clicked()
     {
         pages::run_action(ui.ctx(), ed, st, pages::PageAction::Delete(active));
         ui.close();
     }
-}
-
-/// The file's name (upstream's project title) over its page name and save state, each
-/// truncated to the room it has. Where the host saves the name (`UiState::file_rename`), a click
-/// on it starts its inline rename; the page line opens the shown page's actions.
-fn file_identity(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, tier: Tier) {
-    let p = theme::pal(ui);
-    let title = if st.project_name.is_empty() {
-        ed.doc.name.clone()
-    } else {
-        st.project_name.clone()
-    };
-    let state = if !st.save_state.is_empty() {
-        st.save_state.clone()
-    } else if ed.is_dirty() {
-        "Edited".into()
-    } else {
-        String::new()
-    };
-    let sub = if state.is_empty() {
-        ed.page_name().to_string()
-    } else {
-        format!("{} — {state}", ed.page_name())
-    };
-    ui.spacing_mut().item_spacing.y = 0.0;
-    ui.add_space(if st.native_chrome { 6.0 } else { 2.0 });
-    if st.file_title_draft.is_some() {
-        file_title_field(ui, ed, st);
-    } else if st.file_rename {
-        let r = ui
-            .add(
-                egui::Label::new(title_text(title.clone()))
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text("Rename file");
-        if r.clicked() {
-            st.file_title_draft = Some(title);
-        }
-    } else {
-        ui.add(egui::Label::new(title_text(title)).truncate());
-    }
-    let page = ui
-        .add(
-            egui::Label::new(RichText::new(sub).size(theme::SECONDARY).color(p.secondary))
-                .truncate()
-                .sense(egui::Sense::click()),
-        )
-        .on_hover_text("Page actions");
-    egui::Popup::menu(&page).show(|ui| page_actions(ui, ed, st, tier));
 }
 
 fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
@@ -1458,8 +1713,39 @@ fn commit_rename(ed: &mut Editor, st: &mut UiState) {
     }
 }
 
+/// The layer row that shows what the pointer is over on the canvas (DESIGN.md, linked hover):
+/// the canvas's own hit (`Editor::hover`) while the pointer is in the canvas rectangle last
+/// laid out and over no floating UI, so it clears the moment the pointer leaves the canvas. It
+/// is the node's own row, or inside a collapsed group the nearest row shown (the tree is never
+/// expanded for a hover). Only a highlight: no selection, document, history or scroll changes.
+fn canvas_hover_row(
+    ctx: &egui::Context,
+    ed: &Editor,
+    st: &UiState,
+    canvas: Option<egui::Rect>,
+) -> Option<NodeId> {
+    let at = ctx.pointer_hover_pos()?;
+    if !canvas?.contains(at) || over_floating_ui(ctx, st, at) {
+        return None;
+    }
+    let id = ed.hover?;
+    let mut chain = vec![id];
+    let mut parent = ed.doc.get(id)?.parent;
+    while let Some(p) = parent {
+        chain.push(p);
+        parent = ed.doc.get(p).and_then(|n| n.parent);
+    }
+    // From the root down, the first collapsed group holding it is the deepest row drawn.
+    let collapsed = chain
+        .iter()
+        .rev()
+        .find(|n| **n != id && st.collapsed.contains(n));
+    Some(collapsed.copied().unwrap_or(id))
+}
+
 /// One sidebar row, drawn like an NSOutlineView row: 24pt tall, 6pt radius selection as an
-/// accent tint, subtle hover, disclosure chevron, symbol, name, and eye/lock on hover.
+/// accent tint, subtle hover (the pointer's over the row, or the canvas's over its layer),
+/// disclosure chevron, symbol, name, and eye/lock on hover.
 fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: usize) {
     let Some(n) = ed.doc.get(id).cloned() else {
         return;
@@ -1474,12 +1760,15 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         st.layer_drag = Some((id, None));
     }
     let hovered = ui.rect_contains_pointer(row);
-    // Selection is a soft accent tint (the name keeps its text colour), as in the pages list
-    // and the top bar's toggles.
+    // Selection is a soft accent tint (the name keeps its text colour), as the open panel
+    // toggles are; the current Paper's row is grey instead (it is no selection). The canvas's
+    // hover only lights the row, as the pointer does.
+    let linked = st.chrome.hover_row == Some(id);
     if selected {
-        ui.painter().rect_filled(row, 6.0, theme::selected_fill(ui));
-    } else if hovered {
-        ui.painter().rect_filled(row, 6.0, p.hover);
+        ui.painter()
+            .rect_filled(row, theme::RADIUS, theme::selected_fill(ui));
+    } else if hovered || linked {
+        ui.painter().rect_filled(row, theme::RADIUS, p.hover);
     }
     let fg = if n.visible { p.text } else { p.secondary };
     let fg2 = p.secondary;
@@ -1517,7 +1806,14 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         }
     }
     x += 16.0;
-    theme::paint_icon(ui.painter(), sq(x, 14.0), node_icon(&n), theme::accent());
+    // Symbols are quiet; components and instances keep the accent that tells them apart.
+    let icon = node_icon(&n);
+    let tint = if matches!(icon, Icon::Component | Icon::Instance) {
+        theme::accent()
+    } else {
+        fg2
+    };
+    theme::paint_icon(ui.painter(), sq(x, 14.0), icon, tint);
     x += 20.0;
 
     // Trailing eye / lock buttons: always shown when hidden or locked, otherwise on hover.

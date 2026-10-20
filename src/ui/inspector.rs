@@ -2,7 +2,7 @@
 //! constraints, text, fills, stroke and layer properties. Edits are coalesced per field so a
 //! drag on a number is one undo step, and edits inside instances become overrides.
 
-use super::{UiState, c32, from32, section, title_text};
+use super::{UiState, c32, from32, title_text};
 use crate::editor::vector_ops::BoolOp;
 use crate::editor::{AppRequest, Editor};
 use crate::geom::v2;
@@ -230,22 +230,22 @@ fn icon_toggle(ui: &mut Ui, label: &str, on: bool, tip: &str) -> bool {
     .clicked()
 }
 
-/// The Design inspector (DESIGN.md, revision 2 slice 3): quiet and contextual. With nothing
-/// selected it shows the page and, for a creation tool, only that tool's defaults (labelled
-/// "For new …", which never edit a selection). With a selection it shows the sections every
-/// selected layer has; values they share are shown, values that differ show Mixed (or the
-/// widget is left out, with a word on why), and editing one sets it on all of them in one
-/// coalesced change. Sketch and Export are folded sections.
+/// The Design inspector (DESIGN.md, revision 2 slice 3 and revision 18's states): quiet and
+/// contextual, under the panel's own top row (its title and toggle). With nothing selected (or
+/// after a click on empty canvas) it shows, for a creation tool, that tool's defaults first
+/// (labelled "For new …", which never edit a selection), then the shown Paper and the view's
+/// grid. With a selection it shows the sections every selected layer has; values they share
+/// are shown, values that differ show Mixed (or the widget is left out, with a word on why),
+/// and editing one sets it on all of them in one coalesced change. Sketch and Export are
+/// folded sections.
 pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 5.0;
-            section(ui, "Design");
-            ui.add_space(2.0);
             let ids = ed.top_selection();
             if ids.is_empty() {
-                nothing_selected(ui, ed);
+                nothing_selected(ui, ed, st);
                 separator(ui);
                 export_section(ui, ed, st);
                 return;
@@ -587,15 +587,15 @@ fn export_body(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         ui.checkbox(&mut spec.transparent, "Transparent background");
     }
     let what = match (spec.scope, ed.top_selection().len()) {
-        (Scope::Selection, 0) => format!("page “{}”", ed.page_name()),
+        (Scope::Selection, 0) => format!("Paper “{}”", ed.page_name()),
         (Scope::Selection, 1) => ed
             .doc
             .get(ed.top_selection()[0])
             .map_or("selection".into(), |n| format!("“{}”", n.name)),
         (Scope::Selection, n) => format!("{n} layers"),
         (Scope::Frames, _) => "each frame".into(),
-        (Scope::Page, _) => format!("page “{}”", ed.page_name()),
-        (Scope::AllPages, _) => format!("{} pages", ed.pages.len()),
+        (Scope::Page, _) => format!("Paper “{}”", ed.page_name()),
+        (Scope::AllPages, _) => format!("{} Papers", ed.pages.len()),
     };
     if ui
         .add(
@@ -616,18 +616,13 @@ fn export_body(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     });
 }
 
-/// Nothing selected: the current tool's defaults for what it creates next ("For new …", which
-/// never edit existing layers), or with the Select, Hand or Laser tool just the page and a hint.
-fn nothing_selected(ui: &mut Ui, ed: &mut Editor) {
+/// Nothing selected: for a creation tool, its defaults for what it creates next ("For new …",
+/// which never edit existing layers); then, with every tool, the shown Paper's context
+/// ([`paper_context`]).
+fn nothing_selected(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     use crate::editor::Tool;
     match ed.tool {
-        Tool::Select | Tool::Hand | Tool::Laser => {
-            hint(
-                ui,
-                "Select a layer to edit its design, or pick a tool on the left to draw.",
-            );
-            separator(ui);
-        }
+        Tool::Select | Tool::Hand | Tool::Laser => {}
         Tool::Arrow => {
             ui.label(title_text("For new arrows"));
             let routes = [
@@ -697,16 +692,49 @@ fn nothing_selected(ui: &mut Ui, ed: &mut Editor) {
             separator(ui);
         }
     }
-    ui.label(title_text("Page"));
-    let mut name = ed.page_name().to_string();
-    if ui.text_edit_singleline(&mut name).changed() {
-        let i = ed.active_page;
-        ed.rename_page(i, &name);
+    paper_context(ui, ed, st);
+}
+
+/// The shown Paper (a page of the Canvas, DESIGN.md) and the view, with nothing selected. Paper:
+/// its name and what it holds, which are the document's (a Paper has no fill or size of its own
+/// to show); Rename Paper… opens its one rename field, in the Papers list, so a name is changed
+/// in one place, once, on its own Paper. View: the canvas's grid, a view preference that is
+/// never the Paper's, its undo, its saves or an export.
+fn paper_context(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
+    use crate::render::scene::Background;
+    ui.label(title_text("Paper"));
+    let name = ed.page_name().to_string();
+    let secondary = |t: String| RichText::new(t).size(theme::SECONDARY + 1.0);
+    row(ui, "Name", |ui| {
+        let label = egui::Label::new(secondary(name.clone())).truncate();
+        ui.add(label).on_hover_text(name.clone());
+    });
+    let count = format!("{} layers", ed.doc.nodes.len());
+    row(ui, "Content", |ui| {
+        ui.label(secondary(count));
+    });
+    let place = format!("{} of {}", ed.active_page + 1, ed.pages.len());
+    row(ui, "Paper", |ui| {
+        ui.label(secondary(place));
+    });
+    if ui
+        .small_button("Rename Paper…")
+        .on_hover_text("Rename this Paper in the Papers list")
+        .clicked()
+    {
+        super::start_paper_rename(ed, st);
     }
-    ui.label(
-        RichText::new(format!("{} layers", ed.doc.nodes.len()))
-            .size(theme::SECONDARY)
-            .color(theme::pal(ui).secondary),
+    separator(ui);
+    ui.label(title_text("View"));
+    let grids: Vec<(Background, &str)> = Background::ALL.iter().map(|b| (*b, b.label())).collect();
+    row(ui, "Grid", |ui| {
+        if let Some(b) = combo(ui, "view-grid", st.background, &grids, 96.0) {
+            st.set_background(b);
+        }
+    });
+    hint(
+        ui,
+        "Your view only: not part of the Paper, its undo or its exports.",
     );
 }
 

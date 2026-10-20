@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-20: the one-app source candidate's `home-17` view (unqualified; `home-16`'s view plus the editor's bend handle per curve bend). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-20: the one-app source candidate's `home-18` view (unqualified; the owner's UX revision: an editor without a full-width header and the home's search drawn as one at rest, after `home-17`'s bend handle per curve bend). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -40,8 +40,9 @@ surface Codex grants, Home and the full workspace alike.
   this view", no `ui/open-link`, so no browser link is given on this path.
 - **The editor is the workspace.** It fills the view edge to edge, with no heading, frame,
   fixed-height stage, Close/Export/Full screen/browser buttons, Details or footer. Upstream's own
-  top bar shows the file name (the canvas envelope's `canvas.name`, separate from the page name)
-  and its "All projects" leads home. Every status goes to a live region; by the shared
+  Canvas identity (since `home-18` at its left panel's top, or floating over the canvas while
+  that panel is closed; there is no full-width header) shows the file name (the canvas
+  envelope's `canvas.name`, separate from the Paper's name) and its "All projects" leads home. Every status goes to a live region; by the shared
   `opdStatusKind`, stable healthy states (Ready, Saved) show nothing, loading shows as a small
   temporary note until Ready, and failures, conflicts, refusals and notes show as one note.
 - **Home closes exactly its binding.** Home drains the session; a busy, conflicting or unsaved
@@ -54,11 +55,17 @@ surface Codex grants, Home and the full workspace alike.
   page has no library Home (upstream's Home shows the note to use the OpenPaperDesign home).
 - **Without the module** the library keeps the link hand-off below, and the agent's
   `_library_editor` still hands out the link.
-- **View version.** `ui://openpaperdesign/home-17.html` (2026-10-20 source candidate, not
-  installed or natively accepted): the same view, HTML and layout unchanged, with the editor
-  whose curves have a bend handle on each bend, a drag moving that bend alone (a shared
-  upstream Editor change). The editor's WASM changed, so `home-16` is refused and a cached
-  `home-16` view can't pass for this one. `home-16` (2026-10-19) carried the editor whose
+- **View version.** `ui://openpaperdesign/home-18.html` (2026-10-20 source candidate, not
+  built, rendered, installed or natively accepted): the owner's UX revision (root `DESIGN.md`
+  revision 18). The editor has no full-width header: full-height panels with the Canvas
+  identity in the left panel, mirrored panel toggles, the slim rail, the Paper context with
+  nothing selected, linked hover and the Grid name. The home's search field reads as one at
+  rest (a magnifier and the stronger hairline around the same `#search` input; filtering,
+  Escape, the empty and no-match states, the kept layout and the narrow layout unchanged).
+  Both the view's HTML and the editor's WASM changed, so `home-17` is refused and a cached
+  `home-17` view can't pass for this one. `home-17` (2026-10-20) carried the editor whose
+  curves have a bend handle on each bend, a drag moving that bend alone (a shared upstream
+  Editor change). `home-16` (2026-10-19) carried the editor whose
   connector drag (a bend or an end) stops, changing nothing more, once its arrow is locked
   while the drag is held. `home-15` (2026-10-19) carried the editor whose bent curve keeps a bend handle on its bend
   point, so it can be bent again. `home-14` (2026-10-19) carried the R48 correction
@@ -119,7 +126,7 @@ once to open it (`ui/open-link`).
   isn't loopback, or a late reply after Back opens nothing either.
 - **The panel.** The in-panel editor (same WASM/Session/editor) is offered only as "Edit in this
   view" when the build has it.
-- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-16`, now `home-17`, above) (2026-10-17: its editor
+- **View version.** This home was `ui://openpaperdesign/home-5.html` (then `home-6` to `home-17`, now `home-18`, above) (2026-10-17: its editor
   loads and saves the whole canvas, every page, the page list and the active page; its renderer
   starts on the whole canvas and its in-panel editor uses the `_app_canvas*` tools). `home-4`
   (also 2026-10-17) first hosted upstream's workspace UI with no tool buttons of its own, still

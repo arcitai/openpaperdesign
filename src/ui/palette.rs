@@ -1,4 +1,5 @@
-//! ⌘K command palette: fuzzy search over every action, tool, page, layer and library item.
+//! ⌘K command palette: fuzzy search over every action, tool, page (a Paper, as people see
+//! it), layer and library item.
 
 use super::UiState;
 use crate::editor::shortcuts::{self, Action};
@@ -149,8 +150,8 @@ pub fn entries(ed: &Editor, st: &UiState) -> Vec<Entry> {
     }
     for (i, p) in ed.pages.iter().enumerate() {
         out.push(Entry {
-            label: format!("Go to page: {}", p.name),
-            detail: "Page".into(),
+            label: format!("Go to Paper: {}", p.name),
+            detail: "Paper".into(),
             cmd: Command::Page(i),
         });
     }
@@ -256,7 +257,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
                     ui.set_width(width);
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.palette.query)
-                            .hint_text("Search actions, tools, pages, layers…")
+                            .hint_text("Search actions, tools, Papers, layers…")
                             .font(egui::FontId::proportional(15.0))
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY),

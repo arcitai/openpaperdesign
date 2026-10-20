@@ -95,12 +95,10 @@ fn centre(r: egui::Rect) -> (f64, f64) {
     (r.center().x as f64, r.center().y as f64)
 }
 
-/// A click on the header's Layers toggle, then the arrangement settles.
+/// A click on the Layers toggle (floating at the canvas's top left while the panel is closed),
+/// then the arrangement settles.
 fn toggle_layers(s: &mut WebState) {
-    let r =
-        s.ui.chrome
-            .layers
-            .expect("the header's Layers toggle is laid out");
+    let r = s.ui.chrome.layers.expect("the Layers toggle is laid out");
     click(s, centre(r), 1.0);
     for _ in 0..4 {
         step(s);
@@ -201,10 +199,15 @@ fn overlay_vertices(s: &WebState) -> usize {
 fn the_upstream_workspace_takes_its_panels_and_the_editor_gets_the_rest() {
     let s = state();
     let c = s.canvas_rect();
-    // Upstream's layers (≥ 180 px), design inspector (≥ 220 px) and top bar.
+    // Upstream's layers (≥ 180 px) and design inspector (≥ 220 px), both full height: there is
+    // no header across the surface (DESIGN.md revision 18), so the canvas starts at the top.
     assert!(c.min.x >= 180.0, "layers panel on the left: {c:?}");
     assert!(c.max.x <= W as f32 - 220.0, "inspector on the right: {c:?}");
-    assert!(c.min.y > 0.0, "top bar: {c:?}");
+    assert_eq!(c.min.y, 0.0, "no full-width header above the canvas: {c:?}");
+    assert_eq!(
+        c.max.y, H as f32,
+        "the canvas runs the surface's height: {c:?}"
+    );
     assert_eq!(
         (s.ed.viewport.x, s.ed.viewport.y),
         (c.width() as f64, c.height() as f64),
@@ -911,10 +914,12 @@ fn painted_at(s: &mut WebState, wanted: &str, within: impl Fn(egui::Rect) -> boo
     (r.center().x as f64, r.center().y as f64)
 }
 
-/// The row of page `name` in upstream's pages panel (the left sidebar).
+/// The row of page `name` in upstream's pages panel (the left sidebar's Papers list), not the
+/// Canvas identity above it, whose Paper line names the shown page too.
 fn page_row(s: &mut WebState, name: &str) -> (f64, f64) {
     let left = s.canvas_rect().min.x;
-    painted_at(s, name, |r| r.max.x <= left)
+    let identity = s.ui.chrome.identity.expect("the identity is laid out");
+    painted_at(s, name, |r| r.max.x <= left && !identity.intersects(r))
 }
 
 /// A click on page `name`'s row, laid out.
@@ -925,8 +930,8 @@ fn click_page(s: &mut WebState, name: &str, t: f64) {
     step(s);
 }
 
-/// Item `item` of page `name`'s context menu (upstream's Rename, Duplicate, Delete), opening
-/// the menu with a secondary click on the row if it isn't shown.
+/// Item `item` of page `name`'s context menu (Rename Paper, Duplicate Paper, Delete Paper),
+/// opening the menu with a secondary click on the row if it isn't shown.
 fn menu_item(s: &mut WebState, name: &str, item: &str, t: f64) -> (f64, f64) {
     if !paints(s, item) {
         let (x, y) = page_row(s, name);
@@ -1096,14 +1101,14 @@ fn the_pages_panel_renames_on_enter_or_a_click_away_and_escape_or_a_discard_drop
 fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page() {
     let mut s = state();
     // The only page: upstream's Delete is disabled, so it stays.
-    let d = menu_item(&mut s, "Page 1", "Delete", 100.0);
+    let d = menu_item(&mut s, "Page 1", "Delete Paper", 100.0);
     click(&mut s, d, 200.0);
     step(&mut s);
     step(&mut s);
     assert_eq!(s.ed.pages.len(), 1, "the last page stays");
     assert!(!s.dirty());
     // Duplicate: a copy after it, shown.
-    let d = menu_item(&mut s, "Page 1", "Duplicate", 300.0);
+    let d = menu_item(&mut s, "Page 1", "Duplicate Paper", 300.0);
     click(&mut s, d, 400.0);
     step(&mut s);
     step(&mut s);
@@ -1112,15 +1117,15 @@ fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page(
     assert_eq!(s.ed.page_name(), "Page 1 copy");
     assert_eq!(s.ed.page_doc(1).nodes.len(), 1, "with the page's content");
     // Delete the copy from its menu.
-    let d = menu_item(&mut s, "Page 1 copy", "Delete", 500.0);
+    let d = menu_item(&mut s, "Page 1 copy", "Delete Paper", 500.0);
     click(&mut s, d, 600.0);
     step(&mut s);
     step(&mut s);
     let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["Page 1"]);
-    // The header's + (Add page): pressed where it is, right of the "Pages" title.
+    // The list header's + (Add Paper): pressed where it is, right of the "Papers" title.
     let left = s.canvas_rect().min.x as f64;
-    let (title_x, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+    let (title_x, title_y) = painted_at(&mut s, "Papers", |r| (r.max.x as f64) < left);
     let mut x = left - 4.0;
     let mut t = 1000.0;
     while s.ed.pages.len() == 1 && x > title_x {
@@ -1130,11 +1135,13 @@ fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page(
         t += 500.0;
     }
     step(&mut s);
+    // A new Paper is named as people see pages; the stored legacy "Page 1" stays exactly as
+    // it was (no rename of existing names).
     let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["Page 1", "Page 2"], "added after the active page");
-    assert_eq!(s.ed.page_name(), "Page 2");
-    // Drag Page 2's row onto Page 1's: reordered.
-    let (from, to) = (page_row(&mut s, "Page 2"), page_row(&mut s, "Page 1"));
+    assert_eq!(names, ["Page 1", "Paper 2"], "added after the active page");
+    assert_eq!(s.ed.page_name(), "Paper 2");
+    // Drag Paper 2's row onto Page 1's: reordered.
+    let (from, to) = (page_row(&mut s, "Paper 2"), page_row(&mut s, "Page 1"));
     s.pointer_move(from.0, from.1, t);
     s.pointer_down(from.0, from.1, Button::Primary, t);
     step(&mut s);
@@ -1147,8 +1154,8 @@ fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page(
     step(&mut s);
     step(&mut s);
     let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["Page 2", "Page 1"], "reordered");
-    assert_eq!(s.ed.page_name(), "Page 2", "the shown page stays");
+    assert_eq!(names, ["Paper 2", "Page 1"], "reordered");
+    assert_eq!(s.ed.page_name(), "Paper 2", "the shown page stays");
     // One save: the new list and active page, and the new page's content (never saved).
     let new = s.ed.active_page_id().to_string();
     let snap = s.save_snapshot().expect("the page changes");
@@ -1157,7 +1164,7 @@ fn the_pages_panel_adds_duplicates_reorders_and_deletes_and_keeps_the_last_page(
     assert_eq!(
         list,
         [
-            (new.clone(), "Page 2".to_string()),
+            (new.clone(), "Paper 2".to_string()),
             ("p".to_string(), "Page 1".to_string())
         ]
     );
@@ -1321,24 +1328,37 @@ fn a_clean_reload_takes_the_whole_canvas_and_keeps_each_page_s_view() {
     assert!(!s.dirty());
 }
 
-// ---- one app: the file's identity and the way back live in upstream's own top bar
+// ---- one app: the file's identity and the way back live in upstream's own chrome (the left
+// panel's top, or the controls floating over the canvas while it is closed)
+
+/// Whether text `wanted` is painted inside the Canvas identity (its name and Paper line).
+fn in_identity(s: &mut WebState, wanted: &str) -> bool {
+    let id = s.ui.chrome.identity.expect("the identity is laid out");
+    painted_text(s)
+        .iter()
+        .any(|(t, r)| t.trim() == wanted && id.expand(0.5).contains_rect(*r))
+}
 
 #[test]
-fn the_file_name_is_upstream_s_top_bar_title_above_the_page_name_and_follows_a_rename() {
+fn the_file_name_is_the_canvas_identity_above_the_paper_name_and_follows_a_rename() {
     let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
     let pages = [page("p", "Page 1", rect)];
     let mut s = WebState::open(&canvas_named(&pages, "p", "Landing"), false, W, H).unwrap();
     settle(&mut s, 0.0);
-    let top = s.canvas_rect().min.y;
-    let in_bar = |s: &mut WebState, wanted: &str| {
-        painted_text(s)
-            .iter()
-            .any(|(t, r)| t.trim() == wanted && r.max.y <= top)
-    };
-    assert!(in_bar(&mut s, "Landing"), "the file's name is the title");
+    // A fresh view keeps Layers closed: the compact identity floats at the canvas's top left.
+    let float =
+        s.ui.chrome
+            .left_float
+            .expect("the closed panel's row floats");
+    assert!(float.contains_rect(s.ui.chrome.identity.unwrap()));
+    let in_bar = |s: &mut WebState, wanted: &str| in_identity(s, wanted);
+    assert!(
+        in_bar(&mut s, "Landing"),
+        "the file's name is the Canvas name"
+    );
     assert!(
         in_bar(&mut s, "Page 1"),
-        "the page's name is shown beneath it"
+        "the shown Paper's name is shown with it"
     );
     assert_eq!(
         s.ed.page_name(),
@@ -1357,20 +1377,24 @@ fn the_file_name_is_upstream_s_top_bar_title_above_the_page_name_and_follows_a_r
 #[test]
 fn upstream_s_all_projects_button_is_the_host_s_way_back() {
     let mut s = state();
-    let top = s.canvas_rect().min.y;
-    // The header spans the whole surface above both panels: its first control, at the left
-    // edge, is All projects; the compact menu ("···") and the Layers toggle follow it.
+    let left = s.canvas_rect().min.x;
+    // No header across the surface: the left panel's own top row starts with All projects, at
+    // the surface's top left; the compact menu ("···") and the Layers toggle follow it.
     let home = s.ui.chrome.home.expect("All projects is laid out");
     let menu = s.ui.chrome.menu.expect("the compact menu is laid out");
     let layers = s.ui.chrome.layers.expect("the Layers toggle is laid out");
-    assert!(home.min.x < 12.0 && home.max.y <= top, "{home:?}");
+    assert!(home.min.x < 12.0 && home.max.y <= 40.0, "{home:?}");
     assert!(home.max.x <= menu.min.x && menu.max.x <= layers.min.x);
-    let (menu_x, _) = painted_at(&mut s, "···", |r| r.max.y <= top);
-    assert!((menu_x as f32 - menu.center().x).abs() < 8.0);
     assert!(
-        s.canvas_rect().min.x >= 180.0,
-        "the layers panel below the header"
+        layers.max.x <= left,
+        "all of it in the left panel: {layers:?}"
     );
+    let (menu_x, _) = painted_at(&mut s, "···", |r| r.max.x <= left);
+    assert!((menu_x as f32 - menu.center().x).abs() < 8.0);
+    // The Canvas identity follows under that row, in the same panel.
+    let id = s.ui.chrome.identity.expect("the identity is laid out");
+    assert!(id.min.y >= home.max.y && id.max.x <= left, "{id:?}");
+    assert!(left >= 180.0, "the layers panel beside the canvas");
     click(&mut s, centre(home), 1000.0);
     step(&mut s);
     assert_eq!(
@@ -1397,8 +1421,9 @@ fn narrow_state() -> WebState {
     s
 }
 
-/// Click the header's toggle `label` ("Layers", "Design") where it is laid out and let the
-/// arrangement settle (it changes after one frame without a focused text field).
+/// Click the panel toggle `label` ("Layers", "Design") where it is laid out (in its panel's
+/// top row, or floating over the canvas while that panel is closed) and let the arrangement
+/// settle (it changes after one frame without a focused text field).
 fn toggle(s: &mut WebState, label: &str, t: f64) {
     let r = match label {
         "Layers" => s.ui.chrome.layers,
@@ -1442,16 +1467,24 @@ fn reach_every_tool(s: &mut WebState, mut t: f64) -> std::collections::BTreeSet<
             assert_eq!(tools.len(), 1, "only a one-tool family has no chevron");
             continue;
         };
+        // Revision 18's slim rail: the arrow's own 12 px column (not revision 2's 24 px), a
+        // whole row high (`ROW_H`, or on a short room the rows' smaller height, never below
+        // `MIN_ROW_H`), beside the main button and never over it.
         assert!(
-            chevron.min.x >= main.max.x - 0.5 && chevron.width() >= 24.0 - 0.5,
+            chevron.min.x >= main.max.x - 0.5
+                && chevron.width() >= crate::ui::rail::CHEVRON_W - 0.5
+                && (chevron.height() - main.height()).abs() < 0.5
+                && chevron.height() >= crate::ui::rail::MIN_ROW_H - 0.5,
             "the chevron is its own target, beside the main button: {chevron:?}"
         );
         for (k, tool) in tools.iter().enumerate() {
+            let before = s.ed.tool;
             click(s, centre(chevron), t);
             step(s);
             step(s);
             t += 500.0;
             assert_eq!(s.ui.rail.flyout, Some(fi), "the chevron opens the flyout");
+            assert_eq!(s.ed.tool, before, "opening the flyout chooses no tool");
             let fly = s.ui.rail.rects.flyout.expect("the flyout is laid out");
             assert!(
                 fly.min.x >= canvas.min.x && fly.max.x <= canvas.max.x + 0.5,
@@ -1489,30 +1522,42 @@ fn r25_a_narrow_surface_keeps_the_canvas_all_projects_and_every_tool_reachable()
         "the canvas spans the surface: {c:?}"
     );
     assert!(
-        c.min.y > 0.0 && c.height() > 600.0,
-        "under the top bar: {c:?}"
+        c.min.y == 0.0 && c.height() >= TALL as f32 - 1.0,
+        "the whole surface, with no header: {c:?}"
     );
     assert_eq!(
         (s.ed.viewport.x, s.ed.viewport.y),
         (c.width() as f64, c.height() as f64)
     );
-    // The header carries the file's name, the menu and the Design toggle (text) and the
-    // All projects and Layers toggles (icons), inside the surface and above the canvas.
-    for wanted in ["Landing", "Design", "···"] {
+    // Both panels are closed: their top rows float over the canvas's top corners. The left one
+    // carries All projects, the menu, the Layers toggle and the file's name; the right one the
+    // Design toggle (an icon now, the mirror of Layers). All inside the surface, at its top, and
+    // clear of each other and of the rail.
+    let left = s.ui.chrome.left_float.expect("the left row floats");
+    let right = s.ui.chrome.right_float.expect("the right toggle floats");
+    for wanted in ["Landing", "···"] {
         let painted = painted_text(&mut s);
         let (_, r) = painted
             .iter()
             .find(|(t, _)| t.trim() == wanted)
             .unwrap_or_else(|| panic!("{wanted} not painted: {painted:?}"));
-        assert!(
-            r.max.x <= NARROW as f32 && r.max.y <= c.min.y,
-            "{wanted}: {r:?}"
-        );
+        assert!(left.contains_rect(*r), "{wanted}: {r:?} in {left:?}");
     }
-    for r in [s.ui.chrome.home, s.ui.chrome.layers, s.ui.chrome.design] {
+    for r in [s.ui.chrome.home, s.ui.chrome.layers] {
         let r = r.expect("laid out");
-        assert!(r.max.x <= NARROW as f32 && r.max.y <= c.min.y, "{r:?}");
+        assert!(left.contains_rect(r) && r.max.y <= 40.0, "{r:?}");
     }
+    let design = s.ui.chrome.design.expect("laid out");
+    assert!(
+        right.contains_rect(design) && design.max.x <= NARROW as f32,
+        "{design:?}"
+    );
+    let rail = s.ui.rail.rects.rail.expect("the rail");
+    assert!(
+        !overlap(left, right) && !overlap(left, rail),
+        "{left:?} {right:?} {rail:?}"
+    );
+    assert!(left.max.x <= NARROW as f32 && c.contains_rect(left) && c.contains_rect(right));
     // All projects asks the host to go Home.
     let home = centre(s.ui.chrome.home.unwrap());
     click(&mut s, home, 1000.0);
@@ -1547,9 +1592,22 @@ fn r25_narrow_panels_open_one_at_a_time_as_sheets_and_the_wide_layout_follows_th
     assert_eq!(shown_panel(&s), NarrowPanel::Layers);
     assert_eq!(s.ui.narrow.shown().unwrap().tier, crate::ui::Tier::Sheet);
     assert!(
-        paints(&mut s, "Pages") && paints(&mut s, "Page 1"),
+        paints(&mut s, "Papers") && paints(&mut s, "Page 1"),
         "upstream's pages and layers"
     );
+    // The sheet covers the canvas, so its top row (under its way back) carries the way home
+    // and both toggles; nothing floats.
+    let back = s.ui.chrome.sheet_back.expect("the sheet's way back");
+    let home = s.ui.chrome.home.expect("home on the sheet");
+    let design = s.ui.chrome.design.expect("the Design toggle on the sheet");
+    for r in [home, design] {
+        assert!(
+            r.min.y >= back.max.y && r.max.y <= back.max.y + 48.0,
+            "{r:?}"
+        );
+    }
+    assert!((home.center().y - design.center().y).abs() < 0.5 && design.max.x <= NARROW as f32);
+    assert!(s.ui.chrome.left_float.is_none() && s.ui.chrome.right_float.is_none());
     assert!(
         s.canvas_rect().width() < 2.0,
         "the sheet takes the room: no canvas sliver"
@@ -1568,7 +1626,7 @@ fn r25_narrow_panels_open_one_at_a_time_as_sheets_and_the_wide_layout_follows_th
     toggle(&mut s, "Design", 2000.0);
     assert_eq!(shown_panel(&s), NarrowPanel::Design);
     assert!(paints(&mut s, "Export"), "upstream's inspector");
-    assert!(!paints(&mut s, "Pages"), "one panel at a time");
+    assert!(!paints(&mut s, "Papers"), "one panel at a time");
     // The sheet's own way back to the canvas.
     let back =
         s.ui.chrome
@@ -1596,7 +1654,7 @@ fn r25_narrow_panels_open_one_at_a_time_as_sheets_and_the_wide_layout_follows_th
     toggle(&mut s, "Design", 6000.0);
     let c = s.canvas_rect();
     assert!(c.min.x >= 180.0 && c.max.x <= W as f32 - 220.0, "{c:?}");
-    assert!(paints(&mut s, "Pages") && paints(&mut s, "Export"));
+    assert!(paints(&mut s, "Papers") && paints(&mut s, "Export"));
     // Narrow again: one panel at a time, the one opened last.
     s.resize(NARROW, TALL, 1.0);
     settle(&mut s, t);
@@ -1817,34 +1875,41 @@ fn a_medium_surface_docks_one_panel_beside_the_canvas_and_keeps_a_draft_across_r
 }
 
 #[test]
-fn the_top_bar_keeps_the_file_name_and_its_controls_apart_at_every_width() {
-    // The bar's text never overlaps: the file's name (truncated if need be) ends before the
-    // first control painted right of it, from the narrow sidebar to a wide window.
+fn the_identity_keeps_the_file_name_and_the_controls_apart_at_every_width() {
+    // A fresh view keeps Layers closed, so the left panel's row floats over the canvas with the
+    // Canvas's name (truncated to its slot if need be). From the narrow sidebar to a wide window
+    // the name stays inside the identity and the surface, and overlaps no control (home, menu,
+    // either toggle), the rail or any other text painted beside it.
     for w in [320.0, 480.0, 640.0, 800.0, 1100.0, 1600.0] {
         let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
         let pages = [page("p", "Page 1", rect)];
         let name = "A rather long file name for the top bar";
         let mut s = WebState::open(&canvas_named(&pages, "p", name), false, w, TALL).unwrap();
         settle(&mut s, 0.0);
-        let top = s.canvas_rect().min.y;
-        let bar: Vec<(String, egui::Rect)> = painted_text(&mut s)
-            .into_iter()
-            .filter(|(_, r)| r.max.y <= top)
-            .collect();
-        let (_, title) = bar
+        let id = s.ui.chrome.identity.expect("the identity is laid out");
+        let text = painted_text(&mut s);
+        let (_, title) = text
             .iter()
             .find(|(t, _)| t.trim() == name)
-            .unwrap_or_else(|| panic!("{w}: the file name is painted: {bar:?}"));
+            .unwrap_or_else(|| panic!("{w}: the file name is painted: {text:?}"));
         assert!(
-            title.max.x <= w as f32,
-            "{w}: inside the surface: {title:?}"
+            title.max.x <= w as f32 && id.expand(0.5).contains_rect(*title),
+            "{w}: inside the identity and the surface: {title:?} {id:?}"
         );
-        for (t, r) in bar
+        let chrome = &s.ui.chrome;
+        let controls = [chrome.home, chrome.menu, chrome.layers, chrome.design];
+        for c in controls.into_iter().chain([s.ui.rail.rects.rail]).flatten() {
+            assert!(
+                !overlap(*title, c),
+                "{w}: {c:?} overlaps the name {title:?}"
+            );
+        }
+        for (t, r) in text
             .iter()
-            .filter(|(t, r)| t.trim() != name && r.min.x > title.min.x)
+            .filter(|(t, r)| t.trim() != name && overlap(*r, id))
         {
             assert!(
-                r.min.x >= title.max.x - 0.5 || r.max.y <= title.min.y || r.min.y >= title.max.y,
+                !overlap(*r, *title),
                 "{w}: {t:?} {r:?} overlaps the name {title:?}"
             );
         }
@@ -1993,7 +2058,7 @@ fn the_appearance_follows_the_os_unless_chosen_and_keeps_the_document_and_a_draf
 #[test]
 fn r22_deleting_the_first_of_two_pages_keeps_the_editor_running() {
     let mut s = two_pages();
-    let button = menu_item(&mut s, "Alpha", "Delete", 100.0);
+    let button = menu_item(&mut s, "Alpha", "Delete Paper", 100.0);
     click(&mut s, button, 200.0);
     step(&mut s);
     step(&mut s);
@@ -2015,7 +2080,7 @@ fn r22_deleting_the_middle_of_three_pages_keeps_the_editor_running() {
     let mut s = WebState::open(&canvas(&pages, "beta22"), false, W, H).unwrap();
     settle(&mut s, 0.0);
     open_layers(&mut s);
-    let button = menu_item(&mut s, "Beta", "Delete", 100.0);
+    let button = menu_item(&mut s, "Beta", "Delete Paper", 100.0);
     click(&mut s, button, 200.0);
     step(&mut s);
     step(&mut s);
@@ -2029,7 +2094,7 @@ fn r22_deleting_the_middle_of_three_pages_keeps_the_editor_running() {
 #[test]
 fn r22_deleting_the_last_row_is_a_positive_control() {
     let mut s = two_pages();
-    let button = menu_item(&mut s, "Beta", "Delete", 100.0);
+    let button = menu_item(&mut s, "Beta", "Delete Paper", 100.0);
     click(&mut s, button, 200.0);
     step(&mut s);
     step(&mut s);
@@ -2103,7 +2168,7 @@ fn r77_menu_deletes_of_any_row_active_or_not_keep_the_right_pages_and_shown_page
         if shown != "Beta" {
             click_page(&mut s, shown, 50.0);
         }
-        let button = menu_item(&mut s, deleted, "Delete", 100.0);
+        let button = menu_item(&mut s, deleted, "Delete Paper", 100.0);
         click(&mut s, button, 200.0);
         step(&mut s);
         step(&mut s);
@@ -2123,7 +2188,7 @@ fn r77_menu_deletes_of_any_row_active_or_not_keep_the_right_pages_and_shown_page
     }
     // The last page stays (upstream's Delete is disabled for it), as before.
     let mut s = state();
-    let d = menu_item(&mut s, "Page 1", "Delete", 100.0);
+    let d = menu_item(&mut s, "Page 1", "Delete Paper", 100.0);
     click(&mut s, d, 200.0);
     step(&mut s);
     step(&mut s);
@@ -2148,9 +2213,9 @@ fn r77_a_layer_rename_is_finished_on_its_page_before_any_page_action() {
         match action {
             "switch" => click_page(&mut s, "Beta", 3000.0),
             "add" => {
-                // The header's +, found as the pages panel test finds it.
+                // The list header's +, found as the pages panel test finds it.
                 let left = s.canvas_rect().min.x as f64;
-                let (title_x, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+                let (title_x, title_y) = painted_at(&mut s, "Papers", |r| (r.max.x as f64) < left);
                 let mut x = left - 4.0;
                 let mut t = 3000.0;
                 while s.ed.pages.len() == 2 && x > title_x {
@@ -2162,13 +2227,13 @@ fn r77_a_layer_rename_is_finished_on_its_page_before_any_page_action() {
                 step(&mut s);
             }
             "duplicate" => {
-                let d = menu_item(&mut s, "Beta", "Duplicate", 3000.0);
+                let d = menu_item(&mut s, "Beta", "Duplicate Paper", 3000.0);
                 click(&mut s, d, 3100.0);
                 step(&mut s);
                 step(&mut s);
             }
             _ => {
-                let d = menu_item(&mut s, "Beta", "Delete", 3000.0);
+                let d = menu_item(&mut s, "Beta", "Delete Paper", 3000.0);
                 click(&mut s, d, 3100.0);
                 step(&mut s);
                 step(&mut s);
@@ -2245,7 +2310,7 @@ fn r77_a_page_rename_draft_is_finished_on_its_own_page_before_another_row_is_del
     press(&mut s, "q", "KeyQ");
     step(&mut s);
     // Alpha (the row before it) is deleted from its menu: the draft names Beta, not row 1.
-    let d = menu_item(&mut s, "Alpha", "Delete", 3000.0);
+    let d = menu_item(&mut s, "Alpha", "Delete Paper", 3000.0);
     click(&mut s, d, 3100.0);
     step(&mut s);
     step(&mut s);
@@ -2284,11 +2349,11 @@ fn r23_hidden_rename_setup() -> (WebState, crate::model::NodeId, String, String)
 
 fn r23_go_beta_from_palette(s: &mut WebState) {
     open_palette(s);
-    s.paste("Go to page: Beta");
+    s.paste("Go to Paper: Beta");
     step(s);
     step(s);
-    assert_eq!(s.ui.palette.query, "Go to page: Beta");
-    assert!(paints(s, "Go to page: Beta"));
+    assert_eq!(s.ui.palette.query, "Go to Paper: Beta");
+    assert!(paints(s, "Go to Paper: Beta"));
     press(s, "Enter", "Enter");
     step(s);
     step(s);
@@ -2471,11 +2536,11 @@ fn r78_collapsing_the_pages_panel_finishes_a_page_rename_on_its_page() {
     press(&mut s, "q", "KeyQ");
     step(&mut s);
     assert!(!s.can_reload(), "a changed page-rename draft");
-    // One click on the header's collapse chevron: the sidebar's first item, 16 px wide, inside
-    // its 10 px margin, on the "Pages" title's line. (Any other click there would finish the
-    // field by ordinary click-away first, which wouldn't test the collapse.)
+    // One click on the list header's collapse chevron: its first item, 16 px wide, inside the
+    // sidebar's 10 px margin, on the "Papers" title's line. (Any other click there would finish
+    // the field by ordinary click-away first, which wouldn't test the collapse.)
     let left = s.canvas_rect().min.x as f64;
-    let (_, title_y) = painted_at(&mut s, "Pages", |r| (r.max.x as f64) < left);
+    let (_, title_y) = painted_at(&mut s, "Papers", |r| (r.max.x as f64) < left);
     click(&mut s, (18.0, title_y), 3000.0);
     step(&mut s);
     step(&mut s);
@@ -2522,46 +2587,68 @@ fn r77_an_inspector_number_draft_never_continues_on_the_next_page() {
     }
 }
 
-/// What the owner did in a real browser, at one point of the inspector: click, select all,
-/// type "X", Enter.
-fn type_page_name(s: &mut WebState, (x, y): (f64, f64)) {
-    click(s, (x, y), 5000.0);
+/// Hover then click the frontmost painted text `label` (the last painted: egui paints its menus
+/// and popups after the panels), then lay out twice, as [`click_label`]; returns where it was.
+/// For a menu item whose text a panel paints too (the compact menu's View and the inspector's).
+fn click_front_label(s: &mut WebState, label: &str, t: f64) -> egui::Rect {
+    let text = painted_text(s);
+    let r = text
+        .iter()
+        .rev()
+        .find(|(x, _)| x.trim() == label)
+        .map(|(_, r)| *r)
+        .unwrap_or_else(|| panic!("{label:?} not painted: {text:?}"));
+    let p = r.center();
+    s.pointer_move(p.x as f64, p.y as f64, t);
     step(s);
-    s.modifiers(false, true, false, false);
-    s.key_down("a", "KeyA", false);
-    s.key_up("a", "KeyA");
-    s.modifiers(false, false, false, false);
+    click(s, (p.x as f64, p.y as f64), t + 5.0);
     step(s);
-    for (k, code) in [("X", "KeyX"), ("Enter", "Enter")] {
-        s.key_down(k, code, false);
-        s.key_up(k, code);
-        step(s);
-    }
     step(s);
+    r
 }
 
-/// The inspector's left edge: labels, the full-width page name field, checkboxes and small
-/// buttons (not the sliders, swatches or colour button further right).
-fn inspector_edge(s: &WebState) -> f64 {
-    s.canvas_rect().max.x as f64 + 24.0
+/// Hover then click painted text `wanted` where `within` accepts it, then lay out twice (as
+/// [`click_label`], for text painted in more than one place).
+fn click_label_in(s: &mut WebState, wanted: &str, within: impl Fn(egui::Rect) -> bool, t: f64) {
+    let p = painted_at(s, wanted, within);
+    s.pointer_move(p.0, p.1, t);
+    step(s);
+    click(s, p, t + 5.0);
+    step(s);
+    step(s);
 }
 
 #[test]
-fn the_inspector_page_name_renames_the_page_and_saves_it_with_the_page_list() {
-    // The inspector's page name field (nothing selected), found where it is painted: the
-    // owner's click, select all, "X" and Enter rename the page, as upstream does.
-    let x = inspector_edge(&state());
-    let mut found = None;
-    let mut y = 40.0;
-    while found.is_none() && y < H - 40.0 {
-        let mut s = state();
-        type_page_name(&mut s, (x, y));
-        if s.ed.page_name() == "X" {
-            found = Some(s);
-        }
-        y += 8.0;
+fn the_inspector_s_rename_paper_opens_the_one_paper_rename_and_saves_it_once() {
+    // Revision 18: the inspector shows the shown Paper's name read-only (no second field that
+    // renamed on every keystroke); its Rename Paper… opens that Paper's own rename in the Papers
+    // list, the same field, Enter and page-list save as the list's own rename.
+    let mut s = state();
+    let right = s.canvas_rect().max.x;
+    let text = inspector_text(&mut s);
+    assert!(text.iter().any(|t| t == "Paper") && text.iter().any(|t| t == "Page 1"));
+    assert!(!s.field_has_keyboard(), "no field is open for the name");
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 5000.0);
+    for _ in 0..3 {
+        step(&mut s);
     }
-    let mut s = found.expect("the field renames the page");
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(0));
+    assert_eq!(s.ui.pages.rename_field, s.ctx.memory(|m| m.focused()));
+    assert!(
+        s.field_has_keyboard(),
+        "the Papers list's field has the keyboard"
+    );
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    press(&mut s, "X", "KeyX");
+    step(&mut s);
+    assert_eq!(s.ed.page_name(), "Page 1", "a draft until it is finished");
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.page_name(), "X");
     assert!(!s.field_has_keyboard(), "Enter finished the field");
     assert!(s.ed.meta_dirty && s.dirty() && !s.can_reload());
     let snap = s.save_snapshot().expect("the new name is saved");
@@ -2569,8 +2656,11 @@ fn the_inspector_page_name_renames_the_page_and_saves_it_with_the_page_list() {
     assert_eq!(active, "p");
     assert_eq!(list, [("p".to_string(), "X".to_string())]);
     assert!(sent.is_empty(), "the page's content is unchanged");
+    assert_eq!(saved_name(&snap), None, "not a Canvas rename");
     s.save_succeeded();
     assert!(!s.dirty() && s.can_reload() && !s.unsaved_work());
+    // The inspector shows the new name, still read-only.
+    assert!(inspector_text(&mut s).iter().any(|t| t == "X"));
 }
 
 // ---- revision 2, slice 1: the header's safe area, panel states, Collapse panels and zoom.
@@ -2590,8 +2680,13 @@ fn overlap(a: egui::Rect, b: egui::Rect) -> bool {
     a.intersects(b) && a.intersect(b).area() > 0.5
 }
 
+/// Whether `a` and `b` lie at the same place, within `tol` px on every edge.
+fn same_place(a: egui::Rect, b: egui::Rect, tol: f32) -> bool {
+    (a.min - b.min).length() <= tol && (a.max - b.max).length() <= tol
+}
+
 #[test]
-fn rev2_a_fresh_view_keeps_layers_closed_and_lays_the_header_out_across_the_whole_surface() {
+fn rev18_a_fresh_view_has_no_header_and_each_control_keeps_its_place_when_a_panel_opens() {
     // (width, tier, Design shown in a fresh view)
     for (w, tier, design) in [
         (1280.0, crate::ui::Tier::Wide, true),
@@ -2607,6 +2702,8 @@ fn rev2_a_fresh_view_keeps_layers_closed_and_lays_the_header_out_across_the_whol
         assert!(!a.layers, "{w}: Layers starts closed");
         assert_eq!(a.design, design, "{w}: Design");
         let c = s.canvas_rect();
+        // No header: the canvas (and any open panel) starts at the surface's top.
+        assert_eq!(c.min.y, 0.0, "{w}: no full-width header: {c:?}");
         assert!(c.min.x < 1.0, "{w}: no left panel: {c:?}");
         if design {
             assert!(
@@ -2616,35 +2713,89 @@ fn rev2_a_fresh_view_keeps_layers_closed_and_lays_the_header_out_across_the_whol
         } else {
             assert!(c.width() >= w as f32 - 1.0, "{w}: canvas only: {c:?}");
         }
-        // The header comes first: its controls start at the surface's left edge and the
-        // centred identity sits on the surface's centre (or between the groups when narrow).
+        // The closed left panel's row floats at the canvas's top left (home first); the right
+        // toggle is in the open inspector's top row, or floats at the canvas's top right.
         let home = s.ui.chrome.home.unwrap();
+        let layers = s.ui.chrome.layers.unwrap();
         let design_toggle = s.ui.chrome.design.unwrap();
-        let id = s.ui.chrome.identity.unwrap();
-        assert!(home.min.x < 12.0 && home.max.y <= c.min.y, "{w}: {home:?}");
+        let float = s.ui.chrome.left_float.expect("the left row floats");
         assert!(
-            design_toggle.max.x > w as f32 - 12.0,
+            float.contains_rect(home) && float.contains_rect(layers),
+            "{w}"
+        );
+        assert!(home.min.x < 12.0 && home.max.y <= 40.0, "{w}: {home:?}");
+        assert!(
+            design_toggle.max.x > w as f32 - 20.0 && design_toggle.max.y <= 40.0,
             "{w}: {design_toggle:?}"
         );
-        if w >= 600.0 {
-            assert!(
-                (id.center().x - w as f32 / 2.0).abs() < 1.0,
-                "{w}: centred: {id:?}"
-            );
-        }
-        // Opening Layers puts the panel under the header, which keeps its place.
-        toggle(&mut s, "Layers", 1000.0);
-        let after = s.ui.chrome.home.unwrap();
-        assert_eq!(after, home, "{w}: the header doesn't move for a panel");
-        assert!(s.ui.narrow.shown().unwrap().layers, "{w}");
-        assert_eq!(
-            s.canvas_rect().min.y,
-            c.min.y,
-            "{w}: panels start below the header"
+        assert_eq!(s.ui.chrome.right_float.is_some(), !design, "{w}");
+        // The two toggles are one mirrored pair: the same size, on one line.
+        assert_eq!(layers.size(), design_toggle.size(), "{w}");
+        assert!(
+            (layers.center().y - design_toggle.center().y).abs() < 0.5,
+            "{w}"
         );
-        assert!(paints(&mut s, "Pages"), "{w}: the pages and layers panel");
+        // Neither floating row covers the rail.
+        let rail = s.ui.rail.rects.rail.expect("the rail");
+        assert!(!overlap(float, rail), "{w}: {float:?} {rail:?}");
+        // Opening Layers puts its panel at the left, full height; home and the toggle keep the
+        // places they had while floating, and the floating row is gone.
+        toggle(&mut s, "Layers", 1000.0);
+        assert!(s.ui.narrow.shown().unwrap().layers, "{w}");
+        if tier != crate::ui::Tier::Sheet {
+            let (h2, l2) = (s.ui.chrome.home.unwrap(), s.ui.chrome.layers.unwrap());
+            assert!(
+                same_place(h2, home, 1.5),
+                "{w}: home moved {home:?} → {h2:?}"
+            );
+            assert!(
+                same_place(l2, layers, 1.5),
+                "{w}: toggle moved {layers:?} → {l2:?}"
+            );
+            assert_eq!(s.canvas_rect().min.y, 0.0, "{w}: still no header");
+        }
+        assert!(
+            s.ui.chrome.left_float.is_none(),
+            "{w}: nothing floats on the left"
+        );
+        assert!(paints(&mut s, "Papers"), "{w}: the pages and layers panel");
         assert!(!s.dirty(), "{w}: arranging changes nothing");
     }
+}
+
+#[test]
+fn rev18_the_right_toggle_keeps_its_place_and_both_panels_reach_the_top() {
+    // Wide, both panels open: each runs the surface's full height with its own top row; the
+    // right toggle sits at the inspector's top right, where it floated while it was closed.
+    let mut s = fresh(W, H);
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    let floating = s.ui.chrome.design.expect("the floating right toggle");
+    assert!(s.ui.chrome.right_float.unwrap().contains_rect(floating));
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    toggle(&mut s, "Layers", 1000.0);
+    let a = s.ui.narrow.shown().unwrap();
+    assert!(a.layers && a.design, "{a:?}");
+    let docked = s.ui.chrome.design.unwrap();
+    assert!(
+        same_place(docked, floating, 1.5),
+        "{floating:?} → {docked:?}"
+    );
+    let c = s.canvas_rect();
+    assert!(docked.min.x >= c.max.x && s.ui.chrome.right_float.is_none());
+    let (home, layers) = (s.ui.chrome.home.unwrap(), s.ui.chrome.layers.unwrap());
+    assert!(layers.max.x <= c.min.x && home.max.y <= 40.0);
+    assert!(
+        (home.center().y - docked.center().y).abs() < 0.5,
+        "one top line"
+    );
+    assert_eq!((c.min.y, c.max.y), (0.0, H as f32), "{c:?}");
+    assert!(!s.dirty());
 }
 
 #[test]
@@ -2656,10 +2807,30 @@ fn rev2_collapse_panels_hides_both_and_restore_brings_them_back_and_hide_ui_stay
         "{both:?}"
     );
     let before = page_to_json(&s.ed.page_data(0));
-    // Collapse through the compact menu, as a person finds it.
+    // Collapse through the compact menu, as a person finds it: ··· ▸ View ▸ Collapse.
     click_label(&mut s, "···", 100.0);
-    click_label(&mut s, "View", 200.0);
-    click_label(&mut s, "Collapse / Restore Panels", 300.0);
+    // With nothing selected the inspector (right of the canvas) paints a View section title
+    // too; the menu's View is the one in front, left of the inspector.
+    let right = s.canvas_rect().max.x;
+    let views: Vec<egui::Rect> = painted_text(&mut s)
+        .into_iter()
+        .filter(|(t, _)| t.trim() == "View")
+        .map(|(_, r)| r)
+        .collect();
+    assert!(
+        views.len() >= 2 && views.iter().any(|r| r.min.x >= right),
+        "the menu's and the inspector's View: {views:?}"
+    );
+    let view = click_front_label(&mut s, "View", 200.0);
+    assert!(
+        view.max.x <= right,
+        "the menu's View, not the inspector's: {view:?}"
+    );
+    assert!(
+        paints(&mut s, "Collapse / Restore Panels"),
+        "View's submenu is open"
+    );
+    click_front_label(&mut s, "Collapse / Restore Panels", 300.0);
     for _ in 0..4 {
         step(&mut s);
     }
@@ -2670,8 +2841,12 @@ fn rev2_collapse_panels_hides_both_and_restore_brings_them_back_and_hide_ui_stay
     assert!(c.min.x < 1.0 && c.max.x >= W as f32 - 1.0, "{c:?}");
     assert!(
         s.ui.chrome.home.is_some() && s.ui.rail.rects.rail.is_some() && s.ui.chrome.zoom.is_some(),
-        "the header, the rail and the zoom stay"
+        "the way home, the rail and the zoom stay"
     );
+    // Collapsed, both panels' top rows float over the canvas: the toggles and the identity
+    // stay reachable without a header.
+    assert!(s.ui.chrome.left_float.is_some() && s.ui.chrome.right_float.is_some());
+    assert!(s.ui.chrome.identity.is_some() && s.ui.chrome.design.is_some());
     // Restore (the palette's and menu's same action): the same two panels again.
     s.run(Action::TogglePanels);
     for _ in 0..4 {
@@ -2815,10 +2990,24 @@ fn rev2_the_rail_and_zoom_fit_every_canonical_width_and_short_height_without_ove
         );
         assert!(!overlap(rail, zoom), "{w}×{h}: {rail:?} {zoom:?}");
         assert!(c.contains_rect(zoom), "{w}×{h}: {zoom:?} in {c:?}");
-        if c.height() < crate::ui::rail::SHORT_H {
+        // A fresh view keeps Layers closed: its row floats at the canvas's top left, and the
+        // rail and the zoom keep to the room under it (the canvas itself starts at the top).
+        let float = s.ui.chrome.left_float.expect("the left row floats");
+        assert!(
+            !overlap(rail, float) && !overlap(zoom, float),
+            "{w}×{h}: {float:?}"
+        );
+        if let Some(right) = s.ui.chrome.right_float {
             assert!(
-                (rail.min.y - c.min.y - crate::ui::rail::INSET).abs() < 0.5,
-                "{w}×{h}: a short canvas anchors the rail at the top"
+                !overlap(rail, right) && !overlap(zoom, right),
+                "{w}×{h}: {right:?}"
+            );
+        }
+        let room_top = float.max.y;
+        if c.max.y - room_top < crate::ui::rail::SHORT_H {
+            assert!(
+                (rail.min.y - room_top - crate::ui::rail::INSET).abs() < 0.5,
+                "{w}×{h}: a short room anchors the rail at its top"
             );
             assert!(zoom.min.x >= rail.max.x, "{w}×{h}: the zoom beside it");
         }
@@ -3051,7 +3240,14 @@ fn inspector_text(s: &mut WebState) -> Vec<String> {
 fn rev2_an_empty_inspector_is_quiet_and_a_creation_tool_shows_only_its_own_defaults() {
     let mut s = state();
     let text = inspector_text(&mut s);
-    assert!(text.iter().any(|t| t == "Page"), "{text:?}");
+    // The shown Paper's context (revision 18), not a generic hint: its name and the view's grid.
+    for wanted in ["Paper", "Page 1", "View", "Grid", "Rename Paper…"] {
+        assert!(text.iter().any(|t| t == wanted), "{wanted}: {text:?}");
+    }
+    assert!(
+        !text.iter().any(|t| t.starts_with("Select a layer")),
+        "{text:?}"
+    );
     for absent in [
         "For new shapes",
         "For new arrows",
@@ -3282,21 +3478,37 @@ fn rev2_the_canvas_menu_switches_the_background_as_a_view_preference_only() {
     assert!(s.ui.canvas_menu.is_some(), "the canvas's own menu opened");
     assert!(s.ed.selection.is_empty(), "nothing selected");
     assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn");
+    // The menu's own labels, inside the canvas (the inspector's View row says Grid too).
+    let c = s.canvas_rect();
+    let in_menu = |s: &mut WebState, label: &str| {
+        painted_text(s)
+            .iter()
+            .any(|(t, r)| t.trim() == label && c.contains_rect(*r))
+    };
     for label in [
         "Background",
         "None",
         "Dots",
-        "Lines",
+        "Grid",
         "Zoom to Fit",
         "Collapse Panels",
     ] {
-        assert!(paints(&mut s, label), "{label}");
+        assert!(in_menu(&mut s, label), "{label}");
     }
-    click_label(&mut s, "Lines", 200.0);
+    // Revision 18 names the line pattern Grid everywhere; its stored name stays `lines`, so a
+    // kept preference from before still loads.
+    assert!(!in_menu(&mut s, "Lines"), "the old label is gone");
+    click_label_in(&mut s, "Grid", |r| c.contains_rect(r), 200.0);
     assert_eq!(s.ui.background, scene::Background::Lines);
+    assert_eq!(scene::Background::Lines.label(), "Grid");
     assert!(s.ui.canvas_menu.is_none(), "a choice closes it");
     assert_eq!(requests(&mut s), [HostRequest::Background]);
     assert_eq!(s.background(), "lines");
+    assert!(s.set_background("lines"), "the stored name is still taken");
+    assert!(
+        requests(&mut s).is_empty(),
+        "a kept preference isn't reported back"
+    );
     // Presentation only: the document, its save state, undo, snapping and exports are untouched.
     assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
     assert_eq!(crate::io::svg::export(&s.ed.doc, None, None), svg);
@@ -3418,22 +3630,23 @@ fn rev2_an_open_canvas_menu_keeps_its_press_and_the_next_press_where_it_was_is_t
     assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn");
 }
 
-// ---- revision 2, slice 6: the file's real name, renamed from the header and saved with the
-// canvas (the same canvas save as the pages), and the shown page's own actions
+// ---- revision 2, slice 6: the file's real name, renamed from its identity (revision 18: at
+// the left panel's top) and saved with the canvas (the same canvas save as the pages), and the
+// shown page's own actions
 
-/// Where text starting with `wanted` is painted in the header (its centre, CSS px).
+/// Where text starting with `wanted` is painted in the Canvas identity (its centre, CSS px).
 fn in_header(s: &mut WebState, wanted: &str) -> (f64, f64) {
-    let top = s.canvas_rect().min.y;
+    let id = s.ui.chrome.identity.expect("the identity is laid out");
     let text = painted_text(s);
     let (_, r) = text
         .iter()
-        .find(|(t, r)| t.trim().starts_with(wanted) && r.max.y <= top)
-        .unwrap_or_else(|| panic!("{wanted:?} isn't in the header: {text:?}"));
+        .find(|(t, r)| t.trim().starts_with(wanted) && id.expand(0.5).contains_rect(*r))
+        .unwrap_or_else(|| panic!("{wanted:?} isn't in the identity {id:?}: {text:?}"));
     centre(*r)
 }
 
-/// Click the header's title (`name`) to open its rename field, select its text and type
-/// `text`, laid out: a draft until it is finished.
+/// Click the identity's Canvas name (`name`) to open its rename field, select its text and
+/// type `text`, laid out: a draft until it is finished.
 fn rename_title(s: &mut WebState, name: &str, text: &str, t: f64) {
     let p = in_header(s, name);
     click(s, p, t);
@@ -3549,21 +3762,23 @@ fn rev2_rename_and_content_share_one_save_and_an_older_answer_keeps_a_later_rena
 #[test]
 fn rev2_the_page_line_offers_the_shown_page_s_own_actions() {
     let mut s = state();
+    // The Paper line's menu, not the inspector's own Rename Paper… (right of the canvas).
+    let right = s.canvas_rect().max.x;
     let page = in_header(&mut s, "Page 1");
     click(&mut s, page, 100.0);
     step(&mut s);
     step(&mut s);
-    click_label(&mut s, "Duplicate page", 200.0);
+    click_label(&mut s, "Duplicate Paper", 200.0);
     let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["Page 1", "Page 1 copy"]);
     assert_eq!(s.ed.page_name(), "Page 1 copy");
-    // Rename page… opens the shown page's own rename in the pages list: the same field, the
+    // Rename Paper… opens the shown page's own rename in the Papers list: the same field, the
     // same Enter, and the same page-list save.
     let page = in_header(&mut s, "Page 1 copy");
     click(&mut s, page, 300.0);
     step(&mut s);
     step(&mut s);
-    click_label(&mut s, "Rename page…", 400.0);
+    click_label_in(&mut s, "Rename Paper…", |r| r.max.x <= right, 400.0);
     for _ in 0..4 {
         step(&mut s);
     }
@@ -3811,7 +4026,13 @@ fn rev2_a_status_on_a_short_surface_stays_clear_of_the_rail_and_the_zoom() {
     s.run(Action::CopyAsPng);
     timed_frames(&mut s, 3);
     let canvas = s.canvas_rect();
-    assert!(canvas.height() < crate::ui::rail::SHORT_H, "{canvas:?}");
+    // The canvas now reaches the top (no header); the tools' room under the floating row is
+    // what is short.
+    let room_top = s.ui.chrome.left_float.unwrap().max.y;
+    assert!(
+        canvas.max.y - room_top < crate::ui::rail::SHORT_H,
+        "{canvas:?}"
+    );
     let rail = s.ui.rail.rects.rail.unwrap();
     let zoom = s.ui.chrome.zoom.unwrap();
     let text = painted_text(&mut s);
@@ -3827,8 +4048,9 @@ fn rev2_a_status_on_a_short_surface_stays_clear_of_the_rail_and_the_zoom() {
 
 #[test]
 fn rev2_the_zoom_stays_inside_a_canvas_narrowed_by_widened_panels() {
-    // R33-F5: at 1024 × 270 both panels dragged to their widest (420).
-    let mut s = fresh(1024.0, 270.0);
+    // R33-F5: at 1024 × 270 both panels dragged to their widest (420). Revision 18 has no
+    // 38 px header, so the same 232 px short canvas is now a 1024 × 232 surface.
+    let mut s = fresh(1024.0, 232.0);
     let layers = s.ui.chrome.layers.unwrap();
     timed_click(&mut s, centre(layers));
     let doc = s.ed.doc.clone();
@@ -3849,8 +4071,14 @@ fn rev2_the_zoom_stays_inside_a_canvas_narrowed_by_widened_panels() {
         assert!(!overlap(zoom, rail), "{why}: clear of the rail");
     };
     inside(&mut s, "100%");
-    // Beside the rail there is no room for the whole group (R33 measured it 108 px wide):
-    // only the level is shown, and its own menu zooms in and out.
+    // Beside the rail there is no room for the whole group (R33 measured it 108 px wide at
+    // 100%). Revision 18's slim rail (52 px, not 64) leaves exactly that room at 100%, so the
+    // level is made longer first ("1000%" and more): only the level is shown then, and its own
+    // menu zooms in and out.
+    while s.ed.camera.zoom < 10.0 {
+        s.run(Action::ZoomIn);
+    }
+    inside(&mut s, "1000%");
     assert_eq!((s.ui.chrome.zoom_out, s.ui.chrome.zoom_in), (None, None));
     let level = s.ui.chrome.zoom_level.unwrap();
     timed_click(&mut s, centre(level));
@@ -3924,6 +4152,462 @@ fn rev2_independent_corners_are_mixed_only_when_they_differ() {
     // Control: one corner differs, so Mixed.
     let text = corners_selected(Some([10.0; 4]), Some([10.0, 10.0, 10.0, 4.0]));
     assert!(text.iter().any(|t| t == "Radius  Mixed"), "{text:?}");
+}
+
+// ---- revision 18: linked hover, the slim rail's arrows, the identity's renames and Paper
+// navigation, and the inspector's states. The real upstream UI through this host's input; the
+// geometry read is what it laid out (`UiState::chrome`, `rail.rects`, `layer_rows`).
+
+#[test]
+fn rev18_a_canvas_hover_lights_its_layer_row_and_changes_nothing() {
+    let mut s = state();
+    let id = s.ed.doc.root[0];
+    let before = (page_to_json(&s.ed.page_data(0)), s.ed.history.undo_len());
+    let t0 = s.now_ms + 1000.0;
+    let hover = |s: &mut WebState, (x, y): (f64, f64), t: f64| {
+        s.pointer_move(x, y, t);
+        step(s);
+        step(s);
+    };
+    // Over the rectangle on the canvas: its row in the layers panel shows it, nothing more.
+    let on_rect = at(&s, 150.0, 150.0);
+    hover(&mut s, on_rect, t0);
+    assert_eq!(s.ed.hover, Some(id));
+    assert_eq!(
+        s.ui.chrome.hover_row,
+        Some(id),
+        "the row shows the canvas's hover"
+    );
+    let row = s.ui.layer_rows.iter().find(|(r, _, _)| *r == id).unwrap().1;
+    assert!(
+        row.max.x <= s.canvas_rect().min.x,
+        "a row of the layers panel"
+    );
+    assert!(s.ed.selection.is_empty(), "nothing selected");
+    // Blank canvas: no row is lit.
+    let blank = at(&s, 600.0, 450.0);
+    hover(&mut s, blank, t0 + 20.0);
+    assert_eq!(s.ui.chrome.hover_row, None, "blank canvas");
+    // Over it again, then off the canvas onto the inspector, then the rail: cleared each time,
+    // never left stale.
+    hover(&mut s, on_rect, t0 + 40.0);
+    assert_eq!(s.ui.chrome.hover_row, Some(id));
+    let right = s.canvas_rect().max.x as f64;
+    hover(&mut s, (right + 60.0, 400.0), t0 + 60.0);
+    assert_eq!(
+        s.ui.chrome.hover_row, None,
+        "cleared as the pointer leaves the canvas"
+    );
+    hover(&mut s, on_rect, t0 + 80.0);
+    let rail = centre(s.ui.rail.rects.rows[0].0);
+    hover(&mut s, rail, t0 + 100.0);
+    assert_eq!(
+        s.ui.chrome.hover_row, None,
+        "a floating control isn't the canvas"
+    );
+    // The panel's own row hover still shows on the canvas, as before.
+    let row_at = (row.center().x as f64, row.center().y as f64);
+    hover(&mut s, row_at, t0 + 120.0);
+    assert_eq!(s.ed.hover, Some(id), "the row lights its layer");
+    assert_eq!(
+        s.ui.chrome.hover_row, None,
+        "the pointer isn't on the canvas"
+    );
+    assert!(s.ed.selection.is_empty());
+    let after = (page_to_json(&s.ed.page_data(0)), s.ed.history.undo_len());
+    assert_eq!(after, before, "no document or history change");
+    assert!(!s.dirty() && s.can_reload());
+}
+
+#[test]
+fn rev18_a_hover_inside_a_collapsed_group_lights_the_group_s_row_without_expanding_it() {
+    let mut s = state();
+    let id = s.ed.doc.root[0];
+    s.ed.selection = vec![id];
+    s.run(Action::Group);
+    let g = s.ed.selection[0];
+    assert_ne!(g, id, "a group holds the rectangle");
+    s.ed.selection.clear();
+    s.ui.collapsed.insert(g);
+    step(&mut s);
+    let undo = s.ed.history.undo_len();
+    let (x, y) = at(&s, 150.0, 150.0);
+    s.pointer_move(x, y, s.now_ms + 1000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ed.hover.is_some(), "the canvas hovers the drawing");
+    // Its own row isn't drawn (the group is collapsed): the group's row, the one shown.
+    assert_eq!(s.ui.chrome.hover_row, Some(g));
+    assert!(s.ui.collapsed.contains(&g), "not expanded for a hover");
+    assert!(
+        !s.ui.layer_rows.iter().any(|(r, _, _)| *r == id),
+        "its rows stay hidden"
+    );
+    assert!(s.ed.selection.is_empty() && s.ed.history.undo_len() == undo);
+}
+
+#[test]
+fn rev18_the_slim_rail_shows_an_arrow_only_where_wanted_and_never_moves_the_canvas() {
+    use crate::ui::rail;
+    let mut s = fresh(W, H);
+    let c = s.canvas_rect();
+    let r = s.ui.rail.rects.rail.unwrap();
+    assert_eq!(rail::RAIL_W, 52.0, "slimmer than revision 2's 64 px");
+    assert_eq!(r.width(), rail::RAIL_W);
+    let rows = s.ui.rail.rects.rows.clone();
+    // At rest only the current tool's family (Pointer: Select) shows its arrow. On a surface
+    // without hover a family is chosen first; its arrow then shows and opens its flyout.
+    let rest = [true, false, false, false, false, false];
+    assert_eq!(s.ui.rail.rects.arrows, rest);
+    let t0 = s.now_ms + 1000.0;
+    // Hovering the Shapes row shows its arrow; nothing moves and no tool is chosen.
+    let shapes = centre(rows[2].0);
+    s.pointer_move(shapes.0, shapes.1, t0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ui.rail.rects.arrows[2], "the hovered row's arrow");
+    assert_eq!(s.canvas_rect(), c, "the canvas keeps its rectangle");
+    assert_eq!(s.ui.rail.rects.rail, Some(r));
+    assert_eq!(
+        s.ui.rail.rects.rows, rows,
+        "every target stays where it was"
+    );
+    assert_eq!(s.ed.tool, Tool::Select, "hovering chooses nothing");
+    // Away from the rail it goes again.
+    let blank = at(&s, 600.0, 450.0);
+    s.pointer_move(blank.0, blank.1, t0 + 20.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.rail.rects.arrows, rest);
+    // Keyboard focus (Tab) on another family's control shows that family's arrow too.
+    let mut tabs = 0;
+    while !s.ui.rail.rects.arrows[1..].contains(&true) {
+        assert!(tabs < 300, "Tab reaches the rail");
+        s.key_down("Tab", "Tab", false);
+        s.key_up("Tab", "Tab");
+        step(&mut s);
+        step(&mut s);
+        tabs += 1;
+    }
+    assert!(
+        s.ui.rail.rects.focus.is_some(),
+        "shown for the focused rail control"
+    );
+    assert_eq!(s.ed.tool, Tool::Select, "focus chooses nothing");
+    s.ctx.memory_mut(|m| {
+        if let Some(f) = m.focused() {
+            m.surrender_focus(f);
+        }
+    });
+    step(&mut s);
+    // Choosing Shapes by its main button (a touch's way): its arrow shows at rest, Pointer's
+    // goes, and the arrow then opens the flyout without choosing anything else.
+    click(&mut s, shapes, t0 + 100.0);
+    step(&mut s);
+    s.pointer_move(blank.0, blank.1, t0 + 200.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.tool, Tool::Rect);
+    assert_eq!(
+        s.ui.rail.rects.arrows,
+        [false, false, true, false, false, false]
+    );
+    click(&mut s, centre(rows[2].1.unwrap()), t0 + 300.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.rail.flyout, Some(2));
+    assert_eq!(s.ed.tool, Tool::Rect, "the arrow opened the menu only");
+    assert_eq!(s.canvas_rect(), c);
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    assert_eq!(s.ui.rail.flyout, None);
+    assert_eq!(s.ed.doc.nodes.len(), 1, "nothing drawn");
+}
+
+/// Every rail target as laid out (egui's actual responses): each family's main button, then its
+/// arrow where it has one.
+fn rail_targets(s: &WebState) -> Vec<egui::Rect> {
+    let rows = &s.ui.rail.rects.rows;
+    rows.iter()
+        .flat_map(|(main, arrow)| std::iter::once(*main).chain(*arrow))
+        .collect()
+}
+
+#[test]
+fn rev18_a_short_surface_keeps_every_rail_control_clear_of_the_floating_row_and_hittable() {
+    use crate::ui::rail;
+    // The owner's actual short surface (the lead's run133 probe): 320 × 240, panels closed.
+    // Before, the requested rail (y 45–255) ran past the 240 px canvas and the shown rail
+    // started at y 33, under the floating row (y 1–37). Its rows now take the room there is.
+    let mut s = fresh(320.0, 240.0);
+    timed_frames(&mut s, 4);
+    let c = s.canvas_rect();
+    let top = s.ui.chrome.left_float.expect("floating Home/identity");
+    let right = s.ui.chrome.right_float.expect("floating Design toggle");
+    let rows = s.ui.rail.rects.rows.clone();
+    assert_eq!(rows.len(), 6, "six families");
+    // The probe's own assertion, unchanged in meaning: the first button as egui laid it out.
+    let first = rows[0].0;
+    assert!(
+        !overlap(top, first),
+        "first rail button geometrically overlaps floating controls: top={top:?}; button={first:?}"
+    );
+    // Every target: clear of both floating rows, inside the canvas, at least MIN_ROW_H high,
+    // each distinct from every other.
+    let targets = rail_targets(&s);
+    assert_eq!(targets.len(), 11, "six main buttons and five arrows");
+    for (i, t) in targets.iter().enumerate() {
+        assert!(!overlap(*t, top) && !overlap(*t, right), "{i}: {t:?}");
+        assert!(c.contains_rect(*t), "{i}: {t:?} in {c:?}");
+        assert!(t.height() >= rail::MIN_ROW_H - 0.5, "{i}: {t:?}");
+        for u in &targets[i + 1..] {
+            assert!(!overlap(*t, *u), "{i}: {t:?} and {u:?}");
+        }
+    }
+    // The requested rail is where egui showed it: every actual target lies inside it, and it
+    // is clear of the floating row and the zoom.
+    let shown = s.ui.rail.rects.rail.expect("the rail");
+    for t in &targets {
+        assert!(
+            shown.expand(1.5).contains_rect(*t),
+            "{t:?} outside {shown:?}"
+        );
+    }
+    let zoom = s.ui.chrome.zoom.expect("the zoom");
+    assert!(!overlap(shown, top) && !overlap(zoom, top) && !overlap(zoom, shown));
+    assert!(c.contains_rect(zoom), "{zoom:?} in {c:?}");
+    // Hits: a press just inside each main button's top and bottom edges chooses that family's
+    // member, never a neighbour's, and none reaches the floating row's Home; Home itself is
+    // still the way home.
+    let mut t = s.now_ms + 1000.0;
+    for (fi, (main, _)) in rows.iter().enumerate() {
+        for y in [main.min.y + 1.0, main.max.y - 1.0] {
+            s.run(Action::Tool(if fi == 0 {
+                Tool::Rect
+            } else {
+                Tool::Select
+            }));
+            step(&mut s);
+            click(&mut s, (main.center().x as f64, y as f64), t);
+            step(&mut s);
+            t += 500.0;
+            let got = crate::ui::rail::family_of(s.ed.tool);
+            assert_eq!(got, fi, "a press at y {y} on family {fi}'s button");
+        }
+    }
+    assert_eq!(s.take_request(), None, "no press on the rail reached Home");
+    assert_eq!(s.ui.rail.flyout, None, "nor opened a flyout");
+    let home = s.ui.chrome.home.expect("home");
+    click(&mut s, centre(home), t + 500.0);
+    step(&mut s);
+    assert_eq!(s.take_request(), Some(HostRequest::Home));
+    // And every one of the sixteen tools through its family's button and arrow and flyout.
+    let reached = reach_every_tool(&mut s, t + 1000.0);
+    assert_eq!(reached.len(), 16, "{reached:?}");
+    assert_eq!(s.ed.doc.nodes.len(), 1, "probing drew nothing");
+}
+
+#[test]
+fn rev18_ordinary_heights_keep_the_rail_s_full_rows() {
+    use crate::ui::rail;
+    // Control: a tall surface and the canonical short one (270, whose room under the floating
+    // row still fits six 32 px rows) keep the rail exactly as before.
+    for (w, h) in [(W, H), (NARROW, 270.0)] {
+        let mut s = fresh(w, h);
+        timed_frames(&mut s, 2);
+        let shown = s.ui.rail.rects.rail.expect("the rail");
+        assert_eq!(shown.width(), rail::RAIL_W, "{w}×{h}");
+        assert_eq!(shown.height(), rail::rail_height(), "{w}×{h}");
+        let rows = &s.ui.rail.rects.rows;
+        for (main, arrow) in rows {
+            assert_eq!(
+                main.size(),
+                egui::vec2(rail::MAIN_W, rail::ROW_H),
+                "{w}×{h}"
+            );
+            if let Some(a) = arrow {
+                assert_eq!(
+                    a.size(),
+                    egui::vec2(rail::CHEVRON_W, rail::ROW_H),
+                    "{w}×{h}"
+                );
+            }
+        }
+        let float = s.ui.chrome.left_float.expect("the left row floats");
+        for t in rail_targets(&s) {
+            assert!(!overlap(t, float), "{w}×{h}: {t:?} {float:?}");
+        }
+    }
+}
+
+#[test]
+fn rev18_rename_canvas_opens_in_the_name_s_own_slot_and_survives_collapse_panels() {
+    let mut s = state();
+    let identity = s.ui.chrome.identity.unwrap();
+    // From the compact menu's Rename Canvas…: the field takes the name's place.
+    click_label(&mut s, "···", 100.0);
+    click_label(&mut s, "Rename Canvas…", 200.0);
+    for _ in 0..3 {
+        step(&mut s);
+    }
+    assert!(s.ui.file_title_draft.is_some() && s.field_has_keyboard());
+    let field = s.ui.file_title_field.expect("the field is laid out");
+    let r = s.ctx.read_response(field).expect("its response").rect;
+    assert_eq!(
+        s.ui.chrome.identity,
+        Some(identity),
+        "nothing moved or resized"
+    );
+    assert!(
+        identity.contains_rect(r),
+        "in the name's slot: {r:?} {identity:?}"
+    );
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("Draft name");
+    step(&mut s);
+    // Collapse Panels while the field has the keyboard: the arrangement waits; the draft stays.
+    let before = s.ui.narrow.shown();
+    s.run(Action::TogglePanels);
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(s.ui.narrow.shown(), before, "it waits for the field");
+    assert!(s.unsaved_work() && !s.can_reload(), "the draft is guarded");
+    assert_eq!(s.ui.project_name, "Canvas", "still a draft");
+    // Enter finishes it, once; then the collapse applies and the floating identity names it.
+    press(&mut s, "Enter", "Enter");
+    for _ in 0..4 {
+        step(&mut s);
+    }
+    assert_eq!(s.ui.project_name, "Draft name");
+    let a = s.ui.narrow.shown().unwrap();
+    assert!(!a.layers && !a.design, "then the collapse applies");
+    assert!(in_identity(&mut s, "Draft name"), "the floating identity");
+    let snap = s.save_snapshot().expect("the rename is saved");
+    assert_eq!(saved_name(&snap).as_deref(), Some("Draft name"));
+    s.save_succeeded();
+    assert!(s.save_snapshot().is_none(), "one rename, saved once");
+    // In the floating identity too the field opens in the name's slot; a blank name changes
+    // nothing and says why.
+    let compact = s.ui.chrome.identity.unwrap();
+    let name = in_header(&mut s, "Draft name");
+    click(&mut s, name, 3000.0);
+    for _ in 0..3 {
+        step(&mut s);
+    }
+    let field = s.ui.file_title_field.expect("the field is laid out");
+    let r = s.ctx.read_response(field).expect("its response").rect;
+    assert_eq!(
+        s.ui.chrome.identity,
+        Some(compact),
+        "the floating row keeps its size"
+    );
+    assert!(compact.contains_rect(r), "{r:?} {compact:?}");
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("   ");
+    step(&mut s);
+    press(&mut s, "Enter", "Enter");
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ui.project_name, "Draft name", "a blank name isn't taken");
+    assert!(s.ed.status.contains("1 to 60"), "{}", s.ed.status);
+    assert!(!s.dirty() && s.save_snapshot().is_none());
+}
+
+#[test]
+fn rev18_the_paper_line_navigates_papers_and_a_paper_rename_ends_on_its_own_paper() {
+    let mut s = two_pages();
+    // Rename Paper… from the identity's own menu (a secondary click on the Canvas name) opens
+    // the shown Paper's (Beta's) rename in the Papers list.
+    let name = in_header(&mut s, "Canvas");
+    s.pointer_down(name.0, name.1, Button::Secondary, 100.0);
+    s.pointer_up(name.0, name.1, Button::Secondary, 110.0);
+    step(&mut s);
+    step(&mut s);
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.max.x <= right, 200.0);
+    for _ in 0..3 {
+        step(&mut s);
+    }
+    let beta = page_index(&s, "beta22");
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(beta));
+    assert!(s.field_has_keyboard());
+    press(&mut s, "q", "KeyQ");
+    step(&mut s);
+    // The Paper line's menu lists every Paper; choosing Alpha there finishes the draft on Beta
+    // first, then shows Alpha.
+    let line = in_header(&mut s, "Beta");
+    click(&mut s, line, 1000.0);
+    step(&mut s);
+    step(&mut s);
+    let text = painted_text(&mut s);
+    // The menu is painted over the panel, after its rows: the last "Alpha" is the menu's.
+    let (_, alpha) = text
+        .iter()
+        .rev()
+        .find(|(t, _)| t.trim() == "Alpha")
+        .expect("Alpha in the Paper menu");
+    let p = centre(*alpha);
+    s.pointer_move(p.0, p.1, 2000.0);
+    step(&mut s);
+    click(&mut s, p, 2005.0);
+    step(&mut s);
+    step(&mut s);
+    assert_eq!(s.ed.active_page_id(), "alpha1", "the menu showed Alpha");
+    let names: Vec<&str> = s.ed.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names[0], "Alpha", "Alpha untouched");
+    assert!(
+        names[1] != "Beta" && names[1].contains('q'),
+        "finished on Beta: {names:?}"
+    );
+    assert!(s.ui.pages.renaming.is_none() && !s.field_has_keyboard());
+    let snap = s.save_snapshot().expect("the rename and the switch");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, "alpha1");
+    assert_eq!(list[1].0, "beta22");
+    assert!(sent.is_empty(), "no page's content changed");
+}
+
+#[test]
+fn rev18_an_empty_canvas_click_returns_the_inspector_to_the_paper_context() {
+    let mut s = state();
+    let right = s.canvas_rect().max.x;
+    click_at(&mut s, 150.0, 150.0, 0.0);
+    step(&mut s);
+    step(&mut s);
+    let text = inspector_text(&mut s);
+    assert!(
+        text.iter().any(|t| t.starts_with("X  ")),
+        "the layer's own sections: {text:?}"
+    );
+    assert!(
+        !text.iter().any(|t| t == "Rename Paper…" || t == "View"),
+        "{text:?}"
+    );
+    // A click on empty canvas: no selection, and the shown Paper's context again.
+    click_at(&mut s, 700.0, 500.0, 1000.0);
+    step(&mut s);
+    step(&mut s);
+    assert!(s.ed.selection.is_empty());
+    let text = inspector_text(&mut s);
+    for wanted in ["Paper", "Page 1", "View", "Grid"] {
+        assert!(text.iter().any(|t| t == wanted), "{wanted}: {text:?}");
+    }
+    assert!(!text.iter().any(|t| t.starts_with("X  ")), "{text:?}");
+    // Its Grid is the view's (the same preference as the canvas's menu): no document change.
+    let authored = page_to_json(&s.ed.page_data(0));
+    click_label_in(&mut s, "None", |r| r.min.x >= right, 2000.0);
+    click_label_in(&mut s, "Dots", |r| r.min.x >= right, 3000.0);
+    assert_eq!(s.ui.background, scene::Background::Dots);
+    assert_eq!(requests(&mut s), [HostRequest::Background]);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), authored);
+    assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
 }
 
 // ---- keys

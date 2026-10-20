@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.76 · Updated: 2026-10-20
+Revision: 0.77 · Updated: 2026-10-20
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -464,6 +464,73 @@ engine architecture is `analysis/DESIGN.md`.
       existing rules). Upstreamable as a fix.
     - Not changed: Excalidraw import (its arrow-bound text stays a separate text layer) and
       the PNG/SVG/PDF formats themselves. Upstreamable as a feature with its format guard.
+  - Owner UX revision of 2026-10-20 (root `DESIGN.md` revision 18; owner-authorized; source
+    only, not built, rendered or natively qualified here). Native windows change too.
+    - `src/ui/mod.rs`:
+      - **No header.** `Panel::top("toolbar")` and `top_bar` are gone. `left_panel` and
+        `right_panel` run the full height, each starting with `top_row` (`BAR_H` 38, or
+        `theme::TOOLBAR_H` 40 with native chrome, the traffic lights' row). The frames have no
+        top margin; the sheet's "← Canvas" keeps its own. The header's hairline is gone; the
+        panels' own edges are the only dividers. Reason: owner point 1.
+      - **Floating top rows.** While a panel is closed, `float_left` (`nav`: All projects,
+        `app_menu`, the Layers toggle; then `compact_identity`) and `float_right` (the Design
+        toggle) are egui Areas over the canvas's top corners, each control where it is in the
+        open panel's row. They are floating UI (`over_floating_ui`), so presses stay theirs.
+        The rail and the zoom get the canvas below the left row as their room; `draw` still
+        returns the one canvas rectangle (rendering, clipping, hit tests unchanged). A sheet's
+        top row carries both toggles. `Chrome` adds `canvas`, `left_float`, `right_float` and
+        `hover_row` (records, no behaviour).
+      - **Identity.** `identity`/`compact_identity`, `canvas_name` and `paper_line` in fixed
+        slots (`NAME_H`, `PAPER_H`; the compact width from the kept name), so the Canvas name
+        field (`file_title_field`, the whole slot) opens in place. `in_slot` draws a slot's
+        label or field in a child ui (`Ui::new_child`) that allocates nothing outside the slot:
+        a single-line field is at least egui's 24 px interact height, and placed in a shrunk
+        slot it had pushed the Paper line 2 px down (run132 repair). `paper_menu` (every
+        Paper, then `identity_menu`: Rename Canvas…, Rename Paper…, `paper_actions`), the
+        name's `context_menu`, and the compact menu's top share them. `start_paper_rename`
+        opens the Papers list's own rename (one field, one path); `start_canvas_rename` the
+        name's. `finish_title_draft` finishes a draft whose identity isn't drawn (Hide UI, the
+        Design sheet), as losing focus does. The title's invalid-name note says Canvas.
+      - **Toggles.** `sidebar_toggle` (the pair, with an accessibility name through
+        `widget_info`): "Papers and layers" (`Icon::Sidebar`) and "Properties"
+        (`Icon::SidebarRight`); `pill` and the "Design" text pill are gone. The `···` menu is
+        a bare glyph at rest (`app_menu`: no inactive fill or outline).
+      - **Linked hover.** `canvas_hover_row`: `Editor::hover`, only while the pointer is in
+        the last laid-out canvas and over no floating UI, mapped to the shown row (the
+        nearest collapsed group); `layer_row` paints it with the hover fill. No selection,
+        document, scroll or expansion change; the row's own `ed.hover` is unchanged.
+      - Layer symbols are secondary grey (components and instances keep the accent); the
+        canvas menu and the zoom use the floating radius 10.
+    - `src/ui/rail.rs`: `CHEVRON_W` 24 → 12 (`RAIL_W` 64 → 52). The arrow's target is always
+      laid out; it is painted while its row is hovered or focused, its flyout is open, or its
+      family is the current tool's (`RailRects::arrows` records which). Reason: owner point 5.
+      Short rooms (owner correction after run133): `row_height` gives the rows the whole
+      pixels that fit the tools' room (32 down to `MIN_ROW_H` 24; `rail_rect` and `draw` use
+      it). At 320 × 240 the 210 px rail had run past the 240 px canvas and egui showed it 12 px
+      higher, its first button (y 33) under the floating row (y 1–37); the rows are now 27
+      px and every target lies in the requested rail. Taller rooms are unchanged.
+    - `src/editor/pages.rs` `add_page` (upstream-owned default-name literal, owner correction):
+      a page a person adds is named "Paper N" instead of "Page N". Only this creation path:
+      `add_page_in_background` (agents) and `insert_empty_page`'s own default stay
+      upstream's, existing names, migrations and formats are untouched, and
+      `unique_page_name` still makes it unique.
+    - `src/ui/inspector.rs`: `nothing_selected` takes `UiState`; `paper_context` replaces the
+      generic hint and the always-editable page name (which renamed on every keystroke):
+      the Paper's name read-only with Rename Paper…, its content and place, then View ▸ Grid
+      (`UiState::set_background`). Creation tools' "For new …" defaults come first. The
+      "Design" title moved to the panel's top row. Export's scope texts say Paper.
+    - `src/ui/pages.rs`: "Papers", Add Paper, and the row menu's Rename/Duplicate/Delete Paper;
+      the current Paper's icon is text-coloured, not accent.
+    - `src/theme.rs`: `RADIUS` (6, widgets too, was 7), `focus_ring` (keyboard focus on
+      `quiet_icon_button`, `icon_button` and the rail's arrow and flyout rows),
+      `Icon::SidebarRight`; `quiet_icon_button` lights on focus too.
+    - `src/render/scene.rs`: `Background::Lines.label()` is "Grid"; `name()` stays `lines`.
+      `src/io/export.rs`: scope labels "This Paper", "All Papers". `src/ui/palette.rs`:
+      "Go to Paper: …". `src/editor/shortcuts.rs`: Next/Previous Paper, "Show / hide
+      background" (descriptions and menu labels only; actions and bindings unchanged).
+    - Same Editor, Session, transactions, save, binding, lease and guards; no renderer, format
+      or dependency change. Upstreamable as presentation, except the Paper/Canvas vocabulary,
+      which is an OPD choice.
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.
@@ -587,7 +654,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-17.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-18.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -658,6 +725,19 @@ changed again, so `home-15` is refused and a cached `home-15` view can't pass fo
 editor whose curves have a bend handle per bend (the multi-bend re-edit above). The editor's
 WASM changed again, so `home-16` is refused and a cached `home-16` view can't pass for this
 one. Not installed or natively accepted.
+
+`home-18` (2026-10-20 source candidate) is the owner's UX revision (root `DESIGN.md` revision
+18, the upstream entry above): the editor without a full-width header (full-height panels,
+the Canvas identity in the left panel, mirrored toggles, the slim rail, the Paper context,
+linked hover, Grid naming), Paper counts on Home ("1 Paper", `papers`; the server's `pages`
+count unchanged) with a new library file's first Paper named "Paper 1"
+(`library::FIRST_PAPER` in `NewDocument::blank`; existing and imported files keep their names),
+and the view's own search field drawn as one at rest (a wrapper
+with a magnifier and the stronger hairline around the same `#search` input; filtering,
+Escape, the empty and no-match states, the kept grid/list layout and the narrow layout are
+unchanged). Both the view's HTML and the editor's WASM changed, so `home-17` is refused and a
+cached `home-17` view can't pass for this one. Not built, rendered, installed or natively
+accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

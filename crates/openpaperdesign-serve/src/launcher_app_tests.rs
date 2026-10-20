@@ -225,6 +225,12 @@ async fn library_create_edit_save_close_and_reopen_without_metadata() {
     let dir = lib.root.join("library/v1/canvases").join(&id);
     assert_eq!(created["location"], json!(dir));
     assert!(dir.join("project.json").is_file());
+    // A new file's first page is named as people see pages (a Paper); the stored key and
+    // format are upstream's, and the reopen below reads it back exactly.
+    let first = crate::read_manifest_checked(&dir).unwrap();
+    let names: Vec<&str> = first.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, [crate::library::FIRST_PAPER]);
+    assert_eq!(crate::library::FIRST_PAPER, "Paper 1");
     assert!(!lib.root.join("DESIGN.md").exists() && !lib.root.join("design.md").exists());
     assert!(
         !dir.join("DESIGN.md").exists(),
@@ -279,6 +285,8 @@ async fn library_create_edit_save_close_and_reopen_without_metadata() {
         1,
         "the saved edit is there"
     );
+    let reread = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(reread.pages[0].name, "Paper 1", "its name as saved");
     bound_server(&l2).await.retire().await;
     task2.abort();
 }
@@ -2863,8 +2871,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-17.html",
-        "versioned for the editor's bend handle per curve bend (a changed in-panel editor)"
+        HOME_URI, "ui://openpaperdesign/home-18.html",
+        "versioned for the owner's UX revision (a changed view and in-panel editor)"
     );
 }
 

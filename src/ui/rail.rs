@@ -1,7 +1,11 @@
-//! The tool rail (DESIGN.md, revision 2 slice 2): one slim vertical rail at the canvas's left
-//! edge with six families that hold all sixteen tools. A family's main button runs its current
-//! member; its own chevron (a separate, always visible target) opens a flyout of the family's
-//! tools. Choosing a tool, from the flyout or by its shortcut, makes it the family's member.
+//! The tool rail (DESIGN.md, revision 2 slice 2; slimmed in revision 18): one slim vertical
+//! rail at the canvas's left edge with six families that hold all sixteen tools. A family's
+//! main button runs its current member; its own small arrow (a separate target, always laid
+//! out, so nothing moves when it shows) opens a flyout of the family's tools. The arrow is
+//! drawn while its row is hovered or has the keyboard focus, while its flyout is open, and
+//! always for the current tool's family: a touch or other surface without hover reaches every
+//! flyout by choosing the family first, then its arrow. Choosing a tool, from the flyout or by
+//! its shortcut, makes it the family's member.
 //! Escape closes an open flyout first (the hosts hold the key back from the canvas then, see
 //! [`Rail::captures_input`]); Escape outside it is the editor's own (back to Select), and every
 //! family keeps its member.
@@ -30,13 +34,13 @@ pub const FAMILIES: [(&str, &[Tool]); 6] = [
     ("Draw", &[Tool::Pencil, Tool::Pen, Tool::Eraser]),
 ];
 
-/// Rail geometry, in points (see DESIGN.md: the 52 px of the plan are widened to 64 so the
-/// chevron gets a 24 × 32 px target of its own, apart from the 32 × 32 px main button).
+/// Rail geometry, in points (see DESIGN.md: 52 px wide, the 32 × 32 px main button and the
+/// arrow's own 12 × 32 px target beside it; revision 2's 24 px arrow column made it 64).
 pub const ROW_H: f32 = 32.0;
 pub const ROW_GAP: f32 = 2.0;
 pub const PAD: f32 = 4.0;
 pub const MAIN_W: f32 = 32.0;
-pub const CHEVRON_W: f32 = 24.0;
+pub const CHEVRON_W: f32 = 12.0;
 pub const RAIL_W: f32 = MAIN_W + CHEVRON_W + 2.0 * PAD;
 /// Distance from the canvas's edges.
 pub const INSET: f32 = 8.0;
@@ -49,9 +53,36 @@ pub const FLYOUT_W: f32 = 220.0;
 pub const FLYOUT_MIN: f32 = 180.0;
 pub const FLYOUT_ROW_H: f32 = 32.0;
 
+/// The smallest row (and main button) a short room shrinks the rail's rows to: still a usable
+/// target, above egui's 24 px interact size.
+pub const MIN_ROW_H: f32 = 24.0;
+/// The rail's frame stroke, outside its padding (egui's popup frame).
+const FRAME_STROKE: f32 = 1.0;
+
 /// The rail's height: six rows, their gaps and its padding.
 pub fn rail_height() -> f32 {
-    FAMILIES.len() as f32 * ROW_H + (FAMILIES.len() - 1) as f32 * ROW_GAP + 2.0 * PAD
+    rail_height_for(ROW_H)
+}
+
+/// The rail's height with rows `row_h` high.
+fn rail_height_for(row_h: f32) -> f32 {
+    FAMILIES.len() as f32 * row_h + (FAMILIES.len() - 1) as f32 * ROW_GAP + 2.0 * PAD
+}
+
+/// The rows' height for a tools room (the canvas, or the part of it under the floating top
+/// row): `ROW_H`, or where six such rows don't fit between the room's insets (a short surface,
+/// 320 × 240 say), the whole pixels that do, down to `MIN_ROW_H`. The rail then never runs
+/// past its room, so egui never has to move it up under the floating row.
+pub fn row_height(room: Rect) -> f32 {
+    let n = FAMILIES.len() as f32;
+    let fixed = (n - 1.0) * ROW_GAP + 2.0 * PAD + 2.0 * FRAME_STROKE;
+    let fit = ((room.height() - 2.0 * INSET - fixed) / n).floor();
+    fit.clamp(MIN_ROW_H, ROW_H)
+}
+
+/// The rail's width with rows `row_h` high (its main buttons are square).
+fn rail_width_for(row_h: f32) -> f32 {
+    row_h + CHEVRON_W + 2.0 * PAD
 }
 
 /// Which family `t` belongs to.
@@ -98,8 +129,11 @@ pub fn tool_tip(t: Tool) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct RailRects {
     pub rail: Option<Rect>,
-    /// Per family: the main button and, for families with several tools, the chevron.
+    /// Per family: the main button and, for families with several tools, the arrow's target
+    /// (laid out whether or not the arrow is drawn).
     pub rows: Vec<(Rect, Option<Rect>)>,
+    /// Per family: whether its arrow was drawn (see the module docs).
+    pub arrows: Vec<bool>,
     pub flyout: Option<Rect>,
     pub flyout_rows: Vec<(Tool, Rect)>,
     /// The rail control that had egui's keyboard focus (reached with Tab): its widget id, and
@@ -153,10 +187,12 @@ impl Rail {
     }
 }
 
-/// The rail's rectangle for a canvas: at its left edge, vertically centred in the room the
-/// zoom reservation leaves, or anchored to the top when the canvas is short.
+/// The rail's rectangle for a canvas (the tools' room): at its left edge, vertically centred in
+/// the room the zoom reservation leaves, or anchored to the top when the canvas is short; its
+/// rows as high as [`row_height`] lets them be.
 pub fn rail_rect(canvas: Rect) -> Rect {
-    let h = rail_height();
+    let row_h = row_height(canvas);
+    let h = rail_height_for(row_h);
     let x = canvas.left() + INSET;
     let top = canvas.top() + INSET;
     let short = canvas.height() < SHORT_H;
@@ -167,7 +203,7 @@ pub fn rail_rect(canvas: Rect) -> Rect {
         let centred = (canvas.top() + room_bottom - h) / 2.0;
         centred.max(top)
     };
-    Rect::from_min_size(pos2(x, y), vec2(RAIL_W, h))
+    Rect::from_min_size(pos2(x, y), vec2(rail_width_for(row_h), h))
 }
 
 /// The flyout of family `f` (with `rows` tools) for its rail row at `row`: inward from the rail
@@ -194,6 +230,8 @@ pub fn flyout_rect(canvas: Rect, rail: Rect, row: Rect, rows: usize) -> Rect {
 pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect) {
     rail.follow(ed.tool);
     let rr = rail_rect(canvas);
+    // `ROW_H` (32) normally; fewer whole pixels on a short room (see `row_height`).
+    let row_h = row_height(canvas);
     rail.rects = RailRects {
         rail: Some(rr),
         ..Default::default()
@@ -201,6 +239,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
     let current = family_of(ed.tool);
     let mut open_family: Option<usize> = rail.flyout;
     let mut rows = Vec::new();
+    let mut arrows = Vec::new();
     let mut focus = None;
     egui::Area::new("tool-rail".into())
         .order(egui::Order::Middle)
@@ -212,14 +251,14 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                 .corner_radius(10.0)
                 .inner_margin(PAD)
                 .show(ui, |ui| {
-                    ui.set_width(RAIL_W - 2.0 * PAD);
+                    ui.set_width(rr.width() - 2.0 * PAD);
                     ui.spacing_mut().item_spacing = vec2(0.0, ROW_GAP);
                     for (fi, (name, tools)) in FAMILIES.iter().enumerate() {
                         let member = rail.members[fi];
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             let main =
-                                theme::icon_button(ui, tool_icon(member), MAIN_W, fi == current)
+                                theme::icon_button(ui, tool_icon(member), row_h, fi == current)
                                     .on_hover_text(tool_tip(member));
                             if main.has_focus() {
                                 focus = Some((main.id, None));
@@ -229,30 +268,39 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                                 open_family = None;
                             }
                             let chevron = if tools.len() > 1 {
+                                // Always laid out (the rail never changes size); drawn only
+                                // when it is wanted (see the module docs).
                                 let (r, resp) = ui.allocate_exact_size(
-                                    vec2(CHEVRON_W, ROW_H),
+                                    vec2(CHEVRON_W, row_h),
                                     egui::Sense::click(),
                                 );
                                 let open = open_family == Some(fi);
+                                let row = main.rect.union(r);
+                                let shown = open
+                                    || fi == current
+                                    || ui.rect_contains_pointer(row)
+                                    || main.has_focus()
+                                    || resp.has_focus();
                                 let fill = if open {
                                     theme::selected_fill(ui)
-                                } else if resp.hovered() {
+                                } else if resp.hovered() || resp.has_focus() {
                                     p.hover
                                 } else {
                                     Color32::TRANSPARENT
                                 };
-                                ui.painter().rect_filled(r, 6.0, fill);
-                                let glyph = Rect::from_center_size(r.center(), vec2(10.0, 10.0));
-                                theme::paint_icon(
-                                    ui.painter(),
-                                    glyph,
-                                    Icon::ChevronRight,
-                                    if open || resp.hovered() {
-                                        p.text
-                                    } else {
-                                        p.secondary
-                                    },
-                                );
+                                if shown {
+                                    ui.painter().rect_filled(r, theme::RADIUS, fill);
+                                    let glyph = Rect::from_center_size(r.center(), vec2(8.0, 8.0));
+                                    let lit = open || resp.hovered() || resp.has_focus();
+                                    theme::paint_icon(
+                                        ui.painter(),
+                                        glyph,
+                                        Icon::ChevronRight,
+                                        if lit { p.text } else { p.secondary },
+                                    );
+                                    theme::focus_ring(ui, r, &resp, false);
+                                }
+                                arrows.push(shown);
                                 if resp.has_focus() {
                                     focus = Some((resp.id, None));
                                 }
@@ -261,6 +309,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                                 }
                                 Some(r)
                             } else {
+                                arrows.push(false);
                                 None
                             };
                             rows.push((main.rect, chevron));
@@ -269,6 +318,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                 });
         });
     rail.rects.rows = rows;
+    rail.rects.arrows = arrows;
     rail.rects.focus = focus;
     rail.flyout = open_family;
     let Some(fi) = rail.flyout else { return };
@@ -314,15 +364,8 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                                 } else {
                                     Color32::TRANSPARENT
                                 };
-                                ui.painter().rect_filled(r, 6.0, fill);
-                                if resp.has_focus() {
-                                    ui.painter().rect_stroke(
-                                        r.shrink(1.0),
-                                        6.0,
-                                        egui::Stroke::new(1.5, theme::accent()),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
+                                ui.painter().rect_filled(r, theme::RADIUS, fill);
+                                theme::focus_ring(ui, r, &resp, false);
                                 let icon = Rect::from_center_size(
                                     pos2(r.left() + 16.0, r.center().y),
                                     vec2(18.0, 18.0),

@@ -119,9 +119,13 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// in-panel WASM editor again, HTML and layout unchanged); `home-16` carries the editor whose
 /// connector drag stops once its arrow is locked (a changed in-panel WASM editor again, HTML
 /// and layout unchanged); `home-17` carries the editor whose curves have a bend handle per
-/// bend (a changed in-panel WASM editor again, HTML and layout unchanged). No earlier URI is
-/// served.
-const HOME_URI: &str = "ui://openpaperdesign/home-17.html";
+/// bend (a changed in-panel WASM editor again, HTML and layout unchanged); `home-18` is the
+/// owner's UX revision (DESIGN.md revision 18): an editor without a full-width header (full-
+/// height panels, the Canvas's identity in the left panel, mirrored panel toggles, the slim rail,
+/// the Paper context with nothing selected, linked hover, Grid naming) and the home's search
+/// field drawn as one at rest (a changed view HTML and in-panel WASM editor; the home's layout,
+/// filtering and kept preferences unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-18.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

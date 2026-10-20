@@ -123,7 +123,7 @@ const LIBRARY_SESSION: &str = "Library items stay only while this editor is open
 /// canvas less than about 500 px, too little room to draw (DESIGN.md).
 pub const NARROW_BELOW: f32 = 1024.0;
 /// The width (CSS px) from which the narrow layout's one panel is docked beside the canvas at
-/// its usual width; narrower, it fills the room under the top bar.
+/// its usual width; narrower, it fills the surface (there is no header above it).
 pub const DOCK_FROM: f32 = 600.0;
 
 /// The page list (ids and names, in order) and the active page's id.

@@ -1,5 +1,6 @@
-//! The pages list at the top of the left sidebar (as in Figma): switch, add, rename,
-//! duplicate, delete and drag to reorder.
+//! The pages list in the left panel, under the Canvas's identity (as in Figma): switch, add,
+//! rename, duplicate, delete and drag to reorder. People see a page as a Paper (DESIGN.md:
+//! the Canvas is the saved file, its Papers are its pages); the code keeps upstream's `page`.
 
 use super::{UiState, section};
 use crate::editor::Editor;
@@ -45,8 +46,9 @@ const ROW_H: f32 = 24.0;
 
 /// A page-list action chosen while the panel draws. It runs once, after the rows (`run`): a
 /// deleted, added or moved page would shift the rows still to draw, and a page's open fields
-/// must be finished on that page before another one is shown. The header's page identity
-/// offers the shown page's own actions too (`run_action`).
+/// must be finished on that page before another one is shown. The Canvas's identity (its
+/// Paper line) offers the Paper navigation and the shown page's own actions too
+/// (`run_action`).
 pub(super) enum PageAction {
     Add,
     Switch(usize),
@@ -60,7 +62,7 @@ fn run(ui: &Ui, ed: &mut Editor, st: &mut UiState, action: PageAction) {
     run_action(ui.ctx(), ed, st, action);
 }
 
-/// [`run`], from anywhere in the chrome (the header's page actions).
+/// [`run`], from anywhere in the chrome (the identity's Paper menu).
 pub(super) fn run_action(
     ctx: &egui::Context,
     ed: &mut Editor,
@@ -95,7 +97,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         if theme::icon_button(ui, chevron, 16.0, false).clicked() {
             st.pages.collapsed = !st.pages.collapsed;
         }
-        section(ui, "Pages");
+        section(ui, "Papers");
         if st.pages.collapsed {
             ui.label(
                 RichText::new(ed.page_name())
@@ -105,7 +107,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if theme::icon_button(ui, Icon::Plus, 20.0, false)
-                .on_hover_text("Add page")
+                .on_hover_text("Add Paper")
                 .clicked()
             {
                 action = Some(PageAction::Add);
@@ -161,10 +163,12 @@ fn page_row(
         egui::vec2(ui.available_width(), ROW_H),
         egui::Sense::click_and_drag(),
     );
+    // The shown Paper is the current one, not a selection: a grey fill, as a pressed control
+    // (the accent tint is the layer selection's, DESIGN.md).
     if active {
-        ui.painter().rect_filled(row, 6.0, p.pressed);
+        ui.painter().rect_filled(row, theme::RADIUS, p.pressed);
     } else if resp.hovered() {
-        ui.painter().rect_filled(row, 6.0, p.hover);
+        ui.painter().rect_filled(row, theme::RADIUS, p.hover);
     }
     // Drop indicator while dragging.
     if let Some((from, to)) = st.pages.drag
@@ -182,7 +186,7 @@ fn page_row(
             egui::vec2(13.0, 13.0),
         ),
         Icon::Page,
-        if active { theme::accent() } else { p.secondary },
+        if active { p.text } else { p.secondary },
     );
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(row.left() + 28.0, row.top()),
@@ -239,16 +243,16 @@ fn page_row(
         st.pages.drag = Some((from, to.min(ed.pages.len() - 1)));
     }
     resp.context_menu(|ui| {
-        if ui.button("Rename").clicked() {
+        if ui.button("Rename Paper").clicked() {
             st.pages.renaming = Some((i, ed.pages[i].name.clone()));
             ui.close();
         }
-        if ui.button("Duplicate").clicked() {
+        if ui.button("Duplicate Paper").clicked() {
             *action = Some(PageAction::Duplicate(i));
             ui.close();
         }
         if ui
-            .add_enabled(ed.pages.len() > 1, egui::Button::new("Delete"))
+            .add_enabled(ed.pages.len() > 1, egui::Button::new("Delete Paper"))
             .clicked()
         {
             *action = Some(PageAction::Delete(i));
