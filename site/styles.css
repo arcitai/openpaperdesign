@@ -1,0 +1,339 @@
+@font-face {
+  font-family: Inter;
+  src: url("/assets/fonts/inter-latin-variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/assets/fonts/geist-sans-variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+:root {
+  color-scheme: light;
+  --paper: #fafafa;
+  --ink: #202020;
+  --muted: #626262;
+  --line: #ddd;
+  --accent: #4265a0;
+  --glow: #4265a022;
+  --shadow: #152d5826;
+  --surface: #fff;
+  font:
+    16px/1.65 "Geist Sans",
+    Arial,
+    sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #171717;
+  --ink: #f5f5f5;
+  --muted: #b8b8b8;
+  --line: #373737;
+  --accent: #93b4e9;
+  --glow: #628bd72b;
+  --shadow: #0009;
+  --surface: #202020;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+a {
+  color: inherit;
+  text-decoration: none;
+  text-underline-offset: 4px;
+}
+a:hover {
+  color: var(--accent);
+}
+button {
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+}
+h1,
+p,
+figure {
+  margin: 0;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.site-header,
+main,
+footer {
+  width: calc(100% - 80px);
+  max-width: 960px;
+  margin: auto;
+}
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 80px;
+}
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font:
+    400 20px/1.2 Inter,
+    Arial,
+    sans-serif;
+  letter-spacing: -0.035em;
+  font-synthesis: none;
+}
+.product-mark {
+  display: grid;
+  width: 28px;
+  height: 28px;
+}
+.product-mark img {
+  grid-area: 1/1;
+}
+.logo-dark {
+  visibility: hidden;
+}
+[data-theme="dark"] .logo-dark {
+  visibility: visible;
+}
+[data-theme="dark"] .logo-light {
+  visibility: hidden;
+}
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  font-size: 14px;
+}
+.site-header button {
+  border: 0;
+  background: none;
+  min-width: 44px;
+  min-height: 44px;
+  font-size: 24px;
+}
+.product-hero {
+  padding: 64px 0 48px;
+  max-width: 760px;
+}
+h1 {
+  font:
+    500 clamp(34px, 5.2vw, 64px)/1.06 "Geist Sans",
+    Arial,
+    sans-serif;
+  letter-spacing: -0.04em;
+}
+h1 > span {
+  color: var(--accent);
+}
+.product-hero > p {
+  max-width: 50ch;
+  margin-top: 22px;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1.65;
+}
+.hero-actions {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 26px;
+}
+.button {
+  display: inline-flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  min-height: 46px;
+  padding: 10px 18px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--paper);
+  background: var(--accent);
+  box-shadow: 0 6px 20px var(--glow);
+  transition:
+    transform 180ms ease,
+    box-shadow 180ms ease;
+}
+.button:hover {
+  background: var(--accent);
+  color: var(--paper);
+  box-shadow: 0 10px 26px var(--glow);
+  transform: translateY(-2px);
+}
+.text-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  font-size: 14px;
+}
+.product-hero .release-note {
+  font-size: 12px;
+  margin-top: 14px;
+}
+.canvas-stage {
+  position: relative;
+  isolation: isolate;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.canvas-stage::before {
+  content: "";
+  position: absolute;
+  inset: -30px -24px;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, var(--glow), transparent 70%);
+}
+.canvas-preview {
+  position: relative;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+  box-shadow:
+    0 26px 60px -18px var(--shadow),
+    0 1px 4px var(--shadow);
+  transform: rotate(-0.65deg);
+  transition:
+    transform 300ms ease,
+    box-shadow 300ms ease;
+}
+.canvas-preview::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px #ffffff18;
+}
+@media (hover: hover) {
+  .canvas-stage:hover .canvas-preview {
+    transform: rotate(0);
+    box-shadow:
+      0 30px 68px -18px var(--shadow),
+      0 1px 4px var(--shadow);
+  }
+}
+.canvas-preview img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.credit {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 20px 0 52px;
+}
+.credit a {
+  text-decoration: underline;
+}
+footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 26px 0 36px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+footer div {
+  display: flex;
+  gap: 16px;
+}
+.brand-link {
+  color: var(--ink);
+}
+.brand-name {
+  font-family: Inter, Arial, sans-serif;
+  font-weight: 400;
+  font-synthesis: none;
+  letter-spacing: -0.035em;
+}
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: 20px;
+  background: var(--paper);
+  padding: 12px;
+  z-index: 2;
+}
+.skip-link:focus {
+  top: 10px;
+}
+@media (max-width: 700px) {
+  .site-header,
+  main,
+  footer {
+    width: calc(100% - 40px);
+  }
+  .product-hero {
+    padding-top: 38px;
+  }
+  .wordmark {
+    font-size: 18px;
+  }
+  .site-header nav {
+    gap: 10px;
+  }
+  .product-hero > p {
+    font-size: 16px;
+  }
+  .canvas-stage {
+    padding: 12px;
+    border-radius: 12px;
+    background-size: 24px 24px;
+  }
+  .canvas-stage::before {
+    inset: -16px;
+  }
+  .canvas-preview {
+    transform: none;
+    border-radius: 6px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .button,
+  .canvas-preview {
+    transition: none;
+    transform: none;
+  }
+  .button:hover,
+  .canvas-stage:hover .canvas-preview {
+    transform: none;
+  }
+}
+@media (max-width: 420px) {
+  .site-header nav > a {
+    display: none;
+  }
+  .wordmark {
+    gap: 8px;
+    font-size: 17px;
+  }
+  .site-header {
+    gap: 8px;
+  }
+  .credit {
+    margin-bottom: 36px;
+  }
+}

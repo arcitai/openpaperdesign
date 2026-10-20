@@ -1,0 +1,23 @@
+{
+  "repository": "arcitai/openpaperdesign",
+  "assets": [
+    {
+      "path": "plugin/openpaperdesign/assets/logo.svg",
+      "revision": "b1ca4ac17d0fe861a282a07265e9f13eb3aa2c80",
+      "output": "assets/logo.svg",
+      "sha256": "d4b31d3573a0d8ddee2a28b2e90888fe2f3931487621193c479c23f2d610c7c3"
+    },
+    {
+      "path": "plugin/openpaperdesign/assets/logo-dark.svg",
+      "revision": "b1ca4ac17d0fe861a282a07265e9f13eb3aa2c80",
+      "output": "assets/logo-dark.svg",
+      "sha256": "97f2c928b9a884db8b010f64b1a39dbc4b4f893379c3987d321f1d9299c0258c"
+    },
+    {
+      "path": "docs/openpaperdesign/screenshots/codex-reopen-0078487.jpg",
+      "revision": "v0.1.0",
+      "output": "assets/canvas-v0.1.0.jpg",
+      "sha256": "10801355b25018dd12aa9cb63354163cc4ee1034dcf906abe955180c453c7931"
+    }
+  ]
+}
