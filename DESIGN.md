@@ -82,6 +82,14 @@ change in `src/theme.rs` that carries through to the existing controls:
 - **Home** follows the same tokens: neutral fallbacks, 13 px body, an 18 px title, 6 px
   controls and softer menus. Its structure (Files, Search files, the layout toggles, New file),
   its resting search field and every behaviour are unchanged.
+- **Errors stay readable** (a lead render finding on this candidate): the in-view editor's
+  failure note (save failed, retrying; a refusal) is danger-coloured text with a 1 px
+  danger edge on the view's own surface, and its buttons follow that colour. Before, it was
+  white text on a danger fill, about 2:1 in Dark (white on #ff9a90). The fallbacks now
+  measure about 6.3:1 in Light (#b42318 on #fafafa) and 8.2:1 in Dark (#ff9a90 on
+  #1e1e1f). Under a host's style variables it is the host's own text-danger on its
+  background-primary, the pairing those variables are meant for. The note's wording, live
+  region, actions and timing are unchanged; healthy notes keep their quiet inverted look.
 
 Unchanged: every revision 18 behaviour and protection, the rail's geometry (52 px, 32 px main
 buttons, 12 × 32 arrows, short-room rows), the panel insets and top rows, the canvas

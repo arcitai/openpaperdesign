@@ -795,7 +795,8 @@ accepted here.
 revision 19, the upstream entry above): the editor's neutral palette, 12 pt type scale, filled
 fields in paired columns, tinted current-tool and selection states, one icon size and stroke,
 and the view's matching CSS tokens (neutral fallbacks, 13 px body, 18 px title, 6 px control
-radius, softer menu shadow). Home's structure (Files, Search files, layout toggles, New file),
+radius, softer menu shadow; the in-view editor's failure note as danger text and edge on the
+view's surface rather than white on a danger fill, which measured about 2:1 in Dark). Home's structure (Files, Search files, layout toggles, New file),
 the search field's resting look, filtering, Escape, empty and no-match states, the kept
 layout and the narrow layout are unchanged; no element, id or script changed. Both the view's
 HTML and the editor's WASM changed, so `home-18` is refused and a cached `home-18` view can't

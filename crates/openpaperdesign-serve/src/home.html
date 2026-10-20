@@ -202,7 +202,10 @@
   .ed-alert { position: fixed; z-index: 15; bottom: 16px; left: 50%; display: flex; align-items: center; gap: 10px;
     max-width: min(560px, calc(100vw - 32px)); padding: 8px 8px 8px 14px; transform: translateX(-50%); border-radius: 10px;
     background: var(--opd-text); color: var(--opd-bg); font-size: 13px; overflow-wrap: anywhere; box-shadow: 0 8px 24px rgb(0 0 0 / .16); }
-  .ed-alert.bad { background: var(--opd-danger); color: #fff; }
+  /* A failure: the danger colour is a text colour (the host's text-danger, or the fallback),
+     so it is the text and edge on the view's own surface, never a fill under white text
+     (Dark's pale red under white was about 2:1). */
+  .ed-alert.bad { border: 1px solid currentColor; background: var(--opd-bg); color: var(--opd-danger); }
   /* On the way to Ready: small and muted, gone with the next healthy state. */
   .ed-alert.loading { padding: 4px 10px; opacity: .72; font-size: 12px; box-shadow: none; }
   .ed-alert .btn { flex: none; border-color: currentColor; color: inherit; }
