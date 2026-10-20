@@ -2663,6 +2663,141 @@ fn the_inspector_s_rename_paper_opens_the_one_paper_rename_and_saves_it_once() {
     assert!(inspector_text(&mut s).iter().any(|t| t == "X"));
 }
 
+/// R57's desired-behaviour regression (independent-probes.rs, adopted with its fixture and
+/// assertions; only formatted in this file's style): from a fresh view, Papers closed, the
+/// inspector's Rename Paper… opens the list on the first click with the shown Paper's (Beta's)
+/// rename focused; the draft holds through a resize that waits for it; Enter renames that Paper
+/// only, the legacy "Page 1" and both Papers' content stay exact, in one page-list save.
+#[test]
+fn r57_inspector_rename_opens_closed_papers_and_keeps_target_across_resize() {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let initial = [page("alpha1", "Page 1", rect), page("beta22", "Beta", rect)];
+    let authored: Vec<_> = initial
+        .iter()
+        .map(|p| (p.doc.nodes.clone(), p.doc.root.clone()))
+        .collect();
+    let mut s = WebState::open(&canvas(&initial, "beta22"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    assert!(!s.ui.narrow.shown().unwrap().layers);
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 1000.0);
+    timed_frames(&mut s, 5);
+    assert!(
+        s.ui.narrow.shown().unwrap().layers,
+        "opens the previously closed Papers list"
+    );
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(1));
+    assert!(s.field_has_keyboard());
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("Revised Beta");
+    timed_frames(&mut s, 2);
+    s.resize(800.0, H, 1.0);
+    timed_frames(&mut s, 5);
+    assert_eq!(
+        s.ui.narrow.shown().unwrap().tier,
+        crate::ui::Tier::Wide,
+        "the resize waits for the field"
+    );
+    assert_eq!(s.ed.pages[1].name, "Beta", "still a draft");
+    assert!(s.unsaved_work() && !s.can_reload());
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 5);
+    assert_eq!(s.ui.narrow.shown().unwrap().tier, crate::ui::Tier::Docked);
+    assert_eq!(s.ed.pages[1].name, "Revised Beta");
+    assert_eq!(s.ed.pages[0].name, "Page 1", "legacy name stays exact");
+    assert_eq!(s.ed.active_page_id(), "beta22");
+    let snap = s.save_snapshot().expect("one metadata save");
+    let (active, names, sent) = parse_save(&snap);
+    assert_eq!(active, "beta22");
+    assert_eq!(
+        names,
+        vec![
+            ("alpha1".to_string(), "Page 1".to_string()),
+            ("beta22".to_string(), "Revised Beta".to_string())
+        ]
+    );
+    assert!(sent.is_empty(), "neither Paper's authored content changed");
+    for (i, want) in authored.iter().enumerate() {
+        let data = s.ed.page_data(i);
+        assert_eq!(&(data.doc.nodes, data.doc.root), want, "Paper {i}");
+    }
+    s.save_succeeded();
+    assert!(s.can_reload() && s.save_snapshot().is_none());
+}
+
+#[test]
+fn r57_a_first_click_rename_with_papers_closed_owns_the_keys_until_its_field_has_them() {
+    // Fresh, Papers closed. Right after the first click (before the list has opened and its
+    // field taken the keyboard) a typed "r" is the rename's, never the Rectangle shortcut; then
+    // the field has the keyboard and typing goes into it. Escape drops the draft, and the Paper,
+    // the tool and the save state are as they were. Control: with Papers already open the same
+    // click focuses the field at once, as before.
+    let mut s = fresh(W, H);
+    assert!(!s.ui.narrow.shown().unwrap().layers);
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 1000.0);
+    assert_eq!(
+        s.ui.pages.renaming.as_ref().map(|(i, _)| *i),
+        Some(0),
+        "the requested rename survives the frame that asked for it"
+    );
+    assert!(s.key_down("r", "KeyR", false), "taken for the rename");
+    s.key_up("r", "KeyR");
+    assert_eq!(s.ed.tool, Tool::Select, "no tool shortcut while it opens");
+    timed_frames(&mut s, 5);
+    assert!(
+        s.ui.narrow.shown().unwrap().layers,
+        "the Papers list opened"
+    );
+    assert!(
+        s.ui.pages.rename_field.is_some(),
+        "its row's field is laid out"
+    );
+    assert_eq!(s.ui.pages.rename_field, s.ctx.memory(|m| m.focused()));
+    assert!(s.field_has_keyboard());
+    press(&mut s, "e", "KeyE");
+    timed_frames(&mut s, 1);
+    assert_eq!(s.ed.tool, Tool::Select, "typing is the field's");
+    let draft =
+        s.ui.pages
+            .renaming
+            .as_ref()
+            .map(|(_, n)| n.clone())
+            .unwrap();
+    assert!(
+        draft.ends_with('e') && !draft.contains('r'),
+        "the typed e is in the draft, the held r never went anywhere: {draft:?}"
+    );
+    assert_eq!(s.ed.page_name(), "Page 1", "still a draft");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 2);
+    assert!(s.ui.pages.renaming.is_none() && !s.field_has_keyboard());
+    assert_eq!(s.ed.page_name(), "Page 1", "Escape dropped it");
+    assert!(!s.dirty() && s.can_reload() && s.save_snapshot().is_none());
+    // With nothing requested, the same key is the editor's again.
+    assert!(s.key_down("r", "KeyR", false));
+    s.key_up("r", "KeyR");
+    assert_eq!(
+        s.ed.tool,
+        Tool::Rect,
+        "the shortcut works when no rename is pending"
+    );
+    s.run(Action::Tool(Tool::Select));
+    // Control: Papers already open, the field has the keyboard after the click's own frames.
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 5000.0);
+    timed_frames(&mut s, 2);
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(0));
+    assert!(s.field_has_keyboard(), "open-panel control");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 2);
+    assert_eq!(s.ed.page_name(), "Page 1");
+    assert!(!s.dirty());
+}
+
 // ---- revision 2, slice 1: the header's safe area, panel states, Collapse panels and zoom.
 // These drive the real upstream UI (`ui::draw`) through this host's input; geometry asserts
 // read what it laid out (`UiState::chrome`, `rail.rects`), not a copy of its constants.

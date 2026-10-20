@@ -759,6 +759,14 @@ impl WebState {
             }
             return true;
         }
+        // A rename just asked for (Rename Paper…, a layer's Rename) owns the keyboard before its
+        // field has it: the Papers or layer rows may still be opening (a frame or two). Its keys
+        // go to egui only, never to the editor's shortcuts (R57: an "r" typed then chose the
+        // Rectangle tool). A rename whose rows aren't coming is finished at once by `ui::draw`,
+        // so this never holds keys for a field that won't be shown.
+        if self.ui.pages.renaming.is_some() || self.ui.renaming.is_some() {
+            return true;
+        }
         let editing = self.ed.text_edit.is_some();
         let Some(k) = keys::key(self.ed.mods, editing, key, code) else {
             return false;

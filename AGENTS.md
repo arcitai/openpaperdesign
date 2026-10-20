@@ -491,6 +491,13 @@ engine architecture is `analysis/DESIGN.md`.
         opens the Papers list's own rename (one field, one path); `start_canvas_rename` the
         name's. `finish_title_draft` finishes a draft whose identity isn't drawn (Hide UI, the
         Design sheet), as losing focus does. The title's invalid-name note says Canvas.
+        R57-P2: `draw`'s finish of hidden renames asks `Panels::wanted` again after the
+        panels' widgets ran, so the inspector's Rename Paper… with Papers closed keeps its new
+        draft until its row is shown and focused (before, the frame's earlier `want` finished
+        it at once, and typing reached tool shortcuts). The browser host's `key_down` keeps
+        keys from the editor while a page or layer rename is pending (`renaming` set) and its
+        field doesn't have the keyboard yet; `draw` still finishes any rename whose rows
+        aren't coming.
       - **Toggles.** `sidebar_toggle` (the pair, with an accessibility name through
         `widget_info`): "Papers and layers" (`Icon::Sidebar`) and "Properties"
         (`Icon::SidebarRight`); `pill` and the "Design" text pill are gone. The `···` menu is

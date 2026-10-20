@@ -608,7 +608,10 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
             }
         }
     }
-    if !shown.layers && !want.layers {
+    // Whether the rows are about to be shown is asked again here, after the panels' widgets ran:
+    // one of them (the inspector's Rename Paper…) may just have opened them for a rename it
+    // asked for, which must wait for its row rather than be finished at once (R57).
+    if !shown.layers && !st.panels.wanted(tier).layers {
         // No layer or page rows are drawn, and none are about to be: an open rename is
         // finished as losing focus does (as when the UI is hidden).
         commit_rename(ed, st);
