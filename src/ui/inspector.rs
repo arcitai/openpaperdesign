@@ -40,20 +40,29 @@ fn seal_on_release(ed: &mut Editor, r: &egui::Response) {
     }
 }
 
-/// A row: secondary label on the left, controls on the right.
+/// A row: secondary label on the left, controls on the right, one field high.
 fn row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, 20.0), egui::Sense::hover());
+        let size = egui::vec2(LABEL_W, theme::FIELD_H);
+        let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         ui.painter().text(
             r.left_center(),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(theme::SECONDARY + 1.0),
+            egui::FontId::proportional(theme::BODY),
             theme::pal(ui).secondary,
         );
         add(ui)
     })
     .inner
+}
+
+/// The width of each of two fields sharing a row (X and Y, W and H, the two heads…): half the
+/// room, less the gap between them, so pairs line up in two columns at any panel width.
+fn pair_w(ui: &Ui) -> f32 {
+    ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0)
+        .floor()
+        .max(56.0)
 }
 
 /// A compact number field with a leading letter (like Figma's "X 120").
@@ -68,7 +77,7 @@ fn num_field(
 ) -> Option<f64> {
     let mut v = value;
     let r = ui.add_sized(
-        egui::vec2(width, 20.0),
+        egui::vec2(width, theme::FIELD_H),
         egui::DragValue::new(&mut v)
             .speed(speed)
             .range(range)
@@ -155,16 +164,23 @@ fn shared_char<T: PartialEq>(
 /// edits nothing (a number field can't show Mixed).
 const MIXED: &str = "Mixed";
 
+/// Drawn as the field it stands in for (its place, fill and edge), with the word in the
+/// secondary colour, so a Mixed value keeps the pair's column instead of floating as a label.
 fn mixed(ui: &mut Ui, prefix: &str, width: f32) {
-    let r = ui.add_sized(
-        egui::vec2(width, 20.0),
-        egui::Label::new(
-            RichText::new(format!("{prefix}{MIXED}"))
-                .size(theme::SECONDARY + 1.0)
-                .color(theme::pal(ui).secondary),
-        ),
+    let size = egui::vec2(width, theme::FIELD_H);
+    let (r, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = theme::pal(ui);
+    let edge = egui::Stroke::new(1.0, p.control_border);
+    ui.painter()
+        .rect(r, theme::RADIUS, p.field, edge, egui::StrokeKind::Inside);
+    ui.painter().text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{prefix}{MIXED}"),
+        egui::FontId::proportional(theme::BODY),
+        p.secondary,
     );
-    let _ = r.on_hover_text("The selected layers differ here");
+    let _ = resp.on_hover_text("The selected layers differ here");
 }
 
 /// A [`combo`] that can show Mixed: choosing an option sets it on every selected layer.
@@ -204,8 +220,10 @@ fn hint(ui: &mut Ui, text: &str) {
     );
 }
 
+/// Between sections: one hairline with even room on both sides (with the 6 px row gap, 14 px
+/// above and below), so each section reads as a group without boxes or double rules.
 fn separator(ui: &mut Ui) {
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     let r = ui.available_rect_before_wrap();
     ui.painter().hline(
         r.x_range(),
@@ -216,18 +234,26 @@ fn separator(ui: &mut Ui) {
 }
 
 fn icon_btn(ui: &mut Ui, icon: theme::Icon, on: bool, tip: &str) -> bool {
-    theme::icon_button(ui, icon, 24.0, on)
+    theme::icon_button(ui, icon, theme::FIELD_H, on)
         .on_hover_text(tip)
         .clicked()
 }
 
 fn icon_toggle(ui: &mut Ui, label: &str, on: bool, tip: &str) -> bool {
     ui.add(
-        egui::Button::selectable(on, RichText::new(label).font(theme::semibold(12.0)))
-            .min_size(egui::vec2(24.0, 20.0)),
+        egui::Button::selectable(on, RichText::new(label).font(theme::semibold(theme::BODY)))
+            .min_size(egui::vec2(theme::FIELD_H, theme::FIELD_H)),
     )
     .on_hover_text(tip)
     .clicked()
+}
+
+/// A folded section's header (Sketch, Export): its title, with the quiet line chevron.
+fn folded(title: &str, id: &str) -> egui::CollapsingHeader {
+    egui::CollapsingHeader::new(title_text(title))
+        .id_salt(id)
+        .default_open(false)
+        .icon(theme::disclosure)
 }
 
 /// The Design inspector (DESIGN.md, revision 2 slice 3 and revision 18's states): quiet and
@@ -242,7 +268,8 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 5.0;
+            // 24 px fields 6 px apart: the inspector is the airy part of the chrome.
+            ui.spacing_mut().item_spacing.y = 6.0;
             let ids = ed.top_selection();
             if ids.is_empty() {
                 nothing_selected(ui, ed, st);
@@ -410,7 +437,8 @@ fn arrow_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
         (Route::Elbow, "Elbow"),
     ];
     row(ui, "Type", |ui| {
-        if let Some(v) = combo_mixed(ui, "route", route, &routes, 96.0) {
+        let w = ui.available_width();
+        if let Some(v) = combo_mixed(ui, "route", route, &routes, w) {
             apply(ed, "route", ids, |n| {
                 if let NodeKind::Connector { route, points, .. } = &mut n.kind {
                     *route = v;
@@ -434,14 +462,15 @@ fn arrow_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
     });
     let heads: Vec<(Head, &str)> = Head::ALL.iter().map(|h| (*h, h.label())).collect();
     row(ui, "Heads", |ui| {
-        if let Some(v) = combo_mixed(ui, "h-start", start_head, &heads, 72.0) {
+        let w = pair_w(ui);
+        if let Some(v) = combo_mixed(ui, "h-start", start_head, &heads, w) {
             apply(ed, "heads", ids, |n| {
                 if let NodeKind::Connector { start_head, .. } = &mut n.kind {
                     *start_head = v;
                 }
             });
         }
-        if let Some(v) = combo_mixed(ui, "h-end", end_head, &heads, 72.0) {
+        if let Some(v) = combo_mixed(ui, "h-end", end_head, &heads, w) {
             apply(ed, "heads", ids, |n| {
                 if let NodeKind::Connector { end_head, .. } = &mut n.kind {
                     *end_head = v;
@@ -470,84 +499,80 @@ fn sketch_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) 
         Some(false) => "Sketch",
         None => "Sketch · mixed",
     };
-    egui::CollapsingHeader::new(title_text(title))
-        .id_salt("sketch-section")
-        .default_open(false)
-        .show(ui, |ui| {
-            hint(ui, SKETCH_HELP);
-            match on {
-                Some(on) => {
-                    let mut v = on;
-                    if ui
-                        .checkbox(&mut v, "Hand-drawn style")
-                        .on_hover_text("Sketchy, uneven lines (⌘⌥H)")
-                        .changed()
-                    {
-                        ed.toggle_sketch();
-                    }
-                }
-                None => {
-                    hint(ui, "Some selected layers are hand-drawn, some are clean.");
-                    if ui.small_button("Make all clean").clicked() {
-                        apply(ed, "rough", ids, |n| n.style.rough = None);
-                    }
+    folded(title, "sketch-section").show(ui, |ui| {
+        hint(ui, SKETCH_HELP);
+        match on {
+            Some(on) => {
+                let mut v = on;
+                if ui
+                    .checkbox(&mut v, "Hand-drawn style")
+                    .on_hover_text("Sketchy, uneven lines (⌘⌥H)")
+                    .changed()
+                {
+                    ed.toggle_sketch();
                 }
             }
-            if on != Some(true) {
-                return;
+            None => {
+                hint(ui, "Some selected layers are hand-drawn, some are clean.");
+                if ui.small_button("Make all clean").clicked() {
+                    apply(ed, "rough", ids, |n| n.style.rough = None);
+                }
             }
-            let levels = [(0u8, "Architect"), (1, "Artist"), (2, "Cartoonist")];
-            let cur = uniform(nodes, |n| {
-                n.style
-                    .rough
-                    .map(|r| r.roughness.round().clamp(0.0, 2.0) as u8)
-            })
-            .flatten();
-            row(ui, "Sloppiness", |ui| {
-                if let Some(v) = combo_mixed(ui, "rough", cur, &levels, 96.0) {
-                    apply(ed, "rough", ids, |n| {
-                        if let Some(r) = &mut n.style.rough {
-                            r.roughness = v as f64;
-                        }
-                    });
-                }
-            });
-            let fills: Vec<(FillStyle, &str)> =
-                FillStyle::ALL.iter().map(|f| (*f, f.label())).collect();
-            let style = uniform(nodes, |n| n.style.rough.map(|r| r.fill_style)).flatten();
-            row(ui, "Fill style", |ui| {
-                if let Some(v) = combo_mixed(ui, "fillstyle", style, &fills, 96.0) {
-                    apply(ed, "rough", ids, |n| {
-                        if let Some(r) = &mut n.style.rough {
-                            r.fill_style = v;
-                        }
-                    });
-                }
-            });
-            if ui
-                .small_button("New wobble")
-                .on_hover_text("Re-roll the random seed")
-                .clicked()
-            {
+        }
+        if on != Some(true) {
+            return;
+        }
+        let levels = [(0u8, "Architect"), (1, "Artist"), (2, "Cartoonist")];
+        let cur = uniform(nodes, |n| {
+            n.style
+                .rough
+                .map(|r| r.roughness.round().clamp(0.0, 2.0) as u8)
+        })
+        .flatten();
+        row(ui, "Sloppiness", |ui| {
+            let w = ui.available_width();
+            if let Some(v) = combo_mixed(ui, "rough", cur, &levels, w) {
                 apply(ed, "rough", ids, |n| {
                     if let Some(r) = &mut n.style.rough {
-                        *r = Rough {
-                            seed: r.seed.wrapping_mul(1103515245).wrapping_add(12345) | 1,
-                            ..*r
-                        };
+                        r.roughness = v as f64;
                     }
                 });
             }
         });
+        let fills: Vec<(FillStyle, &str)> =
+            FillStyle::ALL.iter().map(|f| (*f, f.label())).collect();
+        let style = uniform(nodes, |n| n.style.rough.map(|r| r.fill_style)).flatten();
+        row(ui, "Fill style", |ui| {
+            let w = ui.available_width();
+            if let Some(v) = combo_mixed(ui, "fillstyle", style, &fills, w) {
+                apply(ed, "rough", ids, |n| {
+                    if let Some(r) = &mut n.style.rough {
+                        r.fill_style = v;
+                    }
+                });
+            }
+        });
+        if ui
+            .small_button("New wobble")
+            .on_hover_text("Re-roll the random seed")
+            .clicked()
+        {
+            apply(ed, "rough", ids, |n| {
+                if let Some(r) = &mut n.style.rough {
+                    *r = Rough {
+                        seed: r.seed.wrapping_mul(1103515245).wrapping_add(12345) | 1,
+                        ..*r
+                    };
+                }
+            });
+        }
+    });
 }
 
 /// Export settings and button, like Figma's Export section; folded until wanted (the menu and
 /// palette keep every export too).
 fn export_section(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
-    egui::CollapsingHeader::new(title_text("Export"))
-        .id_salt("export-section")
-        .default_open(false)
-        .show(ui, |ui| export_body(ui, ed, st));
+    folded("Export", "export-section").show(ui, |ui| export_body(ui, ed, st));
 }
 
 fn export_body(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
@@ -567,19 +592,21 @@ fn export_body(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 )
             })
             .collect();
-        if let Some(v) = combo(ui, "exp-format", spec.format, &fmts, 64.0) {
+        let w = pair_w(ui);
+        if let Some(v) = combo(ui, "exp-format", spec.format, &fmts, w) {
             spec.format = v;
         }
         if spec.format == Format::Png {
             let scales = [(1u8, "1x"), (2, "2x"), (3, "3x"), (4, "4x")];
-            if let Some(v) = combo(ui, "exp-scale", spec.scale as u8, &scales, 48.0) {
+            if let Some(v) = combo(ui, "exp-scale", spec.scale as u8, &scales, w) {
                 spec.scale = v as f64;
             }
         }
     });
     let scopes: Vec<(Scope, &str)> = Scope::ALL.iter().map(|s| (*s, s.label())).collect();
     row(ui, "Export", |ui| {
-        if let Some(v) = combo(ui, "exp-scope", spec.scope, &scopes, 110.0) {
+        let w = ui.available_width();
+        if let Some(v) = combo(ui, "exp-scope", spec.scope, &scopes, w) {
             spec.scope = v;
         }
     });
@@ -631,7 +658,8 @@ fn nothing_selected(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 (crate::model::Route::Elbow, "Elbow"),
             ];
             row(ui, "Route", |ui| {
-                if let Some(v) = combo(ui, "new-route", ed.arrow_route, &routes, 96.0) {
+                let w = ui.available_width();
+                if let Some(v) = combo(ui, "new-route", ed.arrow_route, &routes, w) {
                     ed.arrow_route = v;
                 }
             });
@@ -665,14 +693,12 @@ fn nothing_selected(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         }
         Tool::Rect | Tool::Ellipse | Tool::Diamond | Tool::Polygon | Tool::Star | Tool::Line => {
             ui.label(title_text("For new shapes"));
-            egui::CollapsingHeader::new(title_text(if ed.sketch.is_some() {
+            let title = if ed.sketch.is_some() {
                 "Sketch · on"
             } else {
                 "Sketch"
-            }))
-            .id_salt("new-sketch-section")
-            .default_open(false)
-            .show(ui, |ui| {
+            };
+            folded(title, "new-sketch-section").show(ui, |ui| {
                 hint(ui, SKETCH_HELP);
                 let mut sketch = ed.sketch.is_some();
                 if ui.checkbox(&mut sketch, "Hand-drawn style").changed() {
@@ -728,7 +754,8 @@ fn paper_context(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     ui.label(title_text("View"));
     let grids: Vec<(Background, &str)> = Background::ALL.iter().map(|b| (*b, b.label())).collect();
     row(ui, "Grid", |ui| {
-        if let Some(b) = combo(ui, "view-grid", st.background, &grids, 96.0) {
+        let w = ui.available_width();
+        if let Some(b) = combo(ui, "view-grid", st.background, &grids, w) {
             st.set_background(b);
         }
     });
@@ -867,32 +894,34 @@ fn align_row(ui: &mut Ui, ed: &mut Editor, _ids: &[NodeId]) {
 /// share it (and an edit sets it on all of them) and Mixed when they differ.
 fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
     let first = &nodes[0];
+    // Paired fields share one row in two equal columns (X Y, W H, Points Ratio, Radius).
+    let half = pair_w(ui);
     ui.horizontal(|ui| {
         match uniform(nodes, |n| n.rect.x) {
             Some(x) => {
-                if let Some(v) = num_field(ui, ed, "X  ", x, 1.0, f64::MIN..=f64::MAX, 92.0) {
+                if let Some(v) = num_field(ui, ed, "X  ", x, 1.0, f64::MIN..=f64::MAX, half) {
                     apply(ed, "x", ids, |n| n.rect.x = v);
                 }
             }
-            None => mixed(ui, "X  ", 92.0),
+            None => mixed(ui, "X  ", half),
         }
         match uniform(nodes, |n| n.rect.y) {
             Some(y) => {
-                if let Some(v) = num_field(ui, ed, "Y  ", y, 1.0, f64::MIN..=f64::MAX, 92.0) {
+                if let Some(v) = num_field(ui, ed, "Y  ", y, 1.0, f64::MIN..=f64::MAX, half) {
                     apply(ed, "y", ids, |n| n.rect.y = v);
                 }
             }
-            None => mixed(ui, "Y  ", 92.0),
+            None => mixed(ui, "Y  ", half),
         }
     });
     ui.horizontal(|ui| {
         match uniform(nodes, |n| n.rect.w) {
             Some(w) => {
-                if let Some(v) = num_field(ui, ed, "W  ", w, 1.0, 0.0..=1e6, 92.0) {
+                if let Some(v) = num_field(ui, ed, "W  ", w, 1.0, 0.0..=1e6, half) {
                     resize(ed, ids, Some(v), None);
                 }
             }
-            None => mixed(ui, "W  ", 92.0),
+            None => mixed(ui, "W  ", half),
         }
         // A text layer's height follows its text.
         let text = nodes
@@ -900,11 +929,11 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
             .any(|n| matches!(n.kind, NodeKind::Text { .. }));
         ui.add_enabled_ui(!text, |ui| match uniform(nodes, |n| n.rect.h) {
             Some(h) => {
-                if let Some(v) = num_field(ui, ed, "H  ", h, 1.0, 0.0..=1e6, 92.0) {
+                if let Some(v) = num_field(ui, ed, "H  ", h, 1.0, 0.0..=1e6, half) {
                     resize(ed, ids, None, Some(v));
                 }
             }
-            None => mixed(ui, "H  ", 92.0),
+            None => mixed(ui, "H  ", half),
         });
     });
     // Shape parameters, when every selected layer is that shape.
@@ -945,7 +974,7 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
             match points {
                 Some(points) => {
                     if let Some(v) =
-                        num_field(ui, ed, "Points ", points as f64, 0.1, 3.0..=60.0, 92.0)
+                        num_field(ui, ed, "Points ", points as f64, 0.1, 3.0..=60.0, half)
                     {
                         apply(ed, "points", ids, |n| {
                             if let NodeKind::Star { points, .. } = &mut n.kind {
@@ -954,12 +983,12 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
                         });
                     }
                 }
-                None => mixed(ui, "Points ", 92.0),
+                None => mixed(ui, "Points ", half),
             }
             match inner {
                 Some(inner) => {
                     if let Some(v) =
-                        num_field(ui, ed, "Ratio ", inner * 100.0, 0.5, 1.0..=100.0, 92.0)
+                        num_field(ui, ed, "Ratio ", inner * 100.0, 0.5, 1.0..=100.0, half)
                     {
                         apply(ed, "ratio", ids, |n| {
                             if let NodeKind::Star { inner, .. } = &mut n.kind {
@@ -968,7 +997,7 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
                         });
                     }
                 }
-                None => mixed(ui, "Ratio ", 92.0),
+                None => mixed(ui, "Ratio ", half),
             }
         });
     }
@@ -987,12 +1016,12 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
             match per_corner {
                 Some(false) => match uniform(nodes, |n| n.style.corner_radius) {
                     Some(radius) => {
-                        if let Some(v) = num_field(ui, ed, "Radius  ", radius, 0.5, 0.0..=1e4, 92.0)
+                        if let Some(v) = num_field(ui, ed, "Radius  ", radius, 0.5, 0.0..=1e4, half)
                         {
                             apply(ed, "radius", ids, |n| n.style.corner_radius = v);
                         }
                     }
-                    None => mixed(ui, "Radius  ", 92.0),
+                    None => mixed(ui, "Radius  ", half),
                 },
                 // Independent corners (on some or all of the layers): the corners every layer
                 // has, compared corner by corner; Mixed only when they really differ.
@@ -1010,7 +1039,7 @@ fn geometry(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
                             }
                         }
                     }
-                    None => mixed(ui, "Radius  ", 92.0),
+                    None => mixed(ui, "Radius  ", half),
                 },
             }
             if ids.len() == 1
@@ -1145,10 +1174,11 @@ fn child_layout(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], first: &Node) {
             (Constraint::Scale, "Scale"),
         ];
         row(ui, "Constraints", |ui| {
-            if let Some(v) = combo(ui, "con-h", first.layout_child.constraints.h, &opts_h, 74.0) {
+            let w = pair_w(ui);
+            if let Some(v) = combo(ui, "con-h", first.layout_child.constraints.h, &opts_h, w) {
                 apply(ed, "layout", ids, |n| n.layout_child.constraints.h = v);
             }
-            if let Some(v) = combo(ui, "con-v", first.layout_child.constraints.v, &opts_v, 74.0) {
+            if let Some(v) = combo(ui, "con-v", first.layout_child.constraints.v, &opts_v, w) {
                 apply(ed, "layout", ids, |n| n.layout_child.constraints.v = v);
             }
         });
@@ -1681,16 +1711,17 @@ fn stroke(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
 fn layer(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
     ui.label(title_text("Layer"));
     ui.horizontal(|ui| {
+        let w = pair_w(ui);
         let opts: Vec<(BlendMode, &str)> = BlendMode::ALL.iter().map(|b| (*b, b.label())).collect();
         let blend = uniform(nodes, |n| n.style.blend);
-        if let Some(v) = combo_mixed(ui, "blend", blend, &opts, 96.0) {
+        if let Some(v) = combo_mixed(ui, "blend", blend, &opts, w) {
             apply(ed, "blend", ids, |n| n.style.blend = v);
         }
         match uniform(nodes, |n| n.style.opacity) {
             Some(opacity) => {
                 let mut op = opacity * 100.0;
                 let r = ui.add_sized(
-                    egui::vec2(70.0, 20.0),
+                    egui::vec2(w, theme::FIELD_H),
                     egui::DragValue::new(&mut op)
                         .range(0.0..=100.0)
                         .suffix("%")
@@ -1701,7 +1732,7 @@ fn layer(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
                 }
                 seal_on_release(ed, &r);
             }
-            None => mixed(ui, "", 70.0),
+            None => mixed(ui, "", w),
         }
     });
 }

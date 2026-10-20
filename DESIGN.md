@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 18 · 2026-10-20 · The one canonical visual and interaction direction for the OPD app
+Revision: 19 · 2026-10-20 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file isn't a
@@ -42,6 +42,51 @@ natively; see AGENTS.md for what was checked):
   proof and no Paper semantics copied): a full-height left panel with the file's identity at
   its top; no global top bar; with nothing selected the right panel shows the page's context,
   and a click on empty canvas returns to it.
+
+## Paper-inspired polish (revision 19, 2026-10-20 evening)
+
+The owner authorized a materially more Paper-like look on top of revision 18. These choices
+are built in source but not yet rendered, reviewed or natively qualified (see AGENTS.md).
+References were the before renders of the b1ca4ac candidate (Light and the actual Dark) and
+the official paper.design homepage's editor illustration. Paper's own website was looked at
+only; no code, asset, font or colour value was taken from it. Everything below is one token
+change in `src/theme.rs` that carries through to the existing controls:
+- **Type hierarchy from weight, not size.** Panel text is 12 pt Inter Regular. Inspector
+  section titles (Paper, View, Fill, Stroke, Layer…) are 12 pt Medium in the text colour, list
+  headers (Papers, Layers, Library, Design) 11 pt Medium in secondary grey, and the Canvas's
+  name the one 13 pt SemiBold title. Before, every title was 13 pt SemiBold and the headers
+  11 pt SemiBold, so the inspector read as a wall of bold.
+- **Neutral, integrated surfaces.** The greys are neutral, without the earlier blue cast:
+  panel #fafafa / #1e1e1f. Buttons, number fields, choices and text fields are one family,
+  filled a step darker than the panel with a faint edge, instead of white boxes with a grey
+  outline. Hover and press darken that fill. Floating surfaces keep a hairline and one
+  softer, closer shadow.
+- **Density.** The lists (layer and Paper rows, 24 px) stay compact. The inspector is the
+  airy part: 24 px fields, 6 px apart, with one hairline and even room between sections.
+  Paired values (X Y, W H, Points Ratio, the arrow heads, Constraints, blend and opacity,
+  export format and scale) fill the row in two equal columns, and a single choice fills the
+  rest of its row, so values line up at any panel width. Mixed is drawn as the field it
+  stands for.
+- **States.** The accent is kept for what is current or focused:
+  - the current tool, a selected layer row, the chosen menu or palette row and an on
+    alignment or layout toggle are the accent tint, with the glyph or text in the accent's
+    "ink" (a step darker in Light, lighter in Dark);
+  - an open panel toggle is pushed in (neutral grey), not blue;
+  - keyboard focus is the 1.5 px accent ring on custom controls, or a 1 px accent-ink edge on
+    egui's own fields, buttons and choices (their `active` look, shared with press and open);
+  - disabled is tertiary grey.
+  Nothing is a solid accent block with white text any more.
+- **Icons.** Every icon button draws its glyph at the 16 pt grid size (smaller only on
+  buttons under 24 pt) with one 1.2 pt line weight, centred. Folded sections (Sketch,
+  Export) use the same line chevron as the lists, not egui's filled triangle.
+- **Home** follows the same tokens: neutral fallbacks, 13 px body, an 18 px title, 6 px
+  controls and softer menus. Its structure (Files, Search files, the layout toggles, New file),
+  its resting search field and every behaviour are unchanged.
+
+Unchanged: every revision 18 behaviour and protection, the rail's geometry (52 px, 32 px main
+buttons, 12 × 32 arrows, short-room rows), the panel insets and top rows, the canvas
+rendering and its Dark display, and the document. The combo boxes still use egui's own small
+filled arrow (restyling it was left out for API safety in this source-only pass).
 
 ## Direction: a calm workbench around the canvas
 
@@ -98,18 +143,20 @@ The principles:
        rename field for the shown Paper, showing that list if needed: one field, one path, one
        page-list change, always on the Paper it was opened for.
    - **The toggles** are one mirrored pair: the sidebar glyph and its mirror image, the same
-     26 px size, quiet colours, tooltip style, focus ring and pressed (open) tint, named for
-     assistive technology. The left one says "Papers and layers", the right one "Properties".
+     26 px size, quiet colours, tooltip style, focus ring and pushed-in (open) neutral fill
+     (revision 19; it was an accent tint), named for assistive technology. The left one says "Papers and layers", the right one "Properties".
      Collapse Panels and Hide UI stay separate modes.
 
    Undo/redo, help and every other command stay in the menu, the command palette and their
    shortcuts; zoom is at the canvas's lower left. There is no outer title, stage or action bar.
-3. **One strong accent.** The canvas's selected tool family is the only solid accent control.
-   Selected rows, open toggles and Home's pressed layout buttons use the accent tint, and their
-   labels keep their colour. The shown Paper's row is the current one, not a selection: a grey
-   (pressed) fill. Layer symbols are secondary grey; only components and instances keep the
-   accent. Keyboard focus on a custom control is a 1.5 px accent ring inside it (white on a
-   solid accent).
+3. **One restrained accent** (revision 19; before, the selected tool was a solid accent). The
+   accent marks what is current, selected or focused, always as a tint. That covers the
+   current tool, selected layer rows, the chosen menu or palette row, an on inspector toggle
+   and Home's pressed layout buttons. Labels keep the text colour; glyphs use the accent's
+   ink. Open panel toggles are pushed in, neutral grey. The shown Paper's row is the current
+   one, not a selection: a grey (pressed) fill. Layer symbols are secondary grey; only
+   components and instances keep the accent. Keyboard focus on a custom control is a 1.5 px
+   accent ring inside it, and on egui's own controls a 1 px accent-ink edge.
 4. **Contextual properties stay in the inspector** (Design); the Canvas's identity, Papers,
    Layers and the Library in the left panel. Arrange (bring forward and send backward) shows in
    the layers header only while something is selected. Every command keeps its menu entry and
@@ -179,7 +226,8 @@ The principles:
      stays available in every state but secondary.
 7. **Quiet surfaces, clear state.** Both panels share one colour and run the surface's full
    height, each separated from the canvas by one vertical hairline; there is no horizontal
-   rule under a top row and no rounded window. Fields are softly filled.
+   rule under a top row and no rounded window. Fields, buttons and choices are softly filled
+   with a faint edge, never white outlined boxes.
 8. **Problems stay visible.** Errors, conflicts and unfinished saves are never hidden for
    neatness (see the status rules in AGENTS.md). The status line sits at the canvas's lower
    edge, right of each control laid out there that reaches the canvas's lower half: the zoom,
@@ -394,43 +442,51 @@ under the host's MCP Apps style variables.
 
 | Token | Light | Dark |
 |---|---|---|
-| surface (panels, top rows) | #fbfbfc | #1f1f22 |
-| field / hover surface | #f1f1f3 | #2a2a2e |
-| control | #ffffff | #2c2c30 |
-| text | #1d1d1f | #ececef |
-| secondary text | #6e6e76 | #a1a1a8 |
-| tertiary / disabled | #b4b4ba | #5f5f66 |
-| hairline | #e6e6ea | #333338 |
-| accent | system accent, else #007aff | system accent, else #007aff (Home: #4c9bff) |
-| selected (selection, open toggle) | accent tint over surface (≈13% light, 27% dark) | |
-| current (the shown Paper's row) | the pressed fill (black 8%) | the pressed fill (white 10%) |
-| hover | black 4% | white 5% |
-| focus ring | accent, 1.5 px inside (white on a solid accent) | |
+| surface (panels, top rows) | #fafafa | #1e1e1f |
+| field (buttons, fields, choices; Home's hover surface) | #f0f0f1 | #2a2a2c |
+| control (floating surfaces use popover: #ffffff / #262628) | #ffffff | #2c2c2e |
+| field edge | black 5.5% | white 5.5% |
+| text | #1c1c1e | #ececed |
+| secondary text | #6c6c70 | #a2a2a6 |
+| tertiary / disabled | #aeaeb2 | #626266 |
+| hairline | #e8e8ea | #303033 |
+| accent | system accent, else #007aff | system accent, else #007aff |
+| accent ink (text, glyph or 1 px edge on its tint; ≥ 4.5:1 there for system blue) | the accent 24% toward black (Home: #0062cc) | the accent 35% toward white (Home: #5ea8ff) |
+| selected (tool, layer row, chosen row, on toggle) | accent tint over surface (≈15% light, 28% dark) | |
+| egui selection (text selection, chosen menu item) | accent at 20% / 35% | |
+| current (the shown Paper's row, an open panel toggle) | the pressed fill (black 5.5%) | the pressed fill (white 8%) |
+| hover | black 3% | white 5% |
+| focus | accent ring, 1.5 px inside (custom controls); accent-ink 1 px edge (egui controls) | |
 | canvas work surface | #eeeef0 | #18181b |
 | canvas grid dot | #cfcfd6 | #34343a |
 | canvas grid line (Grid) | the grid dot at 60% opacity | the grid dot at 60% opacity |
 
-The revision 18 audit (toolbar, sidebar and inspector together, Light and Dark): hover is one
-fill everywhere (rows, icon buttons, the rail's arrows, flyout rows); the accent tint is only a
-selection or an open toggle; the solid accent only the active tool (and the palette's keyboard
-row); the current Paper is grey; layer symbols are grey but for components and instances.
-Home's search uses the stronger hairline (#d4d4da / #46464c) at rest.
+The revision 18 audit (toolbar, sidebar and inspector together, Light and Dark), as revised in
+revision 19: hover is one fill everywhere (rows, icon buttons, the rail's arrows, flyout rows);
+the accent tint marks what is current, selected or focused (the current tool included); open
+panel toggles and the current Paper are grey; layer symbols are grey but for components and
+instances. Home's search uses the stronger hairline (#d6d6d9 / #48484c) at rest.
 
-- **Type:** Inter. 13 body, 11 secondary and section labels (semibold), 13 semibold titles.
+- **Type:** Inter. 12 body; 12 Medium inspector section titles in the text colour; 11
+  secondary text and 11 Medium list headers in secondary grey; the Canvas's name 13
+  SemiBold (`theme::TITLE`). Home: 13 px body, 18 px title.
 - **Shape:**
-  - controls, rows, icon buttons and toggles 6 (one radius, `theme::RADIUS`);
+  - controls, fields, rows, icon buttons and toggles 5 (one radius, `theme::RADIUS`);
   - floating surfaces (the rail, the zoom, the floating top rows, menus, the canvas's menu)
     10, windows and popovers 12;
-  - Home cards 12.
+  - Home: controls 6, list rows 8, cards 10.
 - **Spacing:**
   - a panel's top row 38 (40 with native chrome);
-  - 24 interactive height;
+  - 24 interactive height (`theme::FIELD_H`): inspector fields, labels and toggles share it,
+    6 apart; sections 8 + hairline + 8 apart;
   - 26 icon buttons in the top rows and zoom; rail rows 32 × 32 plus a 12 × 32 arrow;
-  - 16-unit icon grid, about 1.25 stroke.
-- **Shadow:** only floating things (the rail, zoom, the floating top rows, menus, popovers).
-  Panels are flat.
-- **Borders:** hairlines between regions only (one vertical one per open panel). Controls in
-  top rows and rows are borderless until hovered or focused.
+  - 16-unit icon grid, glyphs 16 on 24 pt and larger buttons (`theme::ICON`), 1.2 stroke
+    (clamped 1–1.4).
+- **Shadow:** only floating things (the rail, zoom, the floating top rows, menus, popovers):
+  one soft close shadow (popups 0/2/10 at 8% light, 31% dark). Panels are flat.
+- **Borders:** hairlines between regions only (one vertical one per open panel). Icon
+  controls in top rows and rows are borderless until hovered or focused; fields and buttons
+  carry only their faint edge.
 
 ## Not in scope
 

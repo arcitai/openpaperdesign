@@ -457,17 +457,28 @@ pub(crate) fn from32(c: Color32) -> Color {
     Color::rgba(r, g, b, a)
 }
 
-/// Section header, as in a macOS sidebar or inspector: 11pt semibold, secondary colour.
+/// A panel's list header (Papers, Layers, the right panel's Design): 11pt Inter Medium in the
+/// secondary colour, quieter than the rows it heads.
 pub(crate) fn section(ui: &mut Ui, title: &str) {
-    ui.label(
-        RichText::new(title)
-            .font(theme::semibold(theme::SECONDARY))
-            .color(theme::pal(ui).secondary),
-    );
+    ui.label(section_text(title, theme::pal(ui).secondary));
 }
 
+/// [`section`]'s text in `color` (a tab that is on uses the text colour).
+pub(crate) fn section_text(title: &str, color: Color32) -> RichText {
+    RichText::new(title)
+        .font(theme::medium(theme::SECONDARY))
+        .color(color)
+}
+
+/// An inspector section's title (Fill, Stroke, Paper, View…): the body size in Inter Medium,
+/// in the text colour, as Paper's own property groups are titled.
 pub(crate) fn title_text(text: impl Into<String>) -> RichText {
-    RichText::new(text).font(theme::semibold(theme::BODY))
+    RichText::new(text).font(theme::medium(theme::BODY))
+}
+
+/// The Canvas's name: the panel's one title, 13pt Inter SemiBold.
+fn name_font() -> egui::FontId {
+    theme::semibold(theme::TITLE)
 }
 
 /// Lay out the chrome and return the remaining canvas rectangle (logical px).
@@ -1032,7 +1043,7 @@ fn action_button(
 /// home, the compact menu and its own toggle; on a sheet, which covers the canvas, the right
 /// panel's toggle too), the Canvas's identity, then the Papers, Layers and Library. Undo, redo,
 /// zoom and help stay in the menu, the palette and their shortcuts (zoom also at the canvas's
-/// lower left). Its controls are quiet and only an open toggle is tinted.
+/// lower left). Its controls are quiet; an open toggle stays pushed in.
 fn left_panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, shown: Arrangement, sheet: bool) {
     top_row(ui, top_h(st), |ui| {
         if st.native_chrome && !sheet {
@@ -1110,8 +1121,8 @@ fn design_toggle(ui: &mut Ui, st: &mut UiState, shown: Arrangement) {
 
 /// A side panel's toggle. The left and right ones are one mirrored pair: the sidebar glyph and
 /// its mirror image at the same size, in the same quiet colours, with the same tooltip style,
-/// focus ring and pressed tint (an open panel's toggle is tinted), and its name for assistive
-/// technology.
+/// focus ring and pressed look (an open panel's toggle stays pushed in, neutral grey rather
+/// than accent), and its name and on state for assistive technology.
 fn sidebar_toggle(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> egui::Response {
     let r = theme::quiet_icon_button(ui, icon, CONTROL, on).on_hover_text(tip);
     r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, tip));
@@ -1307,7 +1318,7 @@ fn compact_identity(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, room: f32) {
             .layout_no_wrap(text, font, Color32::PLACEHOLDER);
         g.size().x + 8.0
     };
-    let title = width(ui, canvas_title(ed, st), theme::semibold(theme::BODY));
+    let title = width(ui, canvas_title(ed, st), name_font());
     let line = width(
         ui,
         paper_text(ed, st),
@@ -1334,7 +1345,7 @@ fn canvas_name(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::Rect)
     }
     let title = canvas_title(ed, st);
     let r = in_slot(ui, rect, "canvas-name", |ui| {
-        let label = egui::Label::new(title_text(title.clone())).truncate();
+        let label = egui::Label::new(RichText::new(title.clone()).font(name_font())).truncate();
         ui.add(label.sense(egui::Sense::click()))
     });
     let r = r.on_hover_text(if st.file_rename {
@@ -1441,7 +1452,7 @@ fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::
     let field = egui::TextEdit::singleline(draft)
         .char_limit(MAX_FILE_NAME)
         .desired_width(rect.width())
-        .font(theme::semibold(theme::BODY));
+        .font(name_font());
     let r = in_slot(ui, rect, "canvas-name", |ui| ui.add(field));
     st.file_title_field = Some(r.id);
     // As the layer and page renames: the loss is checked before focus is asked for again.
@@ -1500,14 +1511,9 @@ fn layers(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     ui.horizontal(|ui| {
         for (lib, label) in [(false, "Layers"), (true, "Library")] {
             let on = st.show_library == lib;
-            let r = ui.add(
-                egui::Label::new(
-                    RichText::new(label)
-                        .font(theme::semibold(theme::SECONDARY))
-                        .color(if on { p.text } else { p.secondary }),
-                )
-                .sense(egui::Sense::click()),
-            );
+            let color = if on { p.text } else { p.secondary };
+            let tab = egui::Label::new(section_text(label, color));
+            let r = ui.add(tab.sense(egui::Sense::click()));
             if r.clicked() {
                 st.show_library = lib;
             }
@@ -1613,7 +1619,7 @@ fn layer_drag(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
             }
             LayerDrop::Into(_) => {
                 ui.painter()
-                    .rect_stroke(r, 6.0, stroke, egui::StrokeKind::Inside);
+                    .rect_stroke(r, theme::RADIUS, stroke, egui::StrokeKind::Inside);
             }
         }
     }
@@ -1746,9 +1752,10 @@ fn canvas_hover_row(
     Some(collapsed.copied().unwrap_or(id))
 }
 
-/// One sidebar row, drawn like an NSOutlineView row: 24pt tall, 6pt radius selection as an
-/// accent tint, subtle hover (the pointer's over the row, or the canvas's over its layer),
-/// disclosure chevron, symbol, name, and eye/lock on hover.
+/// One sidebar row, drawn like an NSOutlineView row: 24pt tall (the lists stay compact; the
+/// inspector's sections are the airy part), `theme::RADIUS` selection as an accent tint, subtle
+/// hover (the pointer's over the row, or the canvas's over its layer), disclosure chevron,
+/// 14pt symbol, 12pt name, and eye/lock on hover.
 fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: usize) {
     let Some(n) = ed.doc.get(id).cloned() else {
         return;
@@ -1829,9 +1836,10 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         }
         let b = ui.interact(r, ui.id().with((tip, id)), egui::Sense::click());
         if b.hovered() {
-            ui.painter().rect_filled(r, 5.0, p.hover);
+            ui.painter().rect_filled(r, theme::RADIUS, p.hover);
         }
-        theme::paint_icon(ui.painter(), r.shrink(3.0), icon, fg2);
+        let color = if b.hovered() { p.text } else { fg2 };
+        theme::paint_icon(ui.painter(), r.shrink(3.0), icon, color);
         b.on_hover_text(tip).clicked()
     };
     let eye = if n.visible { Icon::Eye } else { Icon::EyeSlash };

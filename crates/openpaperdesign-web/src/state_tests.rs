@@ -3575,6 +3575,41 @@ fn rev2_a_mixed_selection_never_shows_the_first_layer_s_values_as_shared() {
 }
 
 #[test]
+fn rev19_paired_inspector_fields_fill_the_row_in_two_equal_columns() {
+    // Revision 19: X and Y (and W and H) are one row of two equal fields filling the
+    // inspector's width, Mixed drawn in its own field's place, the columns lined up row to row.
+    // Before, both were 92 px at the row's left, which left the right third of it empty.
+    let (mut s, _, _) = two_rects();
+    let c = s.canvas_rect();
+    let inspector: Vec<(String, egui::Rect)> = fields_read(painted_text(&mut s))
+        .into_iter()
+        .filter(|(_, r)| r.min.x >= c.max.x)
+        .collect();
+    let at = |wanted: &str| {
+        let found = inspector.iter().find(|(t, _)| t.starts_with(wanted));
+        let (_, r) = found.unwrap_or_else(|| panic!("{wanted:?}"));
+        *r
+    };
+    let (x, y, w, h) = (at("X  "), at("Y  "), at("W  "), at("H  "));
+    // The inspector's content runs from its 14 px inset to the surface's.
+    let mid = (c.max.x + W as f32) / 2.0;
+    for (left, right) in [(x, y), (w, h)] {
+        let dy = (left.center().y - right.center().y).abs();
+        assert!(dy < 1.0, "one row: {left:?} {right:?}");
+        assert!(
+            left.max.x < mid && right.min.x > mid,
+            "two columns: {left:?} {right:?}"
+        );
+        let (l, r) = (mid - left.center().x, right.center().x - mid);
+        assert!((l - r).abs() < 3.0, "equal columns: {l} {r}");
+        assert!(right.max.x <= W as f32 - 13.5, "inset: {right:?}");
+    }
+    assert!((x.center().x - w.center().x).abs() < 1.5, "{x:?} {w:?}");
+    assert!((y.center().x - h.center().x).abs() < 1.5, "{y:?} {h:?}");
+    assert!(!s.dirty(), "looking changes nothing");
+}
+
+#[test]
 fn rev2_a_shared_value_edits_every_selected_layer_as_one_undoable_change() {
     let (mut s, a, b) = two_rects();
     let right = s.canvas_rect().max.x;

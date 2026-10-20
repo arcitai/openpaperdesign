@@ -163,7 +163,7 @@ fn page_row(
         egui::vec2(ui.available_width(), ROW_H),
         egui::Sense::click_and_drag(),
     );
-    // The shown Paper is the current one, not a selection: a grey fill, as a pressed control
+    // The shown Paper is the current one, not a selection: a grey fill, as a pushed-in control
     // (the accent tint is the layer selection's, DESIGN.md).
     if active {
         ui.painter().rect_filled(row, theme::RADIUS, p.pressed);
@@ -183,7 +183,7 @@ fn page_row(
         ui.painter(),
         egui::Rect::from_center_size(
             egui::pos2(row.left() + 14.0, row.center().y),
-            egui::vec2(13.0, 13.0),
+            egui::vec2(14.0, 14.0),
         ),
         Icon::Page,
         if active { p.text } else { p.secondary },

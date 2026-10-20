@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.77 · Updated: 2026-10-20
+Revision: 0.78 · Updated: 2026-10-20
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -542,6 +542,47 @@ engine architecture is `analysis/DESIGN.md`.
     - Same Editor, Session, transactions, save, binding, lease and guards; no renderer, format
       or dependency change. Upstreamable as presentation, except the Paper/Canvas vocabulary,
       which is an OPD choice.
+  - Paper-inspired polish of 2026-10-20 evening (root `DESIGN.md` revision 19; owner-authorized;
+    source only, not built, rendered or natively qualified here). Presentation only; native
+    windows change too. Reason: the owner asked for a materially more Paper-like chrome
+    (type, density, surfaces, states, icons, Light/Dark) through one token change propagated
+    to the existing controls.
+    - `src/theme.rs`:
+      - Neutral palette, Light and Dark: no blue cast; the panel #fafafa / #1e1e1f.
+      - Type scale: `BODY` 13 → 12, a new `TITLE` 13 for the Canvas name, and `Heading`.
+      - New tokens: `FIELD_H` 24 and `ICON` 16; `RADIUS` 6 → 5.
+      - Widgets are filled `field` with a faint edge (not white outlined boxes), hover and
+        press darken the fill, and the `active` (pressed, keyboard-focused, open) state has a
+        1 px accent-ink edge.
+      - egui's selection is a translucent accent tint whose text and focused-field edge are
+        `accent_ink`, not a solid accent with white text.
+      - Shadows are softer and closer.
+      - `icon_rect` gives every icon button a 16 pt glyph (smaller only on buttons under
+        24 pt). `paint_icon` uses one stroke weight, 1.2 pt clamped to 1–1.4.
+      - `icon_button`'s selected state (the current tool, alignment and layout toggles) is
+        the `selected_fill` tint with an accent-ink glyph, not solid accent with white.
+      - `quiet_icon_button`'s on state (an open panel's toggle) is a neutral pressed fill.
+      - `disclosure` draws a line chevron for folded sections.
+    - `src/ui/mod.rs`: `section` and the Layers/Library tabs use Inter Medium 11 (were
+      SemiBold); `title_text` (inspector section titles) is Medium 12 in the text colour (was
+      SemiBold 13); the Canvas name keeps SemiBold at `TITLE` (`name_font`, used by the label,
+      the compact width and the rename field, so the field still opens in the name's slot);
+      layer rows' trailing eye/lock use `RADIUS` and light up on hover.
+    - `src/ui/inspector.rs`:
+      - Rows and fields are `FIELD_H` (24, were 20) with 12 pt labels.
+      - Paired fields fill the row in two columns (`pair_w`). That covers X/Y, W/H,
+        Points/Ratio, Radius, the arrow heads, Constraints, blend and opacity, and the export
+        format and scale. Single-choice rows fill the rest of the row.
+      - Mixed is drawn as the field it stands for, with the same placeholder text as before.
+      - Sections sit 6 px apart with one hairline and even room around it.
+      - Sketch and Export use the line chevron (`folded`).
+      - Field prefixes ("X  "…), texts, structure and edit semantics are unchanged.
+    - `src/ui/rail.rs` (flyout glyphs at `ICON`), `src/ui/pages.rs` (14 pt page icon) and
+      `src/ui/palette.rs` (the chosen row is the selection tint with text-coloured labels, 28
+      px rows) follow the same tokens. The rail's geometry (`RAIL_W` 52, `MAIN_W` 32,
+      `CHEVRON_W` 12, `ROW_H` 32, `row_height`) and every panel inset are unchanged.
+    - Same Editor, Session, transactions, save, binding, lease, guards, renderer and canvas
+      display; no format or dependency change. Upstreamable as presentation.
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.
@@ -665,7 +706,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-18.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-19.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -749,6 +790,16 @@ Escape, the empty and no-match states, the kept grid/list layout and the narrow 
 unchanged). Both the view's HTML and the editor's WASM changed, so `home-17` is refused and a
 cached `home-17` view can't pass for this one. Not built, rendered, installed or natively
 accepted here.
+
+`home-19` (2026-10-20 evening source candidate) is the Paper-inspired polish (root `DESIGN.md`
+revision 19, the upstream entry above): the editor's neutral palette, 12 pt type scale, filled
+fields in paired columns, tinted current-tool and selection states, one icon size and stroke,
+and the view's matching CSS tokens (neutral fallbacks, 13 px body, 18 px title, 6 px control
+radius, softer menu shadow). Home's structure (Files, Search files, layout toggles, New file),
+the search field's resting look, filtering, Escape, empty and no-match states, the kept
+layout and the narrow layout are unchanged; no element, id or script changed. Both the view's
+HTML and the editor's WASM changed, so `home-18` is refused and a cached `home-18` view can't
+pass for this one. Not built, rendered, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

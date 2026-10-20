@@ -124,8 +124,12 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// height panels, the Canvas's identity in the left panel, mirrored panel toggles, the slim rail,
 /// the Paper context with nothing selected, linked hover, Grid naming) and the home's search
 /// field drawn as one at rest (a changed view HTML and in-panel WASM editor; the home's layout,
+/// filtering and kept preferences unchanged); `home-19` is the Paper-inspired polish (DESIGN.md
+/// revision 19): the editor's neutral palette, 12pt type scale, filled fields with paired
+/// columns, tinted tool and selection states and one icon size and stroke, and the home's
+/// matching tokens (a changed view HTML and in-panel WASM editor; the home's structure, search,
 /// filtering and kept preferences unchanged). No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-18.html";
+const HOME_URI: &str = "ui://openpaperdesign/home-19.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

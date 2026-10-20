@@ -368,7 +368,7 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                                 theme::focus_ring(ui, r, &resp, false);
                                 let icon = Rect::from_center_size(
                                     pos2(r.left() + 16.0, r.center().y),
-                                    vec2(18.0, 18.0),
+                                    vec2(theme::ICON, theme::ICON),
                                 );
                                 theme::paint_icon(ui.painter(), icon, tool_icon(*t), p.text);
                                 ui.painter().text(

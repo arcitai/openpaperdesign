@@ -6,7 +6,7 @@ use crate::editor::shortcuts::{self, Action};
 use crate::editor::{Editor, Tool};
 use crate::model::NodeId;
 use crate::theme;
-use egui::{Color32, RichText};
+use egui::RichText;
 
 #[derive(Default)]
 pub struct PaletteUi {
@@ -277,33 +277,31 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
                             for (i, e) in results.iter().enumerate().take(60) {
                                 let sel = i == st.palette.selected;
                                 let (row, resp) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 26.0),
+                                    egui::vec2(ui.available_width(), 28.0),
                                     egui::Sense::click(),
                                 );
+                                // The chosen row is the selection tint, as a selected layer row
+                                // and the current tool are; its text keeps the text colour.
                                 if sel {
-                                    ui.painter().rect_filled(row, 6.0, theme::accent());
+                                    let fill = theme::selected_fill(ui);
+                                    ui.painter().rect_filled(row, theme::RADIUS, fill);
                                     ui.scroll_to_rect(row, None);
                                 } else if resp.hovered() {
-                                    ui.painter().rect_filled(row, 6.0, p.hover);
+                                    ui.painter().rect_filled(row, theme::RADIUS, p.hover);
                                 }
-                                let fg = if sel { Color32::WHITE } else { p.text };
                                 ui.painter().text(
                                     egui::pos2(row.left() + 10.0, row.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     &e.label,
                                     egui::FontId::proportional(theme::BODY),
-                                    fg,
+                                    p.text,
                                 );
                                 ui.painter().text(
                                     egui::pos2(row.right() - 10.0, row.center().y),
                                     egui::Align2::RIGHT_CENTER,
                                     &e.detail,
-                                    egui::FontId::proportional(theme::SECONDARY),
-                                    if sel {
-                                        Color32::from_white_alpha(200)
-                                    } else {
-                                        p.secondary
-                                    },
+                                    theme::medium(theme::SECONDARY),
+                                    p.secondary,
                                 );
                                 if resp.clicked() {
                                     chosen = Some(e.cmd.clone());
