@@ -497,7 +497,11 @@ engine architecture is `analysis/DESIGN.md`.
         it at once, and typing reached tool shortcuts). The browser host's `key_down` keeps
         keys from the editor while a page or layer rename is pending (`renaming` set) and its
         field doesn't have the keyboard yet; `draw` still finishes any rename whose rows
-        aren't coming.
+        aren't coming. R58-P2, `src/ui/pages.rs` `page_row`: while a page rename field asks
+        for the focus it also scrolls its row into the Papers list's capped window
+        (`Response::scroll_to_me_animation`, as little as needed, at once), so a rename asked
+        for elsewhere (the tenth of ten Papers, say) is visible and hittable. Only until it has
+        the focus: typing and the person's own scrolling are never pinned back.
       - **Toggles.** `sidebar_toggle` (the pair, with an accessibility name through
         `widget_info`): "Papers and layers" (`Icon::Sidebar`) and "Properties"
         (`Icon::SidebarRight`); `pill` and the "Design" text pill are gone. The `···` menu is

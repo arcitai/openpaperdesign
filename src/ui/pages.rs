@@ -209,6 +209,11 @@ fn page_row(
             }
         } else if !r.has_focus() {
             r.request_focus();
+            // While it takes the focus, the list scrolls (as little as needed, at once) to show
+            // it: a rename asked for from elsewhere (the inspector's, the identity's) may name a
+            // row below the list's capped window (R58). Only until the field has the focus, so
+            // typing and the person's own scrolling afterwards are never pinned back.
+            r.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
         }
     } else {
         let font = if active {

@@ -2728,6 +2728,101 @@ fn r57_inspector_rename_opens_closed_papers_and_keeps_target_across_resize() {
     assert!(s.can_reload() && s.save_snapshot().is_none());
 }
 
+/// Ten Papers ("Paper 1" … "Paper 10", ids p00000 … p00009), the tenth shown, Papers closed:
+/// more rows than the Papers list's capped window holds.
+fn ten_papers() -> WebState {
+    let rect = crate::geom::Rect::new(100.0, 100.0, 200.0, 100.0);
+    let pages: Vec<_> = (0..10)
+        .map(|i| page(&format!("p{i:05}"), &format!("Paper {}", i + 1), rect))
+        .collect();
+    let mut s = WebState::open(&canvas(&pages, "p00009"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    s
+}
+
+/// R58's desired-behaviour regression (independent-scroll-window.rs, adopted with its fixture,
+/// geometry thresholds and assertions; only formatted and its fixture shared): the inspector's
+/// Rename Paper… for the tenth Paper, below the list's capped window, opens a field the person
+/// can see and hit, not an offscreen draft.
+#[test]
+fn r58_inspector_rename_reveals_the_focused_paper_beyond_the_initial_scroll_window() {
+    let mut s = ten_papers();
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 1000.0);
+    timed_frames(&mut s, 8);
+    assert_eq!(s.ui.pages.renaming.as_ref().map(|(i, _)| *i), Some(9));
+    assert!(s.field_has_keyboard());
+    let id = s.ui.pages.rename_field.expect("the intended row's field");
+    let response = s.ctx.read_response(id).expect("actual rename response");
+    assert!(
+        response.interact_rect.height() >= 18.0 && response.interact_rect.width() >= 40.0,
+        "the focused Paper rename must be visible/hittable, not an offscreen draft: {response:?}"
+    );
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 3);
+    assert!(s.ui.pages.renaming.is_none() && !s.field_has_keyboard());
+    assert!(s.can_reload() && s.save_snapshot().is_none());
+}
+
+#[test]
+fn r58_a_revealed_rename_commits_on_its_own_paper_and_never_pins_the_scroll() {
+    let mut s = ten_papers();
+    let names =
+        |s: &WebState| -> Vec<String> { s.ed.pages.iter().map(|p| p.name.clone()).collect() };
+    let before = names(&s);
+    let contents: Vec<_> = (0..10).map(|i| s.ed.page_doc(i).nodes.clone()).collect();
+    let (selection, camera) = (s.ed.selection.clone(), s.ed.camera);
+    let right = s.canvas_rect().max.x;
+    click_label_in(&mut s, "Rename Paper…", |r| r.min.x >= right, 1000.0);
+    timed_frames(&mut s, 8);
+    let id = s.ui.pages.rename_field.expect("the tenth Paper's field");
+    let shown = s.ctx.read_response(id).expect("its response").interact_rect;
+    assert!(shown.height() >= 18.0, "revealed: {shown:?}");
+    // The person scrolls the list back up (the wheel over it): the field moves down with its
+    // row, out of the window, and stays there; nothing scrolls it back while it is focused.
+    let at = (shown.center().x as f64, shown.center().y as f64);
+    for k in 0..4 {
+        s.wheel(0.0, -120.0, at.0, at.1);
+        timed_frames(&mut s, 1);
+        assert!(s.field_has_keyboard(), "{k}: the field keeps the keyboard");
+    }
+    // Long enough for egui's smoothed wheel scrolling to finish.
+    timed_frames(&mut s, 40);
+    let after = s.ctx.read_response(id).expect("its response").rect;
+    assert!(
+        after.min.y > shown.max.y,
+        "the list scrolled up: {shown:?} → {after:?}"
+    );
+    timed_frames(&mut s, 10);
+    let later = s.ctx.read_response(id).expect("its response").rect;
+    assert_eq!(later, after, "no pinning while focused");
+    // Typing still goes into it, and Enter renames that Paper only.
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("Final");
+    timed_frames(&mut s, 2);
+    assert_eq!(s.ed.tool, Tool::Select, "no key reached a tool");
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    let mut want = before.clone();
+    want[9] = "Final".into();
+    assert_eq!(names(&s), want, "only the tenth Paper is renamed");
+    assert_eq!(s.ed.active_page_id(), "p00009");
+    for (i, nodes) in contents.iter().enumerate() {
+        assert_eq!(&s.ed.page_doc(i).nodes, nodes, "Paper {i}'s content");
+    }
+    assert_eq!((s.ed.selection.clone(), s.ed.camera), (selection, camera));
+    let snap = s.save_snapshot().expect("one page-list save");
+    let (active, list, sent) = parse_save(&snap);
+    assert_eq!(active, "p00009");
+    assert_eq!(list[9], ("p00009".to_string(), "Final".to_string()));
+    assert!(sent.is_empty(), "no Paper's content is sent");
+    s.save_succeeded();
+    assert!(s.can_reload() && s.save_snapshot().is_none());
+}
+
 #[test]
 fn r57_a_first_click_rename_with_papers_closed_owns_the_keys_until_its_field_has_them() {
     // Fresh, Papers closed. Right after the first click (before the list has opened and its
