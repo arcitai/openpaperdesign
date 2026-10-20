@@ -19,6 +19,11 @@ OpenPaperDesign is built on paper-rs by [Michael Shimeles](https://github.com/mi
 
 In Codex, I can sketch a system and refine a layout with the agent. Project files stay local and the canvas stays editable. I’m also exploring how AI-generated images can become part of that workflow.
 
+## Product page
+
+The static [product page source](site/README.md) lives in `site/`. Its application
+release, current screenshot and eventual domain deployment remain separate follow-ups.
+
 ---
 
 # paper-rs

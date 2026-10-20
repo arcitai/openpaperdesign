@@ -1,0 +1,7 @@
+Geist Sans variable font, reused unchanged from Arc’IT’s bundled font asset.
+Repository: https://github.com/arcitai/arcitai-website
+Revision: 46e5566e5f4d1f89fc36df43cd5a35c79ff504f5
+Path: public/assets/fonts/geist-sans-variable.woff2
+Upstream: https://github.com/vercel/geist-font
+Licence: SIL Open Font License 1.1; see Geist-LICENSE.txt.
+Served locally; no external font service is used.
