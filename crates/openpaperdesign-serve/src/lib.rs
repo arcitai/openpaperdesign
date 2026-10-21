@@ -45,6 +45,8 @@
 
 pub mod agent;
 mod commit;
+/// A project design guide's bytes and design values: a pure codec, no I/O (R19–R21 precursor).
+pub mod guide;
 #[doc(hidden)]
 pub mod launcher;
 pub(crate) mod library;

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.79 · Updated: 2026-10-21
+Revision: 0.81 · Updated: 2026-10-21
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -692,6 +692,31 @@ engine architecture is `analysis/DESIGN.md`.
     passes it on only while that editor isn't left, and Home sets `#ed-title` as text only for
     the shown editor (`panelHandle === h`); the browser page sets its tab title. No remount,
     server call, save or new timer.
+- Project design guide codec (R19–R21 precursor, not upstream-owned; written in source. The
+  lead's affected checks of the run150 candidate passed: format, the serve library's tests
+  with the 17 guide tests, clippy with no new warning, and the unchanged output-bound probe.
+  That is source verification at that scope, not an independent review or a native, Theme or
+  source-link acceptance): `crates/openpaperdesign-serve/src/guide.rs` (tests in
+  `guide_tests.rs`), `pub mod guide` of the serve library. Pure: bytes in, a `Guide` snapshot,
+  `Tokens` inspection or a checked `Proposal` out; no file system, path, metadata, MCP, browser,
+  host, timer, grant or canvas access, and no caller yet. `Guide::read` keeps the exact bytes
+  (≤ 1 MiB, UTF-8, no NUL; BOM and every line's LF/CRLF/lone CR); `plan_text` plans a prose
+  edit against an expected `Revision` (FNV-1a and length: tells versions apart, not a
+  security check) as Myers line hunks, untouched lines byte-exact, new or changed lines taking
+  the nearest preceding original line's terminator, bounded (`MAX_CHANGED_LINES`,
+  `MAX_DIFF_STEPS`) and refused beyond, and refused (`PlanError::TooLarge`, nothing proposed)
+  when the guide it would make exceeds `MAX_BYTES` (run149 correction after the lead's probe:
+  a `MAX_BYTES` CRLF guide and `MAX_BYTES` draft made a `MAX_BYTES + 1` proposal its own
+  reader refused); `tokens` reads exactly one fenced `json` block marked
+  `"opdDesignTokens": 1` with its own span-recording JSON reader (escape-equivalent duplicate
+  names, depth, lone surrogates and invalid JSON refused; numbers kept as lexemes), version 1
+  groups `colors`, `fontSizes`, `fontWeights` (400/700), `spacing`, `radii`, `frames`
+  (direction, gap, padding); `plan_value` replaces one known supported value's span only and
+  re-reads the result. Reason: the admitted guide/value codec any later source reader/editor
+  needs (rev2 §8–9). It is not a source link: reading, creating or saving a project's guide,
+  Theme's connection, named tokens, font families and Apply stay gated on the real model-call
+  admission and enforceable revocation proof; no Theme, MCP or file route uses it. Same Editor,
+  Session, save, binding and lease; no new dependency or store.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.
