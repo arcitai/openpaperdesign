@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.78 · Updated: 2026-10-20
+Revision: 0.79 · Updated: 2026-10-21
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -583,6 +583,93 @@ engine architecture is `analysis/DESIGN.md`.
       `CHEVRON_W` 12, `ROW_H` 32, `row_height`) and every panel inset are unchanged.
     - Same Editor, Session, transactions, save, binding, lease, guards, renderer and canvas
       display; no format or dependency change. Upstreamable as presentation.
+  - Whole-app workbench, first slice (2026-10-21; root `DESIGN.md` revision 20; owner feedback
+    in #10 and #14; source only, not built, rendered or natively qualified here). Native windows
+    change too. Reason: the owner's Mac use asked for these exact placement, navigation and
+    Theme changes, and they can only be made in the shared upstream UI.
+    - `src/ui/mod.rs`:
+      - **Contextual reveal** (responsive after the lead's run144 render finding that it was
+        wide-only). `Panels::arranged(tier, selected, changed, width)` is what `draw` settles:
+        `wanted` plus the Design panel for a new selection (`UiState::seen_selection` tells a
+        new one) where the person closed it: beside the open panels on a wide surface; docked
+        beside the canvas, or beside the left panel from `BOTH_DOCKED` (800 px), else in its
+        place (`swapped`); on a sheet in an open left sheet's place, or (run145, after the
+        lead's finding that 144 still excepted it without the owner's approval) over a
+        canvas-only sheet once `Panels::hold_cover` is off: `draw` holds it for `COVER_WAIT`
+        (0.4 s, the editor's double-click window) from `UiState::selected_at` and while
+        `Editor::text_edit`, `pen` or `path_edit` is open, asking egui for the frame that
+        ends the wait. It never writes the choices; `toggle` on a revealed Design panel
+        dismisses it until the selection clears, and any toggle ends a reveal not shown yet
+        (so a pinned panel closed with something selected stays closed); the left toggle,
+        Rename and `start_paper_rename` (`open`) take precedence and give the left panel back;
+        `draw` notes a new selection (`Panels::selection`) before the frame's `UiEvent`s, so a
+        Rename arriving with the click that selected (run145's failing R25 test) ends the new
+        reveal instead of being swapped for it later in the frame.
+        `Panels::settled(shown)` makes `revealed()`/`swapped()` what the frame laid out, so
+        toggles act on the reveal on screen. `revealed()`, `swapped()` and `design_choice()`
+        are read-only records. `settle` also holds every arrangement change while
+        `Editor::is_busy()` (a pointer gesture owns the canvas). The R57 check asks `wanted`
+        and treats rows a swap hides as not coming. Docked, both panels draw with their
+        single-panel ids; a swapped Design sheet's way back says "← Layers"/"← Theme", one
+        over the canvas "← Canvas" (the selection kept).
+      - **One Canvas title.** The left top row is `home_menu`, the title (`canvas_name` in a
+        slot that fills the row, recorded as `UiState::left_name_w`) and `layers_toggle` at the
+        right end. `float_left` gives the floating title the same slot, narrowed only to clear
+        the right bar (`right_edge`). `identity`, `compact_identity`, `paper_line`,
+        `paper_text` and `paper_menu` are gone; `go_to_paper` keeps the Paper navigation in
+        the menu; `save_hint` keeps a quiet "Edited"/"Saving…" after the name.
+      - **All Projects menu.** `home_menu` (the square control; `Popup::menu`) opens
+        `all_projects_menu`: Back to All Projects first (the same `AppRequest::Home`), then
+        `identity_menu`, Go to Paper and (without a native menu bar) every upstream menu,
+        Appearance, Background, About & notices. `app_menu` (`···`) is gone;
+        `Chrome::menu` records the same control as `Chrome::home`. The menu and every
+        submenu lay out in `scrolled` (an egui `ScrollArea` capped by `menu_height` from
+        `Chrome::surface`), after the run144 render showed the 320 × 240 menu cut off below Go
+        to Paper; no item was removed. `menu_height` is also its `min_scrolled_height`: the
+        run145 tests showed a 1280 × 800 menu stopping at about 430 px (the popup offers less
+        room than the surface), so a menu that fits is now shown whole.
+      - **An open popup owns the input** (run147; the lead's probe on frozen 145: with the
+        All Projects menu open and nothing focused, ArrowDown nudged the selected rectangle
+        from y 100 to 101, an undoable, saved edit). `ui::popup_open` (egui's public
+        `Popup::is_any_open`) is what both hosts now check, beside `captures_input`: the
+        browser host's `key_down` (after a focused field's own keys), `copy`/`paste` (no Cut
+        or Paste behind it) and `pointer_down`; native `App`'s pressed keys (releases still
+        reach the editor, so a held Space's pan ends), IME commits, mouse presses and touch
+        starts. Reason for the upstream-owned `src/app.rs` and `src/ui/mod.rs` change: the
+        same shared UI's menus, and the same hole, in both hosts; a fix. `home_menu` focuses
+        Back to All Projects when the menu is opened from the keyboard
+        (`clicked && !clicked_by(Primary)`, as egui's own submenus tell it), so egui's focus
+        moves through it with the arrow keys.
+      - **Cursors.** A layer or Paper row carried to a new place sets egui's `Grabbing` cursor.
+      - **Right bar.** `right_tools` (in the Design panel's row) and `float_right` hold
+        `export_button` (the existing `AppRequest::ExportFormat` and Copy as PNG/SVG
+        actions; labelled Export, no sharing service) and `zoom_group` (−, `text_button`
+        level with Fit, Selection, 100%, +; compact where there is no room) before
+        `design_toggle`, whose tooltip is now "Design". `zoom_controls` (lower left) is gone;
+        `Chrome::export` is new.
+      - **Design/Theme.** `UiState::left_tab` (`LeftTab`) and `left_switch` under the top row;
+        Theme hides the Paper and layer rows and finishes their renames first, as the Library
+        tab does; `start_paper_rename` and the layer Rename event switch back to Design.
+    - `src/ui/design_system.rs` (new): the Theme view, useful part first: the shown Paper's
+      text styles and colours (`text_styles`, `colours`, read through
+      `inspector::char_styles` and the node styles); choosing one only selects its layers
+      (`Editor::selection`), so edits go through the existing Design panel. Then one status
+      row each (`status_row`) for the font (the bundled Inter faces; the renderer draws no
+      other family), named tokens (no token store in `Document`) and `DESIGN.md` (no admitted
+      project route, and the guide reading/editing isn't built), reasons in tooltips and a
+      folded Details. Nothing is invented. (Run144 replaced its first, paragraph-heavy layout,
+      which filled a 320 × 240 sheet.)
+    - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
+      `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
+      arrow glyph is drawn at its target's near edge (targets unchanged).
+    - `src/ui/inspector.rs`: `paper_context` no longer repeats the Paper's name or a Rename
+      Paper… (its count reads "1 layer" / "n layers"); `char_styles` is `pub(crate)` for
+      Theme.
+    - `src/ui/pages.rs`: no shown-Paper name beside the folded Papers header; a row being
+      dragged to a new place sets the `Grabbing` cursor.
+    - Same Editor, Session, transactions, save, binding, lease, guards, renderer and document
+      formats; no new dependency, engine, token store or host route. Upstreamable as
+      presentation, except the Canvas/Paper vocabulary and the panel defaults (OPD choices).
 - Upstream changes in the browser host (not upstream-owned, for reference):
   - `WebState::pointer_down` keeps a press on a panel's resize handle from the editor
     (`Chrome::on_panel_edge`), as `App` does.
@@ -706,7 +793,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-19.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-20.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -801,6 +888,14 @@ the search field's resting look, filtering, Escape, empty and no-match states, t
 layout and the narrow layout are unchanged; no element, id or script changed. Both the view's
 HTML and the editor's WASM changed, so `home-18` is refused and a cached `home-18` view can't
 pass for this one. Not built, rendered, installed or natively accepted here.
+
+`home-20` (2026-10-21 source candidate) is the whole-app workbench's first slice (root
+`DESIGN.md` revision 20, the upstream entry above): the in-panel editor's contextual Design
+reveal, one Canvas title, the All Projects menu with Back to All Projects first, Export and the
+zoom in the right bar, separate Select and Hand, and the Design/Theme switch. The view's HTML,
+layout, search, kept preferences and Home freshness are unchanged; the editor's WASM changed,
+so `home-19` is refused and a cached `home-19` view can't pass for this one. Not built,
+rendered, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

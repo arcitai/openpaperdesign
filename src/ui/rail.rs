@@ -1,11 +1,11 @@
-//! The tool rail (DESIGN.md, revision 2 slice 2; slimmed in revision 18): one slim vertical
-//! rail at the canvas's left edge with six families that hold all sixteen tools. A family's
-//! main button runs its current member; its own small arrow (a separate target, always laid
-//! out, so nothing moves when it shows) opens a flyout of the family's tools. The arrow is
-//! drawn while its row is hovered or has the keyboard focus, while its flyout is open, and
-//! always for the current tool's family: a touch or other surface without hover reaches every
-//! flyout by choosing the family first, then its arrow. Choosing a tool, from the flyout or by
-//! its shortcut, makes it the family's member.
+//! The tool rail (DESIGN.md, revision 2 slice 2; slimmed in revision 18; revision 20 gives
+//! Hand its own button): one slim vertical rail at the canvas's left edge with seven families
+//! that hold all sixteen tools. A family's main button runs its current member; its own small
+//! arrow (a separate target, always laid out, so nothing moves when it shows) opens a flyout of
+//! the family's tools. The arrow is drawn while its row is hovered or has the keyboard focus,
+//! while its flyout is open, and always for the current tool's family: a touch or other surface
+//! without hover reaches every flyout by choosing the family first, then its arrow. Choosing a
+//! tool, from the flyout or by its shortcut, makes it the family's member.
 //! Escape closes an open flyout first (the hosts hold the key back from the canvas then, see
 //! [`Rail::captures_input`]); Escape outside it is the editor's own (back to Select), and every
 //! family keeps its member.
@@ -15,9 +15,12 @@ use crate::editor::{Editor, Tool};
 use crate::theme::{self, Icon};
 use egui::{Align2, Color32, Rect, pos2, vec2};
 
-/// The six families, in rail order, with their tools (the first is the initial member).
-pub const FAMILIES: [(&str, &[Tool]); 6] = [
-    ("Pointer", &[Tool::Select, Tool::Hand, Tool::Laser]),
+/// The seven families, in rail order, with their tools (the first is the initial member).
+/// Select (move) and Hand (pan) are separate buttons, each always visible; the Laser pointer
+/// stays in the Pointer family's flyout.
+pub const FAMILIES: [(&str, &[Tool]); 7] = [
+    ("Pointer", &[Tool::Select, Tool::Laser]),
+    ("Hand", &[Tool::Hand]),
     ("Frame", &[Tool::Frame]),
     (
         "Shapes",
@@ -35,18 +38,20 @@ pub const FAMILIES: [(&str, &[Tool]); 6] = [
 ];
 
 /// Rail geometry, in points (see DESIGN.md: 52 px wide, the 32 × 32 px main button and the
-/// arrow's own 12 × 32 px target beside it; revision 2's 24 px arrow column made it 64).
+/// arrow's own 12 × 32 px target beside it; revision 2's 24 px arrow column made it 64). Rows
+/// are 1 px apart (2 before revision 20's seventh row), so a 320 × 240 surface still fits
+/// seven 24 px rows under the floating bar.
 pub const ROW_H: f32 = 32.0;
-pub const ROW_GAP: f32 = 2.0;
+pub const ROW_GAP: f32 = 1.0;
 pub const PAD: f32 = 4.0;
 pub const MAIN_W: f32 = 32.0;
 pub const CHEVRON_W: f32 = 12.0;
 pub const RAIL_W: f32 = MAIN_W + CHEVRON_W + 2.0 * PAD;
 /// Distance from the canvas's edges.
 pub const INSET: f32 = 8.0;
-/// Room kept free under the rail for the zoom controls.
+/// Room kept free under the rail for the status line (the zoom was here until revision 20).
 pub const BOTTOM_RESERVE: f32 = 48.0;
-/// Below this canvas height the rail is anchored to the top and the zoom sits beside it.
+/// Below this room height the rail is anchored to the top.
 pub const SHORT_H: f32 = 270.0;
 /// The flyout's preferred width, its narrowest usable width beside the rail, and its row.
 pub const FLYOUT_W: f32 = 220.0;
@@ -59,7 +64,7 @@ pub const MIN_ROW_H: f32 = 24.0;
 /// The rail's frame stroke, outside its padding (egui's popup frame).
 const FRAME_STROKE: f32 = 1.0;
 
-/// The rail's height: six rows, their gaps and its padding.
+/// The rail's height: seven rows, their gaps and its padding.
 pub fn rail_height() -> f32 {
     rail_height_for(ROW_H)
 }
@@ -70,9 +75,9 @@ fn rail_height_for(row_h: f32) -> f32 {
 }
 
 /// The rows' height for a tools room (the canvas, or the part of it under the floating top
-/// row): `ROW_H`, or where six such rows don't fit between the room's insets (a short surface,
-/// 320 × 240 say), the whole pixels that do, down to `MIN_ROW_H`. The rail then never runs
-/// past its room, so egui never has to move it up under the floating row.
+/// row): `ROW_H`, or where seven such rows don't fit between the room's insets (a short
+/// surface, 320 × 240 say), the whole pixels that do, down to `MIN_ROW_H`. The rail then never
+/// runs past its room, so egui never has to move it up under the floating row.
 pub fn row_height(room: Rect) -> f32 {
     let n = FAMILIES.len() as f32;
     let fixed = (n - 1.0) * ROW_GAP + 2.0 * PAD + 2.0 * FRAME_STROKE;
@@ -145,7 +150,7 @@ pub struct RailRects {
 #[derive(Debug)]
 pub struct Rail {
     /// Each family's current member.
-    pub members: [Tool; 6],
+    pub members: [Tool; 7],
     /// The family whose flyout is open.
     pub flyout: Option<usize>,
     /// Layout of the last frame.
@@ -290,7 +295,10 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, rail: &mut Rail, canvas: Rect)
                                 };
                                 if shown {
                                     ui.painter().rect_filled(r, theme::RADIUS, fill);
-                                    let glyph = Rect::from_center_size(r.center(), vec2(8.0, 8.0));
+                                    // At the target's near edge, close to its button (revision
+                                    // 20); the target itself stays the whole 12 px column.
+                                    let at = pos2(r.left() + 4.5, r.center().y);
+                                    let glyph = Rect::from_center_size(at, vec2(7.0, 7.0));
                                     let lit = open || resp.hovered() || resp.has_focus();
                                     theme::paint_icon(
                                         ui.painter(),

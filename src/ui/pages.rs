@@ -1,11 +1,12 @@
-//! The pages list in the left panel, under the Canvas's identity (as in Figma): switch, add,
-//! rename, duplicate, delete and drag to reorder. People see a page as a Paper (DESIGN.md:
-//! the Canvas is the saved file, its Papers are its pages); the code keeps upstream's `page`.
+//! The pages list in the left panel's Design view, under the Canvas's title (as in Figma):
+//! switch, add, rename, duplicate, delete and drag to reorder. People see a page as a Paper
+//! (DESIGN.md: the Canvas is the saved file, its Papers are its pages); the code keeps
+//! upstream's `page`.
 
 use super::{UiState, section};
 use crate::editor::Editor;
 use crate::theme::{self, Icon};
-use egui::{Color32, RichText, Ui};
+use egui::{Color32, Ui};
 
 #[derive(Default)]
 pub struct PagesUi {
@@ -86,7 +87,6 @@ pub(super) fn run_action(
 }
 
 pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
-    let p = theme::pal(ui);
     let mut action = None;
     ui.horizontal(|ui| {
         let chevron = if st.pages.collapsed {
@@ -97,14 +97,9 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
         if theme::icon_button(ui, chevron, 16.0, false).clicked() {
             st.pages.collapsed = !st.pages.collapsed;
         }
+        // Revision 20: no shown Paper's name beside the folded header (it repeated the Canvas's
+        // title row's and the list's own); the list itself is where Papers are named.
         section(ui, "Papers");
-        if st.pages.collapsed {
-            ui.label(
-                RichText::new(ed.page_name())
-                    .size(theme::SECONDARY)
-                    .color(p.secondary),
-            );
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if theme::icon_button(ui, Icon::Plus, 20.0, false)
                 .on_hover_text("Add Paper")
@@ -244,6 +239,8 @@ fn page_row(
         && let Some(pos) = ui.input(|inp| inp.pointer.interact_pos())
         && let Some((from, _)) = st.pages.drag
     {
+        // The row is being carried to its new place (revision 20).
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         let to = ((pos.y - top) / (ROW_H + 1.0)).floor().max(0.0) as usize;
         st.pages.drag = Some((from, to.min(ed.pages.len() - 1)));
     }

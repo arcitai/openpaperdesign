@@ -625,7 +625,12 @@ impl WebState {
             pressed: true,
             modifiers: self.mods,
         });
-        let theirs = self.ui.captures_input() || self.ui.chrome.on_panel_edge(p);
+        // An open egui popup's press closes it (egui) and never also reaches the canvas, as an
+        // open flyout's or canvas menu's doesn't (run147: before, this route had no popup check,
+        // so the press that closed a menu went to the editor too, with the current tool).
+        let theirs = self.ui.captures_input()
+            || ui::popup_open(&self.ctx)
+            || self.ui.chrome.on_panel_edge(p);
         if self.over_canvas(p) && !theirs {
             // Clicking the canvas takes keyboard focus away from text fields.
             self.ctx.memory_mut(|m| {
@@ -759,6 +764,13 @@ impl WebState {
             }
             return true;
         }
+        // An open egui popup (a menu, a submenu, a choice's list; run147) owns the keys too:
+        // egui moves its focus, chooses and closes it (Escape), and the editor never also gets
+        // them. Before, with the All Projects menu open and nothing focused, ArrowDown nudged
+        // the selected rectangle 1 px (an undoable, saved edit behind the menu).
+        if ui::popup_open(&self.ctx) {
+            return true;
+        }
         // A rename just asked for (Rename Paper…, a layer's Rename) owns the keyboard before its
         // field has it: the Papers or layer rows may still be opening (a frame or two). Its keys
         // go to egui only, never to the editor's shortcuts (R57: an "r" typed then chose the
@@ -802,7 +814,8 @@ impl WebState {
     /// A `paste` event's text: into the egui text field that has the keyboard, else the
     /// editor's Paste (upstream reads it through its clipboard provider).
     pub fn paste(&mut self, text: &str) {
-        if self.field_has_keyboard() {
+        // An open popup's too (`ui::popup_open`): nothing is pasted onto the canvas behind it.
+        if self.field_has_keyboard() || ui::popup_open(&self.ctx) {
             self.events.push(egui::Event::Paste(text.to_string()));
         } else {
             self.clipboard.borrow_mut().incoming = Some(text.to_string());
@@ -817,7 +830,8 @@ impl WebState {
     /// on the next frame (its text then comes from `take_clipboard_text`).
     pub fn copy(&mut self, cut: bool) -> Option<String> {
         self.redraw = true;
-        if self.field_has_keyboard() {
+        // An open popup's too: no Cut deletes the selection behind it.
+        if self.field_has_keyboard() || ui::popup_open(&self.ctx) {
             self.events.push(if cut {
                 egui::Event::Cut
             } else {

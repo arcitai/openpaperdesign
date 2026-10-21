@@ -1010,7 +1010,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(p) = p else { return };
                 // While a tool flyout or the canvas's menu is open the press only closes it; a
                 // press on a panel's resize handle (into the canvas) only resizes the panel.
+                // An open egui popup's press too (`ui::popup_open`): egui closes the popup, and
+                // the press never also reaches the canvas.
                 let theirs = self.st.captures_input()
+                    || ui::popup_open(&self.ctx)
                     || self
                         .st
                         .chrome
@@ -1107,7 +1110,11 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let focused = self.ctx.memory(|m| m.focused());
                 let rail_key = rail.is_some_and(|k| self.st.rail.takes_key(k, focused));
-                if self.ctx.egui_wants_keyboard_input() || flyout_escape || rail_key {
+                // An open egui popup owns the keys pressed while it is open (`ui::popup_open`):
+                // egui moves its focus, chooses and closes it. Releases still reach the editor,
+                // so a key held from before (Space's pan) still ends.
+                let popup = ui::popup_open(&self.ctx) && event.state == ElementState::Pressed;
+                if self.ctx.egui_wants_keyboard_input() || flyout_escape || rail_key || popup {
                     self.gfx.as_ref().unwrap().window.request_redraw();
                     return;
                 }
@@ -1144,7 +1151,7 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw = true;
             }
             WindowEvent::Ime(winit::event::Ime::Commit(s)) => {
-                if !self.ctx.egui_wants_keyboard_input() {
+                if !self.ctx.egui_wants_keyboard_input() && !ui::popup_open(&self.ctx) {
                     self.ed.handle(InputEvent::Text(s));
                 }
                 redraw = true;
@@ -1313,6 +1320,7 @@ impl App {
         let pressure = t.force.map(|f| f.normalized());
         let pos = self.to_canvas(p);
         let theirs = self.st.captures_input()
+            || ui::popup_open(&self.ctx)
             || self
                 .st
                 .chrome

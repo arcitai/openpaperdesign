@@ -129,7 +129,7 @@ pub fn uniform<T: PartialEq>(nodes: &[Node], f: impl Fn(&Node) -> T) -> Option<T
 /// Every distinct style the characters of a text layer have, as upstream's
 /// `TextStyle::char_style` resolves them for the layout: one per run between its ranges' edges,
 /// or the layer's own style when it has no text.
-fn char_styles(n: &Node) -> Vec<crate::model::CharStyle> {
+pub(crate) fn char_styles(n: &Node) -> Vec<crate::model::CharStyle> {
     let len = n.kind.text().map_or(0, |t| t.chars().count());
     let size = n.kind.font_size().unwrap_or(16.0);
     let color = n
@@ -722,34 +722,20 @@ fn nothing_selected(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
 }
 
 /// The shown Paper (a page of the Canvas, DESIGN.md) and the view, with nothing selected. Paper:
-/// its name and what it holds, which are the document's (a Paper has no fill or size of its own
-/// to show); Rename Paper… opens its one rename field, in the Papers list, so a name is changed
-/// in one place, once, on its own Paper. View: the canvas's grid, a view preference that is
-/// never the Paper's, its undo, its saves or an export.
+/// what it holds, the document's (a Paper has no fill or size of its own to show). Its name is
+/// not repeated here (revision 20): it is named and renamed in the Papers list, one field, one
+/// path. View: the canvas's grid, a view preference that is never the Paper's, its undo, its
+/// saves or an export.
 fn paper_context(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
     use crate::render::scene::Background;
     ui.label(title_text("Paper"));
-    let name = ed.page_name().to_string();
-    let secondary = |t: String| RichText::new(t).size(theme::SECONDARY + 1.0);
-    row(ui, "Name", |ui| {
-        let label = egui::Label::new(secondary(name.clone())).truncate();
-        ui.add(label).on_hover_text(name.clone());
-    });
-    let count = format!("{} layers", ed.doc.nodes.len());
+    let count = match ed.doc.nodes.len() {
+        1 => "1 layer".to_string(),
+        n => format!("{n} layers"),
+    };
     row(ui, "Content", |ui| {
-        ui.label(secondary(count));
+        ui.label(RichText::new(count).size(theme::BODY));
     });
-    let place = format!("{} of {}", ed.active_page + 1, ed.pages.len());
-    row(ui, "Paper", |ui| {
-        ui.label(secondary(place));
-    });
-    if ui
-        .small_button("Rename Paper…")
-        .on_hover_text("Rename this Paper in the Papers list")
-        .clicked()
-    {
-        super::start_paper_rename(ed, st);
-    }
     separator(ui);
     ui.label(title_text("View"));
     let grids: Vec<(Background, &str)> = Background::ALL.iter().map(|b| (*b, b.label())).collect();

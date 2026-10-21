@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-20 (evening): the one-app source candidate's `home-19` view (unqualified; the Paper-inspired polish of the editor's and the home's tokens, after `home-18`'s owner UX revision: an editor without a full-width header and the home's search drawn as one at rest). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-21: the one-app source candidate's `home-20` view (unqualified; the whole-app workbench's first slice: contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch; after `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The

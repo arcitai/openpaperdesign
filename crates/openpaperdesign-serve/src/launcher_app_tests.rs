@@ -2871,8 +2871,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-19.html",
-        "versioned for the Paper-inspired polish (a changed view and in-panel editor)"
+        HOME_URI, "ui://openpaperdesign/home-20.html",
+        "versioned for the whole-app workbench (a changed in-panel editor)"
     );
 }
 
