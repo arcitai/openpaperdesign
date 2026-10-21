@@ -86,7 +86,9 @@ function fakeServer(wasm = new Uint8Array(600000).fill(0x61)) {
   // The canvas as the server has it: its pages (id, name, revision, page file), the active page
   // and the canvas revision; `saved` is the last canvas save it stored.
   const srv = { calls: [], canvas: { active_page: 'p1', pages: [{ id: 'p1', name: 'Page 1', revision: '"a"', text: '{"page":1}' }] },
-    revision: '"r1"', saved: undefined, mounts: new Set(), next: 0, wasm, identity: IDENTITY, override: {}, holds: {} };
+    revision: '"r1"', saved: undefined, mounts: new Set(), next: 0, wasm, identity: IDENTITY, override: {}, holds: {},
+    // The file's name as the server has it (a rename elsewhere changes it).
+    name: 'Plan' };
   srv.part = (i) => {
     const parts = Math.ceil(srv.wasm.length / PART);
     const start = i * PART;
@@ -101,7 +103,7 @@ function fakeServer(wasm = new Uint8Array(600000).fill(0x61)) {
     if (srv.holds[name]) await srv.holds[name];
     if (srv.override[name]) return srv.override[name](a);
     const pinned = () => a.binding === BINDING && srv.mounts.has(a.mount);
-    const canvas = (mount) => ok({ binding: BINDING, canvas: { name: 'Plan' }, revision: srv.revision,
+    const canvas = (mount) => ok({ binding: BINDING, canvas: { name: srv.name }, revision: srv.revision,
       active_page: srv.canvas.active_page, pages: srv.canvas.pages, mount });
     switch (name) {
       case T.ASSET: return ok(srv.part(a.part));
@@ -177,6 +179,16 @@ function fakeEnv() {
   return env;
 }
 
+// The file's name in a canvas text the editor is given, or null.
+function nameIn(text) {
+  try {
+    const c = JSON.parse(text).canvas;
+    return c && typeof c.name === 'string' ? c.name : null;
+  } catch {
+    return null;
+  }
+}
+
 // The stand-in engine: records the bytes it is given and boots a mock editor.
 function fakeEngine() {
   const eng = { inits: [], editors: [] };
@@ -203,7 +215,15 @@ function fakeEngine() {
       save_snapshot() { const s = this.pending; this.pending = undefined; return s; },
       save_succeeded() { this.calls.push('saved'); }, save_failed() { this.calls.push('save_failed'); },
       dirty() { return this.pending !== undefined; }, can_reload() { return this.canReload && this.pending === undefined; },
-      reload(t) { this.calls.push('reload:' + t); }, free() { this.freed = true; } };
+      // The Canvas's name the editor has (web.rs `canvas_name`): the one it opened, a finished
+      // rename (a test sets `title`), or a reload's, as the real editor takes it.
+      title: nameIn(text) || '', canvas_name() { return this.title; },
+      reload(t) {
+        this.calls.push('reload:' + t);
+        const n = nameIn(t);
+        if (n !== null) this.title = n;
+      },
+      free() { this.freed = true; } };
     eng.editors.push(ed);
     return ed;
   };
@@ -343,6 +363,58 @@ test('an edit is saved through the canvas tool, pinned to its mount; Ready is th
   t.refs.canvas.fire('keydown', key);
   assert.equal(key.stopped, true);
   assert.ok(t.ed.calls.includes('key:Escape'));
+});
+
+test('R61-F2: the editor reports its Canvas\'s current name (a rename, a reload) once per change; a left editor reports nothing', async () => {
+  const t = setup();
+  const names = [];
+  const h = t.panel.open({ binding: BINDING, refs: t.refs, onStatus: () => {}, onName: (n) => names.push(n) });
+  assert.equal(await h.started, 'mounted');
+  const ed = t.engine.editors.at(-1);
+  ed.isReady = true;
+  t.env.frame(16);
+  await flush();
+  assert.deepEqual(names, ['Plan'], 'the name it opened with');
+  t.env.frame(32);
+  assert.deepEqual(names, ['Plan'], 'only a change is reported');
+  // A finished rename in the same mounted editor (Unicode, as typed), with an unsaved change:
+  // reported at once; nothing remounted; the change stays and is saved once, as any change.
+  const renamed = 'OPD Linux 21-10 — æøå 🌙';
+  ed.title = renamed;
+  ed.pending = '{"pages":[],"renamed":true}';
+  t.env.frame(48);
+  assert.deepEqual(names, ['Plan', renamed]);
+  assert.equal(t.engine.editors.length, 1, 'the same editor');
+  assert.equal(t.refs.canvas.replacedBy, undefined, 'the same canvas');
+  assert.equal(ed.pending, '{"pages":[],"renamed":true}', 'its unsaved change is untouched');
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, 1, 'saved once');
+  t.env.frame(64);
+  assert.deepEqual(names, ['Plan', renamed], 'the save reports nothing new');
+  // Renamed elsewhere (an agent, Home's Rename): the reload in place reports the server's name.
+  t.srv.name = 'Renamed elsewhere';
+  t.srv.revision = '"elsewhere"';
+  t.env.every(1000);
+  await flush();
+  assert.ok(ed.calls.some((c) => c.startsWith('reload:')), 'reloaded in place');
+  t.env.frame(80);
+  assert.deepEqual(names, ['Plan', renamed, 'Renamed elsewhere']);
+  // A poll still under way when the editor is left: its late answer reports nothing, nor does
+  // anything after.
+  t.srv.name = 'Too late';
+  t.srv.revision = '"later"';
+  let answer;
+  t.srv.holds[T.REVISION] = new Promise((r) => { answer = r; });
+  t.env.every(1000);
+  await flush();
+  await h.dispose();
+  delete t.srv.holds[T.REVISION];
+  answer();
+  await flush();
+  ed.title = 'Too late';
+  t.env.frame(96);
+  assert.deepEqual(names, ['Plan', renamed, 'Renamed elsewhere'], 'nothing after leaving');
 });
 
 test('leaving waits for the save under way and saves what is left; then everything is undone once', async () => {

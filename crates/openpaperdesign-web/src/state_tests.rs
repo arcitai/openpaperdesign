@@ -5477,6 +5477,89 @@ fn rev20_the_all_projects_menu_works_from_the_keyboard() {
 }
 
 #[test]
+fn rev20_a_held_space_released_while_a_menu_has_the_focus_ends_the_pan() {
+    // R61-F1 (the R61 review's reproduction): Space held on the canvas, All Projects opened with
+    // the pointer, Tab until a widget of the menu has the focus, Space released there, Escape,
+    // then a Select drag. Before, the release stayed with egui (a focused widget has the
+    // keyboard), Space stayed held and the drag panned the camera by (-80, -40) instead of
+    // moving the rectangle. With the menu unfocused, and with no menu at all, as controls.
+    for case in ["no menu", "menu", "menu focused"] {
+        let mut s = fresh(W, H);
+        s.run(Action::TogglePanels);
+        timed_frames(&mut s, 4);
+        let id = s.ed.doc.root[0];
+        let original = s.ed.doc.get(id).unwrap().rect;
+        let undo = s.ed.history.undo_len();
+        assert!(s.key_down(" ", "Space", false));
+        timed_frames(&mut s, 1);
+        assert!(s.ed.space_down, "{case}: Space holds the pan");
+        if case != "no menu" {
+            open_menu(&mut s, 1000.0);
+            assert!(paints(&mut s, "Back to All Projects"), "{case}: open");
+        }
+        if case == "menu focused" {
+            let mut tabs = 0;
+            while !focused(&s).is_some_and(|(_, in_menu)| in_menu) {
+                assert!(tabs < 100, "Tab reaches the menu");
+                press(&mut s, "Tab", "Tab");
+                timed_frames(&mut s, 3);
+                tabs += 1;
+            }
+            assert!(s.field_has_keyboard(), "the menu has the keyboard");
+        }
+        assert!(s.ed.space_down, "{case}: still held");
+        s.key_up(" ", "Space");
+        timed_frames(&mut s, 2);
+        assert!(!s.ed.space_down, "{case}: the release ends the pan");
+        if case != "no menu" {
+            press(&mut s, "Escape", "Escape");
+            timed_frames(&mut s, 3);
+            assert!(!paints(&mut s, "Back to All Projects"), "{case}: closed");
+        }
+        assert_eq!(s.ed.history.undo_len(), undo, "{case}: nothing edited");
+        assert_eq!(s.ed.tool, Tool::Select, "{case}");
+        let camera = s.ed.camera;
+        let (from, to) = (at(&s, 150.0, 150.0), at(&s, 230.0, 190.0));
+        let t = s.now_ms + 1000.0;
+        drag(&mut s, from, to, t);
+        timed_frames(&mut s, 3);
+        let r = s.ed.doc.get(id).unwrap().rect;
+        assert!(
+            (r.x - original.x - 80.0).abs() < 8.0 && (r.y - original.y - 40.0).abs() < 8.0,
+            "{case}: the Select drag moved the rectangle: {r:?}"
+        );
+        assert_eq!(s.ed.camera, camera, "{case}: no pan");
+    }
+}
+
+#[test]
+fn rev20_a_held_space_released_in_a_text_field_ends_the_pan_and_the_field_keeps_its_own() {
+    // R61-F1, the field side: Space held on the canvas, then the palette's search takes the
+    // keyboard; releasing Space there still ends the pan. Control: a Space typed into the field
+    // is the field's text, and the editor never holds it.
+    let mut s = fresh(W, H);
+    assert!(s.key_down(" ", "Space", false));
+    assert!(s.ed.space_down, "Space holds the pan");
+    open_palette(&mut s);
+    assert!(s.ed.space_down, "still held");
+    s.key_up(" ", "Space");
+    step(&mut s);
+    assert!(!s.ed.space_down, "the release ends the pan");
+    s.paste("abc");
+    step(&mut s);
+    press(&mut s, " ", "Space");
+    step(&mut s);
+    assert!(!s.ed.space_down, "the field's own Space never pans");
+    s.key_up(" ", "Space");
+    step(&mut s);
+    assert_eq!(s.ui.palette.query, "abc ", "typed into the search");
+    press(&mut s, "Escape", "Escape");
+    step(&mut s);
+    assert!(!s.ui.palette.open);
+    assert!(!s.dirty(), "nothing edited");
+}
+
+#[test]
 fn rev20_the_press_that_closes_a_menu_never_reaches_the_canvas() {
     // Run147 (same ownership, the pointer side): with the Rectangle tool active and the All
     // Projects menu open, a click on blank canvas closes the menu and draws nothing, as a press

@@ -112,6 +112,8 @@ async function main() {
     firstPage: first,
     forceWebgl,
     state,
+    // The tab's title follows the name the editor has now: a finished rename, a reload's.
+    onName: (name) => { document.title = `${name || project.name} — openpaperdesign`; },
     onReady: (session) => {
       window.__opdEditor = session.ed;
       // Tell this page's own server that the page loaded and the renderer is Ready, so the

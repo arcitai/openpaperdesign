@@ -1898,6 +1898,42 @@ test('explicit Dark keeps Home dark against a light host palette (the observed d
   panelOnly(v);
 });
 
+test('R61-F2: the editor region is named after the shown editor\'s current Canvas name; a left editor names nothing', async () => {
+  // The R61 review's DOM: after a saved rename the region (labelled by #ed-title) still said the
+  // name the editor was opened with. It now follows the name the shown editor reports (panel.js
+  // `onName`: a finished rename, a reload), in the same mounted editor.
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  const opened = v.els['ed-title'].textContent;
+  assert.ok(opened, 'named when it was opened');
+  assert.equal(typeof h.o.onName, 'function', 'the view asks the editor for its name');
+  h.o.onStatus('Ready');
+  const renamed = 'OPD Linux 21-10 — æøå 🌙';
+  h.o.onName(renamed);
+  assert.equal(v.els['ed-title'].textContent, renamed, 'a finished rename');
+  assert.equal(fake.handles.length, 1, 'nothing remounted');
+  assert.ok(!fake.log.includes('dispose'), 'nor left');
+  h.o.onName('<b>Bold</b> & co');
+  assert.equal(v.els['ed-title'].textContent, '<b>Bold</b> & co', 'a name is text, never markup');
+  h.o.onName('');
+  assert.equal(v.els['ed-title'].textContent, 'Canvas', 'an empty name says Canvas');
+  // Home, then another editor: the left one's late report never renames the shown one.
+  h.o.onName(renamed);
+  h.o.onHome();
+  await flush();
+  await closedHome(v);
+  await relist(v);
+  await openInPanel(v);
+  const current = fake.handles[1];
+  assert.equal(v.els['ed-title'].textContent, opened, 'the new editor\'s own name');
+  h.o.onName('Stale');
+  assert.equal(v.els['ed-title'].textContent, opened, 'the left editor names nothing');
+  current.o.onName('Current name');
+  assert.equal(v.els['ed-title'].textContent, 'Current name');
+  panelOnly(v);
+});
+
 test('explicit Light keeps Home light against a dark host palette', async () => {
   const { v } = await appearanceView('light', DARK_HOST);
   assert.equal(v.rootAttrs['data-theme'], 'light');

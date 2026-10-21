@@ -215,6 +215,9 @@ export function opdIsMac(nav) {
  *   onHome()                         upstream's Home/New/Open: the host's own way back to its
  *                                    canvases (which saves and drains first); without it the
  *                                    status line says where that is
+ *   onName(name)                     the Canvas's name as the editor has it now (its first,
+ *                                    a finished rename, a reload's), once per change: the
+ *                                    host's own accessible name of the editor follows it
  *   log(message), env                (see opdBrowserEnv)
  * }
  * Returns { session, started, drain(), resume(), dispose(), hostThemeChanged(), setAppearance(a),
@@ -382,7 +385,19 @@ export function opdMountEditor(opts) {
   if (media && typeof media.addEventListener === 'function') on(media, 'change', system);
 
   // ---- what the editor asks the page for, after each frame
+  // The Canvas's name last reported (`onName`), so only a change is.
+  let reportedName = null;
   const afterFrame = () => session.withEditor((ed) => {
+    // The name the editor has now (R61-F2: the host's region and heading kept the name the
+    // editor was opened with). Read after the frame that applied a rename or a reload, from the
+    // editor itself; nothing is asked of the server for it.
+    if (!disposed && opts.onName && typeof ed.canvas_name === 'function') {
+      const name = ed.canvas_name();
+      if (typeof name === 'string' && name !== reportedName) {
+        reportedName = name;
+        opts.onName(name);
+      }
+    }
     if (session.canvas && session.canvas.style) session.canvas.style.cursor = ed.cursor();
     for (let r = ed.take_request(); r !== undefined && r !== null; r = ed.take_request()) {
       if (r === 'save') lib.saveStep(session, ui);

@@ -321,6 +321,12 @@ impl WebEditor {
         self.state.appearance().to_string()
     }
 
+    /// The Canvas's name now (see [`WebState::canvas_name`]): the page's accessible name of
+    /// this editor follows it.
+    pub fn canvas_name(&self) -> String {
+        self.state.canvas_name().to_string()
+    }
+
     /// Whether the workspace is shown dark now.
     pub fn dark(&self) -> bool {
         self.state.dark()

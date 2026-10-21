@@ -44,7 +44,11 @@ revision 18 and 19 sections stay as history.
   there is no Paper line under the title and no shown-Paper name beside the folded Papers
   header. The Papers list (Design view) is where Papers are named, switched and renamed; the
   title's menu and the All Projects menu keep Rename Paper… (the same one field) and Go to
-  Paper. The inspector no longer repeats the Paper's name or a Rename Paper… button.
+  Paper. The inspector no longer repeats the Paper's name or a Rename Paper… button. The
+  page's own name for the open editor (Home's editor region and its heading, the browser
+  tab's title) follows the title the editor has now: a finished rename at once, a rename made
+  elsewhere with its reload (R61-F2: the region kept the name it was opened with), in the
+  same mounted editor.
 - **All Projects menu.** The square All Projects control opens one menu whose first item is
   Back to All Projects (the same guarded way home); the separate `···` button is gone, its
   items now in this menu. Where the surface is tall enough the menu and its submenus are
@@ -59,7 +63,10 @@ revision 18 and 19 sections stay as history.
   keys move through it, Enter or Space chooses, Escape closes it, and the selection stays.
   Opened with the pointer, nothing in it has the focus, so the arrow keys do nothing (keyboard
   use starts from the focused All Projects control). Other menus (Export, the zoom level, a Paper row's) get the same
-  protection but not that first focus. All of it awaits the lead's rendered keyboard check.
+  protection but not that first focus. A key's release always reaches the canvas, whoever has
+  the keyboard then (R61-F1): Space held on the canvas and released while a menu item or a
+  field has the focus ends the pan, so the next Select drag moves, not pans. All of it awaits
+  the lead's rendered keyboard check.
 - **Balanced corner bars.** Each bar's toggle is at its right end. The right bar holds Export
   (the existing exports and copies; labelled Export because there is no sharing service, issue
   #2) and the zoom (−, level, +), in the open Design panel's top row or floating at the

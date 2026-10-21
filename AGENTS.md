@@ -640,6 +640,13 @@ engine architecture is `analysis/DESIGN.md`.
         Back to All Projects when the menu is opened from the keyboard
         (`clicked && !clicked_by(Primary)`, as egui's own submenus tell it), so egui's focus
         moves through it with the arrow keys.
+      - **Releases always reach the editor** (R61-F1, P2; the R61 review's reproduction:
+        Space held on the canvas, a pointer-opened menu given the focus with Tab, Space
+        released there, Escape, then a Select drag panned the camera by (-80, -40) instead of
+        moving the rectangle). The browser host's `key_up` and native `App`'s released keys
+        no longer go through the focused-field/popup guard: upstream acts on a release only to
+        let go of a key it holds (`Editor::space_down`), so presses keep their owners and a
+        held key still ends. The native side is the same source change, not a Mac reproduction.
       - **Cursors.** A layer or Paper row carried to a new place sets egui's `Grabbing` cursor.
       - **Right bar.** `right_tools` (in the Design panel's row) and `float_right` hold
         `export_button` (the existing `AppRequest::ExportFormat` and Copy as PNG/SVG
@@ -677,6 +684,14 @@ engine architecture is `analysis/DESIGN.md`.
     (`set_background`).
   - It saves a finished title rename in the canvas save (`saved_name`, the in-flight
     `name`). A draft is guarded as the renames are, and a reload closes it.
+  - The page's accessible name of its editor follows the editor's own (R61-F2, P2: Home's
+    `#editor` region, labelled by `#ed-title`, kept the name it was mounted with after a saved
+    rename). `WebState::canvas_name` / `WebEditor::canvas_name` (upstream's
+    `UiState::project_name`: a finished rename, a reload's) is read after each frame by the
+    shared mount (`editor.js` `onName`, once per change, never after disposal); `panel.js`
+    passes it on only while that editor isn't left, and Home sets `#ed-title` as text only for
+    the shown editor (`panelHandle === h`); the browser page sets its tab title. No remount,
+    server call, save or new timer.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
   from `main`, run the checks below and land it with a PR into `main`. Do not rewrite upstream
   history.

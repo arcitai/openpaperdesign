@@ -422,6 +422,13 @@ impl WebState {
         true
     }
 
+    /// The Canvas's name as this editor has it now: upstream's title (`UiState::project_name`),
+    /// which a finished rename sets at once and a reload sets to the server's. Never a draft
+    /// still being typed. The page names its editor with it (its region and title, R61-F2).
+    pub fn canvas_name(&self) -> &str {
+        &self.ui.project_name
+    }
+
     /// The person's appearance preference now: `system`, `light` or `dark`.
     pub fn appearance(&self) -> &'static str {
         appearance_name(self.ui.appearance)
@@ -803,9 +810,12 @@ impl WebState {
                 modifiers: self.mods,
             });
         }
-        if !self.field_has_keyboard()
-            && let Some(k) = keys::key(self.ed.mods, self.ed.text_edit.is_some(), key, code)
-        {
+        // Every release reaches the editor, whoever has the keyboard now (R61-F1): upstream acts
+        // on a release only to let go of a key it holds (Space's pan, `Editor::space_down`), so a
+        // key pressed on the canvas and released after a field or a menu took the keyboard still
+        // ends. Before, such a release stayed with egui (a menu item had the focus) and the next
+        // Select drag panned. Presses keep their owners (`key_down`).
+        if let Some(k) = keys::key(self.ed.mods, self.ed.text_edit.is_some(), key, code) {
             self.ed.handle(InputEvent::KeyUp { key: k });
         }
         self.redraw = true;

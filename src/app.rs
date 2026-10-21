@@ -1111,10 +1111,15 @@ impl ApplicationHandler<UserEvent> for App {
                 let focused = self.ctx.memory(|m| m.focused());
                 let rail_key = rail.is_some_and(|k| self.st.rail.takes_key(k, focused));
                 // An open egui popup owns the keys pressed while it is open (`ui::popup_open`):
-                // egui moves its focus, chooses and closes it. Releases still reach the editor,
-                // so a key held from before (Space's pan) still ends.
-                let popup = ui::popup_open(&self.ctx) && event.state == ElementState::Pressed;
-                if self.ctx.egui_wants_keyboard_input() || flyout_escape || rail_key || popup {
+                // egui moves its focus, chooses and closes it. Every release still reaches the
+                // editor, whoever has the keyboard (R61-F1): upstream acts on a release only to
+                // let go of a key it holds (Space's pan), so a key pressed on the canvas and
+                // released after a field or a menu item took the focus still ends.
+                let owned = self.ctx.egui_wants_keyboard_input()
+                    || flyout_escape
+                    || rail_key
+                    || ui::popup_open(&self.ctx);
+                if owned && event.state == ElementState::Pressed {
                     self.gfx.as_ref().unwrap().window.request_redraw();
                     return;
                 }

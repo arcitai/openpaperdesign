@@ -1579,7 +1579,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     panelBinding = binding;
     display = newDisplay();
     // The file's name is the workspace's own top-bar title (from the canvas it loads); here it
-    // only names the view for assistive technology.
+    // only names the view for assistive technology (the region is labelled by this heading).
+    // It follows the name the shown editor has (`onName` below): a rename, a reload.
     $('ed-title').textContent = name;
     edRenderer('');
     stayReason = false;
@@ -1612,6 +1613,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       // editor's menus, kept the same way.
       background: canvasBackground.value,
       onBackground: (b) => { if (panelHandle === h) keepBackground(b, h); },
+      // The name the shown editor has now (R61-F2: the region kept the name it was opened with
+      // after a rename). Only the shown editor's: a left or replaced one names nothing. Text,
+      // never markup; an empty name falls back to "Canvas".
+      onName: (n) => { if (panelHandle === h) $('ed-title').textContent = n || 'Canvas'; },
     });
     panelHandle = h;
     h.started.catch((e) => {

@@ -157,10 +157,12 @@ export function opdCreatePanel(opts) {
    * banner). `onHome`: the view's own way back (upstream's Home, New and Open ask for it).
    * Appearance (see opdMountEditor): `appearance` the view's kept preference, `hostTheme()` the
    * host's theme, `onAppearance(appearance)` a new choice from the editor's menu. The canvas
-   * background the same way: `background` and `onBackground(background)`.
+   * background the same way: `background` and `onBackground(background)`. `onName(name)`: the
+   * Canvas's name as this editor has it now (a finished rename, a reload's), for the view's own
+   * accessible name of the editor; never once this editor was left.
    */
   function open({ binding, refs, onStatus, onReady, onHome, appearance, hostTheme, onAppearance,
-    background, onBackground }) {
+    background, onBackground, onName }) {
     const h = { left: false, mounted: null, mount: null, released: false };
     // The kept preferences, as the view knows them now (it can learn them late,
     // `setAppearance`, `setBackground`): the editor is mounted with the latest ones.
@@ -263,6 +265,7 @@ export function opdCreatePanel(opts) {
         onAppearance: (a) => { if (live() && onAppearance) onAppearance(a); },
         background: keptBackground,
         onBackground: (b) => { if (live() && onBackground) onBackground(b); },
+        onName: (n) => { if (live() && onName) onName(n); },
         transport: { fetchPage, put, revision },
         firstPage: canvasPage(v),
         forceWebgl: false,
