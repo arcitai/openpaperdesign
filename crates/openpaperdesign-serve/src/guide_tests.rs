@@ -638,3 +638,227 @@ fn a_refusal_never_changes_the_guide() {
         assert_eq!(g.bytes(), &bytes[..], "{block}");
     }
 }
+
+// ---- R63 corrections
+
+#[test]
+fn an_empty_line_after_a_lone_cr_stays_a_line() {
+    // R63-1: "a\rb\n" made "a\n\n" proposed "a\r\n": the new empty line's LF followed the
+    // kept lone CR and read as one CRLF, so the empty line was lost. It takes a lone CR.
+    let g = Guide::read(b"a\rb\n").unwrap();
+    let w = write(g.plan_text(g.revision(), "a\n\n").unwrap());
+    assert_eq!(w.bytes, b"a\r\r");
+    let back = Guide::read(&w.bytes).unwrap();
+    assert_eq!(back.lines().len(), 2);
+    assert_eq!(back.line_text(1), "");
+    // Before a kept line too; that line keeps its CRLF.
+    let g = Guide::read(b"a\rb\nc\r\n").unwrap();
+    let w = write(g.plan_text(g.revision(), "a\n\nc\n").unwrap());
+    assert_eq!(w.bytes, b"a\r\rc\r\n");
+    // An unchanged empty LF line that an edit would bring right after a lone CR: kept as it is,
+    // its LF would complete that CR and the line would be lost, and its bytes are never
+    // rewritten to avoid it. Nothing is proposed. (The first R63 correction rewrote the LF.)
+    let before = b"x\ry\n\nz\n";
+    let g = Guide::read(before).unwrap();
+    assert_eq!(
+        g.plan_text(g.revision(), "x\n\nz\n"),
+        Err(PlanError::LineEndMerge)
+    );
+    assert_eq!(g.bytes(), before);
+    // A second empty line there: either a proposal that leaves the unchanged empty line's
+    // bytes (4..5) outside every hunk and reads back as the draft, or the same refusal.
+    match g.plan_text(g.revision(), "x\n\n\nz\n") {
+        Err(e) => assert_eq!(e, PlanError::LineEndMerge),
+        Ok(p) => {
+            let w = write(p);
+            let outside = w
+                .hunks
+                .iter()
+                .all(|h| h.original.end <= 4 || h.original.start >= 5);
+            assert!(outside, "{:?}", w.hunks);
+            let back = Guide::read(&w.bytes).unwrap();
+            let texts: Vec<&str> = (0..back.lines().len()).map(|i| back.line_text(i)).collect();
+            assert_eq!(texts, ["x", "", "", "z"]);
+        }
+    }
+    assert_eq!(g.bytes(), before);
+    // Anywhere else an empty line takes the usual terminator (control).
+    let g = Guide::read(b"a\nb\r\n").unwrap();
+    let w = write(g.plan_text(g.revision(), "a\n\nb\n").unwrap());
+    assert_eq!(w.bytes, b"a\n\nb\r\n");
+    let g = Guide::read(b"a\r\nb\n").unwrap();
+    let w = write(g.plan_text(g.revision(), "a\n\n").unwrap());
+    assert_eq!(w.bytes, b"a\r\n\n");
+}
+
+#[test]
+fn a_broken_block_marked_with_an_escaped_name_is_never_unmarked_data() {
+    // R63-2: the marker spelled with escapes, in a block that doesn't parse, was taken for
+    // unmarked data, so a valid block beside it was editable. The escaped name is built here
+    // (a backslash, then u006f for its first letter) so the guide's bytes hold the escape,
+    // never the plain name.
+    let escaped = ["\\", "u006fpdDesignTokens"].concat();
+    let broken = |template: &str| {
+        let json = template.replace("MARK", &escaped);
+        assert!(
+            json.contains(&escaped) && !json.contains(BLOCK_KEY),
+            "{json}"
+        );
+        format!("```json\n{json}\n```")
+    };
+    let duplicate_names = r##"{"MARK":1,"colors":{"x":"#112233","x":"#332211"}}"##;
+    for template in [
+        duplicate_names,
+        r##"{"MARK":1,}"##,
+        r##"{"MARK":1,"MARK":1}"##,
+    ] {
+        let bytes = fenced(&broken(template));
+        let g = Guide::read(&bytes).unwrap();
+        assert!(matches!(g.tokens(), Tokens::ReadOnly { .. }), "{template}");
+        assert_eq!(g.bytes(), &bytes[..]);
+    }
+    let x = path(Group::Colors, "x");
+    let black = TokenValue::Color(Color::BLACK);
+    let valid = r##"```json
+{"opdDesignTokens":1,"colors":{"x":"#010203"}}
+```"##;
+    let bytes = fenced(&format!("{valid}\n{}", broken(duplicate_names)));
+    let g = Guide::read(&bytes).unwrap();
+    assert!(matches!(
+        g.tokens(),
+        Tokens::ReadOnly {
+            reason: ReadOnly::Multiple,
+            ..
+        }
+    ));
+    assert!(matches!(
+        g.plan_value(g.revision(), &x, &black),
+        Err(EditError::NotEditable { .. })
+    ));
+    assert_eq!(g.bytes(), &bytes[..]);
+    // A valid block marked with the escaped name is the supported block (control).
+    let bytes = fenced(&valid.replace(BLOCK_KEY, &escaped));
+    let g = Guide::read(&bytes).unwrap();
+    let w = write(g.plan_value(g.revision(), &x, &black).unwrap());
+    assert_eq!(
+        w.bytes,
+        replaced(&bytes, "\"#010203\"", "\"#000000\"").as_bytes()
+    );
+    // An unmarked JSON block that doesn't parse is other data (control).
+    let g = Guide::read(&fenced("```json\n{\"name\":\"x\",}\n```")).unwrap();
+    assert!(matches!(
+        g.tokens(),
+        Tokens::None { other_blocks } if other_blocks.len() == 1
+    ));
+}
+
+#[test]
+fn fenced_examples_in_lists_and_html_are_not_the_guides_values() {
+    // R63-3: a fence inside <pre> or indented in a list item was read as the guide's block.
+    let x = path(Group::Colors, "x");
+    let black = TokenValue::Color(Color::BLACK);
+    let block = "~~~json\n{\"opdDesignTokens\":1,\"colors\":{\"x\":\"#010203\"}}\n~~~\n";
+    for example in [
+        format!("<pre>\n{block}</pre>\n"),
+        format!("<!-- example\n{block}-->\n"),
+        format!("<div>\n{block}\n"),
+        format!(
+            "- Documentation example:\n\n  {}",
+            block.replace('\n', "\n  ")
+        ),
+        format!("1. Step\n   {}", block.replace('\n', "\n   ")),
+    ] {
+        let g = Guide::read(example.as_bytes()).unwrap();
+        assert!(matches!(g.tokens(), Tokens::None { .. }), "{example}");
+        assert!(g.plan_value(g.revision(), &x, &black).is_err(), "{example}");
+        assert_eq!(g.bytes(), example.as_bytes());
+    }
+    // After the HTML block ends, or after the list (a blank line, then the margin), a block is
+    // the guide's (control).
+    for before in [
+        "<pre>\nexample\n</pre>\n",
+        "<div>\nexample\n\n",
+        "- item\n\nParagraph.\n",
+    ] {
+        let text = format!("{before}{block}");
+        let g = Guide::read(text.as_bytes()).unwrap();
+        let w = write(g.plan_value(g.revision(), &x, &black).unwrap());
+        let want = text.replace("\"#010203\"", "\"#000000\"");
+        assert_eq!(w.bytes, want.as_bytes(), "{before}");
+    }
+}
+
+#[test]
+fn numbers_are_used_only_as_written_never_rounded_into_support() {
+    // R63-4: 400.00000000000000001 was weight 400, 1000.00000000000000001 size 1000 and
+    // -1e-99999 spacing -0.
+    let state = |group: Group, lexeme: &str| {
+        let text = format!(
+            "```json\n{{\"opdDesignTokens\":1,\"{}\":{{\"x\":{lexeme}}}}}\n```\n",
+            group.key()
+        );
+        let g = Guide::read(text.as_bytes()).unwrap();
+        value(&supported(&g), &path(group, "x"))
+    };
+    use EntryState::*;
+    for (group, lexeme) in [
+        (Group::FontWeights, "400.00000000000000001"),
+        (Group::FontWeights, "399.99999999999999999"),
+        (Group::FontWeights, "700.00000000000000001"),
+        (Group::FontSizes, "1000.00000000000000001"),
+        (Group::FontSizes, "1e-99999"),
+        (Group::Spacing, "-1e-99999"),
+        (Group::Radii, "100000.000000000001"),
+        (Group::Spacing, "3.14159265358979323846"),
+    ] {
+        assert!(matches!(state(group, lexeme), Unsupported(_)), "{lexeme}");
+    }
+    // Other spellings of supported values, and the bounds themselves, are supported.
+    for (group, lexeme, want) in [
+        (Group::FontWeights, "4e2", TokenValue::Weight(400)),
+        (Group::FontWeights, "7.00e2", TokenValue::Weight(700)),
+        (Group::FontSizes, "1000", TokenValue::Size(1000.0)),
+        (Group::FontSizes, "1E3", TokenValue::Size(1000.0)),
+        (Group::Radii, "100000", TokenValue::Length(100_000.0)),
+        (Group::Spacing, "0", TokenValue::Length(0.0)),
+        (Group::Spacing, "0.1", TokenValue::Length(0.1)),
+        (Group::Spacing, "16.50", TokenValue::Length(16.5)),
+    ] {
+        assert_eq!(state(group, lexeme), Supported(want), "{lexeme}");
+    }
+    // An unsupported number is kept as it is and can't be edited.
+    let text =
+        "```json\n{\"opdDesignTokens\":1,\"fontWeights\":{\"x\":400.00000000000000001}}\n```\n";
+    let g = Guide::read(text.as_bytes()).unwrap();
+    let x = path(Group::FontWeights, "x");
+    assert!(matches!(
+        g.plan_value(g.revision(), &x, &TokenValue::Weight(700)),
+        Err(EditError::Unsupported { .. })
+    ));
+    assert_eq!(g.bytes(), text.as_bytes());
+}
+
+#[test]
+fn a_marked_block_fenced_with_more_than_json_is_read_only() {
+    // R63 P3: the info string must be exactly `json`; `json custom-v2` was editable.
+    let text = "~~~json custom-v2\n{\"opdDesignTokens\":1,\"colors\":{\"x\":\"#010203\"}}\n~~~\n";
+    let g = Guide::read(text.as_bytes()).unwrap();
+    let info = "json custom-v2".to_string();
+    assert_eq!(
+        g.tokens(),
+        Tokens::ReadOnly {
+            reason: ReadOnly::Format { info: info.clone() },
+            blocks: vec![FencedBlock { lines: 0..3, info }]
+        }
+    );
+    let x = path(Group::Colors, "x");
+    let black = TokenValue::Color(Color::BLACK);
+    assert!(g.plan_value(g.revision(), &x, &black).is_err());
+    assert_eq!(g.bytes(), text.as_bytes());
+    // Plain json in another letter case is the supported block (control).
+    let text = text.replace("json custom-v2", "JSON");
+    assert!(matches!(
+        Guide::read(text.as_bytes()).unwrap().tokens(),
+        Tokens::Supported(_)
+    ));
+}

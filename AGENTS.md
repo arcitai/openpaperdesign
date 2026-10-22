@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.81 · Updated: 2026-10-21
+Revision: 0.84 · Updated: 2026-10-22
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -692,10 +692,10 @@ engine architecture is `analysis/DESIGN.md`.
     passes it on only while that editor isn't left, and Home sets `#ed-title` as text only for
     the shown editor (`panelHandle === h`); the browser page sets its tab title. No remount,
     server call, save or new timer.
-- Project design guide codec (R19–R21 precursor, not upstream-owned; written in source. The
-  lead's affected checks of the run150 candidate passed: format, the serve library's tests
-  with the 17 guide tests, clippy with no new warning, and the unchanged output-bound probe.
-  That is source verification at that scope, not an independent review or a native, Theme or
+- Project design guide codec (R19–R21 precursor, not upstream-owned; written in source with
+  its unit tests. History: the independent R63 review of the run150 candidate requested
+  changes, corrected below. Which exact candidate passed which checks or reviews is recorded
+  in its source handoff, not here; nothing in this entry is an independent, native, Theme or
   source-link acceptance): `crates/openpaperdesign-serve/src/guide.rs` (tests in
   `guide_tests.rs`), `pub mod guide` of the serve library. Pure: bytes in, a `Guide` snapshot,
   `Tokens` inspection or a checked `Proposal` out; no file system, path, metadata, MCP, browser,
@@ -712,9 +712,31 @@ engine architecture is `analysis/DESIGN.md`.
   names, depth, lone surrogates and invalid JSON refused; numbers kept as lexemes), version 1
   groups `colors`, `fontSizes`, `fontWeights` (400/700), `spacing`, `radii`, `frames`
   (direction, gap, padding); `plan_value` replaces one known supported value's span only and
-  re-reads the result. Reason: the admitted guide/value codec any later source reader/editor
-  needs (rev2 §8–9). It is not a source link: reading, creating or saving a project's guide,
-  Theme's connection, named tokens, font families and Apply stay gated on the real model-call
+  re-reads the result. R63 correction (four P2s and a P3 of the independent review):
+  - a CR and LF never meet across two written lines (an LF there read as one CRLF and the
+    line was lost: `"a\rb\n"` made `"a\n\n"` proposed `"a\r\n"`): a new empty line right
+    after a lone CR takes a lone CR, and a new line that would end in a lone CR before an
+    unchanged empty LF line takes CRLF. An unchanged line's bytes are never rewritten for
+    this (the first R63 correction rewrote such an empty line's LF to CR; the lead's probe
+    showed that broke the untouched-bytes contract): where an edit would bring an unchanged
+    empty LF line right after a lone CR, it is refused (`PlanError::LineEndMerge`, nothing
+    proposed). Every prose proposal is read back against the draft (`PlanError::SelfCheck`);
+  - a `json` block that doesn't parse counts as marked when any string in it decodes to the
+    marker (`mentions_marker`), so an escaped-marker broken block makes the values read-only
+    (alone, or `Multiple` beside a valid block) instead of passing as unmarked data. Its tests
+    build the escaped name at run time, so their inputs really hold the backslash escape and
+    not the plain name (an earlier version of those inputs held the plain name);
+  - `fences` skips HTML blocks (`<pre>`/`<script>`/`<style>`/`<textarea>` to the closing tag,
+    `<!--` to `-->`, other tag lines to a blank line) and marks fences indented inside a list
+    `contained` (ignored), so documentation examples are not editable values;
+  - `number` uses a lexeme only when an f64 holds it exactly as written (`Decimal`: the f64's
+    shortest decimal equals the lexeme's exact value), so `400.00000000000000001`,
+    `1000.00000000000000001` or `-1e-99999` stay unsupported while `4e2` and `7.00e2` stay
+    weights 400 and 700;
+  - a marked block's info string must be exactly `json` (any case): `json custom-v2` is
+    `ReadOnly::Format`.
+  Reason: the admitted guide/value codec any later source reader/editor needs (rev2 §8–9).
+  It is not a source link: reading, creating or saving a project's guide, Theme's connection, named tokens, font families and Apply stay gated on the real model-call
   admission and enforceable revocation proof; no Theme, MCP or file route uses it. Same Editor,
   Session, save, binding and lease; no new dependency or store.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut

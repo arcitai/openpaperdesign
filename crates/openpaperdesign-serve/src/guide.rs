@@ -25,7 +25,16 @@
 //!   start the guide's first terminator, or LF in a guide without any;
 //! - whether the guide ends with a terminator follows the draft (adding one uses the same
 //!   rule);
-//! - the BOM is the guide's: kept as it is (a leading U+FEFF in the draft stands for it).
+//! - the BOM is the guide's: kept as it is (a leading U+FEFF in the draft stands for it);
+//! - a CR and LF must never meet across two lines (read back as one CRLF, the second line
+//!   would be lost, R63): a new empty line right after a line ending in a lone CR takes a lone
+//!   CR, and a new line that would end in a lone CR right before an unchanged empty LF line
+//!   takes CRLF. An unchanged line's bytes are never rewritten for this: where an edit would
+//!   bring an unchanged empty LF line right after a lone CR, it is refused
+//!   ([`PlanError::LineEndMerge`], nothing proposed).
+//!
+//! Every proposal is checked before it is returned: read back, its lines and final line end
+//! must be exactly the draft's (else [`PlanError::SelfCheck`], nothing proposed).
 //!
 //! Working it out is bounded: where lines both go and come between the common first and last
 //! lines, a change of more than [`MAX_CHANGED_LINES`] lines (inserted plus deleted), or one
@@ -34,16 +43,24 @@
 //! larger than [`MAX_BYTES`], its BOM and kept terminators counted: every proposal is a guide
 //! [`Guide::read`] takes.
 //!
-//! **Values** ([`Guide::tokens`]): exactly one fenced block whose info string is `json` and
-//! whose JSON is an object with `"opdDesignTokens": 1`. Recognized fences (supported subset of
-//! Markdown): a line indented at most three spaces opening with three or more backticks or
-//! tildes, closed by a line of the same character at least as long. Not recognized: fences in
-//! block quotes or list items, fences indented with a tab, indented code blocks and HTML. A
-//! fence-looking line inside another fenced block is that block's content. Other fenced data
-//! (YAML, TOML, JSON without the marker) is listed and left alone, never converted. Two
-//! candidate blocks, an unclosed one, invalid JSON, a repeated key (also one spelled with
-//! escapes), nesting deeper than [`MAX_DEPTH`] or another version make the values read-only
-//! with the reason; prose edits stay possible.
+//! **Values** ([`Guide::tokens`]): exactly one fenced block whose info string is exactly `json`
+//! (any letter case, nothing after it) and whose JSON is an object with `"opdDesignTokens": 1`
+//! (the name also spelled with escapes). Recognized fences (supported subset of Markdown): a
+//! line indented at most three spaces opening with three or more backticks or tildes, closed by
+//! a line of the same character at least as long. Not recognized (R63: conservatively, without
+//! a full Markdown parser): fences in block quotes; fences indented inside a list (after a list
+//! item line, until a line at the margin after a blank line); anything inside an HTML block
+//! (from a line starting with `<pre`, `<script`, `<style` or `<textarea` to its closing tag,
+//! from `<!--` to `-->`, and from any other line starting with a tag, `<!` or `<?` to the next
+//! blank line, so also a fence directly after such a line); fences indented with a tab;
+//! indented code blocks. A fence-looking line inside another fenced block is that block's
+//! content. Other fenced data (YAML, TOML, JSON without the marker) is listed and left alone,
+//! never converted. Two candidate blocks, an unclosed one, a marked block with another info
+//! string (`json custom-v2`), invalid JSON, a repeated key (also one spelled with escapes),
+//! nesting deeper than [`MAX_DEPTH`] or another version make the values read-only with the
+//! reason; prose edits stay possible. A `json` block that doesn't parse counts as marked when
+//! the marker appears in it, also as an escaped string, so a broken marked block is never
+//! taken for unmarked data beside a valid one.
 //!
 //! Version 1 shape (a proposed shape for this codec, not an outside standard). Each group is an
 //! object of named values; anything else in the block is kept as it is and listed as unknown:
@@ -56,7 +73,11 @@
 //!   (a length) and `padding` (a length, or four: top, right, bottom, left).
 //!
 //! Units in strings (`"16px"`), other colour syntaxes and other weights are unsupported, shown
-//! as such, never guessed. Nothing is read from prose.
+//! as such, never guessed. Nothing is read from prose. A number is used only when an f64 holds
+//! it exactly as written (its shortest decimal is the same number: `16`, `0.5`, `4e2`,
+//! `7.00e2`, `1.00e+1`); a spelling that would round (`400.00000000000000001`,
+//! `1000.00000000000000001`, `-1e-99999`) stays unsupported, so nothing rounds into a supported
+//! value or across a bound (R63).
 //!
 //! **Value edits** ([`Guide::plan_value`]): a known, supported value is replaced in its own byte
 //! span only; every other byte (unknown keys, huge number lexemes, escapes, whitespace, prose)
@@ -208,6 +229,12 @@ pub enum PlanError {
     },
     /// The difference is too large to work out within the budgets.
     TooComplex,
+    /// The planned bytes didn't read back as the draft (a defect; nothing is proposed).
+    SelfCheck,
+    /// The edit would bring an unchanged empty LF line right after a line ending in a lone CR:
+    /// read back, that CR and LF would be one CRLF and the empty line would be lost, and
+    /// avoiding it would mean rewriting a byte the person didn't change. Nothing is proposed.
+    LineEndMerge,
 }
 
 impl fmt::Display for PlanError {
@@ -224,6 +251,13 @@ impl fmt::Display for PlanError {
                 f,
                 "the change is too large to work out line by line (at most \
                  {MAX_CHANGED_LINES} lines changed); nothing was planned"
+            ),
+            PlanError::SelfCheck => {
+                f.write_str("the plan didn't read back as the draft; nothing was planned")
+            }
+            PlanError::LineEndMerge => f.write_str(
+                "an unchanged empty line would follow a lone CR and merge into it; nothing was \
+                 planned",
             ),
         }
     }
@@ -346,6 +380,10 @@ pub enum ReadOnly {
     Multiple,
     /// The marked block has no closing fence.
     Unclosed,
+    /// The marked block's info string isn't exactly `json` (`json custom-v2`, say).
+    Format {
+        info: String,
+    },
     /// The marked block isn't valid JSON; `offset` is in the guide's bytes.
     Invalid {
         message: String,
@@ -371,6 +409,11 @@ impl fmt::Display for ReadOnly {
                  the values",
             ),
             ReadOnly::Unclosed => f.write_str("the opdDesignTokens block has no closing fence"),
+            ReadOnly::Format { info } => write!(
+                f,
+                "the opdDesignTokens block is fenced as {info:?}, not plain json, so its format \
+                 isn't one this editor supports"
+            ),
             ReadOnly::Invalid { message, offset } => {
                 write!(
                     f,
@@ -541,6 +584,12 @@ impl Guide {
         &self.text[l.start..l.end]
     }
 
+    /// Whether line `i` is empty and ends in LF.
+    fn is_blank_lf(&self, i: usize) -> bool {
+        let l = &self.lines[i];
+        l.start == l.end && l.terminator == Terminator::Lf
+    }
+
     fn body_start(&self) -> usize {
         if self.bom { BOM.len() } else { 0 }
     }
@@ -599,6 +648,20 @@ impl Guide {
         out.extend_from_slice(&self.bytes()[..self.body_start()]);
         let mut orig_pos = self.body_start();
         let mut hunks: Vec<Hunk> = Vec::new();
+        // The last line written ends in a lone CR: an empty line after it must not end in LF,
+        // which would read as one CRLF and lose that empty line (R63).
+        let mut after_cr = false;
+        // For each step: whether the next line written is an unchanged empty LF line.
+        let mut before_blank_lf = vec![false; items.len()];
+        let mut next = false;
+        for (k, (op, _)) in items.iter().enumerate().rev() {
+            before_blank_lf[k] = next;
+            match op {
+                Op::Keep(i) => next = self.is_blank_lf(*i),
+                Op::Insert(_) => next = false,
+                Op::Delete(_) => {}
+            }
+        }
         for (k, (op, policy)) in items.into_iter().enumerate() {
             let last = Some(k) == last_emitted;
             match op {
@@ -614,6 +677,12 @@ impl Guide {
                         (_, _, Terminator::None) => policy,
                         (_, _, t) => t,
                     };
+                    if after_cr && self.is_blank_lf(i) {
+                        // Its LF would complete the CR before it: the line would be lost, and
+                        // its own bytes are never rewritten to avoid that.
+                        return Err(PlanError::LineEndMerge);
+                    }
+                    after_cr = want == Terminator::Cr;
                     let at = out.len();
                     if want == l.terminator {
                         out.extend_from_slice(&self.bytes()[l.start..l.full_end()]);
@@ -625,14 +694,41 @@ impl Guide {
                     orig_pos = l.full_end();
                 }
                 Op::Insert(j) => {
+                    let mut want = if last && !ends_with_newline {
+                        Terminator::None
+                    } else {
+                        policy
+                    };
+                    if after_cr && b[j].is_empty() && want == Terminator::Lf {
+                        want = Terminator::Cr;
+                    }
+                    // A lone CR right before an unchanged empty LF line would take its LF.
+                    if want == Terminator::Cr && before_blank_lf[k] {
+                        want = Terminator::CrLf;
+                    }
+                    after_cr = want == Terminator::Cr;
                     let at = out.len();
                     out.extend_from_slice(b[j].as_bytes());
-                    if !last || ends_with_newline {
-                        out.extend_from_slice(policy.bytes());
-                    }
+                    out.extend_from_slice(want.bytes());
                     push_hunk(&mut hunks, orig_pos..orig_pos, at..out.len());
                 }
             }
+        }
+        // Read back, the result must be the draft: its lines and its final line end.
+        let body =
+            std::str::from_utf8(&out[self.body_start()..]).map_err(|_| PlanError::SelfCheck)?;
+        let back = split_lines(body, 0);
+        let same = back.len() == b.len()
+            && back
+                .iter()
+                .zip(&b)
+                .all(|(l, s)| body[l.start..l.end] == **s)
+            && back
+                .last()
+                .is_some_and(|l| l.terminator != Terminator::None)
+                == ends_with_newline;
+        if !same {
+            return Err(PlanError::SelfCheck);
         }
         if out == self.bytes() {
             return Ok(Proposal::Unchanged);
@@ -659,7 +755,8 @@ impl Guide {
         let fences = self.fences();
         let mut candidates = Vec::new();
         let mut other_blocks = Vec::new();
-        for f in &fences {
+        // A fence inside a list or HTML block is an example, not a block of this guide's (R63).
+        for f in fences.iter().filter(|f| !f.contained) {
             let block = FencedBlock {
                 lines: f.open..f.close.map_or(self.lines.len(), |c| c + 1),
                 info: f.info.clone(),
@@ -668,13 +765,16 @@ impl Guide {
             let content = self.fence_content(f);
             let text = &self.text[content.clone()];
             let parsed = first.eq_ignore_ascii_case("json").then(|| parse(text));
+            // A block that doesn't parse is marked when the marker appears in it at all, also
+            // spelled with escapes (R63), so a broken marked block is never unmarked data.
             let marked = match &parsed {
                 Some(Ok(Json::Object(members, _))) => members.iter().any(|m| m.key == BLOCK_KEY),
-                Some(Err(_)) => text.contains(BLOCK_KEY),
+                Some(Err(_)) => mentions_marker(text),
                 _ => false,
             };
             if marked {
-                candidates.push((f.close.is_some(), block, content.start, parsed));
+                let exact = f.info.eq_ignore_ascii_case("json");
+                candidates.push((f.close.is_some(), block, content.start, parsed, exact));
             } else if ["json", "jsonc", "json5", "yaml", "yml", "toml"]
                 .iter()
                 .any(|k| first.eq_ignore_ascii_case(k))
@@ -687,13 +787,16 @@ impl Guide {
             reason,
             blocks: blocks.clone(),
         };
-        let (closed, block, base, parsed) = match candidates.len() {
+        let (closed, block, base, parsed, exact) = match candidates.len() {
             0 => return Tokens::None { other_blocks },
             1 => candidates.remove(0),
             _ => return read_only(ReadOnly::Multiple),
         };
         if !closed {
             return read_only(ReadOnly::Unclosed);
+        }
+        if !exact {
+            return read_only(ReadOnly::Format { info: block.info });
         }
         let root = match parsed {
             Some(Ok(root)) => root,
@@ -845,23 +948,56 @@ impl Guide {
         }))
     }
 
-    /// The fenced blocks, in order (see the module's supported subset).
+    /// The fenced blocks, in order (see the module's supported subset). Lines of an HTML block
+    /// are never read as fences; a fence indented inside a list is `contained` (an example).
     fn fences(&self) -> Vec<Fence> {
         let mut out = Vec::new();
+        let mut html: Option<HtmlEnd> = None;
+        let mut list = false;
+        let mut after_blank = false;
         let mut i = 0;
         while i < self.lines.len() {
-            let Some((ch, len, info)) = fence_open(self.line_text(i)) else {
+            let line = self.line_text(i);
+            if let Some(end) = html {
+                if html_ends(end, line) {
+                    html = None;
+                }
+                after_blank = is_blank(line);
                 i += 1;
                 continue;
-            };
-            let close =
-                (i + 1..self.lines.len()).find(|&k| fence_close(self.line_text(k), ch, len));
-            out.push(Fence {
-                open: i,
-                close,
-                info: info.to_string(),
-            });
-            i = close.map_or(self.lines.len(), |c| c + 1);
+            }
+            if let Some((ch, len, info)) = fence_open(line) {
+                let close =
+                    (i + 1..self.lines.len()).find(|&k| fence_close(self.line_text(k), ch, len));
+                let contained = list && indent(line) > 0;
+                out.push(Fence {
+                    open: i,
+                    close,
+                    info: info.to_string(),
+                    contained,
+                });
+                // A fence at the margin ends a list.
+                list = list && contained;
+                after_blank = false;
+                i = close.map_or(self.lines.len(), |c| c + 1);
+                continue;
+            }
+            if is_blank(line) {
+                after_blank = true;
+                i += 1;
+                continue;
+            }
+            if let Some(end) = html_start(line) {
+                if end == HtmlEnd::Blank || !html_ends(end, line) {
+                    html = Some(end);
+                }
+            } else if list_item(line) {
+                list = true;
+            } else if after_blank && indent(line) == 0 {
+                list = false;
+            }
+            after_blank = false;
+            i += 1;
         }
         out
     }
@@ -892,6 +1028,105 @@ struct Fence {
     open: usize,
     close: Option<usize>,
     info: String,
+    /// Indented inside a list: an example, not one of the guide's blocks.
+    contained: bool,
+}
+
+/// How an HTML block ends: at a line containing its closing tag, at a line containing a text,
+/// or at a blank line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlEnd {
+    Tag(&'static str),
+    Text(&'static str),
+    Blank,
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+fn is_blank(line: &str) -> bool {
+    line.trim_matches(|c| c == ' ' || c == '\t').is_empty()
+}
+
+/// The HTML block a line starts, if any: indented at most three spaces, `<` then a tag name,
+/// `/`, `!` or `?` (a conservative reading of CommonMark's HTML blocks).
+fn html_start(line: &str) -> Option<HtmlEnd> {
+    if indent(line) > 3 {
+        return None;
+    }
+    let rest = line.trim_start_matches(' ').to_ascii_lowercase();
+    let after = rest.strip_prefix('<')?;
+    for tag in ["pre", "script", "style", "textarea"] {
+        if let Some(next) = after.strip_prefix(tag)
+            && (next.is_empty() || next.starts_with([' ', '\t', '>']))
+        {
+            return Some(HtmlEnd::Tag(tag));
+        }
+    }
+    if after.starts_with("!--") {
+        return Some(HtmlEnd::Text("-->"));
+    }
+    let next = *after.as_bytes().first()?;
+    (next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')).then_some(HtmlEnd::Blank)
+}
+
+/// Whether `line` ends an HTML block that ends at `end`.
+fn html_ends(end: HtmlEnd, line: &str) -> bool {
+    match end {
+        HtmlEnd::Tag(tag) => line.to_ascii_lowercase().contains(&format!("</{tag}>")),
+        HtmlEnd::Text(text) => line.contains(text),
+        HtmlEnd::Blank => is_blank(line),
+    }
+}
+
+/// A list item's first line: indented at most three spaces, `-`, `+` or `*`, or one to nine
+/// digits and `.` or `)`, then a space, a tab or the line's end.
+fn list_item(line: &str) -> bool {
+    if indent(line) > 3 {
+        return false;
+    }
+    let rest = line.trim_start_matches(' ').as_bytes();
+    let marker = match rest.first() {
+        Some(b'-' | b'+' | b'*') => 1,
+        Some(b'0'..=b'9') => {
+            let n = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if n > 9 || !matches!(rest.get(n), Some(b'.' | b')')) {
+                return false;
+            }
+            n + 1
+        }
+        _ => return false,
+    };
+    matches!(rest.get(marker), None | Some(b' ' | b'\t'))
+}
+
+/// Whether a string in `text` (not valid JSON) is the marker, also spelled with escapes, or
+/// the marker appears in it at all.
+fn mentions_marker(text: &str) -> bool {
+    if text.contains(BLOCK_KEY) {
+        return true;
+    }
+    let mut p = Parser {
+        s: text.as_bytes(),
+        src: text,
+        i: 0,
+    };
+    while p.i < p.s.len() {
+        if p.s[p.i] != b'"' {
+            p.i += 1;
+            continue;
+        }
+        let start = p.i;
+        match p.string() {
+            Ok((s, _)) if s == BLOCK_KEY => return true,
+            Ok(_) => {}
+            // Unterminated: nothing more to read.
+            Err(_) if p.i >= p.s.len() => return false,
+            Err(_) => p.i = p.i.max(start + 1),
+        }
+    }
+    false
 }
 
 /// An opening fence line: its character, length and info string.
@@ -1409,9 +1644,60 @@ fn hex_color(s: &str) -> Option<Color> {
     }
 }
 
-/// A number lexeme's value, if finite.
+/// A number lexeme's value, when an f64 holds it exactly as written: finite, and its shortest
+/// decimal the same number (R63). A spelling that would round (`400.00000000000000001`,
+/// `-1e-99999`) gives none, so nothing rounds into a supported value or across a bound.
 fn number(src: &str, r: &Range<usize>) -> Option<f64> {
-    src[r.clone()].parse::<f64>().ok().filter(|x| x.is_finite())
+    let lexeme = &src[r.clone()];
+    let x = lexeme.parse::<f64>().ok().filter(|x| x.is_finite())?;
+    (Decimal::of(&format!("{x}")) == Decimal::of(lexeme)).then_some(x)
+}
+
+/// A JSON number's exact value: its significant digits (no leading or trailing zero; none for
+/// zero, whatever its sign) times ten to `exponent`. An exponent too large for an i64 saturates.
+#[derive(Debug, PartialEq, Eq)]
+struct Decimal {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+impl Decimal {
+    /// `lexeme` is a valid JSON number (or Rust's display of a finite f64).
+    fn of(lexeme: &str) -> Decimal {
+        let (negative, rest) = match lexeme.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, lexeme),
+        };
+        let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+            Some((m, e)) => (m, e),
+            None => (rest, "0"),
+        };
+        let saturated = if exponent.starts_with('-') {
+            i64::MIN / 2
+        } else {
+            i64::MAX / 2
+        };
+        let mut exponent = exponent.parse::<i64>().unwrap_or(saturated);
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        exponent = exponent.saturating_sub(frac.len() as i64);
+        let all = format!("{int}{frac}");
+        let significant = all.trim_start_matches('0');
+        let digits = significant.trim_end_matches('0');
+        exponent = exponent.saturating_add((significant.len() - digits.len()) as i64);
+        if digits.is_empty() {
+            return Decimal {
+                negative: false,
+                digits: String::new(),
+                exponent: 0,
+            };
+        }
+        Decimal {
+            negative,
+            digits: digits.to_string(),
+            exponent,
+        }
+    }
 }
 
 fn length(v: &Json, src: &str) -> Result<f64, &'static str> {
