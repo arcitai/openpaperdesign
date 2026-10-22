@@ -7972,3 +7972,275 @@ fn r67_an_unlocked_instance_takes_a_theme_text_style_with_its_main_in_one_step()
     step(&mut s);
     assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
 }
+
+// ---- R68 correction: a locked instance's inherited text box. The independent R68 review's
+// probes are kept here; where one was adapted, its comment says how and why.
+
+/// The reviewer's fixture, unchanged but for formatting: `whole` fitted at 24, made a main
+/// component with one instance whose child gets its own 18 through the ordinary
+/// `Editor::style_text` (overriding exactly `font`), plus `size` if `size_override`; the
+/// instance locked.
+fn r68_font_override_fixture(
+    size_override: bool,
+) -> (
+    WebState,
+    StyleIds,
+    crate::model::NodeId,
+    crate::model::NodeId,
+) {
+    let (mut s, ids, _) = text_style_fixture();
+    // Establish normal fitted geometry before making a component, through the existing
+    // whole-layer typography operation rather than seeding inconsistent instance links.
+    s.ed.selection = vec![ids.whole];
+    s.ed.style_text("font size", |sp| sp.size = Some(24.0));
+    let (instance, child) = instance_of(&mut s, ids.whole, false);
+    s.ed.selection = vec![child];
+    s.ed.style_text("font size", |sp| sp.size = Some(18.0));
+    let link = s.ed.doc.get(child).unwrap().instance.as_ref().unwrap();
+    assert!(link.overrides.iter().any(|k| k == "font"));
+    assert!(!link.overrides.iter().any(|k| k == "size"));
+    if size_override {
+        s.ed.begin("Keep instance text size");
+        s.ed.mark_overrides(&[child], "size");
+        s.ed.commit();
+    }
+    s.ed.edit("Lock instance", |tx| {
+        tx.node_mut(instance).unwrap().locked = true
+    });
+    s.ed.selection.clear();
+    timed_frames(&mut s, 4);
+    assert!(s.ed.doc.is_effectively_locked(child));
+    assert_eq!(s.ed.doc.get(child).unwrap().kind.font_size(), Some(18.0));
+    (s, ids, instance, child)
+}
+
+#[test]
+fn r68_a_locked_instance_inheriting_only_its_text_box_refuses_the_style_whole_and_says_so() {
+    // R68 F1: the reviewer's `r68_locked_font_override_without_size_override_keeps_child_exact`
+    // failed (kept as historical evidence, not here): the locked child kept its own 18 but its
+    // box went from 36.72 × 21.78 to 65.28 × 38.72, because the main text is laid out again
+    // and instances copy a box unless they override `size`. Corrected by refusal before
+    // anything changes, so that probe's expectations of a changed main, a save and Undo/Redo
+    // of the change aren't this contract; its fixture is kept, and its locked-child-exact
+    // assertion is strengthened to the whole Paper, history, stamp, unsaved state, selection
+    // and the instance root.
+    let (mut s, _, instance, child) = r68_font_override_fixture(false);
+    let before_child = s.ed.doc.get(child).unwrap().clone();
+    let before_root = s.ed.doc.get(instance).unwrap().clone();
+    open_theme(&mut s);
+    assert_refused(&mut s, "24 · Regular", ui::design_system::INHERITED_STYLE);
+    assert_eq!(s.ed.doc.get(child), Some(&before_child));
+    assert_eq!(s.ed.doc.get(instance), Some(&before_root));
+}
+
+#[test]
+fn r68_locked_font_and_size_override_keeps_instance_root_exact() {
+    // The reviewer's passing control, unchanged but for formatting: overriding both `font`
+    // and `size`, the locked child and its instance keep everything while the main changes.
+    let (mut s, ids, instance, child) = r68_font_override_fixture(true);
+    let before_child = s.ed.doc.get(child).unwrap().clone();
+    let before_root = s.ed.doc.get(instance).unwrap().clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_channel(&mut s, "Size ", "32");
+    close_picker(&mut s);
+    assert_eq!(
+        s.ed.doc.get(ids.whole).unwrap().kind.font_size(),
+        Some(32.0)
+    );
+    assert_eq!(
+        s.ed.doc.get(child),
+        Some(&before_child),
+        "both local overrides keep the text node"
+    );
+    assert_eq!(
+        s.ed.doc.get(instance),
+        Some(&before_root),
+        "Theme must preserve the locked component root's inherited geometry too"
+    );
+}
+
+#[test]
+fn r68_native_style_hold_advances_deadline_and_saves_finitely_after_close() {
+    // The reviewer's passing probe, unchanged but for formatting.
+    use std::time::Instant;
+    let root =
+        std::env::temp_dir().join(format!("opd-r68-native-style-{:016x}", fastrand::u64(..)));
+    let store = crate::project::Store::open(root.clone()).unwrap();
+    let mut sess = native_session::Session::new(store);
+    sess.create(&mut Editor::default(), "R68 native style")
+        .unwrap();
+    let (mut s, ids, _) = text_style_fixture();
+    for i in 0..s.ed.pages.len() {
+        sess.project
+            .as_ref()
+            .unwrap()
+            .save_page(&s.ed.page_data(i))
+            .unwrap();
+    }
+    s.ed.meta_dirty = true;
+    sess.save(&mut s.ed).unwrap();
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_field(&mut s, "Size ");
+    let delay = native_session::AUTOSAVE_DELAY;
+    let mut now = Instant::now();
+    for (key, code, value) in [("3", "Digit3", 3.0), ("2", "Digit2", 32.0)] {
+        press(&mut s, key, code);
+        timed_frames(&mut s, 2);
+        assert_eq!(
+            s.ed.doc.get(ids.whole).unwrap().kind.font_size(),
+            Some(value)
+        );
+        assert!(ui::design_system::editing(&s.ctx, &s.ed));
+        now += delay * 3;
+        assert!(!sess.autosave_due_ui(&s.ed, &s.ctx, now));
+        assert_eq!(
+            sess.next_deadline(),
+            Some(now + delay),
+            "held check moves deadline forward"
+        );
+        assert_eq!(
+            page_to_json(&sess.project.as_ref().unwrap().load_pages().unwrap()[0]),
+            before,
+            "no disk save while open"
+        );
+    }
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+    assert!(!sess.autosave_due_ui(&s.ed, &s.ctx, now + delay / 2));
+    assert_eq!(
+        sess.next_deadline(),
+        Some(now + delay),
+        "closed check does not postpone the original deadline"
+    );
+    assert!(sess.autosave_due_ui(&s.ed, &s.ctx, now + delay));
+    sess.save(&mut s.ed).unwrap();
+    let edited = page_to_json(&s.ed.page_data(0));
+    assert_eq!(
+        page_to_json(&sess.project.as_ref().unwrap().load_pages().unwrap()[0]),
+        edited
+    );
+    assert!(!s.ed.project_dirty());
+    assert_eq!(sess.next_deadline(), None);
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        before,
+        "native style has one complete Undo"
+    );
+    assert!(
+        s.ed.project_dirty(),
+        "saved marker remains a history boundary"
+    );
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    assert!(
+        !s.ed.is_dirty(),
+        "saved marker still names this history boundary"
+    );
+    assert!(
+        s.ed.project_dirty(),
+        "Undo and Redo advance the page generation until a real save"
+    );
+    sess.save(&mut s.ed).unwrap();
+    assert!(!s.ed.project_dirty());
+    // Two uses of the exact same ordinary coalescing key straddle a real Session save.
+    s.ed.selection = vec![ids.whole];
+    s.ed.style_text_coalesced("font size", |sp| sp.size = Some(40.0));
+    sess.save(&mut s.ed).unwrap();
+    let saved40 = page_to_json(&s.ed.page_data(0));
+    s.ed.style_text_coalesced("font size", |sp| sp.size = Some(48.0));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        saved40,
+        "generic save seals even the same field/layers key"
+    );
+    assert!(
+        !s.ed.is_dirty(),
+        "saved history marker survives subsequent coalesced edit and Undo"
+    );
+    assert!(
+        s.ed.project_dirty(),
+        "generation still asks the Session to save the Undo"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn r68_native_close_saves_an_open_theme_editor_and_generic_save_still_seals() {
+    // The reviewer's passing probe, unchanged but for formatting.
+    use std::time::Instant;
+    let root =
+        std::env::temp_dir().join(format!("opd-r68-native-close-{:016x}", fastrand::u64(..)));
+    let store = crate::project::Store::open(root.clone()).unwrap();
+    let mut sess = native_session::Session::new(store);
+    sess.create(&mut Editor::default(), "R68 native close")
+        .unwrap();
+    let (mut s, ids, _) = text_style_fixture();
+    for i in 0..s.ed.pages.len() {
+        sess.project
+            .as_ref()
+            .unwrap()
+            .save_page(&s.ed.page_data(i))
+            .unwrap();
+    }
+    s.ed.meta_dirty = true;
+    sess.save(&mut s.ed).unwrap();
+    let before = page_to_json(&s.ed.page_data(0));
+    let project_dir = sess.project.as_ref().unwrap().dir.clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_channel(&mut s, "Size ", "32");
+    assert!(ui::design_system::editing(&s.ctx, &s.ed));
+    let now = Instant::now();
+    assert!(!sess.autosave_due_ui(&s.ed, &s.ctx, now));
+    sess.close(&mut s.ed).unwrap();
+    let edited = page_to_json(&s.ed.page_data(0));
+    assert_eq!(
+        page_to_json(
+            &crate::project::Project::open(&project_dir)
+                .unwrap()
+                .load_pages()
+                .unwrap()[0]
+        ),
+        edited,
+        "explicit close bypasses hold and saves"
+    );
+    assert!(sess.project.is_none());
+    assert_eq!(sess.next_deadline(), None);
+    assert!(!s.ed.project_dirty());
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert!(s.ed.project_dirty());
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    assert!(!s.ed.is_dirty(), "saved history marker is retained");
+    assert!(
+        s.ed.project_dirty(),
+        "history generation advanced, matching ordinary Session semantics"
+    );
+    // A subsequent ordinary coalesced edit must not merge backward over the saved value.
+    s.ed.selection = vec![ids.whole];
+    s.ed.style_text_coalesced("font size", |sp| sp.size = Some(40.0));
+    assert!(s.ed.project_dirty());
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        edited,
+        "generic saved boundary is retained"
+    );
+    assert!(!s.ed.is_dirty());
+    assert!(s.ed.project_dirty());
+    std::fs::remove_dir_all(root).unwrap();
+}

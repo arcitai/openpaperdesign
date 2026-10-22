@@ -197,7 +197,7 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         let in_use = active.as_ref().is_some_and(|a| a.now == style);
         if !in_use
             && !links.is_empty()
-            && reaches_locked(ed, &links, &style_groups(&style_targets(ed, style)))
+            && reaches_locked(ed, &links, &style_groups(ed, &style_targets(ed, style)))
         {
             let id = key.with(("refused", style));
             let paint = |ui: &Ui, r| style_glyph(ui, r, theme::pal(ui).tertiary);
@@ -223,37 +223,40 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         }
     }
     if let Some((style, change, popup)) = changed {
-        let r = match active.take() {
-            Some(a) if a.now == style => Some(a),
+        let next = match active.take() {
+            Some(a) if a.now == style => {
+                // Each later change of a use is tried on a copy too: one that would reach a
+                // locked layer isn't applied, and the use ends (its earlier changes stay, one
+                // step).
+                if restyle_reaches_locked(ed, &a, change) {
+                    ed.history.seal();
+                    None
+                } else {
+                    Some(a)
+                }
+            }
             other => {
                 if other.is_some() {
                     ed.history.seal();
                 }
-                if reaches_locked(ed, &links, &style_groups(&style_targets(ed, style))) {
-                    // Refused before anything changes (see `reaches_locked`).
-                    egui::Popup::close_id(ui.ctx(), popup);
-                    ed.status = INHERITED_STYLE.into();
-                    None
-                } else {
-                    ed.end_text_edit();
-                    Some(Restyle {
-                        from: style,
-                        now: style,
-                        targets: style_targets(ed, style),
-                        stamp: 0,
-                        popup,
-                    })
-                }
+                fresh_restyle(ed, &links, style, popup, change)
             }
         };
-        if let Some(mut r) = r {
-            restyle(ed, &r, change);
-            r.now = match change {
-                StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
-                StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
-            };
-            r.stamp = ed.doc_stamp;
-            active = Some(r);
+        match next {
+            Some(mut r) => {
+                restyle(ed, &r, change);
+                r.now = match change {
+                    StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
+                    StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
+                };
+                r.stamp = ed.doc_stamp;
+                active = Some(r);
+            }
+            None => {
+                // Refused before it applies (see `reaches_locked`, `restyle_reaches_locked`).
+                egui::Popup::close_id(ui.ctx(), popup);
+                ed.status = INHERITED_STYLE.into();
+            }
         }
     } else if active.as_ref().is_some_and(|a| open != Some(a.now)) {
         // Its editor closed (or its style left the list): that interaction is one step.
@@ -332,9 +335,9 @@ pub const INHERITED_COLOUR: &str = "A locked instance inherits this colour from 
                                     and would change with it. Unlock that instance to change \
                                     the colour here.";
 /// Why Theme won't change a text style here (as [`INHERITED_COLOUR`]).
-pub const INHERITED_STYLE: &str = "A locked instance inherits this text style from its \
-                                   component and would change with it. Unlock that instance \
-                                   to change the style here.";
+pub const INHERITED_STYLE: &str = "A locked instance inherits this text style or its text box \
+                                   from its component and would change with it. Unlock that \
+                                   instance to change the style here.";
 
 /// Every instance layer, by the layer it inherits from (`InstanceLink::main`).
 fn inheritors(ed: &Editor) -> HashMap<NodeId, Vec<NodeId>> {
@@ -412,8 +415,83 @@ fn colour_groups(places: &[Place]) -> Vec<(NodeId, &'static str)> {
 }
 
 /// A text style's targets as the override group they change.
-fn style_groups(targets: &[StyleTarget]) -> Vec<(NodeId, &'static str)> {
-    targets.iter().map(|t| (t.id, "font")).collect()
+fn style_groups(ed: &Editor, targets: &[StyleTarget]) -> Vec<(NodeId, &'static str)> {
+    let mut out = Vec::new();
+    for t in targets {
+        // Its font, and its text box: `restyle` lays the text out again (`fit_text`), and
+        // instances copy a box's width and height unless they override `size` (R68: a locked
+        // instance overriding only `font` still took the main's new box).
+        out.push((t.id, "font"));
+        out.push((t.id, "size"));
+        // A group around it takes new bounds, and an auto-layout frame reflows (and may hug):
+        // their boxes and places change too, up to the component itself.
+        for a in ed.doc.ancestors(t.id) {
+            let Some(n) = ed.doc.get(a) else {
+                continue;
+            };
+            if n.is_group() || n.layout.is_some() {
+                out.push((a, "size"));
+                out.push((a, "position"));
+            }
+            if n.component {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A new text style use beginning with `change`, or `None` when Theme refuses it before
+/// anything changes: a locked instance inherits the style or its text box ([`reaches_locked`]
+/// on [`style_groups`]), or applying the change would reach a locked layer some other way
+/// ([`restyle_reaches_locked`]). An open text edit is ended only once it is allowed; if that
+/// changed the Paper, its targets are found and checked again.
+fn fresh_restyle(
+    ed: &mut Editor,
+    links: &HashMap<NodeId, Vec<NodeId>>,
+    style: StyleKey,
+    popup: egui::Id,
+    change: StyleChange,
+) -> Option<Restyle> {
+    let allowed = |ed: &Editor, r: &Restyle| {
+        !reaches_locked(ed, links, &style_groups(ed, &r.targets))
+            && !restyle_reaches_locked(ed, r, change)
+    };
+    let r = Restyle {
+        from: style,
+        now: style,
+        targets: style_targets(ed, style),
+        stamp: 0,
+        popup,
+    };
+    if !allowed(&*ed, &r) {
+        return None;
+    }
+    let stamp = ed.doc_stamp;
+    ed.end_text_edit();
+    if ed.doc_stamp == stamp {
+        return Some(r);
+    }
+    let r = Restyle {
+        targets: style_targets(ed, style),
+        ..r
+    };
+    allowed(&*ed, &r).then_some(r)
+}
+
+/// Whether applying `change` to `r`'s targets would change any effectively locked layer: the
+/// change applied to a copy of the shown Paper through the very same code (`restyle`: its
+/// range edits, `fit_text`, overrides and the commit's fixup, which keeps component
+/// instances, groups, auto layout and bound arrows in step), so every derived effect counts,
+/// not only the inherited values [`reaches_locked`] foresees for a row (R68). Nothing of the
+/// real document or its history is touched.
+fn restyle_reaches_locked(ed: &Editor, r: &Restyle, change: StyleChange) -> bool {
+    let mut probe = Editor::new(ed.doc.clone());
+    restyle(&mut probe, r, change);
+    ed.doc
+        .nodes
+        .keys()
+        .any(|id| ed.doc.is_effectively_locked(*id) && probe.doc.get(*id) != ed.doc.get(*id))
 }
 
 /// A row's swatch or "Aa" whose change Theme refuses (`reason`): drawn quietly by `paint`, the

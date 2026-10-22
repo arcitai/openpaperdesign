@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.88 · Updated: 2026-10-22
+Revision: 0.89 · Updated: 2026-10-23
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -753,6 +753,23 @@ engine architecture is `analysis/DESIGN.md`.
         controls with one-step Undo/Redo; and the native session through `autosave_due_ui` and
         the real `Session` save (adapted: a fresh temporary store, and the normal save after
         the picker closes).
+      **R68 correction** (run167; the independent R68 review's one P2, source only): a locked
+      instance whose text overrides only `font` kept its own 18 but still took the main's new
+      text box, since `restyle` lays the main out again (`fit_text`) and `copy_props` copies a
+      box unless `size` is overridden. `style_groups` now names `font` and `size` for each
+      target, and `size`/`position` for its group and auto-layout ancestors up to the
+      component, so `reaches_locked` refuses such a row up front; and every text style change,
+      the first and each later one, is first applied to a throwaway `Editor::new` over a copy
+      of the shown Paper through the same `restyle` (range edits, `fit_text`, overrides, the
+      commit's fixup with component sync, groups, auto layout and arrows), refusing it if any
+      effectively locked layer would differ (`restyle_reaches_locked`; a first change refused
+      leaves everything as it was, a later one ends the use with its earlier changes as one
+      step). `INHERITED_STYLE` now names the text box too. Component sync itself is unchanged.
+      Tests: the reviewer's fixture and its three passing probes kept (the font-and-size
+      override control, the native style hold and timer, native close and the generic seal),
+      unchanged but for formatting; its failing probe's case as a refusal test (whole Paper,
+      history, stamp, unsaved state, selection, child and instance root unchanged, reason
+      shown), since the probe's changed-main expectation isn't the refusal contract.
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).
