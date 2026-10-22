@@ -862,3 +862,139 @@ fn a_marked_block_fenced_with_more_than_json_is_read_only() {
         Tokens::Supported(_)
     ));
 }
+
+// ---- R64 corrections
+
+#[test]
+fn a_broken_quote_never_hides_an_escaped_marker() {
+    // R64-1: in {"x":"broken, "NAME":1,} the name's opening quote was read as the broken
+    // string's close, so with the name spelled with escapes the block was unmarked data and a
+    // valid block beside it was editable (the plain name was refused). The escapes are built
+    // here (a backslash, u, four hex digits), so the guide's bytes hold them, not the name.
+    let first = ["\\", "u006fpdDesignTokens"].concat();
+    let every: String = BLOCK_KEY
+        .chars()
+        .map(|c| format!("{}u{:04X}", '\\', u32::from(c)))
+        .collect();
+    let x = path(Group::Colors, "x");
+    let black = TokenValue::Color(Color::BLACK);
+    let valid = "```json\n{\"opdDesignTokens\":1,\"colors\":{\"x\":\"#010203\"}}\n```";
+    // The plain name is the control: the escaped spellings must be refused the same way.
+    for name in [first.as_str(), every.as_str(), BLOCK_KEY] {
+        for template in [
+            r#"{"x":"broken, "MARK":1,}"#,
+            r#"{"x":"broken, "MARK":1}"#,
+            r#"{"a":"b "c", "MARK":1}"#,
+        ] {
+            let json = template.replace("MARK", name);
+            if name != BLOCK_KEY {
+                assert!(json.contains('\\') && !json.contains(BLOCK_KEY), "{json}");
+            }
+            let block = format!("```json\n{json}\n```");
+            let bytes = fenced(&block);
+            let g = Guide::read(&bytes).unwrap();
+            assert!(
+                matches!(
+                    g.tokens(),
+                    Tokens::ReadOnly {
+                        reason: ReadOnly::Invalid { .. },
+                        ..
+                    }
+                ),
+                "{json}"
+            );
+            assert!(g.plan_value(g.revision(), &x, &black).is_err(), "{json}");
+            assert_eq!(g.bytes(), &bytes[..]);
+            let bytes = fenced(&format!("{valid}\n{block}"));
+            let g = Guide::read(&bytes).unwrap();
+            assert!(
+                matches!(
+                    g.tokens(),
+                    Tokens::ReadOnly {
+                        reason: ReadOnly::Multiple,
+                        ..
+                    }
+                ),
+                "{json}"
+            );
+            assert!(
+                matches!(
+                    g.plan_value(g.revision(), &x, &black),
+                    Err(EditError::NotEditable { .. })
+                ),
+                "{json}"
+            );
+            assert_eq!(g.bytes(), &bytes[..]);
+        }
+    }
+    // Without the name, the same broken quotes are other data, also beside the valid block,
+    // which stays the supported one (control).
+    let other = "```json\n{\"x\":\"broken, \"name\":1,}\n```";
+    let g = Guide::read(&fenced(other)).unwrap();
+    assert!(matches!(
+        g.tokens(),
+        Tokens::None { other_blocks } if other_blocks.len() == 1
+    ));
+    let bytes = fenced(&format!("{valid}\n{other}"));
+    let g = Guide::read(&bytes).unwrap();
+    let w = write(g.plan_value(g.revision(), &x, &black).unwrap());
+    let want = replaced(&bytes, "\"#010203\"", "\"#000000\"");
+    assert_eq!(w.bytes, want.as_bytes());
+    // Valid JSON with the escaped name only as a value is other data (control).
+    let note = format!("```json\n{{\"note\":\"{every}\"}}\n```");
+    let g = Guide::read(&fenced(&note)).unwrap();
+    assert!(matches!(
+        g.tokens(),
+        Tokens::None { other_blocks } if other_blocks.len() == 1
+    ));
+    // A valid block marked with the fully escaped name is the supported block (control).
+    let bytes = fenced(&valid.replace(BLOCK_KEY, &every));
+    let g = Guide::read(&bytes).unwrap();
+    let w = write(g.plan_value(g.revision(), &x, &black).unwrap());
+    let want = replaced(&bytes, "\"#010203\"", "\"#000000\"");
+    assert_eq!(w.bytes, want.as_bytes());
+}
+
+#[test]
+fn enclosed_html_examples_end_only_at_their_closing_text() {
+    // R64-2: a CDATA section, processing instruction or declaration ended at its first blank
+    // line, so a fence after that line inside it was the guide's block: editable alone, or a
+    // second block beside the real one.
+    let x = path(Group::Colors, "x");
+    let black = TokenValue::Color(Color::BLACK);
+    let example = "~~~json\n{\"opdDesignTokens\":1,\"colors\":{\"x\":\"#010203\"}}\n~~~\n";
+    let real = example.replace("#010203", "#0a0b0c");
+    for (open, close) in [
+        ("<![CDATA[", "]]>"),
+        ("<?example", "?>"),
+        ("<!DOCTYPE example", ">"),
+        // Already ending at its closing text (control).
+        ("<!-- example", "-->"),
+    ] {
+        let enclosed = format!("{open}\nDocumentation example\n\n{example}\n{close}\n");
+        let unclosed = format!("{open}\nUnclosed example\n\n{example}");
+        // Alone, or unclosed (to the guide's end, so also a real block after it): no block.
+        for text in [
+            enclosed.clone(),
+            unclosed.clone(),
+            format!("{unclosed}\n{real}"),
+        ] {
+            let g = Guide::read(text.as_bytes()).unwrap();
+            assert!(matches!(g.tokens(), Tokens::None { .. }), "{text}");
+            assert!(g.plan_value(g.revision(), &x, &black).is_err(), "{text}");
+            assert_eq!(g.bytes(), text.as_bytes());
+        }
+        // A real block before or after the closed example, or after a one-line one, is the
+        // guide's block: its edit changes its own bytes only, the example's stay.
+        for text in [
+            format!("{real}\n{enclosed}"),
+            format!("{enclosed}\n{real}"),
+            format!("{open} one line {close}\n{real}"),
+        ] {
+            let g = Guide::read(text.as_bytes()).unwrap();
+            let w = write(g.plan_value(g.revision(), &x, &black).unwrap());
+            let want = text.replace("\"#0a0b0c\"", "\"#000000\"");
+            assert_eq!(w.bytes, want.as_bytes(), "{text}");
+        }
+    }
+}

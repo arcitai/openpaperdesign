@@ -50,17 +50,19 @@
 //! a line of the same character at least as long. Not recognized (R63: conservatively, without
 //! a full Markdown parser): fences in block quotes; fences indented inside a list (after a list
 //! item line, until a line at the margin after a blank line); anything inside an HTML block
-//! (from a line starting with `<pre`, `<script`, `<style` or `<textarea` to its closing tag,
-//! from `<!--` to `-->`, and from any other line starting with a tag, `<!` or `<?` to the next
-//! blank line, so also a fence directly after such a line); fences indented with a tab;
-//! indented code blocks. A fence-looking line inside another fenced block is that block's
-//! content. Other fenced data (YAML, TOML, JSON without the marker) is listed and left alone,
-//! never converted. Two candidate blocks, an unclosed one, a marked block with another info
-//! string (`json custom-v2`), invalid JSON, a repeated key (also one spelled with escapes),
-//! nesting deeper than [`MAX_DEPTH`] or another version make the values read-only with the
-//! reason; prose edits stay possible. A `json` block that doesn't parse counts as marked when
-//! the marker appears in it, also as an escaped string, so a broken marked block is never
-//! taken for unmarked data beside a valid one.
+//! (from a line starting with `<pre`, `<script`, `<style` or `<textarea` to its closing tag;
+//! from `<!--`, `<![CDATA[`, `<?` or a declaration `<!` and a letter to its closing `-->`,
+//! `]]>`, `?>` or `>`, blank lines inside included (R64), or unclosed to the guide's end; from
+//! any other line starting with a tag or `<!` to the next blank line, so also a fence directly
+//! after such a line); fences indented with a tab; indented code blocks. A fence-looking line
+//! inside another fenced block is that block's content. Other fenced data (YAML, TOML, JSON
+//! without the marker) is listed and left alone, never converted. Two candidate blocks, an
+//! unclosed one, a marked block with another info string (`json custom-v2`), invalid JSON, a
+//! repeated key (also one spelled with escapes), nesting deeper than [`MAX_DEPTH`] or another
+//! version make the values read-only with the reason; prose edits stay possible. A `json` block
+//! that doesn't parse counts as marked when the marker's name appears anywhere in it, each
+//! character as itself or a `\u` escape, whatever its quotes (R64), so a broken marked block is
+//! never taken for unmarked data beside a valid one; nothing is repaired or rewritten.
 //!
 //! Version 1 shape (a proposed shape for this codec, not an outside standard). Each group is an
 //! object of named values; anything else in the block is kept as it is and listed as unknown:
@@ -766,7 +768,8 @@ impl Guide {
             let text = &self.text[content.clone()];
             let parsed = first.eq_ignore_ascii_case("json").then(|| parse(text));
             // A block that doesn't parse is marked when the marker appears in it at all, also
-            // spelled with escapes (R63), so a broken marked block is never unmarked data.
+            // spelled with escapes (R63) and whatever its quotes (R64), so a broken marked block
+            // is never unmarked data.
             let marked = match &parsed {
                 Some(Ok(Json::Object(members, _))) => members.iter().any(|m| m.key == BLOCK_KEY),
                 Some(Err(_)) => mentions_marker(text),
@@ -1050,7 +1053,9 @@ fn is_blank(line: &str) -> bool {
 }
 
 /// The HTML block a line starts, if any: indented at most three spaces, `<` then a tag name,
-/// `/`, `!` or `?` (a conservative reading of CommonMark's HTML blocks).
+/// `/`, `!` or `?` (a conservative reading of CommonMark's HTML blocks). A comment, CDATA
+/// section, processing instruction or declaration runs to its closing `-->`, `]]>`, `?>` or `>`
+/// (unclosed, to the guide's end); another tag, to a blank line.
 fn html_start(line: &str) -> Option<HtmlEnd> {
     if indent(line) > 3 {
         return None;
@@ -1064,11 +1069,21 @@ fn html_start(line: &str) -> Option<HtmlEnd> {
             return Some(HtmlEnd::Tag(tag));
         }
     }
+    // The enclosed forms end at their own closing text only, never at a blank line inside them.
     if after.starts_with("!--") {
         return Some(HtmlEnd::Text("-->"));
     }
+    if after.starts_with("![cdata[") {
+        return Some(HtmlEnd::Text("]]>"));
+    }
+    if after.starts_with('?') {
+        return Some(HtmlEnd::Text("?>"));
+    }
+    if after.starts_with('!') && after.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) {
+        return Some(HtmlEnd::Text(">"));
+    }
     let next = *after.as_bytes().first()?;
-    (next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')).then_some(HtmlEnd::Blank)
+    (next.is_ascii_alphabetic() || matches!(next, b'/' | b'!')).then_some(HtmlEnd::Blank)
 }
 
 /// Whether `line` ends an HTML block that ends at `end`.
@@ -1101,32 +1116,36 @@ fn list_item(line: &str) -> bool {
     matches!(rest.get(marker), None | Some(b' ' | b'\t'))
 }
 
-/// Whether a string in `text` (not valid JSON) is the marker, also spelled with escapes, or
-/// the marker appears in it at all.
+/// Whether the marker's name appears anywhere in `text` (not valid JSON), each character as
+/// itself or as a `\u` escape. Quotes aren't paired (a broken string before the name must not
+/// hide it, R64), and each place reads at most six bytes a character, so the scan is linear.
 fn mentions_marker(text: &str) -> bool {
-    if text.contains(BLOCK_KEY) {
-        return true;
-    }
-    let mut p = Parser {
-        s: text.as_bytes(),
-        src: text,
-        i: 0,
-    };
-    while p.i < p.s.len() {
-        if p.s[p.i] != b'"' {
-            p.i += 1;
+    let s = text.as_bytes();
+    (0..s.len()).any(|i| marker_at(s, i))
+}
+
+/// Whether the marker's name, each character as itself or as a `\u` escape, starts at `i`.
+fn marker_at(s: &[u8], mut i: usize) -> bool {
+    for want in BLOCK_KEY.bytes() {
+        if s.get(i) == Some(&want) {
+            i += 1;
             continue;
         }
-        let start = p.i;
-        match p.string() {
-            Ok((s, _)) if s == BLOCK_KEY => return true,
-            Ok(_) => {}
-            // Unterminated: nothing more to read.
-            Err(_) if p.i >= p.s.len() => return false,
-            Err(_) => p.i = p.i.max(start + 1),
+        if s.get(i..i + 2) != Some(&b"\\u"[..]) {
+            return false;
         }
+        let Some(hex) = s.get(i + 2..i + 6) else {
+            return false;
+        };
+        let value = hex
+            .iter()
+            .try_fold(0, |v, &h| Some(v * 16 + char::from(h).to_digit(16)?));
+        if value != Some(u32::from(want)) {
+            return false;
+        }
+        i += 6;
     }
-    false
+    true
 }
 
 /// An opening fence line: its character, length and info string.
