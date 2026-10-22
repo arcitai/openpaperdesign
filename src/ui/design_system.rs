@@ -37,6 +37,7 @@ use crate::editor::Editor;
 use crate::model::{CharStyle, Color, NodeId, NodeKind, Paint};
 use crate::theme;
 use egui::{RichText, Ui};
+use std::collections::{HashMap, HashSet};
 
 /// A text style a Paper uses: its size in hundredths of a point (so equal sizes group), bold
 /// and italic.
@@ -179,6 +180,7 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
     if styles.is_empty() {
         note(ui, "No text on this Paper.");
     }
+    let links = inheritors(ed);
     let mut changed = None;
     let mut open = None;
     for (style, ids) in styles {
@@ -188,6 +190,20 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         }
         if ids.iter().all(|id| ed.doc.is_effectively_locked(*id)) {
             style_glyph(ui, slot, theme::pal(ui).tertiary);
+            continue;
+        }
+        // A locked instance inherits it (R67): no editor, the reason said instead. (The style
+        // being changed was checked when its change began.)
+        let in_use = active.as_ref().is_some_and(|a| a.now == style);
+        if !in_use
+            && !links.is_empty()
+            && reaches_locked(ed, &links, &style_groups(&style_targets(ed, style)))
+        {
+            let id = key.with(("refused", style));
+            let paint = |ui: &Ui, r| style_glyph(ui, r, theme::pal(ui).tertiary);
+            if refused_slot(ui, id, slot, INHERITED_STYLE, paint) {
+                ed.status = INHERITED_STYLE.into();
+            }
             continue;
         }
         // The editor's identity: the style its row had when the change began, so it stays open
@@ -207,29 +223,38 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         }
     }
     if let Some((style, change, popup)) = changed {
-        let mut r = match active.take() {
-            Some(a) if a.now == style => a,
+        let r = match active.take() {
+            Some(a) if a.now == style => Some(a),
             other => {
                 if other.is_some() {
                     ed.history.seal();
                 }
-                ed.end_text_edit();
-                Restyle {
-                    from: style,
-                    now: style,
-                    targets: style_targets(ed, style),
-                    stamp: 0,
-                    popup,
+                if reaches_locked(ed, &links, &style_groups(&style_targets(ed, style))) {
+                    // Refused before anything changes (see `reaches_locked`).
+                    egui::Popup::close_id(ui.ctx(), popup);
+                    ed.status = INHERITED_STYLE.into();
+                    None
+                } else {
+                    ed.end_text_edit();
+                    Some(Restyle {
+                        from: style,
+                        now: style,
+                        targets: style_targets(ed, style),
+                        stamp: 0,
+                        popup,
+                    })
                 }
             }
         };
-        restyle(ed, &r, change);
-        r.now = match change {
-            StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
-            StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
-        };
-        r.stamp = ed.doc_stamp;
-        active = Some(r);
+        if let Some(mut r) = r {
+            restyle(ed, &r, change);
+            r.now = match change {
+                StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
+                StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
+            };
+            r.stamp = ed.doc_stamp;
+            active = Some(r);
+        }
     } else if active.as_ref().is_some_and(|a| open != Some(a.now)) {
         // Its editor closed (or its style left the list): that interaction is one step.
         ed.history.seal();
@@ -295,9 +320,118 @@ pub fn restyling(ctx: &egui::Context, ed: &Editor) -> bool {
 }
 
 /// Whether a value change from Theme (a colour or a text style) is under way: its whole use is
-/// one undo step, so the browser host holds its autosave meanwhile (see [`recolouring`]).
+/// one undo step, so every host holds its autosave meanwhile (the browser's
+/// `WebState::save_snapshot`, the native `Session::autosave_due_ui`; see [`recolouring`]).
 pub fn editing(ctx: &egui::Context, ed: &Editor) -> bool {
     recolouring(ctx, ed) || restyling(ctx, ed)
+}
+
+/// Why Theme won't change a colour here (the swatch's tooltip, and the status line when it is
+/// chosen anyway). See [`reaches_locked`].
+pub const INHERITED_COLOUR: &str = "A locked instance inherits this colour from its component \
+                                    and would change with it. Unlock that instance to change \
+                                    the colour here.";
+/// Why Theme won't change a text style here (as [`INHERITED_COLOUR`]).
+pub const INHERITED_STYLE: &str = "A locked instance inherits this text style from its \
+                                   component and would change with it. Unlock that instance \
+                                   to change the style here.";
+
+/// Every instance layer, by the layer it inherits from (`InstanceLink::main`).
+fn inheritors(ed: &Editor) -> HashMap<NodeId, Vec<NodeId>> {
+    let mut out: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for n in ed.doc.nodes.values() {
+        if let Some(l) = &n.instance {
+            out.entry(l.main).or_default().push(n.id);
+        }
+    }
+    out
+}
+
+/// Whether a Theme change of each `(layer, override group)` in `changed` would also change an
+/// effectively locked layer (R67). Committing an edit inside a main component keeps every
+/// instance of it in sync (`Editor::fixup` → `sync_node` → `copy_props`), whatever the
+/// instance's lock: a layer that inherits the group from a changed one (not overriding it)
+/// takes the new value, and so on through instances of instances. Theme's targets skip locked
+/// layers, so such a change is refused before anything changes, rather than reaching a locked
+/// layer behind its back; ordinary component editing elsewhere is unchanged. `links` is
+/// [`inheritors`].
+fn reaches_locked(
+    ed: &Editor,
+    links: &HashMap<NodeId, Vec<NodeId>>,
+    changed: &[(NodeId, &'static str)],
+) -> bool {
+    if links.is_empty() {
+        return false;
+    }
+    let direct: HashSet<NodeId> = changed.iter().map(|(id, _)| *id).collect();
+    let in_component = |id: NodeId| {
+        std::iter::once(id)
+            .chain(ed.doc.ancestors(id))
+            .any(|a| ed.doc.get(a).is_some_and(|n| n.component))
+    };
+    let mut queue: Vec<(NodeId, &str)> = changed.to_vec();
+    let mut seen: HashSet<(NodeId, &str)> = HashSet::new();
+    while let Some((id, key)) = queue.pop() {
+        // Only an edit inside a main component is synced to its instances.
+        if !seen.insert((id, key)) || !in_component(id) {
+            continue;
+        }
+        for &dep in links.get(&id).into_iter().flatten() {
+            let Some(d) = ed.doc.get(dep) else {
+                continue;
+            };
+            let overrides = d
+                .instance
+                .as_ref()
+                .is_some_and(|l| l.overrides.iter().any(|o| o == key));
+            // A layer changed directly is one of the change's own (unlocked) targets.
+            if overrides || direct.contains(&dep) {
+                continue;
+            }
+            if ed.doc.is_effectively_locked(dep) {
+                return true;
+            }
+            queue.push((dep, key));
+        }
+    }
+    false
+}
+
+/// A colour's places as the override groups they change.
+fn colour_groups(places: &[Place]) -> Vec<(NodeId, &'static str)> {
+    let mut out = Vec::new();
+    for p in places {
+        if !p.fills.is_empty() {
+            out.push((p.id, "fills"));
+        }
+        if p.stroke {
+            out.push((p.id, "stroke"));
+        }
+    }
+    out
+}
+
+/// A text style's targets as the override group they change.
+fn style_groups(targets: &[StyleTarget]) -> Vec<(NodeId, &'static str)> {
+    targets.iter().map(|t| (t.id, "font")).collect()
+}
+
+/// A row's swatch or "Aa" whose change Theme refuses (`reason`): drawn quietly by `paint`, the
+/// reason as its tooltip and accessible description. Choosing it changes nothing; it returns
+/// whether it was chosen, so the caller says the reason in the status line.
+fn refused_slot(
+    ui: &mut Ui,
+    id: egui::Id,
+    slot: egui::Rect,
+    reason: &str,
+    paint: impl FnOnce(&Ui, egui::Rect),
+) -> bool {
+    let mut child = ui.new_child(egui::UiBuilder::new().id(id).max_rect(slot));
+    let (rect, resp) = child.allocate_exact_size(slot.size(), egui::Sense::click());
+    paint(&child, rect);
+    theme::focus_ring(&child, rect, &resp, false);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, reason));
+    resp.on_hover_text(reason).clicked()
 }
 
 /// Where the shown Paper's unlocked text layers have characters in `style`, resolved as the
@@ -623,6 +757,7 @@ fn used_colours(ui: &mut Ui, ed: &mut Editor) {
     if colours.is_empty() {
         note(ui, "No solid colours on this Paper.");
     }
+    let links = inheritors(ed);
     let mut changed = None;
     let mut open = None;
     for (c, ids) in colours.into_iter().take(MAX_COLOURS) {
@@ -632,6 +767,20 @@ fn used_colours(ui: &mut Ui, ed: &mut Editor) {
         }
         if ids.iter().all(|id| ed.doc.is_effectively_locked(*id)) {
             locked_swatch(ui, swatch, c);
+            continue;
+        }
+        // A locked instance inherits it (R67): no picker, the reason said instead. (The colour
+        // being changed was checked when its change began.)
+        let in_use = active.as_ref().is_some_and(|a| a.now == c);
+        if !in_use
+            && !links.is_empty()
+            && reaches_locked(ed, &links, &colour_groups(&places(ed, c)))
+        {
+            let id = key.with(("refused", c));
+            let paint = |ui: &Ui, r| locked_swatch(ui, r, c);
+            if refused_slot(ui, id, swatch, INHERITED_COLOUR, paint) {
+                ed.status = INHERITED_COLOUR.into();
+            }
             continue;
         }
         // The picker's identity: the colour its row had when the change began, so it stays
@@ -651,26 +800,35 @@ fn used_colours(ui: &mut Ui, ed: &mut Editor) {
         }
     }
     if let Some((c, to, popup)) = changed {
-        let mut r = match active.take() {
-            Some(a) if a.now == c => a,
+        let r = match active.take() {
+            Some(a) if a.now == c => Some(a),
             other => {
                 if other.is_some() {
                     ed.history.seal();
                 }
-                ed.end_text_edit();
-                Recolour {
-                    from: c,
-                    now: c,
-                    places: places(ed, c),
-                    stamp: 0,
-                    popup,
+                if reaches_locked(ed, &links, &colour_groups(&places(ed, c))) {
+                    // Refused before anything changes (see `reaches_locked`).
+                    egui::Popup::close_id(ui.ctx(), popup);
+                    ed.status = INHERITED_COLOUR.into();
+                    None
+                } else {
+                    ed.end_text_edit();
+                    Some(Recolour {
+                        from: c,
+                        now: c,
+                        places: places(ed, c),
+                        stamp: 0,
+                        popup,
+                    })
                 }
             }
         };
-        recolour(ed, &r, to);
-        r.now = to;
-        r.stamp = ed.doc_stamp;
-        active = Some(r);
+        if let Some(mut r) = r {
+            recolour(ed, &r, to);
+            r.now = to;
+            r.stamp = ed.doc_stamp;
+            active = Some(r);
+        }
     } else if active.as_ref().is_some_and(|a| open != Some(a.now)) {
         // Its picker closed (or its colour left the list): that interaction is one step.
         ed.history.seal();
@@ -719,8 +877,9 @@ fn picker(
     (changed, egui::Popup::is_id_open(child.ctx(), popup), popup)
 }
 
-/// The swatch of a colour only locked layers use: shown, not changeable here.
-fn locked_swatch(ui: &mut Ui, swatch: egui::Rect, c: Color) {
+/// The swatch of a colour only locked layers use (or one a locked instance inherits): shown,
+/// not changeable here.
+fn locked_swatch(ui: &Ui, swatch: egui::Rect, c: Color) {
     let edge = egui::Stroke::new(1.0, theme::pal(ui).control_border);
     ui.painter()
         .rect(swatch, 3.0, super::c32(c), edge, egui::StrokeKind::Inside);

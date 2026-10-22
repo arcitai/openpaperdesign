@@ -214,9 +214,13 @@ impl App {
         true
     }
 
-    /// Autosave when due. Called after every frame and on timer wake-ups.
+    /// Autosave when due. Called after every frame and on timer wake-ups. A Theme change still
+    /// under way waits (`Session::autosave_due_ui`), so its one undo step isn't split.
     fn tick_autosave(&mut self) {
-        if self.session.autosave_due(&self.ed, Instant::now()) {
+        if self
+            .session
+            .autosave_due_ui(&self.ed, &self.ctx, Instant::now())
+        {
             self.save_project(false);
         }
     }

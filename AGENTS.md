@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.87 · Updated: 2026-10-22
+Revision: 0.88 · Updated: 2026-10-22
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -724,6 +724,35 @@ engine architecture is `analysis/DESIGN.md`.
       and `rev21_a_text_style_editor_never_outlives_its_document_or_paper`. An agent's
       `get_jsx` reports a text's base style only, so a range's proof is the page file and the
       render, never inferred rich-run JSX.
+      **R67 corrections** (run165; the independent R67 review's two P2s, source only):
+      - **Locked instances.** Theme's targets skip locked layers, but committing a change inside
+        a main component syncs every instance of it (`Editor::fixup` → `sync_node` →
+        `copy_props`) whatever its lock, so a locked instance's inherited red or 24 changed
+        anyway. Component sync is unchanged; Theme now refuses such a change before anything
+        changes: `reaches_locked` follows `InstanceLink::main` from the change's layers and
+        override groups (`fills`/`stroke`, `font`), through instances of instances, while the
+        layer is inside a main component and not overriding that group, and refuses when it
+        reaches an effectively locked layer that isn't a target. Such a row's swatch or "Aa"
+        (`refused_slot`) opens nothing; its tooltip and, when chosen, the status line say
+        `INHERITED_COLOUR` / `INHERITED_STYLE` (unlock that instance). The check runs again when
+        a change begins, so a refusal never applies anything. Rows no locked instance inherits,
+        and unlocked instances (which take the change as targets, with the inspector's
+        overrides), are unchanged.
+      - **Native autosave.** `Session::autosave_due_ui` (upstream `src/session.rs`, called by
+        `App::tick_autosave` in `src/app.rs` with the app's egui context) holds the native
+        autosave while `design_system::editing` is true, as `WebState::save_snapshot` does,
+        moving its deadline on so the event loop's timer doesn't spin; it is due again an
+        autosave delay after the use ends, and closing the project (`save_all`) saves
+        regardless. `Session::autosave_due`, `save`, `mark_saved` and the history seal are
+        unchanged. Reason for the upstream-owned files: the shared Theme UI is drawn by the
+        native app too, and only its own host can hold its own save.
+      - Tests (`rev21`'s `state_tests.rs`, `r67_*`): the reviewer's three passing probes (late
+        acknowledgement during colour and style, failed save and discard) kept unchanged but for
+        formatting; refusal for colour and style with the whole page, history, stamp, unsaved
+        state and selection unchanged and the reason shown, plus successful unlocked-instance
+        controls with one-step Undo/Redo; and the native session through `autosave_due_ui` and
+        the real `Session` save (adapted: a fresh temporary store, and the normal save after
+        the picker closes).
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).

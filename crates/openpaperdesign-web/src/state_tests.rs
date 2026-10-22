@@ -7628,3 +7628,347 @@ fn rev21_a_text_style_editor_never_outlives_its_document_or_paper() {
 fn get_italic(doc: &Document, id: crate::model::NodeId) -> bool {
     doc.get(id).unwrap().text_style.italic
 }
+
+// ---- R67 corrections: Theme beside component instances, and the native host's autosave.
+// The independent R67 review's probes are kept here; where one was adapted, its comment says
+// how and why.
+
+/// The native app's own project session (upstream `src/session.rs`), for its autosave decision.
+#[allow(dead_code)]
+#[path = "../../../src/session.rs"]
+mod native_session;
+
+#[test]
+fn r67_late_colour_ack_keeps_newer_edit_dirty_and_one_step() {
+    // The reviewer's probe, unchanged but for formatting.
+    let (mut s, ids, _) = theme_fixture();
+    s.ed.edit("Earlier unrelated move", |tx| {
+        tx.node_mut(ids.e).unwrap().rect.x += 10.0;
+    });
+    let before = page_to_json(&s.ed.page_data(0));
+    let earlier = s
+        .save_snapshot()
+        .expect("earlier save starts before picker");
+    assert_eq!(page_to_json(&sent_page(&earlier)), before);
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_field(&mut s, "R ");
+    press(&mut s, "1", "Digit1");
+    timed_frames(&mut s, 2);
+    s.save_succeeded(); // Real acknowledgement after the first newer picker change.
+    assert!(
+        s.dirty(),
+        "older acknowledgement cannot mark the newer edit saved"
+    );
+    assert!(
+        s.save_snapshot().is_none(),
+        "newer picker edit remains held"
+    );
+    type_with_autosaves(&mut s, &[("5", "Digit5"), ("0", "Digit0")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    let edited = page_to_json(&s.ed.page_data(0));
+    let save = s.save_snapshot().expect("final value offered on close");
+    assert_eq!(page_to_json(&sent_page(&save)), edited);
+    s.save_succeeded();
+    assert!(!s.dirty());
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        before,
+        "late ack did not split picker"
+    );
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn r67_late_style_ack_keeps_newer_edit_dirty_and_one_step() {
+    // The reviewer's probe, unchanged but for formatting.
+    let (mut s, ids, _) = text_style_fixture();
+    s.ed.edit("Earlier unrelated move", |tx| {
+        tx.node_mut(ids.bold).unwrap().rect.x += 10.0;
+    });
+    let before = page_to_json(&s.ed.page_data(0));
+    s.save_snapshot().expect("earlier save starts");
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_field(&mut s, "Size ");
+    press(&mut s, "3", "Digit3");
+    timed_frames(&mut s, 2);
+    s.save_succeeded();
+    assert!(s.dirty());
+    assert!(s.save_snapshot().is_none());
+    type_with_autosaves(&mut s, &[("2", "Digit2")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    s.save_snapshot().expect("final style save");
+    s.save_succeeded();
+    assert!(!s.dirty());
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+}
+
+#[test]
+fn r67_failed_save_releases_inflight_and_discard_ends_hold_immediately() {
+    // The reviewer's probe, unchanged but for formatting.
+    let (mut s, _, _) = theme_fixture();
+    let original = pages_now(&s);
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_channel(&mut s, "R ", "150");
+    assert!(s.save_snapshot().is_none());
+    s.set_focused(false);
+    s.save_snapshot()
+        .expect("departure can send while popup is open");
+    s.save_failed(); // Same WebState callback used on conflict/refusal.
+    assert!(s.dirty());
+    assert!(!s.can_reload(), "failed save never makes it clean");
+    s.set_focused(true);
+    assert!(
+        s.save_snapshot().is_none(),
+        "focus holds current edit again"
+    );
+    s.reload(&canvas(&original, "p")).expect("explicit discard");
+    assert!(
+        !ui::design_system::editing(&s.ctx, &s.ed),
+        "stale stamp ends hold before next draw"
+    );
+    timed_frames(&mut s, 3);
+    assert!(!ui::popup_open(&s.ctx));
+    assert!(!s.dirty());
+    assert!(s.can_reload());
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page_to_json(&original[0]));
+}
+
+#[test]
+fn r67_the_native_session_autosave_keeps_one_theme_use_one_undo_step() {
+    // R67 F2: the reviewer's `r67_native_session_autosave_retains_one_undo_per_colour_use`
+    // failed with three `Session` saves while R was typed 1, 5, 0 into one open picker, and
+    // one Undo at R 15, not 255. This drives the native app's own decision,
+    // `Session::autosave_due_ui` (what `App::tick_autosave` calls with its egui context), with
+    // the actual `Session` save. Adapted from the probe: a fresh temporary store instead of
+    // the reviewer's own fixture path, the clock past the autosave delay at every key (the
+    // save is due by time, and held), and the normal autosave after the picker closes, the
+    // one save the corrected hold leaves (the probe expected the disk to have R 150 without
+    // any further `Session` call). Its one-Undo-to-255 and full-page assertions are kept.
+    use crate::model::Paint;
+    use std::time::Instant;
+    let root = std::env::temp_dir().join(format!("opd-r67-session-{:016x}", fastrand::u64(..)));
+    let store = crate::project::Store::open(root.clone()).unwrap();
+    let mut sess = native_session::Session::new(store);
+    let mut empty = Editor::default();
+    sess.create(&mut empty, "R67 Session").unwrap();
+    let (mut s, ids, _) = theme_fixture();
+    s.ed.meta_dirty = true;
+    sess.save(&mut s.ed).unwrap(); // Seed this fresh project with the exact fixture.
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_field(&mut s, "R ");
+    let delay = native_session::AUTOSAVE_DELAY;
+    let mut now = Instant::now();
+    let mut saves = 0;
+    let keys = [
+        ("1", "Digit1", 1),
+        ("5", "Digit5", 15),
+        ("0", "Digit0", 150),
+    ];
+    for (key, code, value) in keys {
+        press(&mut s, key, code);
+        timed_frames(&mut s, 2);
+        let a = s.ed.doc.get(ids.a).unwrap();
+        assert_eq!(a.style.fills[0], Paint::solid(Color::rgb(value, 0, 0)));
+        assert!(ui::design_system::editing(&s.ctx, &s.ed));
+        now += delay * 3;
+        if sess.autosave_due_ui(&s.ed, &s.ctx, now) {
+            sess.save(&mut s.ed).unwrap();
+            saves += 1;
+        }
+    }
+    assert_eq!(saves, 0, "no save while the picker is open");
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+    // The normal autosave once the picker closed: due an autosave delay later.
+    now += delay;
+    assert!(
+        sess.autosave_due_ui(&s.ed, &s.ctx, now),
+        "due once it closed"
+    );
+    sess.save(&mut s.ed).unwrap();
+    let edited = page_to_json(&s.ed.page_data(0));
+    let saved = sess.project.as_ref().unwrap().load_pages().unwrap();
+    assert_eq!(
+        page_to_json(&saved[0]),
+        edited,
+        "the Session saved the page"
+    );
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        s.ed.doc.get(ids.a).unwrap().style.fills[0],
+        Paint::solid(Color::rgb(255, 0, 0)),
+        "one Undo restores the starting red"
+    );
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        before,
+        "one full-page Undo"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Layer `main_child` made a main component (wrapped in a component frame) and one instance of
+/// it placed beside, locked if `locked`: the instance and its child inheriting from
+/// `main_child`, laid out with nothing selected.
+fn instance_of(
+    s: &mut WebState,
+    main_child: crate::model::NodeId,
+    locked: bool,
+) -> (crate::model::NodeId, crate::model::NodeId) {
+    s.ed.selection = vec![main_child];
+    s.ed.create_component();
+    let main = s.ed.selection[0];
+    let instance =
+        s.ed.create_instance(main, crate::geom::v2(700.0, 100.0))
+            .unwrap();
+    let child = s.ed.doc.get(instance).unwrap().children[0];
+    let link = s.ed.doc.get(child).unwrap().instance.clone().unwrap();
+    assert_eq!(link.main, main_child);
+    if locked {
+        s.ed.edit("Lock instance", |tx| {
+            tx.node_mut(instance).unwrap().locked = true
+        });
+        assert!(s.ed.doc.is_effectively_locked(child));
+    }
+    s.ed.selection.clear();
+    timed_frames(s, 4);
+    (instance, child)
+}
+
+/// A Theme row's change refused because a locked instance inherits it: choosing its swatch or
+/// "Aa" opens nothing, says `reason` in the status line, and changes nothing at all (the page,
+/// the history, the document stamp, the unsaved state, the selection).
+fn assert_refused(s: &mut WebState, row: &str, reason: &str) {
+    let page = page_to_json(&s.ed.page_data(0));
+    let kept = (s.ed.history.undo_len(), s.ed.doc_stamp, s.dirty());
+    let p = theme_swatch(s, row);
+    timed_click(s, p);
+    assert!(!ui::popup_open(&s.ctx), "{row}: nothing opens");
+    assert_eq!(s.ed.status, reason);
+    assert!(paints(s, reason), "{row}: the reason is shown");
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        page,
+        "{row}: nothing changed"
+    );
+    assert_eq!((s.ed.history.undo_len(), s.ed.doc_stamp, s.dirty()), kept);
+    assert!(s.ed.selection.is_empty());
+}
+
+#[test]
+fn r67_a_colour_a_locked_instance_inherits_is_refused_whole_and_said() {
+    // R67 F1: the reviewer's `r67_theme_colour_keeps_locked_component_instance_exact` failed
+    // with the locked instance's child turned yellow (component sync reached it behind
+    // Theme's lock filter). Corrected by refusal, before anything changes, with the reason:
+    // that probe's "main turns yellow" expectation isn't this contract, so its fixture is kept
+    // and its locked-child-exact assertion is strengthened to the whole Paper and history.
+    use crate::model::Paint;
+    let (mut s, ids, _) = theme_fixture();
+    let (_, child) = instance_of(&mut s, ids.a, true);
+    let child_before = s.ed.doc.get(child).unwrap().clone();
+    assert_eq!(child_before.style.fills[0], Paint::solid(RED));
+    open_theme(&mut s);
+    assert_refused(&mut s, "#ff0000", ui::design_system::INHERITED_COLOUR);
+    assert_eq!(s.ed.doc.get(child), Some(&child_before));
+    // Blue, `a`'s upper fill, is inherited too and refused the same way; green, the ellipse's
+    // own fill, which no locked instance inherits, still changes.
+    assert_refused(&mut s, "#0000ff", ui::design_system::INHERITED_COLOUR);
+    open_picker(&mut s, "#00ff00");
+    picker_channel(&mut s, "R ", "255");
+    close_picker(&mut s);
+    let b = s.ed.doc.get(ids.b).unwrap();
+    assert_eq!(b.style.fills[0], Paint::solid(YELLOW));
+    assert_eq!(s.ed.doc.get(child), Some(&child_before));
+}
+
+#[test]
+fn r67_an_unlocked_instance_takes_a_theme_colour_with_its_main_in_one_step() {
+    // The successful control for R67 F1: the same component, its instance unlocked.
+    use crate::model::Paint;
+    let (mut s, ids, _) = theme_fixture();
+    let (_, child) = instance_of(&mut s, ids.a, false);
+    let before_doc = s.ed.doc.clone();
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_channel(&mut s, "G ", "255");
+    close_picker(&mut s);
+    assert_eq!(
+        s.ed.doc.get(ids.a).unwrap().style.fills[0],
+        Paint::solid(YELLOW)
+    );
+    assert_eq!(
+        s.ed.doc.get(child).unwrap().style.fills[0],
+        Paint::solid(YELLOW)
+    );
+    for id in [ids.c, ids.d, ids.g] {
+        assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{id:?}");
+    }
+    let edited = page_to_json(&s.ed.page_data(0));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn r67_a_text_style_a_locked_instance_inherits_is_refused_whole_and_said() {
+    // R67 F1, typography: the reviewer's `r67_theme_style_keeps_locked_component_instance_exact`
+    // failed with the locked instance's child at 32. Refused as for colours (see there).
+    let (mut s, ids, _) = text_style_fixture();
+    let (_, child) = instance_of(&mut s, ids.whole, true);
+    let child_before = s.ed.doc.get(child).unwrap().clone();
+    assert_eq!(child_before.kind.font_size(), Some(24.0));
+    open_theme(&mut s);
+    assert_refused(&mut s, "24 · Regular", ui::design_system::INHERITED_STYLE);
+    assert_eq!(s.ed.doc.get(child), Some(&child_before));
+}
+
+#[test]
+fn r67_an_unlocked_instance_takes_a_theme_text_style_with_its_main_in_one_step() {
+    // The successful control for R67 F1, typography.
+    let (mut s, ids, _) = text_style_fixture();
+    let (_, child) = instance_of(&mut s, ids.whole, false);
+    let before_doc = s.ed.doc.clone();
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_field(&mut s, "Size ");
+    type_with_autosaves(&mut s, &[("3", "Digit3"), ("2", "Digit2")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    let size = |s: &WebState, id| s.ed.doc.get(id).unwrap().kind.font_size();
+    assert_eq!(size(&s, ids.whole), Some(32.0));
+    assert_eq!(size(&s, child), Some(32.0));
+    for id in [ids.locked, ids.grouped, ids.group, ids.bold] {
+        assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{id:?}");
+    }
+    let edited = page_to_json(&s.ed.page_data(0));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
