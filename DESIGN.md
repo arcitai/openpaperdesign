@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 20 · 2026-10-21 · The one canonical visual and interaction direction for the OPD app
+Revision: 21 · 2026-10-22 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file is the
@@ -23,14 +23,93 @@ The owner's explicit priority governs every choice below, and wins where a refer
 - The same restraint applies to Home, the editor, the tools, the inspector, type and spacing,
   in light, dark and narrow layouts. Airiness never shrinks the drawing room below usable.
 
+## Where things stand (revision 21, 2026-10-22)
+
+One place to find the current brief and what is left. The full criteria stay in the issues
+themselves and the owner comments they link (#10's seven groups, comment 6314311252; #14's
+Design/Theme and canonical source brief, comment 6314311627; the consolidated delivery order,
+comment 6347896307); this summary doesn't replace them, and no issue is closed by it.
+
+**Candidates, kept apart.**
+- **Installed: `6630ec4`** (revision 20's workbench below and its R61/R62 corrections). Its
+  source, Linux and browser checks, exact CI and the Mac artifact (R66, one build, one
+  unchanged production proof) were accepted, and the Mac operator installed exactly that
+  binary on 2026-10-22 at 19:55 CEST, saved drawings, settings and the 27 plugin files kept.
+  **Not proven:** which build the open editor actually loaded (the old tab didn't close;
+  Home's static `0.1.0` doesn't identify the view), R56's complete native app/resource
+  identity, and the full native journey. So "it looks the same" isn't yet tied to either build.
+- **Local after it: `622732f`**, the no-I/O guide codec (R63–R65 corrections; R65 accepted
+  it at source scope locally). It is not installed, adds no file, source or Theme authority,
+  and nothing in the app calls it.
+- **Local after that (revision 21, implemented, not installed):** the new architecture mark
+  (#8) and Theme's in-place changes of a colour and of a text style in use (principle 4); see
+  their sections. The lead's bounded checks passed on this source: the WebState/library,
+  serve and integration suites, formatting, the plugin's manifest and SVG checks, and real
+  renders of Theme on a disposable fixture (below). Still pending: an independent review of
+  the exact combined candidate, its production build and CI, and any native or Mac check.
+
+**#10's seven groups** (owner brief; Mac re-test targets once the loaded build is known):
+
+| Group | Delivered at source/qualification level (6630) | Open |
+|---|---|---|
+| 1. Contextual Design | Temporary reveal on selection or creation, restore on clear, the pinned/open choice kept apart (synthetic and Linux surfaces) | The same journey on the actually loaded Mac build; field drafts kept |
+| 2. Canvas/Paper names | One Canvas title, one Papers list, fewer repetitions; R62's accessible name after a rename | Long/Unicode names, keyboard rename, Saved and reopen on one fixture, on Mac |
+| 3. Toolbar | Select and Hand separate, revised families and proportions; R62's Space release after a popup | Mac layout and arrow spacing, every tool and shortcut; Return to Select stays (owner-accepted) |
+| 4. Corner bars, navigation | Zoom and Export upper right, one All Projects menu with Back first, local collapse/restore, guarded navigation | Seen on the loaded build, dirty/conflict navigation included. Share is a real supported action only: no cloud or multiplayer (#2) |
+| 5. One visual language | Shared type, icons, panels, fields, pickers, menus and states; representative Light/Dark, wide/narrow/short renders | Partly qualified: the owner's visual acceptance on Mac, cursor/drag, tooltip, picker and dialog corners |
+| 6. Design / Theme | The switch; the Paper's text styles and colours (choosing selects); read-only Inter; the source shown "Not connected". Revision 21 adds changing a colour and a text style in use, in place (lead-checked with real renders; review and native pending) | Named tokens, font families, explicit Apply of a named value and the project's `DESIGN.md`/`design.md` (R19–R21; see Theme below) |
+| 7. The whole app | A shared sweep with Home/editor/panel/menu/Theme/conflict/reopen evidence; upstream editor and shared primitives kept | The whole brief, all 22 requirements and the owner's Mac acceptance; Home freshness is still triage (no stale state shown, no refresh mechanism chosen) |
+
+**Other open issues** (each keeps its own full criteria):
+- **#6** (functional and native acceptance, admission): the seven groups' native gaps above;
+  canonical project admission with per-call and idle revocation is the external prerequisite
+  for any project file route (R19–R20).
+- **#8** (the plugin's mark): revision 21 implements the owner's 19 October architecture
+  direction in source; showing it in the installed Codex, the open flow and before/after
+  screenshots at real size stay open.
+- **#14/#15** (design system): Theme's supported part and its blocks are mapped below; the
+  2026-10-22 Hallmark reference is a method (real screenshots, kept wiring, fresh review), not
+  code, a runtime or an authority.
+- **#12** (sensitive files and distribution checks): its implementation admission wasn't
+  established by this bounded reconciliation (not an owner rejection); it stays unassigned,
+  with its full issue scope unchanged. Nothing is implemented for it here.
+- **#2** (collaboration) deliberately deferred; **#7**'s older extra work separately
+  specified, not closed in bulk; **#16** awaits the full Foundation assessment (its evidence
+  is the gap); **#18**
+  (standalone app), **#19** (screenshots and site) and **#20** (deploy) stay unfinished or held.
+
+## The plugin's mark (revision 21, issue #8; implemented, display unproven)
+
+The owner's 19 October direction: a mark that suggests architecture, systems and an editable
+canvas more clearly than the earlier document-like sheet, still readable at sidebar size and
+distinct from AIOS. It is OPD's own: no Paper, Excalidraw or other brand is used or implied,
+and the paper-rs credit and licences stay.
+- **The mark:** an open canvas frame (a rounded square, its lower-right corner open) holding a
+  block joined by one elbow connector to a second block, which sits on the frame's open corner
+  as its selection handle: a small system being drawn and edited on a canvas.
+- **Reading at 16–24 px:** a 24-unit grid with about 2 units of padding, one 1.75-unit stroke
+  for the frame and the connector, two solid blocks, and at least 1.5 units between any two
+  marks, so nothing merges at 16 px.
+- **Colour:** the composer icons (`icon.svg`, `icon-dark.svg`) are one ink (#1d1d1f, #f2f2f5);
+  the listing logos (`logo.svg`, `logo-dark.svg`) colour the handle block with the accent
+  (#2f5bea, #7c9cff), as the earlier mark did. Same four files, sizes and wiring.
+- **Checked:** the plugin's manifest and SVG rules and the launcher's icon wiring (the served
+  icons are these files' bytes) passed the lead's checks on this source.
+- **Not claimed:** how Codex shows it (listing, composer, sidebar, selected rows), the
+  before/after screenshots at real size, an independent review and the installed display stay
+  open.
+
 ## Whole-app workbench (revision 20, 2026-10-21)
 
 The owner's 21 October feedback from ordinary Mac use (issue #10, and #14 for Theme) releases
 the earlier wait and supersedes the older placement choices it names. These decisions are
-**intended and written in source, not yet rendered, reviewed or qualified**; the before state
+built in source and installed as `6630ec4` (see "Where things stand": accepted at source,
+Linux, CI and Mac-artifact level; the loaded view and native use unproven); the before state
 was captured by the lead on the frozen d0 candidate (a user-closed Design panel stayed closed
 when a rectangle was selected). The operative principles below are updated to match; the
-revision 18 and 19 sections stay as history.
+revision 18 and 19 sections are history only, and where they differ (a Paper line under the
+title, a separate `···` menu, the zoom at the lower left, a "Properties" toggle) revision 20
+and the principles win.
 - **Contextual Design reveal** (responsive since the run144 correction, and over a
   canvas-only sheet since run145, with no width excepted; principle 6 has the rules). Where
   the person closed the Design panel, a new selection or creation shows it at every width, and
@@ -92,22 +171,27 @@ revision 18 and 19 sections stay as history.
 
 | Capability | State | Notes |
 |---|---|---|
-| Fonts | Supported, read-only | The renderer draws one bundled family, Inter (SIL OFL 1.1), in Regular, Bold, Italic and Bold Italic. Theme shows it as one status row ("Inter · 4 faces"); no other family can be chosen. |
-| Text styles on this Paper | Supported (inspect; edit through selection) | Every distinct size and weight/italic the Paper's text layers use (ranges included), with how many layers use it. Choosing one selects those layers, so the Design panel's Text section edits them together through the existing coalesced, undoable edits. |
-| Colours on this Paper | Supported (inspect; edit through selection) | Every solid fill and stroke colour in use, with its layers; choosing one selects them for the Fill or Stroke section. |
-| Named tokens (colour, radius, spacing, type…) | Blocked | The consumed upstream editor has no token store: `Document` holds its nodes and order only, a node's `Style` holds literal values, and `src/theme.rs` holds the app chrome's own values, not a canvas's. OPD will take named values from the project's design source rather than invent a second store (R21). |
-| Project design source (`DESIGN.md` / `design.md`) | Blocked: admission and implementation | The app library and the in-view editor have no admitted project folder; OPD never infers one from the current folder, a picked folder, the project list or a canvas. Both the bounded source contract of R19–R20 (an explicit, admitted, revocable link) and the guide reading and editing itself are still to be built. Theme shows "Not connected", with the reason. |
-| Apply to selection / new objects | Partly | Editing the selected text or colours applies values through the existing Design panel; an explicit Apply of a named value waits on named tokens. |
-| Guide and value codec (precursor) | Written in source, no I/O, nothing shown | `openpaperdesign-serve`'s `guide` module, with its unit tests. The independent R63 review of an earlier version requested changes (a blank line lost after a lone CR, a broken escaped-marker block taken for unmarked data, fenced examples in lists and HTML read as values, numbers rounded into support, an info string beyond `json` accepted), and the R64 review found two residual cases (a broken quote before an escaped marker hiding it; a CDATA section or processing instruction released at a blank line inside it); those are corrected below. Which exact candidate passed which checks or reviews is recorded in its source handoff; this row is no native, Theme or source-link acceptance. Given a guide's bytes (UTF-8, at most 1 MiB, no NUL), it keeps them exactly (BOM, LF/CRLF/lone CR, front matter, unknown sections) and plans, against an expected revision, a line-hunk prose edit that leaves every untouched line's bytes (refused, not shortened, when the result would exceed 1 MiB; refused too in the rare case where an edit would bring an unchanged empty line right after a lone CR, which would merge into it), or one value's own byte span in one fenced block whose info string is exactly `json`, marked `"opdDesignTokens": 1` (also spelled with escapes, and a block that doesn't parse but names the marker anywhere, even escaped and whatever its quotes, makes the values read-only), outside lists and HTML blocks (a comment, CDATA section, processing instruction or declaration up to its own closing text, blank lines inside included, or to the guide's end when unclosed); a number counts only as written exactly (no rounding into support). Version 1 values: `colors` ("#rrggbb"/"#rrggbbaa"), `fontSizes` (points), `fontWeights` (400/700 only), `spacing`, `radii`, `frames` (direction, gap, padding). Other formats, several blocks, invalid JSON or repeated names stay read-only with the reason. It reads no file, links no source and changes nothing in Theme: the source stays "Not connected", named tokens and Apply stay blocked. |
+| Fonts | Supported, read-only | The renderer draws one bundled family, Inter (SIL OFL 1.1), in Regular, Bold, Italic and Bold Italic. Theme shows it as one status row ("Inter · 4 faces"); no other family can be chosen. Choosing families is blocked by the engine, not by the source link: a text style (`TextStyle`, `TextSpan`) has no family field and the layout and glyph paths load the bundled faces only, so it needs a document field with a page-version guard, bundled or loaded faces and their licences: an engine and format change of its own. |
+| Text styles on this Paper | Supported (inspect; select; change in place, below) | Every distinct size and weight/italic the Paper's text layers use (ranges included), with how many layers use it. Choosing one selects those layers, so the Design panel's Text section edits them together through the existing coalesced, undoable edits. |
+| Colours on this Paper | Supported (inspect; select; change in place: revision 21, lead-checked with real renders, review pending) | Every solid fill and stroke colour in use, with its layers; choosing the row selects them for the Fill or Stroke section. Its swatch (revision 21) changes the colour itself, as the Paper's shared value: through the selection alone it couldn't, because layers sharing a colour seldom share whole fills and strokes, so the Design panel showed Mixed and offered only to replace them. The change reaches exactly the solid fills and strokes that had the colour when it began, on unlocked layers (locked ones keep theirs), as one undo step per picker use through the canvas's own edits, save and conflict checks (the autosave waits while a changed picker is open on the focused page, since a save's acknowledgement closes the undo step: run159 split one typed 150 into three steps); instances get overrides as in the Design panel. Gradients, text-run colours and named values are untouched; no store is created. |
+| Text styles: change in place | Supported (revision 21, lead-checked with real renders, review pending) | Each text style row's "Aa" button (in the swatch's place; the row itself still selects) opens a small editor: the style's size, and Inter's four faces (Regular, Bold, Italic, Bold Italic), no family. It changes that style wherever the shown Paper's text uses it, which selecting the layers couldn't (their whole text changes, not only that style's characters): exactly the characters that had it when the change began, on unlocked layers. A layer whose every character has it changes its own size or face; otherwise a range style covers exactly those characters, keeping each range's other values (colour, underline, strike). Text is laid out again by the existing layout (a fixed width kept). One editor use is one undo step, saved once it closes (the autosave waits, as for colours); instances get overrides. It needs no project source and creates no named style: like the colours, these are the Paper's own literal values changed in place, not a token store. The lead's real render (a disposable fixture): Size typed 3, 2 key by key gave 32; Bold merged its row with an existing 32 Bold heading; 4, 0 then reached only the characters first in the style (a whole body layer and ranges of another), not the heading, other styles or a locked control. Full page comparisons kept the Unicode text, colours, underline, strike, spacing, width, position and other layers (only the text height reflowed); nothing saved while the editor was open, Saved once it closed, one Undo gave the whole earlier page and one Redo the edited one, and a guarded Home and direct reopen kept both. An agent's `get_jsx` showed the whole layer's 40 px / 700; it shows a text's base style only, so the ranges' proof is the page file and the render. |
+| Named tokens (colour, radius, spacing, type…) | Blocked | The consumed upstream editor has no token store: `Document` holds its nodes and order only, a node's `Style` holds literal values, and `src/theme.rs` holds the app chrome's own values, not a canvas's. OPD will take named values from the project's design source rather than invent a second store (R21). Exact prerequisite: a held, admitted project source (below) whose guide the codec reads; its version 1 `colors`, `fontSizes`, `fontWeights`, `spacing`, `radii` and `frames` are those names. |
+| Project design source (`DESIGN.md` / `design.md`) | Blocked: admission and implementation | The app library and the in-view editor have no admitted project folder; OPD never infers one from the current folder, a picked folder, the project list or a canvas. Both the bounded source contract of R19–R20 (an explicit, admitted, revocable link) and the guide reading and editing itself are still to be built. Exact prerequisite (#6, #14): the host's canonical project admission with a per-call check and idle revocation, which no route here can honestly assume; then read, create and checked save through the codec's revision and span edits. Theme shows "Not connected", with the reason. |
+| Apply to selection / new objects | Partly | Editing the selected text or colours applies values through the existing Design panel, and a colour or text style in use changes in place from Theme (revision 21); an explicit Apply of a named value waits on named tokens, so on the held source. |
+| Guide and value codec (precursor) | Accepted at source scope locally (`622732f`, R65), not installed; no I/O, nothing shown | `openpaperdesign-serve`'s `guide` module, with its unit tests. The independent R63 review of an earlier version requested changes (a blank line lost after a lone CR, a broken escaped-marker block taken for unmarked data, fenced examples in lists and HTML read as values, numbers rounded into support, an info string beyond `json` accepted), and the R64 review found two residual cases (a broken quote before an escaped marker hiding it; a CDATA section or processing instruction released at a blank line inside it); those are corrected below. Which exact candidate passed which checks or reviews is recorded in its source handoff; this row is no native, Theme or source-link acceptance. Given a guide's bytes (UTF-8, at most 1 MiB, no NUL), it keeps them exactly (BOM, LF/CRLF/lone CR, front matter, unknown sections) and plans, against an expected revision, a line-hunk prose edit that leaves every untouched line's bytes (refused, not shortened, when the result would exceed 1 MiB; refused too in the rare case where an edit would bring an unchanged empty line right after a lone CR, which would merge into it), or one value's own byte span in one fenced block whose info string is exactly `json`, marked `"opdDesignTokens": 1` (also spelled with escapes, and a block that doesn't parse but names the marker anywhere, even escaped and whatever its quotes, makes the values read-only), outside lists and HTML blocks (a comment, CDATA section, processing instruction or declaration up to its own closing text, blank lines inside included, or to the guide's end when unclosed); a number counts only as written exactly (no rounding into support). Version 1 values: `colors` ("#rrggbb"/"#rrggbbaa"), `fontSizes` (points), `fontWeights` (400/700 only), `spacing`, `radii`, `frames` (direction, gap, padding). Other formats, several blocks, invalid JSON or repeated names stay read-only with the reason. It reads no file, links no source and changes nothing in Theme: the source stays "Not connected", named tokens and Apply stay blocked. |
 
 ### Accepted 22-point plan (revision 2) → current state
 
 "Built" means written in source at that revision and checked by the lead at that
-candidate's own scope; "revision 20" items are intended and unchecked.
+candidate's own scope. Revision 20's items are in installed `6630ec4`, accepted at source,
+Linux, CI and Mac-artifact level, with the loaded build and native use unproven (see "Where
+things stand"); revision 21's items are local, implemented and lead-checked at bounded scope
+(independent review, production build, CI and native pending). All 22 stay active until
+their native and owner acceptance.
 
 | ID | Requirement | State now |
 |---|---|---|
-| R01 | Calm, consistent Home/editor/plugin | Built (revisions 2, 18, 19); revision 20 extends the same tokens to the new bars, switch and Theme |
+| R01 | Calm, consistent Home/editor/plugin | Built (revisions 2, 18, 19); revision 20 extends the same tokens to the new bars, switch and Theme; revision 21 gives the plugin its architecture mark (#8; package checks passed, display unproven) |
 | R02 | No permanently open left panel | Built; unchanged |
 | R03 | One Collapse/Restore for both panels | Built; unchanged (the contextual reveal never applies while collapsed) |
 | R04 | Panels and corner controls placed logically at every width | Revised in revision 20: toggles at each bar's right end, Export and zoom in the right bar |
@@ -121,21 +205,21 @@ candidate's own scope; "revision 20" items are intended and unchecked.
 | R12 | Home Grid default, kept List, equal cards | Built |
 | R13 | Quiet Home without footer, notices kept | Built |
 | R14 | Obvious New file destination | Built (storage cue) |
-| R15 | Diagrams as an explicit workflow | Built in part (labels, label groups, bends); the rest of the workflow stays open |
-| R16 | No stale canvas band when resizing panels | Kept as a reproduction item; no defect established |
-| R17 | Light / Dark / System coherent | Built; re-check needed for the revision 20 surfaces |
-| R18 | Input, focus, save, conflict, Home and reopen correct | Built; revision 20 must keep them (re-check needed) |
-| R19 | Design system tab reads, creates and edits the project's DESIGN.md | Not built: needs the admitted-source contract and the guide reading/editing itself (Theme shows "Not connected"); not complete. A precursor is written: the no-I/O lossless guide codec (above); it reads and saves nothing |
+| R15 | Diagrams as an explicit workflow | Built in part (labels, label groups, bends). The lead's retained Linux/synthetic workflows on the d006 candidate passed at their recorded scope: grouped duplicate and delete, resize, quick connect, a labelled multi-point bend, reattach and detach, Frame, the export producer, and a conflict refused then explicitly reloaded and reapplied. Not every diagram workflow, nor any native one; the rest stays open |
+| R16 | No stale canvas band when resizing panels | A reproduction item, no defect established: a bounded synthetic DOM run (47.9 s of motion, 924 recorded frames, 484 of them during the gesture, with discriminating controls) showed no blank band or duplicated anchor. Not covered: a focused 500 px deferral case, other equipment and software, native windows, and every frame |
+| R17 | Light / Dark / System coherent | Built; revision 20's surfaces rendered in representative Light/Dark (Linux); the owner's Mac look is open |
+| R18 | Input, focus, save, conflict, Home and reopen correct | Built; revision 20 kept them in the synthetic and Linux checks (R61/R62 fixes included); native Mac re-check open |
+| R19 | Design system tab reads, creates and edits the project's DESIGN.md | Not built: needs the admitted-source contract and the guide reading/editing itself (Theme shows "Not connected"); not complete. A precursor is accepted locally: the no-I/O lossless guide codec (above, `622732f`); it reads and saves nothing |
 | R20 | Resolve the actual project, reuse DESIGN.md / design.md | Not built: the same admission contract and its implementation; not complete |
-| R21 | Useful tokens visible and editable alongside prose | Partly: fonts, text styles and colours in use; named tokens blocked (the codec reads and plans version 1 values from bytes, but no source reaches it) |
+| R21 | Useful tokens visible and editable alongside prose | Partly: fonts, text styles and colours in use; a colour and a text style in use change in place (revision 21; real UI, autosave, one-step Undo and reopen checked by the lead with real renders; review pending); font families need engine, model and catalogue support; named tokens blocked (the codec reads and plans version 1 values from bytes, but no source reaches it) |
 | R22 | Reference pack, audit and critique before implementation | Done (2026-10-18), extended by the 2026-10-20 and 2026-10-21 references |
 
 Native, package and installation acceptance stay separate for every row.
 
 ## Owner UX revision (revision 18, 2026-10-20)
 
-The owner's 20 October revision, as built in source (not yet rendered, reviewed or qualified
-natively; see AGENTS.md for what was checked):
+History: the owner's 20 October revision as it was then built (later rendered and installed
+inside `6630ec4`). Where revision 20 changed it, revision 20 and the principles win:
 - **No full-width editor header.** Both panels run the surface's full height, each with its
   own top row in the safe area (principle 2). A closed panel's top row floats over the
   canvas's top corner instead.
@@ -155,8 +239,9 @@ natively; see AGENTS.md for what was checked):
 
 ## Paper-inspired polish (revision 19, 2026-10-20 evening)
 
-The owner authorized a materially more Paper-like look on top of revision 18. These choices
-are built in source but not yet rendered, reviewed or natively qualified (see AGENTS.md).
+History: the owner authorized a materially more Paper-like look on top of revision 18. These
+choices were built then and are part of installed `6630ec4`; revision 20 and the principles
+win where they differ.
 References were the before renders of the b1ca4ac candidate (Light and the actual Dark) and
 the official paper.design homepage's editor illustration. Paper's own website was looked at
 only; no code, asset, font or colour value was taken from it. Everything below is one token
@@ -287,7 +372,9 @@ The principles:
      backward) shows in the layers header only while something is selected.
    - **Theme:** the canvas's design system, honestly scoped (see "Theme: supported and blocked"
      above): first the text styles and colours this Paper actually uses, each choosing its
-     layers for the Design panel to edit; then one short status row each for the font
+     layers for the Design panel to edit, and each colour's swatch (revision 21) the Design
+     panel's colour button, which changes that colour wherever the Paper uses it as a solid
+     fill or stroke, one undo step per use; then one short status row each for the font
      ("Inter · 4 faces"), named tokens ("Not available") and `DESIGN.md` ("Not connected"),
      with the reasons as tooltips and in a folded Details. It is not the appearance, which
      stays System / Light / Dark in the All Projects menu.

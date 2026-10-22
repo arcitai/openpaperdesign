@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-21: the one-app source candidate's `home-20` view (unqualified; the whole-app workbench's first slice: contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch; after `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision). Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-22: the local source candidate's `home-21` view (unqualified; Theme changes a colour in use) and the plugin's new architecture mark (issue #8, unqualified), after `home-20`, the whole-app workbench's first slice (contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch), installed on the Mac as `6630ec4` on 2026-10-22 with its loaded view unproven, and `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision. Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -756,7 +756,11 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
   - The static SVGs live in `assets/`: `logo.svg`/`logo-dark.svg` for the listing, and
     `icon.svg`/`icon-dark.svg` for the composer. Each has a 24-unit `viewBox` and a 48×48
     intrinsic size.
-  - The mark is an open sheet with a folded corner and a selection handle.
+  - The mark (owner direction of 2026-10-19: architecture, systems and an editable canvas;
+    before, an open sheet with a folded corner and a selection handle) is an open canvas
+    frame holding a block joined by one elbow connector to a second block, which sits on the
+    frame's open corner as its selection handle. The listing logos colour that block with the
+    accent; the composer icons are one ink.
   - The launcher embeds `icon.svg`/`icon-dark.svg` at build time. It sends them as SVG data
     URIs (light and dark themes) in the home entry's tool `icons` and as the `serverInfo.icons`
     fallback.

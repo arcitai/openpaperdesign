@@ -132,8 +132,10 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// revision 20): the editor's contextual Design reveal, one Canvas title, the All Projects menu,
 /// Export and zoom in the right bar, separate Select and Hand, and the Design/Theme switch (a
 /// changed in-panel WASM editor; the view's HTML, layout, search and kept preferences
-/// unchanged). No earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-20.html";
+/// unchanged); `home-21` carries the editor whose Theme changes a colour in use wherever the
+/// Paper uses it (DESIGN.md revision 21; a changed in-panel WASM editor again, after installed
+/// `home-20`; HTML and layout unchanged). No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-21.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

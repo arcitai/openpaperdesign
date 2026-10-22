@@ -1103,7 +1103,8 @@ impl WebState {
     }
 
     /// The canvas save to send now, or `None` when there is nothing to save, a save is already
-    /// in flight, or a gesture/text edit still owns the open transaction. It is
+    /// in flight, a gesture/text edit still owns the open transaction, or a Theme colour or text
+    /// style change is under way on the focused page (`ui::design_system::editing`). It is
     /// `{active_page, pages: [{id, name, text?}]}`: the whole page list in order, the active
     /// page, and an upstream page file (`page_to_json` of `Editor::page_data`) for each page
     /// upstream counts as changed (`Editor::dirty_pages`, a new page included); the server
@@ -1111,6 +1112,14 @@ impl WebState {
     /// answer (see [`WebState::save_succeeded`]).
     pub fn save_snapshot(&mut self) -> Option<String> {
         if self.inflight.is_some() || self.ed.is_busy() || self.ed.text_edit.is_some() {
+            return None;
+        }
+        // A colour or text style change from Theme still under way (its picker or editor open)
+        // is one undo step, and this save's acknowledgement would seal the history in the
+        // middle of it (run159: one Undo after typing 1, 5, 0 into R went back to 15, not 50).
+        // It is saved once that closes. Only while the page has the focus: a blur (a leave
+        // starting) lets it save, so a departure never waits on an open editor.
+        if self.focused && ui::design_system::editing(&self.ctx, &self.ed) {
             return None;
         }
         self.ed.commit_pending();

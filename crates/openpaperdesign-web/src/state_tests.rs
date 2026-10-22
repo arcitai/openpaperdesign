@@ -6796,3 +6796,835 @@ fn a_successful_library_add_clears_its_own_earlier_refusal_on_every_retry() {
     assert!(!painted);
     s.run(Action::ToggleSnapping);
 }
+
+// ---- revision 21: Theme changes a colour in use, through upstream's Theme view and egui's own
+// colour picker, laid out headless (egui layout only: no GPU, browser or native proof).
+
+const RED: Color = Color::rgb(255, 0, 0);
+const GREEN: Color = Color::rgb(0, 255, 0);
+const BLUE: Color = Color::rgb(0, 0, 255);
+const CYAN: Color = Color::rgb(0, 255, 255);
+const YELLOW: Color = Color::rgb(255, 255, 0);
+
+/// The layers of [`theme_pages`]' shown Paper.
+struct ThemeIds {
+    /// Red as the lower of two fills (blue above it).
+    a: crate::model::NodeId,
+    /// A green ellipse with a red 3 px stroke.
+    b: crate::model::NodeId,
+    /// A locked red rectangle.
+    c: crate::model::NodeId,
+    /// A red rectangle inside the locked group `g`.
+    d: crate::model::NodeId,
+    /// A gradient from red to white.
+    e: crate::model::NodeId,
+    g: crate::model::NodeId,
+    /// Black text whose characters are a red run.
+    t: crate::model::NodeId,
+}
+
+/// A layer of `kind` at `(x, y, w, h)` at the top of `doc`, then `set` on it.
+fn theme_layer(
+    doc: &mut Document,
+    kind: NodeKind,
+    (x, y, w, h): (f64, f64, f64, f64),
+    set: impl FnOnce(&mut Node),
+) -> crate::model::NodeId {
+    let id = doc.alloc_id();
+    let mut n = Node::new(id, kind, crate::geom::Rect::new(x, y, w, h));
+    set(&mut n);
+    doc.nodes.insert(id, n);
+    doc.root.push(id);
+    id
+}
+
+/// Two Papers: "Page 1" (`p`, shown) uses red in every way [`ThemeIds`] lists; "Other" (`q`)
+/// has one red rectangle, whose id is `a`'s (ids are per Paper).
+fn theme_pages() -> (Vec<PageData>, ThemeIds) {
+    use crate::model::{Paint, TextSpan};
+    let solid = |c: Color| vec![Paint::solid(c)];
+    let mut doc = Document::default();
+    let a = theme_layer(&mut doc, NodeKind::Rect, (100.0, 100.0, 80.0, 60.0), |n| {
+        n.style.fills = vec![Paint::solid(RED), Paint::solid(BLUE)];
+    });
+    let b = theme_layer(
+        &mut doc,
+        NodeKind::Ellipse,
+        (250.0, 100.0, 80.0, 60.0),
+        |n| {
+            n.style.fills = solid(GREEN);
+            n.style.stroke = Some(RED);
+            n.style.stroke_width = 3.0;
+        },
+    );
+    let c = theme_layer(&mut doc, NodeKind::Rect, (400.0, 100.0, 40.0, 40.0), |n| {
+        n.style.fills = solid(RED);
+        n.locked = true;
+    });
+    let g = theme_layer(&mut doc, NodeKind::Group, (500.0, 100.0, 40.0, 40.0), |n| {
+        n.locked = true;
+    });
+    let d = theme_layer(&mut doc, NodeKind::Rect, (0.0, 0.0, 40.0, 40.0), |n| {
+        n.style.fills = solid(RED);
+        n.parent = Some(g);
+    });
+    doc.root.retain(|id| *id != d);
+    doc.nodes.get_mut(&g).unwrap().children.push(d);
+    let e = theme_layer(&mut doc, NodeKind::Rect, (100.0, 250.0, 80.0, 60.0), |n| {
+        n.style.fills = vec![Paint::linear(RED, Color::WHITE)];
+    });
+    let text = NodeKind::Text {
+        text: "Label".into(),
+        font_size: 24.0,
+        auto_width: true,
+        align: crate::model::TextAlign::Left,
+    };
+    let t = theme_layer(&mut doc, text, (250.0, 250.0, 60.0, 20.0), |n| {
+        n.style.fills = solid(Color::BLACK);
+        n.text_style.spans.push(TextSpan {
+            start: 0,
+            end: 5,
+            color: Some(RED),
+            ..Default::default()
+        });
+    });
+    let shown = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut other = page(
+        "q",
+        "Other",
+        crate::geom::Rect::new(100.0, 100.0, 80.0, 60.0),
+    );
+    for n in other.doc.nodes.values_mut() {
+        n.style.fills = solid(RED);
+    }
+    assert_eq!(other.doc.root, vec![a], "the other Paper reuses a's id");
+    let ids = ThemeIds {
+        a,
+        b,
+        c,
+        d,
+        e,
+        g,
+        t,
+    };
+    (vec![shown, other], ids)
+}
+
+/// [`theme_pages`] opened on "Page 1", laid out, the left panel open; with the other Paper as
+/// it was given.
+fn theme_fixture() -> (WebState, ThemeIds, PageData) {
+    let (pages, ids) = theme_pages();
+    let mut s = WebState::open(&canvas(&pages, "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    (s, ids, pages[1].clone())
+}
+
+/// The left panel's Theme view.
+fn open_theme(s: &mut WebState) {
+    let left = s.canvas_rect().min.x;
+    let t = s.now_ms + 1000.0;
+    click_label_in(s, "Theme", |r| r.max.x <= left, t);
+    assert_eq!(s.ui.left_tab, crate::ui::LeftTab::Theme);
+}
+
+/// The swatch of Theme's colour row `hex`: 14 px, centred 15 px before the row's painted label.
+fn theme_swatch(s: &mut WebState, hex: &str) -> (f64, f64) {
+    let left = s.canvas_rect().min.x;
+    let text = painted_text(s);
+    let (_, r) = text
+        .iter()
+        .find(|(t, r)| t.trim() == hex && r.max.x <= left)
+        .unwrap_or_else(|| panic!("{hex} isn't a Theme row: {text:?}"));
+    (r.min.x as f64 - 15.0, r.center().y as f64)
+}
+
+/// A click on row `hex`'s swatch, which opens its colour picker.
+fn open_picker(s: &mut WebState, hex: &str) {
+    let p = theme_swatch(s, hex);
+    timed_click(s, p);
+    assert!(ui::popup_open(&s.ctx), "{hex}: its picker opened");
+}
+
+/// `value` typed into the open picker's `channel` field ("R ", "G ", "B ") with
+/// [`picker_field`]: the paste replaces its selected text (applied as typed) and Enter
+/// finishes it. The picker stays open.
+fn picker_channel(s: &mut WebState, channel: &str, value: &str) {
+    picker_field(s, channel);
+    s.paste(value);
+    step(s);
+    press(s, "Enter", "Enter");
+    timed_frames(s, 3);
+    assert!(ui::popup_open(&s.ctx), "{channel:?}: the picker stays open");
+}
+
+/// The open picker's or style editor's `channel` field ("R ", "G ", "B ", or "Size ") in its
+/// text mode, its text selected: a click puts egui's drag value in its text mode and Ctrl+A
+/// selects its text. egui paints the field's prefix and its number as two texts on one line,
+/// the number right after the prefix (run158's observed layout: "R " then "255"; run162's:
+/// "Size " then "24.0"); the field is the two together, clicked at their middle. A colour
+/// channel's number is a whole 0–255; the size's is a finite decimal.
+fn picker_field(s: &mut WebState, channel: &str) {
+    let valid = |number: &str| match channel {
+        "Size " => number.trim().parse::<f64>().is_ok_and(f64::is_finite),
+        _ => number.trim().parse::<u8>().is_ok(),
+    };
+    let text = painted_text(s);
+    let r = text
+        .windows(2)
+        .rev()
+        .find(|w| {
+            let ((prefix, p), (number, n)) = (&w[0], &w[1]);
+            prefix.as_str() == channel
+                && valid(number)
+                && (n.center().y - p.center().y).abs() < 1.0
+                && (n.min.x - p.max.x).abs() < 1.0
+        })
+        .map(|w| w[0].1.union(w[1].1))
+        .unwrap_or_else(|| panic!("no {channel:?} field painted: {text:?}"));
+    timed_click(s, centre(r));
+    assert!(s.field_has_keyboard(), "{channel:?}: its text mode");
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+}
+
+/// A press on blank canvas: it closes the open picker and never reaches the editor.
+fn close_picker(s: &mut WebState) {
+    let selection = s.ed.selection.clone();
+    let p = at(s, 700.0, 500.0);
+    timed_click(s, p);
+    assert!(!ui::popup_open(&s.ctx), "a press outside closes the picker");
+    assert_eq!(s.ed.selection, selection, "the press stayed the picker's");
+}
+
+#[test]
+fn rev21_a_theme_colour_changes_where_it_was_used_in_one_step_and_saves_exactly() {
+    use crate::model::Paint;
+    let (mut s, ids, other) = theme_fixture();
+    let before = s.ed.doc.clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    assert!(
+        s.ed.selection.is_empty(),
+        "the swatch isn't the row: nothing is selected"
+    );
+    // Keys belong to the open picker, never the editor.
+    let tool = s.tool();
+    for (key, code) in [("r", "KeyR"), ("Delete", "Delete")] {
+        assert!(s.key_down(key, code, false));
+        s.key_up(key, code);
+    }
+    timed_frames(&mut s, 2);
+    assert_eq!(s.tool(), tool);
+    assert!(ui::popup_open(&s.ctx));
+    assert_eq!(s.ed.doc, before, "nothing changed yet");
+    // One picker use: red to black (the text's fill), to green (the ellipse's own fill), to
+    // cyan. Each step passes a colour other layers already use; the rows merge and move, and
+    // the picker stays open on the places that were red when it began.
+    let node = |s: &WebState, id| s.ed.doc.get(id).unwrap().clone();
+    picker_channel(&mut s, "R ", "0");
+    let a = node(&s, ids.a).style.fills;
+    assert_eq!(a, [Paint::solid(Color::BLACK), Paint::solid(BLUE)]);
+    assert_eq!(node(&s, ids.b).style.stroke, Some(Color::BLACK));
+    picker_channel(&mut s, "G ", "255");
+    assert_eq!(node(&s, ids.a).style.fills[0], Paint::solid(GREEN));
+    assert_eq!(node(&s, ids.b).style.stroke, Some(GREEN));
+    picker_channel(&mut s, "B ", "255");
+    close_picker(&mut s);
+    let after = s.ed.doc.clone();
+    // Only those places changed: the blue fill above, the ellipse's own green fill, the
+    // text's black fill and red run, the locked layers, the gradient and the other Paper stay.
+    let mut a = before.get(ids.a).unwrap().clone();
+    a.style.fills = vec![Paint::solid(CYAN), Paint::solid(BLUE)];
+    assert_eq!(after.get(ids.a), Some(&a));
+    let mut b = before.get(ids.b).unwrap().clone();
+    b.style.stroke = Some(CYAN);
+    assert_eq!(after.get(ids.b), Some(&b));
+    assert_eq!(b.style.fills, [Paint::solid(GREEN)]);
+    for id in [ids.c, ids.d, ids.e, ids.g, ids.t] {
+        assert_eq!(after.get(id), before.get(id), "{id:?}");
+    }
+    assert_eq!(
+        (&after.root, after.nodes.len()),
+        (&before.root, before.nodes.len())
+    );
+    assert_eq!(s.ed.page_data(1).doc.nodes, other.doc.nodes);
+    assert!(paints(&mut s, "#ff0000"), "the locked layers keep red");
+    // The whole picker use is one undo step; Redo brings it back.
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, before.nodes, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, after.nodes);
+    // A second picker use is a step of its own.
+    open_picker(&mut s, "#00ffff");
+    picker_channel(&mut s, "R ", "255");
+    close_picker(&mut s);
+    assert_eq!(node(&s, ids.a).style.fills[0], Paint::solid(Color::WHITE));
+    assert_eq!(node(&s, ids.b).style.stroke, Some(Color::WHITE));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, after.nodes, "only the second use undone");
+    s.run(Action::Redo);
+    step(&mut s);
+    let last = s.ed.doc.clone();
+    // A row only locked layers use shows its swatch, but no picker.
+    let p = theme_swatch(&mut s, "#ff0000");
+    timed_click(&mut s, p);
+    assert!(!ui::popup_open(&s.ctx));
+    assert_eq!(s.ed.doc, last);
+    // Saved exactly as edited (the shown Paper only), and reopened as saved.
+    assert!(s.dirty());
+    let snap = s.save_snapshot().expect("the change is saved");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), page_to_json(&s.ed.page_data(0)));
+    s.save_succeeded();
+    assert!(!s.dirty());
+    let reopened = WebState::open(&canvas(&pages_now(&s), "p"), false, W, H).unwrap();
+    assert_eq!(
+        (&reopened.ed.doc.nodes, &reopened.ed.doc.root),
+        (&last.nodes, &last.root)
+    );
+    assert_eq!(reopened.ed.page_data(1).doc.nodes, other.doc.nodes);
+}
+
+#[test]
+fn rev21_a_reload_under_an_open_picker_ends_it_before_it_can_change_the_new_document() {
+    use crate::model::Paint;
+    let (mut s, ids, _) = theme_fixture();
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_channel(&mut s, "R ", "0");
+    assert_eq!(
+        s.ed.doc.get(ids.a).unwrap().style.fills[0],
+        Paint::solid(Color::BLACK)
+    );
+    // The explicit discard (the conflict banner's reload) loads another document whose
+    // layers reuse a's and b's ids and already have the picker's current colour there.
+    let (mut pages, _) = theme_pages();
+    let doc = &mut pages[0].doc;
+    doc.nodes.get_mut(&ids.a).unwrap().style.fills = vec![Paint::solid(Color::BLACK)];
+    doc.nodes.get_mut(&ids.b).unwrap().style.stroke = Some(Color::BLACK);
+    let loaded = pages[0].doc.clone();
+    s.reload(&canvas(&pages, "p")).unwrap();
+    timed_frames(&mut s, 3);
+    assert!(
+        !ui::popup_open(&s.ctx),
+        "the picker closed with the document it was for"
+    );
+    let text = painted_text(&mut s);
+    assert!(!text.iter().any(|(t, _)| t.starts_with("R ")), "{text:?}");
+    assert_eq!(
+        s.ed.doc.nodes, loaded.nodes,
+        "nothing of it reached the new one"
+    );
+    assert!(!s.dirty());
+    // A new picker use there starts from what that document has: the ellipse's green fill
+    // only, not its black stroke or the black rectangle.
+    open_picker(&mut s, "#00ff00");
+    picker_channel(&mut s, "R ", "255");
+    close_picker(&mut s);
+    let mut b = loaded.get(ids.b).unwrap().clone();
+    b.style.fills = vec![Paint::solid(YELLOW)];
+    assert_eq!(s.ed.doc.get(ids.b), Some(&b));
+    assert_eq!(s.ed.doc.get(ids.a), loaded.get(ids.a));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, loaded.nodes);
+}
+
+#[test]
+fn rev21_hiding_theme_or_showing_another_paper_keeps_each_picker_use_on_its_own_paper() {
+    use crate::model::Paint;
+    let (mut s, ids, other) = theme_fixture();
+    let before = s.ed.doc.clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_channel(&mut s, "R ", "0");
+    let changed = s.ed.doc.clone();
+    // Design while the picker is open: the press closes it, and Theme isn't drawn any more.
+    let left = s.canvas_rect().min.x;
+    for _ in 0..2 {
+        if s.ui.left_tab != crate::ui::LeftTab::Design {
+            let t = s.now_ms + 1000.0;
+            click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+        }
+    }
+    assert_eq!(s.ui.left_tab, crate::ui::LeftTab::Design);
+    assert!(!ui::popup_open(&s.ctx));
+    assert_eq!(s.ed.doc, changed);
+    // The other Paper, whose rectangle reuses a's id: its own red, its own step.
+    let t = s.now_ms + 1000.0;
+    click_page(&mut s, "Other", t);
+    assert_eq!(s.ed.active_page_id(), "q");
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_channel(&mut s, "G ", "255");
+    close_picker(&mut s);
+    let q = s.ed.doc.get(ids.a).unwrap();
+    assert_eq!(q.style.fills, [Paint::solid(YELLOW)]);
+    assert_eq!(
+        s.ed.page_data(0).doc.nodes,
+        changed.nodes,
+        "Page 1 as its own picker left it"
+    );
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, other.doc.nodes);
+    // Back on Page 1, its picker use, though Theme was hidden in the middle of it, is one step.
+    let left = s.canvas_rect().min.x;
+    let t = s.now_ms + 1000.0;
+    click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+    let t = s.now_ms + 1000.0;
+    click_page(&mut s, "Page 1", t);
+    assert_eq!(s.ed.active_page_id(), "p");
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, before.nodes);
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, changed.nodes);
+}
+
+#[test]
+fn rev21_autosaves_while_typing_into_the_picker_keep_its_use_one_undo_step() {
+    // Run159's rendered failure: R typed key by key (1, 5, 0) with the page's autosave
+    // acknowledged between the keys; each acknowledgement sealed the history, so one Undo went
+    // back to R 15, not the colour the picker began with.
+    use crate::model::Paint;
+    let (mut s, ids, _) = theme_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "#ff0000");
+    picker_field(&mut s, "R ");
+    // Each key is a change of its own (R 1, then 15, then 150), and after each one the page's
+    // autosave gets its chance: a save it offers is taken and acknowledged at once.
+    let keys = [
+        ("1", "Digit1", 1),
+        ("5", "Digit5", 15),
+        ("0", "Digit0", 150),
+    ];
+    let mut offered = 0;
+    for (key, code, r) in keys {
+        press(&mut s, key, code);
+        timed_frames(&mut s, 2);
+        let a = s.ed.doc.get(ids.a).unwrap();
+        assert_eq!(a.style.fills[0], Paint::solid(Color::rgb(r, 0, 0)), "{key}");
+        if s.save_snapshot().is_some() {
+            s.save_succeeded();
+            offered += 1;
+        }
+        timed_frames(&mut s, 1);
+    }
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    assert!(ui::popup_open(&s.ctx), "the picker is still open");
+    assert!(
+        s.dirty(),
+        "{offered} saves taken while typing; the change is still to save"
+    );
+    close_picker(&mut s);
+    // Saved once the picker closed; the saved page reopens exactly.
+    let edited = page_to_json(&s.ed.page_data(0));
+    assert_ne!(edited, before);
+    let snap = s.save_snapshot().expect("saved once the picker closed");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), edited);
+    s.save_succeeded();
+    assert!(!s.dirty());
+    let other = pages_now(&s)[1].clone();
+    let reopened = WebState::open(&canvas(&[sent, other], "p"), false, W, H).unwrap();
+    assert_eq!(page_to_json(&reopened.ed.page_data(0)), edited);
+    // One Undo: the whole page as it was before the picker; one Redo: as edited.
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    // A departure (the page's blur) never waits on an open picker: its change saves then.
+    open_picker(&mut s, "#960000");
+    picker_field(&mut s, "R ");
+    press(&mut s, "9", "Digit9");
+    timed_frames(&mut s, 2);
+    let a = s.ed.doc.get(ids.a).unwrap();
+    assert_eq!(a.style.fills[0], Paint::solid(Color::rgb(9, 0, 0)));
+    assert!(s.save_snapshot().is_none(), "held while the picker is open");
+    s.set_focused(false);
+    let snap = s.save_snapshot().expect("a blur lets it save");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), page_to_json(&s.ed.page_data(0)));
+    s.save_succeeded();
+    assert!(!s.dirty());
+    s.set_focused(true);
+}
+
+// ---- revision 21: Theme changes a text style in use, through the Theme view's style editor
+// (headless egui layout, as above).
+
+/// The layers of [`text_style_pages`]' shown Paper.
+struct StyleIds {
+    /// "Title", all of it 24 Regular (grows to fit its text).
+    whole: crate::model::NodeId,
+    /// Unicode text, 18 Regular, centred, fixed width, spaced, with 24 Regular in two ranges
+    /// (the second also red and underlined), an 18 Bold range and a struck 18 range.
+    mixed: crate::model::NodeId,
+    /// A locked 24 Regular layer.
+    locked: crate::model::NodeId,
+    /// A 24 Regular layer inside the locked group `group`.
+    grouped: crate::model::NodeId,
+    group: crate::model::NodeId,
+    /// 36 Bold: another style.
+    bold: crate::model::NodeId,
+}
+
+/// A text layer's kind: `text` at `size`, left aligned.
+fn text_kind(text: &str, size: f64, auto_width: bool) -> NodeKind {
+    NodeKind::Text {
+        text: text.into(),
+        font_size: size,
+        auto_width,
+        align: crate::model::TextAlign::Left,
+    }
+}
+
+/// Two Papers: "Page 1" (`p`, shown) uses 24 Regular in every way [`StyleIds`] lists; "Other"
+/// (`q`) has a 24 Regular text whose id is `whole`'s (ids are per Paper).
+fn text_style_pages() -> (Vec<PageData>, StyleIds) {
+    use crate::model::TextSpan;
+    let span = |start, end| TextSpan {
+        start,
+        end,
+        ..Default::default()
+    };
+    let mut doc = Document::default();
+    let whole = theme_layer(
+        &mut doc,
+        text_kind("Title", 24.0, true),
+        (100.0, 100.0, 20.0, 10.0),
+        |_| {},
+    );
+    // Æble — øre ✓ ok: chars 0–3 "Æble", 7–9 "øre", 11 "✓", 12–14 " ok".
+    let mixed = theme_layer(
+        &mut doc,
+        text_kind("Æble — øre ✓ ok", 18.0, false),
+        (100.0, 200.0, 300.0, 30.0),
+        |n| {
+            if let NodeKind::Text { align, .. } = &mut n.kind {
+                *align = crate::model::TextAlign::Center;
+            }
+            n.text_style.letter_spacing = 1.5;
+            n.text_style.line_height = Some(1.4);
+            n.text_style.spans = vec![
+                TextSpan {
+                    size: Some(24.0),
+                    ..span(0, 4)
+                },
+                TextSpan {
+                    size: Some(24.0),
+                    color: Some(RED),
+                    underline: Some(true),
+                    ..span(7, 10)
+                },
+                TextSpan {
+                    bold: Some(true),
+                    ..span(11, 12)
+                },
+                TextSpan {
+                    strike: Some(true),
+                    ..span(12, 15)
+                },
+            ];
+        },
+    );
+    let locked = theme_layer(
+        &mut doc,
+        text_kind("Locked", 24.0, true),
+        (100.0, 300.0, 80.0, 30.0),
+        |n| n.locked = true,
+    );
+    let group = theme_layer(&mut doc, NodeKind::Group, (400.0, 300.0, 80.0, 30.0), |n| {
+        n.locked = true
+    });
+    let grouped = theme_layer(
+        &mut doc,
+        text_kind("Grouped", 24.0, true),
+        (0.0, 0.0, 80.0, 30.0),
+        |n| n.parent = Some(group),
+    );
+    doc.root.retain(|id| *id != grouped);
+    doc.nodes.get_mut(&group).unwrap().children.push(grouped);
+    let bold = theme_layer(
+        &mut doc,
+        text_kind("Heading", 36.0, true),
+        (100.0, 400.0, 160.0, 44.0),
+        |n| n.text_style.bold = true,
+    );
+    let shown = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut doc = Document::default();
+    let elsewhere = theme_layer(
+        &mut doc,
+        text_kind("Elsewhere", 24.0, true),
+        (100.0, 100.0, 120.0, 30.0),
+        |_| {},
+    );
+    assert_eq!(elsewhere, whole, "the other Paper reuses whole's id");
+    let other = PageData {
+        id: "q".into(),
+        name: "Other".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let ids = StyleIds {
+        whole,
+        mixed,
+        locked,
+        grouped,
+        group,
+        bold,
+    };
+    (vec![shown, other], ids)
+}
+
+/// [`text_style_pages`] opened on "Page 1", laid out, the left panel open.
+fn text_style_fixture() -> (WebState, StyleIds, Vec<PageData>) {
+    let (pages, ids) = text_style_pages();
+    let mut s = WebState::open(&canvas(&pages, "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    (s, ids, pages)
+}
+
+/// Every character's resolved style, as the layout draws it.
+fn resolved(n: &Node) -> Vec<crate::model::CharStyle> {
+    let size = n.kind.font_size().unwrap();
+    let len = n.kind.text().unwrap().chars().count();
+    (0..len)
+        .map(|i| n.text_style.char_style(i, size, Color::INK))
+        .collect()
+}
+
+/// Keys typed one by one into the field that has the keyboard, the page's autosave offered
+/// after each (a save it gives is taken and acknowledged at once); how many it gave.
+fn type_with_autosaves(s: &mut WebState, keys: &[(&str, &str)]) -> usize {
+    let mut offered = 0;
+    for (key, code) in keys {
+        press(s, key, code);
+        timed_frames(s, 2);
+        if s.save_snapshot().is_some() {
+            s.save_succeeded();
+            offered += 1;
+        }
+        timed_frames(s, 1);
+    }
+    offered
+}
+
+#[test]
+fn rev21_a_theme_text_style_changes_only_its_characters_in_one_step_and_saves_exactly() {
+    use crate::model::CharStyle;
+    let (mut s, ids, pages) = text_style_fixture();
+    let before_page = page_to_json(&s.ed.page_data(0));
+    let before = s.ed.doc.clone();
+    open_theme(&mut s);
+    // The row's Aa button (in the swatch's place) opens the style's editor; the row isn't
+    // chosen, so nothing is selected.
+    open_picker(&mut s, "24 · Regular");
+    assert!(s.ed.selection.is_empty());
+    // Its size typed key by key (3, then 36), the autosave offered between the keys.
+    picker_field(&mut s, "Size ");
+    let offered = type_with_autosaves(&mut s, &[("3", "Digit3"), ("6", "Digit6")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    assert!(ui::popup_open(&s.ctx));
+    assert!(s.dirty(), "{offered} saves taken while typing");
+    let size = |s: &WebState, id| s.ed.doc.get(id).unwrap().kind.font_size();
+    assert_eq!(size(&s, ids.whole), Some(36.0));
+    // Bold: the style now meets 36 Bold (another layer's), the rows merge and move, and the
+    // editor stays on the characters it began with: 40 reaches them, not the heading.
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Bold", t);
+    assert!(ui::popup_open(&s.ctx), "a face keeps the editor open");
+    picker_field(&mut s, "Size ");
+    type_with_autosaves(&mut s, &[("4", "Digit4"), ("0", "Digit0")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    assert!(s.dirty());
+    close_picker(&mut s);
+    let after = s.ed.doc.clone();
+    let get = |d: &Document, id| d.get(id).unwrap().clone();
+    // The whole layer: its own size and face, laid out again where it was.
+    let (w0, w1) = (get(&before, ids.whole), get(&after, ids.whole));
+    let mut want = w0.clone();
+    if let NodeKind::Text { font_size, .. } = &mut want.kind {
+        *font_size = 40.0;
+    }
+    want.text_style.bold = true;
+    want.rect = w1.rect;
+    assert_eq!(w1, want);
+    assert_eq!((w1.rect.x, w1.rect.y), (w0.rect.x, w0.rect.y));
+    assert!(w1.rect.w > w0.rect.w, "{:?} -> {:?}", w0.rect, w1.rect);
+    // The mixed layer: exactly its two 24 Regular ranges, their colour and underline kept;
+    // its other characters, base size, alignment, spacing and width as they were.
+    let (m0, m1) = (get(&before, ids.mixed), get(&after, ids.mixed));
+    let target = |i: usize| i < 4 || (7..10).contains(&i);
+    let want: Vec<CharStyle> = resolved(&m0)
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if target(i) {
+                CharStyle {
+                    size: 40.0,
+                    bold: true,
+                    ..c
+                }
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert_eq!(resolved(&m1), want);
+    let mut same = m0.clone();
+    same.text_style.spans = m1.text_style.spans.clone();
+    same.rect.h = m1.rect.h;
+    assert_eq!(m1, same, "only its ranges' styles and its laid-out height");
+    // Locked layers (themselves or through a group), the other style and the other Paper.
+    for id in [ids.locked, ids.grouped, ids.group, ids.bold] {
+        assert_eq!(after.get(id), before.get(id), "{id:?}");
+    }
+    assert_eq!(after.root, before.root);
+    assert_eq!(s.ed.page_data(1).doc.nodes, pages[1].doc.nodes);
+    // Saved once the editor closed, exactly as edited; the saved page reopens exactly.
+    let edited = page_to_json(&s.ed.page_data(0));
+    let snap = s.save_snapshot().expect("saved once the editor closed");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), edited);
+    s.save_succeeded();
+    assert!(!s.dirty());
+    let reopened = WebState::open(&canvas(&[sent, pages[1].clone()], "p"), false, W, H).unwrap();
+    assert_eq!(page_to_json(&reopened.ed.page_data(0)), edited);
+    // One Undo: the whole page as it was; one Redo: as edited.
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before_page, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    // A second use is its own step: 40 Bold to Italic.
+    open_picker(&mut s, "40 · Bold");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Italic", t);
+    close_picker(&mut s);
+    let w = get(&s.ed.doc, ids.whole);
+    assert_eq!((w.text_style.bold, w.text_style.italic), (false, true));
+    assert!(resolved(&get(&s.ed.doc, ids.mixed))[7].italic);
+    assert_eq!(get(&s.ed.doc, ids.bold), get(&before, ids.bold));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        edited,
+        "only the second use undone"
+    );
+    // A style only locked layers use has no editor.
+    let p = theme_swatch(&mut s, "24 · Regular");
+    timed_click(&mut s, p);
+    assert!(!ui::popup_open(&s.ctx));
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn rev21_a_text_style_editor_never_outlives_its_document_or_paper() {
+    let (mut s, ids, pages) = text_style_fixture();
+    let before = s.ed.doc.clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_field(&mut s, "Size ");
+    type_with_autosaves(&mut s, &[("3", "Digit3")]);
+    let size = |s: &WebState, id| s.ed.doc.get(id).unwrap().kind.font_size();
+    assert_eq!(size(&s, ids.whole), Some(3.0));
+    // The explicit discard loads another document whose text reuses `whole`'s id and already
+    // has the editor's current style: the editor closes with the document it was for.
+    let (mut fresh, _) = text_style_pages();
+    if let NodeKind::Text { font_size, .. } =
+        &mut fresh[0].doc.nodes.get_mut(&ids.whole).unwrap().kind
+    {
+        *font_size = 3.0;
+    }
+    let loaded = fresh[0].doc.clone();
+    s.reload(&canvas(&fresh, "p")).unwrap();
+    timed_frames(&mut s, 3);
+    assert!(
+        !ui::popup_open(&s.ctx),
+        "the editor closed with its document"
+    );
+    let text = painted_text(&mut s);
+    assert!(!text.iter().any(|(t, _)| t == "Size "), "{text:?}");
+    assert_eq!(
+        s.ed.doc.nodes, loaded.nodes,
+        "nothing of it reached the new one"
+    );
+    assert!(!s.dirty());
+    // Back to the fixture as saved; a face on Page 1, then Design while it is open: the press
+    // closes it and Theme isn't drawn any more.
+    s.reload(&canvas(&pages, "p")).unwrap();
+    timed_frames(&mut s, 2);
+    open_picker(&mut s, "24 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Italic", t);
+    let changed = s.ed.doc.clone();
+    assert!(get_italic(&changed, ids.whole));
+    let left = s.canvas_rect().min.x;
+    for _ in 0..2 {
+        if s.ui.left_tab != crate::ui::LeftTab::Design {
+            let t = s.now_ms + 1000.0;
+            click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+        }
+    }
+    assert!(!ui::popup_open(&s.ctx));
+    // The other Paper, whose text reuses `whole`'s id: its own 24 Regular, its own step.
+    let t = s.now_ms + 1000.0;
+    click_page(&mut s, "Other", t);
+    assert_eq!(s.ed.active_page_id(), "q");
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Bold", t);
+    close_picker(&mut s);
+    let q = s.ed.doc.get(ids.whole).unwrap();
+    assert_eq!((q.text_style.bold, q.text_style.italic), (true, false));
+    assert_eq!(
+        s.ed.page_data(0).doc.nodes,
+        changed.nodes,
+        "Page 1 as its use left it"
+    );
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, pages[1].doc.nodes);
+    // Back on Page 1, its use, though Theme was hidden in the middle of it, is one step.
+    let t = s.now_ms + 1000.0;
+    click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+    let t = s.now_ms + 1000.0;
+    click_page(&mut s, "Page 1", t);
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(s.ed.doc.nodes, before.nodes);
+}
+
+/// Whether text layer `id` of `doc` is italic as a whole.
+fn get_italic(doc: &Document, id: crate::model::NodeId) -> bool {
+    doc.get(id).unwrap().text_style.italic
+}

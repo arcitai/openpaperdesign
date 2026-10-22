@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.85 · Updated: 2026-10-22
+Revision: 0.87 · Updated: 2026-10-22
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -666,6 +666,64 @@ engine architecture is `analysis/DESIGN.md`.
       project route, and the guide reading/editing isn't built), reasons in tooltips and a
       folded Details. Nothing is invented. (Run144 replaced its first, paragraph-heavy layout,
       which filled a 320 × 240 sheet.)
+      **A colour in use changes in place** (revision 21, 2026-10-22, #14/#10 group 6;
+      implemented; lead-checked with real renders, independent review, production and native
+      pending; see root `DESIGN.md`): a colour row's swatch is the Design panel's colour button (egui's
+      `color_edit_button_srgba` in a child `Ui` with its own explicit id, taking no room; the
+      row around it still selects). Reason: selecting a colour's layers couldn't change the
+      colour, since layers sharing it seldom share whole fills and strokes, so the Design
+      panel showed Mixed and offered only "Use one fill/stroke" (replacing them). `Recolour`
+      (in egui's temp memory) records, at the first change, the exact solid fills and strokes
+      with that colour on unlocked layers (`places`; `Document::is_effectively_locked`), and
+      every change of that picker use sets those places only (`recolour`: one
+      `begin_coalescing` transaction keyed by the colour and layers, `mark_overrides` for
+      `fills`/`stroke` as `inspector::apply` does, then `commit`), so passing another colour
+      on the way never spreads it; the history is sealed when that picker closes, so one use
+      is one undo step. The picker keeps its identity (the colour it began with) while its row
+      moves; a row of locked layers only shows its swatch. Gradients, text-run colours and
+      other pages are untouched; no named value, store, format or engine change, and the
+      canvas save, conflict, Undo and lease are the existing ones. Run158 correction (found by
+      reading, not by a failing run): `Recolour` also keeps `Editor::doc_stamp` after its own
+      change; any other change of the document while its picker is open (a reload or the
+      conflict discard, another Paper, Undo, an agent's edit) ends it and closes the picker
+      (`Popup::close_id`), since egui keeps a popup open across a reload and the recorded
+      places could otherwise reach another document's layers reusing those ids. Tests
+      (`crates/openpaperdesign-web/src/state_tests.rs`, `rev21_*`, headless egui layout through
+      the real Theme view and egui's own picker fields): targets kept across colours already
+      in use (rows merging and moving), locked layers and ancestors, gradients, text runs and
+      the other Paper exact, one Undo/Redo step per picker use, save and reopen, a reload
+      under an open picker, and hiding Theme or switching Papers mid-use. Run159 correction
+      (a rendered failure on the real WASM UI and Linux backend: R typed 1, 5, 0 showed 150 and
+      Saved, and one Undo gave 15, not 50): each autosave's acknowledgement
+      (`WebState::save_succeeded` → `Editor::mark_page_saved` → `mark_saved`) seals the
+      history, which is right in general (the saved state stays a history boundary) but split
+      the open picker use. `design_system::recolouring` (a fixed egui memory id, the picker's
+      popup id and the document stamp) tells the host a changed picker use is still open, and
+      `WebState::save_snapshot` holds the save while it is and the page has the focus; it
+      saves once the picker closes or isn't shown, the document changes otherwise, or the page
+      blurs (a departure). `mark_saved`, in-flight and conflict handling are unchanged. Test
+      `rev21_autosaves_while_typing_into_the_picker_keep_its_use_one_undo_step`.
+      **A text style in use changes in place** (revision 21, run162; implemented; lead-checked
+      with real renders, independent review, production and native pending):
+      each text style row's "Aa" button (an explicit-id child `Ui` in the swatch slot, the row
+      around it still selecting) opens a `Popup::menu` editor with the style's size (a
+      `DragValue`, 1–1000) and Inter's four faces; no family. Reason: selecting a style's layers
+      edits their whole text through `style_text_with`, not only that style's characters.
+      `Restyle` (egui temp memory, fixed id) freezes `style_targets` at the first change: per
+      unlocked text layer, every character resolved (`TextStyle::char_style`, the runs between
+      span edges, as `text_styles` lists them) to that style. A layer wholly in it changes its
+      own `font_size` or `bold`/`italic` with its ranges' values for it dropped (as
+      `style_text_with`'s whole-layer path); otherwise `TextStyle::apply_range` over exactly
+      those char ranges sets only the changing value, keeping each range's colour, underline
+      and strike. Then `mark_overrides` (`font size`/`font`), `fit_text` (fixed widths kept)
+      and one coalesced transaction per editor use, sealed when it closes; the same identity,
+      stale-stamp and `Popup::close_id` handling as `Recolour`, and `design_system::editing`
+      (colour or style under way) is what `WebState::save_snapshot` now holds the autosave on.
+      No new primitive: existing `TextStyle`, `Editor` transaction, override and layout code.
+      Tests: `rev21_a_theme_text_style_changes_only_its_characters_in_one_step_and_saves_exactly`
+      and `rev21_a_text_style_editor_never_outlives_its_document_or_paper`. An agent's
+      `get_jsx` reports a text's base style only, so a range's proof is the page file and the
+      render, never inferred rich-run JSX.
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).
@@ -861,7 +919,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-20.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-21.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -962,13 +1020,25 @@ pass for this one. Not built, rendered, installed or natively accepted here.
 reveal, one Canvas title, the All Projects menu with Back to All Projects first, Export and the
 zoom in the right bar, separate Select and Hand, and the Design/Theme switch. The view's HTML,
 layout, search, kept preferences and Home freshness are unchanged; the editor's WASM changed,
-so `home-19` is refused and a cached `home-19` view can't pass for this one. Not built,
-rendered, installed or natively accepted here.
+so `home-19` is refused and a cached `home-19` view can't pass for this one. Later installed
+as part of `6630ec4` (root `DESIGN.md`, "Where things stand"); its loaded view and native use
+are unproven.
+
+`home-21` (2026-10-22 source candidate, root `DESIGN.md` revision 21) is the same view (HTML
+and layout unchanged) with the editor whose Theme changes a colour in use wherever the Paper
+uses it (the upstream entry above). The editor's WASM changed after installed `home-20`, so
+`home-20` is refused and a cached `home-20` view can't pass for this one. It also carries
+Theme's text style change (run162). Built and rendered by the lead at bounded scope; not
+independently reviewed, installed or natively accepted.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
 `foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
-embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them.
+embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them. Revision 21
+(issue #8, the owner's 2026-10-19 architecture direction; root `DESIGN.md`, "The plugin's
+mark") replaced the earlier sheet-and-handle mark in all four, same paths, sizes and wiring;
+the package and icon-wiring checks passed, but its display in Codex isn't shown and it isn't
+installed.
 `openpaperdesign_canvases` (read-only, bounded list of `design/` projects) and `open_editor`'s
 workspace/project/canvas identity are ordinary admitted calls, not exemptions. `open_editor`
 reads the bound manifest only after the bound root's identity and entries pass again
