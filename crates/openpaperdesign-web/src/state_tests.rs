@@ -8244,3 +8244,293 @@ fn r68_native_close_saves_an_open_theme_editor_and_generic_save_still_seals() {
     assert!(s.ed.project_dirty());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+// ---- R69 correction: a refused first Theme change is atomic, an open text edit included. The
+// independent R69 review's actual-widget probes are kept here (its helper-level ones beside
+// `design_system`); where one was adapted, its comment says how and why.
+
+/// The reviewer's fixture, unchanged but for formatting: a vertical auto-layout frame holding
+/// a fitted 24 "Title" and a rectangle, locked if `locked`; no instances.
+fn r69_flow_fixture(locked: bool) -> (WebState, crate::model::NodeId, crate::model::NodeId) {
+    let mut doc = Document::default();
+    let frame = theme_layer(
+        &mut doc,
+        NodeKind::Frame { clip: false },
+        (100.0, 100.0, 350.0, 300.0),
+        |n| {
+            n.layout = Some(crate::model::AutoLayout {
+                direction: crate::model::Direction::Vertical,
+                ..Default::default()
+            });
+        },
+    );
+    let text = theme_layer(
+        &mut doc,
+        text_kind("Title", 24.0, true),
+        (10.0, 10.0, 20.0, 10.0),
+        |n| n.parent = Some(frame),
+    );
+    let sibling = theme_layer(&mut doc, NodeKind::Rect, (10.0, 50.0, 80.0, 30.0), |n| {
+        n.parent = Some(frame)
+    });
+    doc.root.retain(|id| *id == frame);
+    doc.nodes.get_mut(&frame).unwrap().children = vec![text, sibling];
+    let mut ed = Editor::new(doc);
+    ed.selection = vec![text];
+    ed.style_text("font size", |sp| sp.size = Some(24.0));
+    ed.edit("Lock control", |tx| {
+        tx.node_mut(sibling).unwrap().locked = locked
+    });
+    let page = ed.page_data(0);
+    let mut s = WebState::open(&canvas(&[page.clone()], &page.id), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    assert!(s.ed.doc.nodes.values().all(|n| n.instance.is_none()));
+    assert_eq!(s.ed.doc.is_effectively_locked(sibling), locked);
+    (s, text, sibling)
+}
+
+#[test]
+fn r69_first_derived_layout_refusal_keeps_page_history_selection_and_saved_state() {
+    // The reviewer's passing probe, unchanged but for formatting.
+    let (mut s, text, sibling) = r69_flow_fixture(true);
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_field(&mut s, "Size ");
+    let page = page_to_json(&s.ed.page_data(0));
+    let selection = s.ed.selection.clone();
+    let markers = (
+        s.ed.history.undo_len(),
+        format!("{:?}", s.ed.history),
+        s.ed.doc_stamp,
+        s.ed.revision,
+        s.dirty(),
+    );
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    s.paste("32");
+    timed_frames(&mut s, 4);
+    assert!(
+        !ui::popup_open(&s.ctx),
+        "the dry-run-only refusal closes the popup"
+    );
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert!(paints(&mut s, ui::design_system::INHERITED_STYLE));
+    assert_eq!(s.ed.doc.get(text).unwrap().kind.font_size(), Some(24.0));
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page);
+    assert_eq!(s.ed.selection, selection);
+    assert_eq!(
+        (
+            s.ed.history.undo_len(),
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.ed.revision,
+            s.dirty()
+        ),
+        markers
+    );
+    assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+    assert!(
+        s.save_snapshot().is_none(),
+        "no new dirty state from refusal"
+    );
+}
+
+#[test]
+fn r69_later_derived_refusal_keeps_earlier_face_as_one_undo_and_releases_save_hold() {
+    // The reviewer's passing probe, unchanged but for formatting.
+    let (mut s, text, sibling) = r69_flow_fixture(true);
+    let before = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Italic", t);
+    assert!(s.ed.doc.get(text).unwrap().text_style.italic);
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert!(ui::design_system::editing(&s.ctx, &s.ed));
+    assert!(s.save_snapshot().is_none());
+    let earlier = page_to_json(&s.ed.page_data(0));
+    let markers = (s.ed.history.undo_len(), s.ed.doc_stamp, s.ed.revision);
+    picker_field(&mut s, "Size ");
+    s.paste("32");
+    timed_frames(&mut s, 4);
+    assert!(!ui::popup_open(&s.ctx));
+    assert!(paints(&mut s, ui::design_system::INHERITED_STYLE));
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        earlier,
+        "later refused value never applies"
+    );
+    assert_eq!(
+        (s.ed.history.undo_len(), s.ed.doc_stamp, s.ed.revision),
+        markers
+    );
+    assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+    let snap = s
+        .save_snapshot()
+        .expect("earlier allowed value is saved after the refusal closes its use");
+    assert_eq!(page_to_json(&sent_page(&snap)), earlier);
+    s.save_succeeded();
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), earlier);
+}
+
+#[test]
+fn r69_unlocked_derived_layout_is_allowed_and_undo_redo_include_sibling_geometry() {
+    // The reviewer's passing probe, unchanged but for formatting.
+    let (mut s, text, sibling) = r69_flow_fixture(false);
+    let before = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    picker_channel(&mut s, "Size ", "32");
+    close_picker(&mut s);
+    assert_eq!(s.ed.doc.get(text).unwrap().kind.font_size(), Some(32.0));
+    assert_ne!(
+        s.ed.doc.get(sibling).unwrap().rect.y,
+        control.rect.y,
+        "paired control actually exercises derived motion"
+    );
+    let edited = page_to_json(&s.ed.page_data(0));
+    let snap = s.save_snapshot().expect("allowed layout edit saves");
+    assert_eq!(page_to_json(&sent_page(&snap)), edited);
+    s.save_succeeded();
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn r69_actual_theme_recheck_refusal_keeps_an_empty_draft_and_locked_next_row_exact() {
+    // R69 F1: the reviewer's probe of this name failed on the reviewed source (kept as the
+    // review's evidence): the refused first change had already ended the open draft, removing
+    // the emptied text and moving the locked next row (y 49.04 -> 34.52), with history 0 -> 1
+    // and a changed page offered to save. Its fixture, trigger, visible refusal and requested
+    // font assertions are kept unchanged. Adapted: its middle assertions recorded that defect
+    // (a changed page to save, its acknowledgement, and the Undo/Redo that reversed and
+    // replayed it), so they become the corrected contract: the whole page, the open draft
+    // with its caret and range, the selection, history, stamp, revision and unsaved state stay
+    // exact, nothing new is offered to save, and the draft still takes typing.
+    let mut doc = Document::default();
+    let frame = theme_layer(
+        &mut doc,
+        NodeKind::Frame { clip: false },
+        (100.0, 100.0, 200.0, 300.0),
+        |n| {
+            n.layout = Some(crate::model::AutoLayout {
+                wrap: true,
+                ..Default::default()
+            });
+        },
+    );
+    let title = theme_layer(
+        &mut doc,
+        text_kind("Title", 12.0, false),
+        (0.0, 0.0, 80.0, 10.0),
+        |n| n.parent = Some(frame),
+    );
+    let draft = theme_layer(
+        &mut doc,
+        text_kind("Box", 24.0, false),
+        (0.0, 0.0, 60.0, 10.0),
+        |n| n.parent = Some(frame),
+    );
+    let locked = theme_layer(&mut doc, NodeKind::Rect, (0.0, 0.0, 120.0, 20.0), |n| {
+        n.parent = Some(frame)
+    });
+    doc.root.retain(|id| *id == frame);
+    doc.nodes.get_mut(&frame).unwrap().children = vec![title, draft, locked];
+    let mut ed = Editor::new(doc);
+    ed.selection = vec![draft];
+    ed.style_text("font size", |sp| sp.size = Some(24.0));
+    ed.selection = vec![title];
+    ed.style_text("font size", |sp| sp.size = Some(12.0));
+    ed.edit("Lock next row", |tx| {
+        tx.node_mut(locked).unwrap().locked = true
+    });
+    let initial = ed.page_data(0);
+    let mut s = WebState::open(&canvas(&[initial.clone()], &initial.id), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    open_theme(&mut s);
+    s.ed.start_text_edit(draft, None);
+    s.ed.insert_text("  ");
+    timed_frames(&mut s, 3);
+    open_picker(&mut s, "12 · Regular");
+    picker_field(&mut s, "Size ");
+    assert_eq!(
+        s.ed.text_edit.as_ref().map(|t| t.id),
+        Some(draft),
+        "the live text draft is still open at the actual Theme change"
+    );
+    let before = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(locked).unwrap().clone();
+    let edit = s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+    let markers = (
+        s.ed.history.undo_len(),
+        format!("{:?}", s.ed.history),
+        s.ed.doc_stamp,
+        s.ed.revision,
+        s.dirty(),
+    );
+    let selection = s.ed.selection.clone();
+    s.paste("18");
+    timed_frames(&mut s, 4);
+    assert!(!ui::popup_open(&s.ctx));
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert!(
+        paints(&mut s, ui::design_system::INHERITED_STYLE),
+        "actual visible refusal"
+    );
+    assert_eq!(
+        s.ed.doc.get(title).unwrap().kind.font_size(),
+        Some(12.0),
+        "the requested style was refused"
+    );
+    // The corrected contract (see above).
+    assert_eq!(
+        s.ed.doc.get(locked),
+        Some(&control),
+        "the locked next row stays"
+    );
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        before,
+        "a refused first Theme change must preserve the entire page and pending text draft"
+    );
+    assert_eq!(
+        s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+        edit,
+        "the draft stays open with its caret"
+    );
+    assert_eq!(s.ed.selection, selection);
+    assert_eq!(
+        (
+            s.ed.history.undo_len(),
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.ed.revision,
+            s.dirty()
+        ),
+        markers
+    );
+    assert!(
+        s.save_snapshot().is_none(),
+        "nothing is offered to save while the draft stays open"
+    );
+    s.ed.insert_text("x");
+    let typed = s.ed.doc.get(draft).unwrap().kind.text().cloned();
+    assert_eq!(
+        typed.as_deref().map(str::trim),
+        Some("x"),
+        "the draft still types"
+    );
+}

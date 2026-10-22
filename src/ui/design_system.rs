@@ -441,11 +441,14 @@ fn style_groups(ed: &Editor, targets: &[StyleTarget]) -> Vec<(NodeId, &'static s
     out
 }
 
-/// A new text style use beginning with `change`, or `None` when Theme refuses it before
-/// anything changes: a locked instance inherits the style or its text box ([`reaches_locked`]
-/// on [`style_groups`]), or applying the change would reach a locked layer some other way
-/// ([`restyle_reaches_locked`]). An open text edit is ended only once it is allowed; if that
-/// changed the Paper, its targets are found and checked again.
+/// A new text style use beginning with `change`, or `None` when Theme refuses it, before
+/// anything of the live editor changes. Its whole first step is tried on a preview first
+/// (`Editor::preview`, R69): ending an open text edit (which commits it, and may remove an
+/// emptied text and so reflow its frame), the targets found after that, the inheritance
+/// foresight ([`reaches_locked`] on [`style_groups`]) and the change with all its follow-ups;
+/// it is refused if any effectively locked layer of the live document would differ. Only an
+/// admitted use touches the live editor, by the same steps (the text edit ended, the targets
+/// found again); the caller then applies the change.
 fn fresh_restyle(
     ed: &mut Editor,
     links: &HashMap<NodeId, Vec<NodeId>>,
@@ -453,41 +456,50 @@ fn fresh_restyle(
     popup: egui::Id,
     change: StyleChange,
 ) -> Option<Restyle> {
-    let allowed = |ed: &Editor, r: &Restyle| {
-        !reaches_locked(ed, links, &style_groups(ed, &r.targets))
-            && !restyle_reaches_locked(ed, r, change)
+    let mut probe = ed.preview();
+    probe.end_text_edit();
+    let probe_links;
+    let links = if ed.text_edit.is_some() {
+        probe_links = inheritors(&probe);
+        &probe_links
+    } else {
+        links
     };
     let r = Restyle {
         from: style,
         now: style,
-        targets: style_targets(ed, style),
+        targets: style_targets(&probe, style),
         stamp: 0,
         popup,
     };
-    if !allowed(&*ed, &r) {
+    if reaches_locked(&probe, links, &style_groups(&probe, &r.targets)) {
         return None;
     }
-    let stamp = ed.doc_stamp;
-    ed.end_text_edit();
-    if ed.doc_stamp == stamp {
-        return Some(r);
+    restyle(&mut probe, &r, change);
+    if locked_differ(ed, &probe) {
+        return None;
     }
-    let r = Restyle {
+    ed.end_text_edit();
+    Some(Restyle {
         targets: style_targets(ed, style),
         ..r
-    };
-    allowed(&*ed, &r).then_some(r)
+    })
 }
 
 /// Whether applying `change` to `r`'s targets would change any effectively locked layer: the
-/// change applied to a copy of the shown Paper through the very same code (`restyle`: its
-/// range edits, `fit_text`, overrides and the commit's fixup, which keeps component
-/// instances, groups, auto layout and bound arrows in step), so every derived effect counts,
-/// not only the inherited values [`reaches_locked`] foresees for a row (R68). Nothing of the
-/// real document or its history is touched.
+/// change applied to a preview of the shown Paper (`Editor::preview`: its document and open
+/// transaction) through the very same code (`restyle`: its range edits, `fit_text`,
+/// overrides and the commit's fixup, which keeps component instances, groups, auto layout and
+/// bound arrows in step), so every derived effect counts, not only the inherited values
+/// [`reaches_locked`] foresees for a row (R68). Nothing of the live editor is touched.
 fn restyle_reaches_locked(ed: &Editor, r: &Restyle, change: StyleChange) -> bool {
-    let mut probe = Editor::new(ed.doc.clone());
+    let mut probe = ed.preview();
     restyle(&mut probe, r, change);
+    locked_differ(ed, &probe)
+}
+
+/// Whether any of `ed`'s effectively locked layers differs (or is gone) in `probe`.
+fn locked_differ(ed: &Editor, probe: &Editor) -> bool {
     ed.doc
         .nodes
         .keys()
@@ -1089,4 +1101,217 @@ fn value_row(ui: &mut Ui, swatch: bool, label: &str, count: usize) -> (egui::Res
 fn select(ed: &mut Editor, ids: Vec<NodeId>) {
     ed.end_text_edit();
     ed.selection = ids;
+}
+
+/// The independent R69 review's helper-level probes, kept as regressions: unchanged but for
+/// formatting (a named snapshot type, and the failing probe's diagnostic print omitted).
+/// `r69_refusal_after_empty_draft_cleanup_is_atomic_too` failed on the reviewed
+/// source (its live empty draft was removed and the locked next row moved before the final
+/// refusal; the original failure stays the review's evidence); its assertions are the
+/// corrected contract, unchanged.
+#[cfg(test)]
+mod r69_review {
+    use super::*;
+    use crate::geom::Rect;
+    use crate::model::{AutoLayout, Direction, Document, Node, TextAlign};
+
+    fn layer(doc: &mut Document, kind: NodeKind, rect: Rect) -> NodeId {
+        let id = doc.alloc_id();
+        doc.nodes.insert(id, Node::new(id, kind, rect));
+        doc.root.push(id);
+        id
+    }
+
+    fn text(s: &str) -> NodeKind {
+        NodeKind::Text {
+            text: s.into(),
+            font_size: 24.0,
+            auto_width: true,
+            align: TextAlign::Left,
+        }
+    }
+
+    type Snapshot = (
+        Document,
+        usize,
+        String,
+        u64,
+        u64,
+        bool,
+        Vec<NodeId>,
+        Option<(NodeId, usize, Option<usize>)>,
+    );
+
+    fn snapshot(ed: &Editor) -> Snapshot {
+        (
+            ed.doc.clone(),
+            ed.history.undo_len(),
+            format!("{:?}", ed.history),
+            ed.doc_stamp,
+            ed.revision,
+            ed.is_dirty(),
+            ed.selection.clone(),
+            ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+        )
+    }
+
+    #[test]
+    fn r69_first_dry_run_refusal_keeps_a_pending_text_edit_and_its_caret() {
+        let mut doc = Document::default();
+        let frame = layer(
+            &mut doc,
+            NodeKind::Frame { clip: false },
+            Rect::new(100.0, 100.0, 300.0, 300.0),
+        );
+        doc.nodes.get_mut(&frame).unwrap().layout = Some(AutoLayout {
+            direction: Direction::Vertical,
+            ..Default::default()
+        });
+        let title = layer(&mut doc, text("Title"), Rect::new(0.0, 0.0, 50.0, 30.0));
+        let control = layer(&mut doc, NodeKind::Rect, Rect::new(0.0, 0.0, 80.0, 20.0));
+        for id in [title, control] {
+            doc.nodes.get_mut(&id).unwrap().parent = Some(frame);
+        }
+        doc.root.retain(|id| *id == frame);
+        doc.nodes.get_mut(&frame).unwrap().children = vec![title, control];
+        let draft = layer(&mut doc, text("Draft"), Rect::new(500.0, 100.0, 50.0, 30.0));
+        let mut ed = Editor::new(doc);
+        ed.selection = vec![title];
+        ed.style_text("font size", |sp| sp.size = Some(24.0));
+        ed.edit("Lock", |tx| tx.node_mut(control).unwrap().locked = true);
+        ed.start_text_edit(draft, None);
+        ed.insert_text("ø draft");
+        let before = snapshot(&ed);
+        let links = inheritors(&ed);
+        assert!(
+            links.is_empty(),
+            "this case requires the new dry run, not the row's inheritance shortcut"
+        );
+        assert!(
+            fresh_restyle(
+                &mut ed,
+                &links,
+                (2400, false, false),
+                egui::Id::new("r69"),
+                StyleChange::Size(32.0)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            snapshot(&ed),
+            before,
+            "refusal leaves pending recording, text, history and caret alone"
+        );
+        ed.insert_text("!");
+        assert_eq!(
+            ed.doc.get(draft).unwrap().kind.text().map(String::as_str),
+            Some("ø draft!")
+        );
+    }
+
+    #[test]
+    fn r69_allowed_change_rechecks_targets_after_ending_an_empty_text_draft() {
+        let mut doc = Document::default();
+        let title = layer(&mut doc, text("Title"), Rect::new(100.0, 100.0, 50.0, 30.0));
+        let empty = layer(&mut doc, text("  "), Rect::new(500.0, 100.0, 50.0, 30.0));
+        let mut ed = Editor::new(doc);
+        ed.start_text_edit(empty, None);
+        let stamp = ed.doc_stamp;
+        let links = inheritors(&ed);
+        let r = fresh_restyle(
+            &mut ed,
+            &links,
+            (2400, false, false),
+            egui::Id::new("r69"),
+            StyleChange::Size(32.0),
+        )
+        .expect("no locks, normal empty-draft finish allowed");
+        assert_ne!(
+            ed.doc_stamp, stamp,
+            "empty text cleanup actually changed the page"
+        );
+        assert!(ed.text_edit.is_none());
+        assert!(ed.doc.get(empty).is_none());
+        assert_eq!(
+            r.targets.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![title]
+        );
+        let after_cleanup = ed.doc.clone();
+        restyle(&mut ed, &r, StyleChange::Size(32.0));
+        assert_eq!(ed.doc.get(title).unwrap().kind.font_size(), Some(32.0));
+        ed.undo();
+        assert_eq!(
+            ed.doc, after_cleanup,
+            "the Theme edit is its own complete undo step after normal draft completion"
+        );
+    }
+
+    #[test]
+    fn r69_refusal_after_empty_draft_cleanup_is_atomic_too() {
+        // A wrapping row's taller (24 pt) draft masks the target's 12 -> 18 height change.
+        // Once the empty draft is removed, the locked second row would follow that height.
+        // Every text box is fitted first by the real Editor; no inconsistent geometry seed.
+        let mut doc = Document::default();
+        let frame = layer(
+            &mut doc,
+            NodeKind::Frame { clip: false },
+            Rect::new(100.0, 100.0, 200.0, 300.0),
+        );
+        doc.nodes.get_mut(&frame).unwrap().layout = Some(AutoLayout {
+            direction: Direction::Horizontal,
+            wrap: true,
+            ..Default::default()
+        });
+        let title = layer(&mut doc, text("Title"), Rect::new(0.0, 0.0, 80.0, 10.0));
+        let draft = layer(&mut doc, text("Box"), Rect::new(0.0, 0.0, 60.0, 10.0));
+        for id in [title, draft] {
+            let n = doc.nodes.get_mut(&id).unwrap();
+            n.parent = Some(frame);
+            if let NodeKind::Text { auto_width, .. } = &mut n.kind {
+                *auto_width = false;
+            }
+        }
+        let control = layer(&mut doc, NodeKind::Rect, Rect::new(0.0, 0.0, 120.0, 20.0));
+        doc.nodes.get_mut(&control).unwrap().parent = Some(frame);
+        doc.nodes.get_mut(&frame).unwrap().children = vec![title, draft, control];
+        doc.root.retain(|id| *id == frame);
+        let mut ed = Editor::new(doc);
+        ed.selection = vec![draft];
+        ed.style_text("font size", |sp| sp.size = Some(24.0));
+        ed.selection = vec![title];
+        ed.style_text("font size", |sp| sp.size = Some(12.0));
+        ed.edit("Lock", |tx| tx.node_mut(control).unwrap().locked = true);
+        ed.start_text_edit(draft, None);
+        ed.insert_text("  ");
+        let before = snapshot(&ed);
+        let links = inheritors(&ed);
+        let proposed = Restyle {
+            from: (1200, false, false),
+            now: (1200, false, false),
+            targets: style_targets(&ed, (1200, false, false)),
+            stamp: 0,
+            popup: egui::Id::new("r69-cleanup"),
+        };
+        assert!(
+            !restyle_reaches_locked(&ed, &proposed, StyleChange::Size(18.0)),
+            "the first preview really permits the proposed change"
+        );
+        let result = fresh_restyle(
+            &mut ed,
+            &links,
+            (1200, false, false),
+            egui::Id::new("r69-cleanup"),
+            StyleChange::Size(18.0),
+        );
+        assert!(
+            result.is_none(),
+            "the final preview refuses the proposed change"
+        );
+        assert_eq!(
+            snapshot(&ed),
+            before,
+            "a refused first change must also preserve the open draft and locked drawing data \
+             when ending the draft would reflow"
+        );
+    }
 }

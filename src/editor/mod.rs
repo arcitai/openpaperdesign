@@ -448,6 +448,21 @@ impl Editor {
         self.saved_marker = Some(self.history.undo_len());
     }
 
+    /// A throwaway editor of the shown page as it stands for an edit: its document, open
+    /// transaction (with its coalescing key), text edit, selection and suspended layouts; no
+    /// history, clipboard, other pages or host state. An operation tried on it shows its whole
+    /// effect on the document, the open text edit's completion and the commit's fixup
+    /// included, without touching this editor (Theme admits a change this way before
+    /// changing anything, R69).
+    pub fn preview(&self) -> Editor {
+        let mut e = Editor::new(self.doc.clone());
+        e.rec = self.rec.clone();
+        e.text_edit = self.text_edit.clone();
+        e.selection = self.selection.clone();
+        e.layout_suspended = self.layout_suspended.clone();
+        e
+    }
+
     /// Replace the document (open/new).
     pub fn load(&mut self, doc: Document, camera: Option<Camera>, path: Option<PathBuf>) {
         *self = Editor {

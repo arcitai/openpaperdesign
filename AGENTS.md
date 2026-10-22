@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.89 · Updated: 2026-10-23
+Revision: 0.90 · Updated: 2026-10-23
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -770,6 +770,28 @@ engine architecture is `analysis/DESIGN.md`.
       unchanged but for formatting; its failing probe's case as a refusal test (whole Paper,
       history, stamp, unsaved state, selection, child and instance root unchanged, reason
       shown), since the probe's changed-main expectation isn't the refusal contract.
+      **R69 correction** (run168; the independent R69 review's one P2, source only): the first
+      check above tried `restyle` on a document-only copy, then ended the live text edit
+      before its final check, so a refused first change could already have committed the open
+      draft (an emptied text removed, its wrapping auto-layout row reflowed, a locked next row
+      moved, history 0 → 1, a changed page offered to save). Now `fresh_restyle` admits the
+      whole first step on `Editor::preview` (new in upstream `src/editor/mod.rs`: a throwaway
+      editor with the shown page's document, open transaction and coalescing key, text edit,
+      selection and suspended layouts; `src/history.rs` `Recording` gains a derive-only
+      `Clone` for it): ending the text edit, the targets after it, the inheritance foresight,
+      and the change with all its follow-ups; refused if any effectively locked layer of the
+      live document would differ. Only an admitted use then ends the live text edit and finds
+      its targets again; a refusal leaves the live editor exactly as it was (document, open
+      draft with caret and range, selection, history, open transaction, stamp, unsaved state).
+      Later changes of a use are tried on a preview too. Text completion, component sync,
+      transactions and saving are unchanged elsewhere. Reason for the upstream-owned files: a
+      faithful preview needs the open transaction, which only the editor holds. Tests: the
+      reviewer's five passing probes (three actual-widget, two helper-level beside
+      `design_system`) unchanged but for formatting; its helper-level failing probe unchanged
+      (its assertions are the corrected contract); its actual-widget failing probe with the
+      same fixture, trigger, visible refusal and requested-font checks, and its middle
+      assertions (which recorded the defect: a changed page saved, then reversed and replayed)
+      adapted to the exact-state contract.
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).
