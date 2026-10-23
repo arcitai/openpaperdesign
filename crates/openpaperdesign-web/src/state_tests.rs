@@ -9889,3 +9889,172 @@ fn r179_the_design_font_refuses_a_locked_instance_inheriting_its_box_and_admits_
     step(&mut s);
     assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
 }
+
+// ---- R73-F1: a family click that also finishes a typed metric. The R73 review's probe
+// (`r73_metric_draft_then_family_keeps_both_and_one_undo`, and its separate letter spacing
+// control) failed: the metric typed and not entered was finished by the click's focus loss in
+// the same frame as the family, and replaced it (both layers stayed Inter). Kept here without
+// its evidence file writes; its inputs and assertions are unchanged.
+
+/// [`design_markers`] without the unsaved flag (a metric typed and not entered may count there,
+/// and a refusal drops it): the history, stamp, selection and open text edit with its caret.
+fn theme_markers(
+    s: &WebState,
+) -> (
+    String,
+    u64,
+    Vec<crate::model::NodeId>,
+    Option<(crate::model::NodeId, usize, Option<usize>)>,
+) {
+    let (history, stamp, selection, _, edit) = design_markers(s);
+    (history, stamp, selection, edit)
+}
+
+#[test]
+fn r180_a_family_click_finishing_a_typed_metric_applies_both_in_one_step() {
+    use crate::model::FontFamily;
+    for (label, value) in [("Line height", "125%"), ("Letter spacing", "2.5")] {
+        let (mut s, ids) = metric_fixture();
+        let before = page_to_json(&s.ed.page_data(0));
+        let before_doc = s.ed.doc.clone();
+        open_theme(&mut s);
+        open_picker(&mut s, "20 · Regular");
+        metric_typed(&mut s, label, value);
+        let t = s.now_ms + 1000.0;
+        click_front_label(&mut s, "Geist Mono", t);
+        timed_frames(&mut s, 3);
+        assert!(
+            [ids.first, ids.second]
+                .iter()
+                .all(|id| s.ed.doc.get(*id).unwrap().text_style.family == FontFamily::GeistMono),
+            "{label}: the clicked family applies"
+        );
+        assert!(
+            metric_applied(&s, &ids, label),
+            "{label}: the pending metric is committed, not discarded by choosing the family"
+        );
+        assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+        assert!(
+            ui::popup_open(&s.ctx),
+            "{label}: a family keeps the editor open"
+        );
+        assert!(s.ed.status.is_empty(), "{label}: {}", s.ed.status);
+        // The style's other layers are exactly as they were.
+        for id in [ids.control, ids.locked] {
+            assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{label}: {id:?}");
+        }
+        close_picker(&mut s);
+        let after = page_to_json(&s.ed.page_data(0));
+        let snap = s.save_snapshot().expect("the completed use saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), after);
+        s.save_succeeded();
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{label}: one undo for both"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), after, "{label}");
+    }
+}
+
+#[test]
+fn r180_a_typed_metric_and_family_are_admitted_together_or_not_at_all() {
+    use crate::model::{Direction, FontFamily};
+    // In a row a line height alone leaves the locked sibling where it is (it is admitted: the
+    // control), while Geist Mono widens the title and would move it. Typed and finished by the
+    // family click, the two are one change: refused whole, before either applies.
+    let (mut s, text, _) = metric_flow_fixture(true, Direction::Horizontal);
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    theme_metric(&mut s, "Line height", "125%");
+    close_picker(&mut s);
+    assert_eq!(
+        s.ed.doc.get(text).unwrap().text_style.line_height,
+        Some(1.25),
+        "control: the line height alone is admitted"
+    );
+    let (mut s, text, sibling) = metric_flow_fixture(true, Direction::Horizontal);
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    metric_typed(&mut s, "Line height", "125%");
+    let page = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    let markers = theme_markers(&s);
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    assert!(!ui::popup_open(&s.ctx), "refused, the editor closes");
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page, "neither applied");
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert_eq!(theme_markers(&s), markers);
+    let n = s.ed.doc.get(text).unwrap();
+    assert_eq!(n.text_style.family, FontFamily::Inter);
+    assert_eq!(n.text_style.line_height, None);
+    assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    assert!(s.save_snapshot().is_none(), "nothing to save");
+    // Unlocked, the same typed line height and click: both apply, the sibling follows, and
+    // one Undo/Redo gives the whole page.
+    let (mut s, text, free) = metric_flow_fixture(false, Direction::Horizontal);
+    let before = page_to_json(&s.ed.page_data(0));
+    let place = s.ed.doc.get(free).unwrap().rect;
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    metric_typed(&mut s, "Line height", "125%");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    let n = s.ed.doc.get(text).unwrap();
+    assert_eq!(n.text_style.family, FontFamily::GeistMono);
+    assert_eq!(n.text_style.line_height, Some(1.25));
+    assert_ne!(s.ed.doc.get(free).unwrap().rect, place, "it really moves");
+    close_picker(&mut s);
+    let after = page_to_json(&s.ed.page_data(0));
+    let snap = s.save_snapshot().expect("the allowed use saves");
+    assert_eq!(page_to_json(&sent_page(&snap)), after);
+    s.save_succeeded();
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), after);
+}
+
+#[test]
+fn r180_a_refused_metric_and_family_keep_an_open_text_draft() {
+    use crate::model::{Direction, FontFamily};
+    // The title's own text being edited too: the combined first change is tried with the
+    // draft's commit on a preview and refused before the draft is finished. The page, history,
+    // stamp, selection and caret stay, nothing is offered to save, and the draft still types.
+    let (mut s, text, sibling) = metric_flow_fixture(true, Direction::Vertical);
+    open_theme(&mut s);
+    s.ed.start_text_edit(text, None);
+    s.ed.insert_text("ø");
+    timed_frames(&mut s, 3);
+    open_picker(&mut s, "24 · Regular");
+    metric_typed(&mut s, "Line height", "125%");
+    let page = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    let markers = theme_markers(&s);
+    assert!(markers.3.is_some(), "a draft is open");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page);
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert_eq!(theme_markers(&s), markers);
+    assert_eq!(
+        s.ed.doc.get(text).unwrap().text_style.family,
+        FontFamily::Inter
+    );
+    assert!(s.save_snapshot().is_none(), "nothing offered to save");
+    s.ed.insert_text("x");
+    let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
+    assert!(typed.ends_with("øx"), "the draft still types: {typed}");
+}

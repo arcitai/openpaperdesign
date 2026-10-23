@@ -266,8 +266,8 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         if frame.drawn && prior.as_ref().is_some_and(|d| d.popup == popup) {
             prior_drawn = true;
         }
-        if let Some(change) = frame.change {
-            changed = Some((style, change, popup));
+        if !frame.changes.is_empty() {
+            changed = Some((style, frame.changes, popup));
         }
         if frame.open {
             open = Some(style);
@@ -287,8 +287,8 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
     {
         finish_draft(ui.ctx(), ed, &links, &mut active, &d);
     }
-    if let Some((style, change, popup)) = changed {
-        apply_style_change(ui.ctx(), ed, &links, &mut active, style, change, popup);
+    if let Some((style, changes, popup)) = changed {
+        apply_style_change(ui.ctx(), ed, &links, &mut active, style, &changes, popup);
     } else if active.as_ref().is_some_and(|a| open != Some(a.now)) {
         // Its editor closed (or its style left the list): that interaction is one step.
         ed.history.seal();
@@ -325,34 +325,38 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
     });
 }
 
-/// Apply `change` to the text style `style` (its editor's popup `popup`), continuing the use
+/// Apply `changes` to the text style `style` (its editor's popup `popup`), continuing the use
 /// under way (`active`) or beginning one: a later change of a use is tried on a preview, a
 /// first one admitted whole by [`fresh_restyle`]; a font family, line height or letter spacing
-/// needs every target to be a whole layer. A refused change applies nothing, closes the editor
-/// and says why in the status line. The one path for the editor's fields and for a metric
-/// finished after its field went away ([`finish_draft`]).
+/// needs every target to be a whole layer. `changes` are what one frame of the editor finished,
+/// in order, and are admitted together (R73-F1: a click on a family that also finishes a typed
+/// line height or letter spacing finishes both, and neither is applied unless both are). A
+/// refused change applies nothing, closes the editor and says why in the status line. The one
+/// path for the editor's fields and for a metric finished after its field went away
+/// ([`finish_draft`]).
 fn apply_style_change(
     ctx: &egui::Context,
     ed: &mut Editor,
     links: &HashMap<NodeId, Vec<NodeId>>,
     active: &mut Option<Restyle>,
     style: StyleKey,
-    change: StyleChange,
+    changes: &[StyleChange],
     popup: egui::Id,
 ) {
     // Why a change is refused: a metric for a style only part of some layer has, or a locked
     // layer it would reach.
     let mut reason = INHERITED_STYLE;
+    let whole_layer = changes.iter().any(|c| c.whole_layer());
     let next = match active.take() {
         Some(a) if a.now == style => {
             // Each later change of a use is tried on a copy too: one that would reach a locked
             // layer isn't applied, and the use ends (its earlier changes stay, one step). A
             // family or metric needs every frozen target to be a whole layer.
-            if change.whole_layer() && !metrics(ed, &a.targets).eligible {
+            if whole_layer && !metrics(ed, &a.targets).eligible {
                 reason = RANGE_METRICS;
                 ed.history.seal();
                 None
-            } else if restyle_reaches_locked(ed, &a, change) {
+            } else if restyle_reaches_locked(ed, &a, changes) {
                 ed.history.seal();
                 None
             } else {
@@ -363,11 +367,8 @@ fn apply_style_change(
             if other.is_some() {
                 ed.history.seal();
             }
-            let fresh = fresh_restyle(ed, links, style, popup, change);
-            if fresh.is_none()
-                && change.whole_layer()
-                && !metrics(ed, &style_targets(ed, style)).eligible
-            {
+            let fresh = fresh_restyle(ed, links, style, popup, changes);
+            if fresh.is_none() && whole_layer && !metrics(ed, &style_targets(ed, style)).eligible {
                 reason = RANGE_METRICS;
             }
             fresh
@@ -375,15 +376,7 @@ fn apply_style_change(
     };
     match next {
         Some(mut r) => {
-            restyle(ed, &r, change);
-            let (size, b, i, family) = r.now;
-            r.now = match change {
-                StyleChange::Size(v) => ((v * 100.0).round() as i64, b, i, family),
-                StyleChange::Face { bold, italic } => (size, bold, italic, family),
-                StyleChange::Family(f) => (size, b, i, f),
-                // A layer metric isn't part of the style's key: the row stays where it is.
-                StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => r.now,
-            };
+            restyle_all(ed, &mut r, changes);
             r.stamp = ed.doc_stamp;
             *active = Some(r);
         }
@@ -502,7 +495,7 @@ fn finish_draft(
             StyleChange::Size(_) | StyleChange::Face { .. } | StyleChange::Family(_) => false,
         };
         if !unchanged {
-            apply_style_change(ctx, ed, links, active, d.style, change, d.popup);
+            apply_style_change(ctx, ed, links, active, d.style, &[change], d.popup);
         }
     }
 }
@@ -661,10 +654,12 @@ pub fn editing(ctx: &egui::Context, ed: &Editor) -> bool {
 pub const INHERITED_COLOUR: &str = "A locked instance inherits this colour from its component \
                                     and would change with it. Unlock that instance to change \
                                     the colour here.";
-/// Why Theme won't change a text style here (as [`INHERITED_COLOUR`]).
-pub const INHERITED_STYLE: &str = "A locked instance inherits this text style or its text box \
-                                   from its component and would change with it. Unlock that \
-                                   instance to change the style here.";
+/// Why Theme (or the Design panel's Font) won't change a text style here: the change would
+/// also change a locked layer, whatever the kind (R73 P3: it named only an instance, also when
+/// a plain locked layer beside the text in an auto layout was what it would move).
+pub const INHERITED_STYLE: &str = "A locked layer would change too: an instance inheriting \
+                                   this style or its text box, or a layer its new box would \
+                                   move. Unlock it to make this change.";
 
 /// Every instance layer, by the layer it inherits from (`InstanceLink::main`).
 fn inheritors(ed: &Editor) -> HashMap<NodeId, Vec<NodeId>> {
@@ -768,21 +763,21 @@ fn style_groups(ed: &Editor, targets: &[StyleTarget]) -> Vec<(NodeId, &'static s
     out
 }
 
-/// A new text style use beginning with `change`, or `None` when Theme refuses it, before
-/// anything of the live editor changes. Its whole first step is tried on a preview first
-/// (`Editor::preview`, R69): ending an open text edit (which commits it, and may remove an
-/// emptied text and so reflow its frame), the targets found after that (for a line height or
-/// letter spacing, every one a whole layer, [`RANGE_METRICS`]), the inheritance
-/// foresight ([`reaches_locked`] on [`style_groups`]) and the change with all its follow-ups;
+/// A new text style use beginning with `changes` (one frame's, in order), or `None` when Theme
+/// refuses it, before anything of the live editor changes. Its whole first step is tried on a
+/// preview first (`Editor::preview`, R69): ending an open text edit (which commits it, and may
+/// remove an emptied text and so reflow its frame), the targets found after that (for a family,
+/// line height or letter spacing, every one a whole layer, [`RANGE_METRICS`]), the inheritance
+/// foresight ([`reaches_locked`] on [`style_groups`]) and every change with all its follow-ups;
 /// it is refused if any effectively locked layer of the live document would differ. Only an
 /// admitted use touches the live editor, by the same steps (the text edit ended, the targets
-/// found again); the caller then applies the change.
+/// found again); the caller then applies the changes.
 fn fresh_restyle(
     ed: &mut Editor,
     links: &HashMap<NodeId, Vec<NodeId>>,
     style: StyleKey,
     popup: egui::Id,
-    change: StyleChange,
+    changes: &[StyleChange],
 ) -> Option<Restyle> {
     let mut probe = ed.preview();
     probe.end_text_edit();
@@ -802,13 +797,14 @@ fn fresh_restyle(
     };
     // A family, line height or letter spacing belongs to whole layers only: never a part of a
     // subset.
-    if change.whole_layer() && !metrics(&probe, &r.targets).eligible {
+    let whole_layer = changes.iter().any(|c| c.whole_layer());
+    if whole_layer && !metrics(&probe, &r.targets).eligible {
         return None;
     }
     if reaches_locked(&probe, links, &style_groups(&probe, &r.targets)) {
         return None;
     }
-    restyle(&mut probe, &r, change);
+    restyle_all(&mut probe, &mut r.clone(), changes);
     if locked_differ(ed, &probe) {
         return None;
     }
@@ -819,16 +815,32 @@ fn fresh_restyle(
     })
 }
 
-/// Whether applying `change` to `r`'s targets would change any effectively locked layer: the
-/// change applied to a preview of the shown Paper (`Editor::preview`: its document and open
-/// transaction) through the very same code (`restyle`: its range edits, `fit_text`,
+/// Whether applying `changes` to `r`'s targets would change any effectively locked layer: the
+/// changes applied together to a preview of the shown Paper (`Editor::preview`: its document
+/// and open transaction) through the very same code ([`restyle_all`]: range edits, `fit_text`,
 /// overrides and the commit's fixup, which keeps component instances, groups, auto layout and
 /// bound arrows in step), so every derived effect counts, not only the inherited values
 /// [`reaches_locked`] foresees for a row (R68). Nothing of the live editor is touched.
-fn restyle_reaches_locked(ed: &Editor, r: &Restyle, change: StyleChange) -> bool {
+fn restyle_reaches_locked(ed: &Editor, r: &Restyle, changes: &[StyleChange]) -> bool {
     let mut probe = ed.preview();
-    restyle(&mut probe, r, change);
+    restyle_all(&mut probe, &mut r.clone(), changes);
     locked_differ(ed, &probe)
+}
+
+/// `changes` given to `r`'s targets in order ([`restyle`]), the style the use now has
+/// (`r.now`) following each: a size or face moves the row, a family too; a layer metric isn't
+/// part of the key, so the row stays where it is. All of them coalesce into the use's one step.
+fn restyle_all(ed: &mut Editor, r: &mut Restyle, changes: &[StyleChange]) {
+    for &change in changes {
+        restyle(ed, r, change);
+        let (size, b, i, family) = r.now;
+        r.now = match change {
+            StyleChange::Size(v) => ((v * 100.0).round() as i64, b, i, family),
+            StyleChange::Face { bold, italic } => (size, bold, italic, family),
+            StyleChange::Family(f) => (size, b, i, f),
+            StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => r.now,
+        };
+    }
 }
 
 /// Whether any of `ed`'s effectively locked layers differs (or is gone) in `probe`.
@@ -1074,7 +1086,9 @@ fn style_editor(
          step. Locked layers keep theirs."
     ));
     let (_, bold, italic, family) = style;
-    let mut change = None;
+    // Every change the frame finishes, in order: a click on a face or family that also takes the
+    // focus from a typed metric finishes that metric in the same frame (R73-F1), and both count.
+    let mut changes = Vec::new();
     let mut typing = None;
     let mut drawn = false;
     egui::Popup::menu(&resp)
@@ -1093,13 +1107,13 @@ fn style_editor(
                     .prefix("Size "),
             );
             if r.changed() && (size * 100.0).round() as i64 != style.0 {
-                change = Some(StyleChange::Size(size));
+                changes.push(StyleChange::Size(size));
             }
             ui.horizontal_wrapped(|ui| {
                 for (face, b, i) in FACES {
                     let on = (b, i) == (bold, italic);
                     if ui.add(egui::Button::selectable(on, face)).clicked() && !on {
-                        change = Some(StyleChange::Face { bold: b, italic: i });
+                        changes.push(StyleChange::Face { bold: b, italic: i });
                     }
                 }
             });
@@ -1107,7 +1121,7 @@ fn style_editor(
             // offered when every layer in the style has it throughout (the note below says why
             // not otherwise).
             if let Some(f) = family_choice(ui, family, shown.eligible) {
-                change = Some(StyleChange::Family(f));
+                changes.push(StyleChange::Family(f));
             }
             ui.add_space(4.0);
             // The whole layers' paragraph metrics: a value, Auto, or Mixed (they differ; a value
@@ -1118,7 +1132,7 @@ fn style_editor(
             if let Some(lh) = entered.as_deref().and_then(parse_line_height)
                 && shown.line_height != Some(lh)
             {
-                change = Some(StyleChange::LineHeight(lh));
+                changes.push(StyleChange::LineHeight(lh));
             }
             typing = draft.map(|t| (Metric::LineHeight, t));
             let ls = shown
@@ -1128,7 +1142,7 @@ fn style_editor(
             if let Some(ls) = entered.as_deref().and_then(parse_letter_spacing)
                 && shown.letter_spacing != Some(ls)
             {
-                change = Some(StyleChange::LetterSpacing(ls));
+                changes.push(StyleChange::LetterSpacing(ls));
             }
             if let Some(t) = draft {
                 typing = Some((Metric::LetterSpacing, t));
@@ -1138,7 +1152,7 @@ fn style_editor(
             }
         });
     EditorFrame {
-        change,
+        changes,
         open: egui::Popup::is_id_open(ui.ctx(), popup),
         popup,
         typing,
@@ -1172,8 +1186,9 @@ pub(super) fn family_choice(ui: &mut Ui, now: FontFamily, enabled: bool) -> Opti
 
 /// What one style's editor did this frame.
 struct EditorFrame {
-    /// A finished change to the style.
-    change: Option<StyleChange>,
+    /// The changes to the style finished this frame, in order (usually one; a click that also
+    /// finishes a typed metric gives both).
+    changes: Vec<StyleChange>,
     /// Whether its popup is open after this frame.
     open: bool,
     popup: egui::Id,
@@ -1798,7 +1813,7 @@ mod metric_tests {
         let before = ed.doc.clone();
         let links = inheritors(&ed);
         let family = StyleChange::Family(FontFamily::GeistMono);
-        assert!(fresh_restyle(&mut ed, &links, inter, egui::Id::new("f"), family).is_none());
+        assert!(fresh_restyle(&mut ed, &links, inter, egui::Id::new("f"), &[family]).is_none());
         assert_eq!(ed.doc, before, "nothing changed");
         // The whole layer alone: its family changes, its text, range and box width rule stay.
         let alone: Vec<StyleTarget> = style_targets(&ed, inter)
@@ -1855,7 +1870,9 @@ mod metric_tests {
 }
 
 /// The independent R69 review's helper-level probes, kept as regressions: unchanged but for
-/// formatting (a named snapshot type, and the failing probe's diagnostic print omitted).
+/// formatting (a named snapshot type, and the failing probe's diagnostic print omitted) and,
+/// since R73-F1, each change passed as a one-element slice (`fresh_restyle` and
+/// `restyle_reaches_locked` admit one frame's changes together).
 /// `r69_refusal_after_empty_draft_cleanup_is_atomic_too` failed on the reviewed
 /// source (its live empty draft was removed and the locked next row moved before the final
 /// refusal; the original failure stays the review's evidence); its assertions are the
@@ -1944,7 +1961,7 @@ mod r69_review {
                 &links,
                 (2400, false, false, FontFamily::Inter),
                 egui::Id::new("r69"),
-                StyleChange::Size(32.0)
+                &[StyleChange::Size(32.0)]
             )
             .is_none()
         );
@@ -1974,7 +1991,7 @@ mod r69_review {
             &links,
             (2400, false, false, FontFamily::Inter),
             egui::Id::new("r69"),
-            StyleChange::Size(32.0),
+            &[StyleChange::Size(32.0)],
         )
         .expect("no locks, normal empty-draft finish allowed");
         assert_ne!(
@@ -2046,7 +2063,7 @@ mod r69_review {
             popup: egui::Id::new("r69-cleanup"),
         };
         assert!(
-            !restyle_reaches_locked(&ed, &proposed, StyleChange::Size(18.0)),
+            !restyle_reaches_locked(&ed, &proposed, &[StyleChange::Size(18.0)]),
             "the first preview really permits the proposed change"
         );
         let result = fresh_restyle(
@@ -2054,7 +2071,7 @@ mod r69_review {
             &links,
             style,
             egui::Id::new("r69-cleanup"),
-            StyleChange::Size(18.0),
+            &[StyleChange::Size(18.0)],
         );
         assert!(
             result.is_none(),

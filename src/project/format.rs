@@ -1,6 +1,7 @@
 //! On-disk formats for projects and pages, with versioned migrations.
 //!
-//! Every file carries `format` and `version`. Loading parses into `serde_json::Value`, runs the
+//! Every file carries `format` and `version`. Loading parses into `serde_json::Value` (a page
+//! after a raw check that no member it reads is named twice, see `check_unambiguous`), runs the
 //! migration chain from the file's version up to the current one, then deserializes. Each step
 //! is a pure function `Value -> Value`, so old files keep loading forever and every step is
 //! unit-testable on its own.
@@ -227,6 +228,8 @@ pub fn page_to_json(p: &PageData) -> String {
 
 /// Parse a page file (or a legacy `.paper-rs` document) of any supported version.
 pub fn page_from_json(s: &str) -> Result<PageData, FormatError> {
+    // Before `Value`, which keeps only the last of a member named twice (R73-F2).
+    check_unambiguous(s)?;
     let v: Value = serde_json::from_str(s).map_err(FormatError::Json)?;
     check_labels(&v)?;
     check_families(&v)?;
@@ -247,6 +250,102 @@ pub fn page_from_json(s: &str) -> Result<PageData, FormatError> {
         doc,
         camera: f.camera,
     })
+}
+
+/// Where [`Unambiguous`] is in a page: its top level, its `nodes` list, one node, or one node's
+/// `text_style`.
+#[derive(Clone, Copy)]
+enum Level {
+    Top,
+    Nodes,
+    Node,
+    Style,
+}
+
+/// A page read member by member with serde, before it becomes a `Value` (which keeps only the
+/// last of a member named twice, so a checked value could differ from the one written): in its
+/// top level (`format`, `version`, `nodes`…), each node and each node's `text_style`, a member
+/// named twice is an error, names compared as decoded (an escaped spelling of `family` is
+/// `family`). Those are the objects whose members the page checks read (`check_labels`,
+/// `check_families`, `migrate`): a second `family`, `text_style`, `nodes` or `version` could
+/// otherwise hide an unknown family, or one an older version can't hold, behind an accepted one
+/// and drop it on the next save. The rest of the page is skipped.
+#[derive(Clone, Copy)]
+struct Unambiguous(Level);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Unambiguous {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Unambiguous {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if let Level::Nodes = self.0 {
+            while seq.next_element_seed(Unambiguous(Level::Node))?.is_some() {}
+        } else {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let checked = !matches!(self.0, Level::Nodes);
+        let mut names = std::collections::HashSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if checked && !names.insert(name.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "{name:?} is named twice in one object, so what it holds is ambiguous"
+                )));
+            }
+            let inner = match (self.0, name.as_str()) {
+                (Level::Top, "nodes") => Some(Level::Nodes),
+                (Level::Node, "text_style") => Some(Level::Style),
+                _ => None,
+            };
+            match inner {
+                Some(level) => map.next_value_seed(Unambiguous(level))?,
+                None => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A page with a member named twice where the page checks read ([`Unambiguous`]) is refused
+/// whole, before anything is read from it. Text that isn't JSON is left to the parse that
+/// follows (its error is the one reported, as before).
+fn check_unambiguous(s: &str) -> Result<(), FormatError> {
+    use serde::de::DeserializeSeed;
+    let mut de = serde_json::Deserializer::from_str(s);
+    match Unambiguous(Level::Top).deserialize(&mut de) {
+        Err(e) if e.is_data() => Err(FormatError::Invalid(format!("the page's {e}"))),
+        _ => Ok(()),
+    }
 }
 
 /// A `label` is a connector field of page v4: a page that declares an older version (or none)
@@ -739,6 +838,154 @@ mod tests {
             })
         ));
         assert!(with(&|v| v["version"] = json!(4_294_967_301_u64)).is_err());
+    }
+
+    /// `name` with its character `at` written as a JSON Unicode escape (a backslash, `u` and
+    /// four hex digits), built at run time so the input really holds the escape, not the plain
+    /// name.
+    fn escaped(name: &str, at: usize) -> String {
+        name.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == at {
+                    format!("{}u{:04x}", '\\', c as u32)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_member_named_twice_cannot_hide_a_font_family_and_is_refused_whole() {
+        use crate::model::FontFamily;
+        // R73-F2: these raw pages (a `Value` can't hold a member twice, so they are text) were
+        // read with the last member only: an unknown family behind Geist Mono, and a Geist Mono
+        // in a v3 page behind Inter, were accepted and dropped on the next save.
+        let mono = page_to_json(&text_page(FontFamily::GeistMono, false));
+        let inter = page_to_json(&text_page(FontFamily::Inter, false));
+        let marker = "\"family\": \"Geist Mono\"";
+        assert!(mono.contains(marker) && mono.contains("\"version\": 5"));
+        let under = mono.replacen("\"version\": 5", "\"version\": 3", 1);
+        let family = escaped("family", 3);
+        let text_style = escaped("text_style", 8);
+        assert_eq!(family, format!("fam{}u0069ly", '\\'));
+        // The nodes list of the Geist Mono page, to put before the Inter page's own.
+        let at = mono.find("\"nodes\": ").unwrap();
+        let mono_nodes = mono[at..mono.rfind('}').unwrap()].trim_end();
+        let at = inter.find("\"nodes\": [").unwrap();
+        let node = at + inter[at..].find("\"id\": ").unwrap();
+        let mut shadowed_style = inter.clone();
+        shadowed_style.insert_str(
+            node,
+            &format!(r#""{text_style}": {{"family": "Geist Mono"}}, "text_style": {{}}, "#),
+        );
+        let with = |page: &str, members: &str| page.replacen(marker, members, 1);
+        let escaped_second = format!(r#""family": "Helvetica", "{family}": "Geist Mono""#);
+        let cases = [
+            // The reviewer's three inputs.
+            (
+                "unknown, then Geist Mono",
+                with(&mono, r#""family": "Helvetica", "family": "Geist Mono""#),
+            ),
+            (
+                "unknown, then an escaped Geist Mono",
+                with(&mono, &escaped_second),
+            ),
+            (
+                "v3: Geist Mono, then Inter",
+                with(&under, r#""family": "Geist Mono", "family": "Inter""#),
+            ),
+            // The other order of each.
+            (
+                "Geist Mono, then unknown",
+                with(&mono, r#""family": "Geist Mono", "family": "Helvetica""#),
+            ),
+            (
+                "v3: Inter, then Geist Mono",
+                with(&under, r#""family": "Inter", "family": "Geist Mono""#),
+            ),
+            // The containers a family is read through.
+            ("text_style twice (escaped first)", shadowed_style),
+            (
+                "nodes twice",
+                inter.replacen("\"nodes\": ", &format!("{mono_nodes}, \"nodes\": "), 1),
+            ),
+            (
+                "version twice",
+                under.replacen("\"version\": 3", "\"version\": 3, \"version\": 5", 1),
+            ),
+        ];
+        for (what, raw) in cases {
+            let e = page_from_json(&raw).unwrap_err();
+            assert!(
+                matches!(e, FormatError::Invalid(ref m) if m.contains("named twice")),
+                "{what}: {e}"
+            );
+        }
+        // Controls: the single-member pages, as before. Geist Mono at v5 reads back exactly,
+        // also with its key escaped (the same member); an explicit Inter reads as Inter; an Inter
+        // page keeps its v3 bytes; an unknown family and a v3 Geist Mono are refused as before.
+        let back = page_from_json(&mono).unwrap();
+        assert_eq!(page_to_json(&back), mono);
+        let escaped_key = mono.replacen(marker, &format!("\"{family}\": \"Geist Mono\""), 1);
+        assert_ne!(escaped_key, mono);
+        assert_eq!(page_from_json(&escaped_key).unwrap(), back);
+        let explicit = mono.replacen(marker, "\"family\": \"Inter\"", 1);
+        let explicit = explicit.replacen("\"version\": 5", "\"version\": 3", 1);
+        assert_eq!(page_to_json(&page_from_json(&explicit).unwrap()), inter);
+        assert_eq!(page_to_json(&page_from_json(&inter).unwrap()), inter);
+        let unknown = mono.replacen(marker, "\"family\": \"Helvetica\"", 1);
+        assert!(matches!(
+            page_from_json(&unknown),
+            Err(FormatError::Invalid(ref m)) if m.contains("font family")
+        ));
+        assert!(matches!(
+            page_from_json(&under),
+            Err(FormatError::Invalid(ref m)) if m.contains("version 5")
+        ));
+        // Text that isn't JSON is still reported as such.
+        assert!(matches!(
+            page_from_json(&mono[..mono.len() - 1]),
+            Err(FormatError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn a_project_refuses_an_ambiguous_page_without_writing_it() {
+        use crate::model::FontFamily;
+        // R73-F2 through the normal project reader, on a test-owned temporary project: the
+        // refused page file is left byte for byte, so no save can drop the hidden family.
+        let root = std::env::temp_dir().join(format!("opd-r180-{:016x}", fastrand::u64(..)));
+        let store = super::super::Store::open(root.clone()).unwrap();
+        let page = text_page(FontFamily::GeistMono, false);
+        let p = store
+            .create_with_pages("R180 family", vec![page.clone()])
+            .unwrap();
+        let p = super::super::Project::open(&p.dir).unwrap();
+        let loaded = p.load_page(&page.id).unwrap();
+        assert_eq!(loaded.doc.nodes, page.doc.nodes, "control");
+        p.save_page(&loaded).unwrap();
+        let mono = std::fs::read_to_string(p.page_path(&page.id)).unwrap();
+        assert!(mono.contains("\"family\": \"Geist Mono\""));
+        let marker = "\"family\": \"Geist Mono\"";
+        let under = mono.replacen("\"version\": 5", "\"version\": 3", 1);
+        let with = |page: &str, members: &str| page.replacen(marker, members, 1);
+        for raw in [
+            with(&under, r#""family": "Geist Mono", "family": "Inter""#),
+            with(&mono, r#""family": "Helvetica", "family": "Geist Mono""#),
+            with(&mono, r#""family": "Helvetica""#),
+        ] {
+            std::fs::write(p.page_path(&page.id), &raw).unwrap();
+            assert!(p.load_page(&page.id).is_err());
+            assert!(p.load_pages().is_err(), "the project load too");
+            assert_eq!(
+                std::fs::read_to_string(p.page_path(&page.id)).unwrap(),
+                raw,
+                "the refused file is unchanged"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

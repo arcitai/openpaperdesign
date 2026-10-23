@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.93 · Updated: 2026-10-23
+Revision: 0.94 · Updated: 2026-10-23
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -861,7 +861,17 @@ engine architecture is `analysis/DESIGN.md`.
         the `font` group in `src/editor/structure.rs` `override_key`, so instances sync and
         overrides are what `copy_props` already copies), one coalesced step with size, face and
         metrics. The Fonts status row (`fonts_status`) lists the bundled families and which
-        the Paper's text layers use.
+        the Paper's text layers use. R73-F1 correction (the independent R73 review's real-widget
+        probe: a Line height or Letter spacing typed and not entered, then one click on Geist
+        Mono, left both layers Inter with the metric applied, because the click's focus loss
+        finished the metric in the same frame and `style_editor`'s one `change` kept only the
+        later): `EditorFrame::changes` keeps every change a frame finishes, in order, and
+        `apply_style_change`, `fresh_restyle` and `restyle_reaches_locked` admit them together
+        on one preview (`restyle_all`), so they apply in the use's one coalesced step or, if
+        any locked layer would change, neither applies. The R69 review's helper probes pass
+        their one change as a one-element slice. R73 P3: `INHERITED_STYLE` names any locked
+        layer (an inheriting instance, or one the text's new box would move) instead of only an
+        instance; when and what it refuses is unchanged.
       - `src/ui/inspector.rs`: the Text section's Font row (`combo_mixed`, Mixed when the
         selected layers differ) sets the selected layers' family through `inspector::apply`
         (one step, `fit_text`); `WHOLE_LAYER_FONT` says so while a text range is selected.
@@ -876,7 +886,13 @@ engine architecture is `analysis/DESIGN.md`.
       - Formats: page version 5 (`project::format::PAGE_VERSION_FAMILIES`, `has_font_family`,
         `check_families`: only a page with a family other than Inter is written as v5; an
         older reader refuses it as newer; a family in a page declaring an older version, or one
-        this build doesn't have, is refused, never read as Inter); the single `.paper-rs` file
+        this build doesn't have, is refused, never read as Inter; R73-F2 correction: the shared
+        `page_from_json` first reads the raw text with serde (`Unambiguous`, as the clipboard's
+        reader does) and refuses a member named twice, names compared as decoded, in the page's
+        top level, a node or a `text_style`, since `Value` kept only the last and a second
+        `family`, `text_style`, `nodes` or `version` hid an unknown or underdeclared family
+        that the next save then dropped; text that isn't JSON is reported as before); the
+        single `.paper-rs` file
         refuses a family (`io::file::to_string_checked`); clipboard `openpaperdesign/clipboard`
         version 2 (`io::clipboard::FAMILY_VERSION`; version 1 and unversioned payloads stay
         byte-exact, and either naming another family, or any naming an unknown one, is
