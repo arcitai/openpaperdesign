@@ -12,6 +12,8 @@ pub enum UiEvent {
     TogglePalette,
     Rename(NodeId),
     ToggleUi,
+    /// Collapse both side panels, or restore their arrangement.
+    TogglePanels,
     ToggleHelp,
     ToggleGrid,
 }

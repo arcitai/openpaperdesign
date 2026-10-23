@@ -292,6 +292,8 @@ pub struct BoundHost {
     broken: crate::Broken,
     /// Every page id this host has held (released by `crate::Server::retire`).
     held: crate::HeldPages,
+    /// The app library's identity check, for a library canvas (see `crate::Guard`).
+    guard: Option<crate::Guard>,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
@@ -419,6 +421,18 @@ impl BoundHost {
         broken: crate::Broken,
         held: crate::HeldPages,
     ) -> Result<BoundHost, String> {
+        BoundHost::prepare_guarded(dir, broken, held, None)
+    }
+
+    fn prepare_guarded(
+        dir: &Path,
+        broken: crate::Broken,
+        held: crate::HeldPages,
+        guard: Option<crate::Guard>,
+    ) -> Result<BoundHost, String> {
+        if let Some(g) = &guard {
+            g()?;
+        }
         let mut h = BoundHost {
             ed: Editor::default(),
             project: Project {
@@ -435,6 +449,7 @@ impl BoundHost {
             gpu_tried: false,
             broken,
             held,
+            guard,
         };
         h.load()?;
         Ok(h)
@@ -495,34 +510,8 @@ impl BoundHost {
         plain(&self.project.dir.join(PAGES_DIR), Kind::Dir)?;
         // Write only to safe names (listed pages come from the checked manifest, new ones get
         // upstream's random hex ids) and never through a link.
-        if let Some(bad) = ed.pages.iter().find(|p| !valid_page_id(&p.id)) {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save a page with unsafe id {:?}",
-                bad.id
-            )));
-        }
-        let mut folded = std::collections::HashSet::new();
-        if let Some(dup) = ed
-            .pages
-            .iter()
-            .find(|p| !folded.insert(p.id.to_ascii_lowercase()))
-        {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save: page id {:?} differs from another only in case",
-                dup.id
-            )));
-        }
-        let mut prefixes = std::collections::HashSet::new();
-        if let Some(dup) = ed
-            .pages
-            .iter()
-            .find(|p| !prefixes.insert(page_prefix(&p.id)))
-        {
-            return Err(crate::commit::CommitError::Failed(format!(
-                "refusing to save: page id {:?} shares its first six characters with another",
-                dup.id
-            )));
-        }
+        let ids: Vec<&str> = ed.pages.iter().map(|p| p.id.as_str()).collect();
+        crate::check_page_ids(&ids).map_err(crate::commit::CommitError::Failed)?;
         crate::refuse_if_broken(&self.broken)?;
         // One commit for the whole call (see `crate::commit`): new images, then every changed
         // page, then the manifest; on any error every file is as it was.
@@ -932,6 +921,9 @@ fn execute_inner(
 ) -> Result<(ToolResult, Option<Ack>), String> {
     let dir = host.project.dir.clone();
     check_root(&dir, root_id)?;
+    if let Some(g) = &host.guard {
+        g()?;
+    }
     check_project_dir(&dir)?;
     host.sync()?;
     let mut args = args.clone();
@@ -1119,12 +1111,26 @@ pub(crate) async fn send_and_wait(
 
 /// Prepare the host thread without resetting layout state. Once activated, calls run one
 /// at a time under the binding's writer fence; a retired binding never executes another job.
+#[allow(dead_code)]
 pub(crate) fn spawn_host(
     dir: PathBuf,
     root_id: (u64, u64),
     lifecycle: Arc<crate::lifecycle::Lifecycle>,
     broken: crate::Broken,
     held: crate::HeldPages,
+) -> Result<Calls, String> {
+    spawn_host_guarded(dir, root_id, lifecycle, broken, held, None)
+}
+
+/// [`spawn_host`] with the app library's guard (see `crate::Guard`), checked before the
+/// project is loaded and before every call.
+pub(crate) fn spawn_host_guarded(
+    dir: PathBuf,
+    root_id: (u64, u64),
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    broken: crate::Broken,
+    held: crate::HeldPages,
+    guard: Option<crate::Guard>,
 ) -> Result<Calls, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Option<Job>>();
     let calls = Calls {
@@ -1137,7 +1143,7 @@ pub(crate) fn spawn_host(
     std::thread::Builder::new()
         .name("opd-mcp-host".into())
         .spawn(move || {
-            let host = BoundHost::prepare(&dir, broken, held);
+            let host = BoundHost::prepare_guarded(&dir, broken, held, guard);
             let mut host = match host {
                 Ok(h) => {
                     let _ = ready_tx.send(Ok(()));

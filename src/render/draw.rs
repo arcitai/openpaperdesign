@@ -228,6 +228,7 @@ pub fn node_draw(n: &Node, wr: Rect, opacity: f64) -> NodeDraw {
     let mut ops = Vec::new();
     if let Some(r) = n.style.rough {
         ops = super::rough::node_ops(n, wr, opacity, &r);
+        label_ops(n, wr, opacity, &mut ops);
         return NodeDraw {
             ops,
             blend: n.style.blend,
@@ -236,7 +237,10 @@ pub fn node_draw(n: &Node, wr: Rect, opacity: f64) -> NodeDraw {
     match &n.kind {
         NodeKind::Group => {}
         NodeKind::Text { .. } => text_ops(n, wr, opacity, &mut ops),
-        NodeKind::Connector { .. } => connector_ops(n, wr, opacity, &mut ops, false),
+        NodeKind::Connector { .. } => {
+            connector_ops(n, wr, opacity, &mut ops, false);
+            label_ops(n, wr, opacity, &mut ops);
+        }
         NodeKind::Sticky { .. } => {
             let c = n
                 .style
@@ -409,6 +413,35 @@ pub fn connector_ops(n: &Node, wr: Rect, opacity: f64, ops: &mut Vec<DrawOp>, he
     }
 }
 
+/// Padding of an arrow label's backing around its text.
+pub const LABEL_PAD: f64 = 3.0;
+
+/// World rect of an arrow's label with its backing (None without a label).
+pub fn label_rect(n: &Node, wr: Rect) -> Option<Rect> {
+    n.kind.label()?;
+    let l = text::layout_node(n)?;
+    let o = wr.min() + text::text_offset(n);
+    Some(Rect::new(o.x, o.y, l.width.max(1.0), l.height).inflate(LABEL_PAD))
+}
+
+/// An arrow's label over its line: a backing in the canvas's colour (authored white, so a dark
+/// canvas display adapts it like any fill) that hides the line under the text, then the text
+/// itself in the arrow's colour. An empty label (one being typed) draws nothing.
+fn label_ops(n: &Node, wr: Rect, opacity: f64, ops: &mut Vec<DrawOp>) {
+    if n.kind.label().is_none_or(str::is_empty) {
+        return;
+    }
+    let Some(r) = label_rect(n, wr) else {
+        return;
+    };
+    ops.push(DrawOp::Fill {
+        path: vector::rounded_rect(r, [4.0; 4]),
+        paint: PaintSpec::Solid(rgba(Color::WHITE, opacity)),
+        even_odd: false,
+    });
+    text_ops(n, wr, opacity, ops);
+}
+
 fn text_ops(n: &Node, wr: Rect, opacity: f64, ops: &mut Vec<DrawOp>) {
     let Some(l) = text::layout_node(n) else {
         return;
@@ -481,5 +514,10 @@ pub fn draw_bounds(n: &Node, wr: Rect) -> Rect {
     if matches!(n.kind, NodeKind::Sticky { .. }) {
         pad = pad.max(4.0);
     }
-    wr.inflate(pad)
+    let b = wr.inflate(pad);
+    // An arrow's label may reach past its line's box.
+    match label_rect(n, wr) {
+        Some(l) => b.union(&l),
+        None => b,
+    }
 }

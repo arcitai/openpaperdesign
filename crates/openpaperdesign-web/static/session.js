@@ -15,12 +15,24 @@
 //   nothing written), and the unsaved state stays on screen until the person explicitly
 //   discards it (`discard`), which loads the server's version in place. Editing is suspended
 //   while that load is under way, so no edit can be made that it would then replace.
+// - Leaving (`drain`) first stops input and polling, waits for a save in flight and saves what
+//   is left; it reports 'clean' only when the editor has nothing unsaved and no gesture or text
+//   edit under way. Anything else (a conflict, a failed or unanswered save, an unfinished edit)
+//   keeps the editor; `resume` gives it back to the person.
+// - A resize redraws at once (`resized`): reconfiguring the canvas to its new size clears it,
+//   and the page would paint that before the next animation frame (a white flash per resize
+//   step while a panel divider is dragged).
+// - `dispose` ends the session for good, at any point: every later step of a boot, fallback,
+//   poll, discard or save finds it disposed and does nothing more. An editor that finishes
+//   booting afterwards is freed at once: no observer, canvas, Ready or save comes from it.
 
 export class Session {
   /**
+   * `page` is what the editor edits as one unit: the whole canvas (every page, the page list and
+   * the active page) as the server sends it, and its one canvas revision.
    * deps: {
    *   boot(canvas, page, webgl) -> Promise<editor>   page = { text, revision }
-   *   fetchPage() -> Promise<page>                    the page as the server has it now
+   *   fetchPage() -> Promise<page>                    the canvas as the server has it now
    *   replaceCanvas(old) -> canvas                    a fresh canvas in place of `old`
    *   observeResize(canvas, onResize) -> { disconnect() }
    *   put(snapshot, revision) -> Promise<{ ok, status, revision }>
@@ -44,13 +56,23 @@ export class Session {
     // discard): an answer only applies if nothing started after its own request.
     this.generation = 0;
     this.polling = false;
+    // The page clock of the last animation frame drawn (a resize redraws at it, see `resized`).
+    this.lastFrameTime = undefined;
     this.saveDone = Promise.resolve();
+    this.discardDone = Promise.resolve();
+    // Set by `drain` (no input or polling while leaving) and `dispose` (for good).
+    this.closing = false;
+    this.disposed = false;
+    // Once Ready, edits were possible: a later error (which clears `ready`) can't make an
+    // editor with unsaved work look clean (`drain`).
+    this.wasReady = false;
   }
 
   /** May the user edit right now? */
   editable() {
     const s = this.state;
-    return Boolean(this.ed) && s.ready && !s.switching && !s.error && !s.discarding;
+    return Boolean(this.ed) && !this.disposed && !this.closing && s.ready && !s.switching
+      && !s.error && !s.discarding;
   }
 
   /** Run `fn(editor)` only when editing is allowed (input, toolbar). */
@@ -61,7 +83,7 @@ export class Session {
 
   /** Run `fn(editor)` when there is an editor that isn't being replaced (resize, frames). */
   withEditor(fn) {
-    if (!this.ed || this.state.switching) return undefined;
+    if (!this.ed || this.disposed || this.state.switching) return undefined;
     return fn(this.ed);
   }
 
@@ -72,20 +94,38 @@ export class Session {
     try {
       await this.open(page, forceWebgl);
     } catch (e) {
+      if (this.disposed) return;
       if (forceWebgl) throw e;
       await this.fallBack(e && e.message ? e.message : String(e));
     }
   }
 
   async open(page, webgl) {
-    this.ed = await this.deps.boot(this.canvas, page, webgl);
+    const ed = await this.deps.boot(this.canvas, page, webgl);
+    if (this.disposed) {
+      // Left while it booted: this editor never becomes the session's.
+      ed.free();
+      return;
+    }
+    this.ed = ed;
     this.state.revision = page.revision;
-    this.state.backend = this.ed.backend();
+    this.state.backend = ed.backend();
     this.observer = this.deps.observeResize(this.canvas, () => this.resized());
   }
 
   resized() {
-    this.withEditor((ed) => this.deps.resize && this.deps.resize(ed, this.canvas));
+    this.withEditor((ed) => {
+      if (!this.deps.resize) return;
+      this.deps.resize(ed, this.canvas);
+      // A new backing size (the editor reconfigures its GPU surface to it) clears what the
+      // canvas shows, and the page paints right after resize observers run, before the next
+      // animation frame: without a picture now, every resize step of a continuous resize would
+      // show a cleared (white) canvas once. So the picture is drawn again here, in the same task
+      // as the reconfigure, at the last frame's time (no animation advances). Only after a first
+      // frame, and never over a terminal error; Ready, errors and fallback stay the frame loop's
+      // (`frame` reports them on the next animation frame, as before).
+      if (this.lastFrameTime !== undefined && !this.state.error) ed.frame(this.lastFrameTime);
+    });
   }
 
   /** WebGPU failed before Ready: reopen with WebGL2 on a fresh canvas, visibly. */
@@ -96,7 +136,9 @@ export class Session {
       this.deps.log(`WebGPU failed, falling back to WebGL: ${reason}`);
       s.fallback = reason;
       await this.saveDone;
+      if (this.disposed) return;
       const page = await this.deps.fetchPage();
+      if (this.disposed) return;
       if (this.observer) { this.observer.disconnect(); this.observer = null; }
       if (this.ed) { this.ed.free(); this.ed = null; }
       this.canvas = this.deps.replaceCanvas(this.canvas);
@@ -114,12 +156,14 @@ export class Session {
    */
   frame(t) {
     const s = this.state;
+    if (this.disposed) return 'stopped';
     if (s.error) {
       if (this.errorReported) return 'stopped';
       this.errorReported = true;
       return 'error';
     }
     if (s.switching || !this.ed) return undefined;
+    this.lastFrameTime = t;
     this.ed.frame(t);
     const gpuError = this.ed.gpu_error();
     if (gpuError) {
@@ -133,12 +177,14 @@ export class Session {
     }
     if (!s.ready && this.ed.ready()) {
       s.ready = true;
+      this.wasReady = true;
       return 'ready';
     }
     return undefined;
   }
 
   fail(msg) {
+    if (this.disposed) return;
     this.state.ready = false;
     this.state.error = msg;
     this.deps.log(msg);
@@ -207,6 +253,8 @@ export class Session {
     const gen = ++this.generation;
     // No input, toolbar action or save reaches the editor until this is done.
     s.discarding = true;
+    let done;
+    this.discardDone = new Promise((r) => { done = r; });
     try {
       const page = await this.deps.fetchPage();
       // Apply only to the editor that asked, and only if nothing else started meanwhile.
@@ -221,13 +269,23 @@ export class Session {
       return 'discarded';
     } finally {
       s.discarding = false;
+      done();
     }
   }
 
   /** Save the editor's pending change, if any. Returns what happened, for the status line. */
   async save() {
+    if (!this.editable()) return undefined;
+    return this.saveNow();
+  }
+
+  /** `save`, also while leaving (`drain`): never after `dispose`, an error or before Ready. */
+  async saveNow() {
     const s = this.state;
-    if (!this.editable() || s.saving || s.conflict) return undefined;
+    if (!this.ed || this.disposed || !s.ready || s.switching || s.error || s.discarding
+      || s.saving || s.conflict) {
+      return undefined;
+    }
     const ed = this.ed;
     const snapshot = ed.save_snapshot();
     if (snapshot === undefined) return undefined;
@@ -257,5 +315,58 @@ export class Session {
       s.saving = false;
       done();
     }
+  }
+
+  /**
+   * Leaving the editor (Back, Close, the view going away): stop input and polling, wait for a
+   * save or discard under way, then save any change that is left. Returns 'clean' only when
+   * nothing unsaved remains and no gesture or text edit is under way (`can_reload`); a missing
+   * snapshot alone doesn't mean clean. Otherwise the reason: 'conflict', 'failed',
+   * 'unreachable' (no answer: it may or may not have been written), 'busy' (an edit still
+   * under way), 'error' (the renderer stopped with unsaved changes) or 'stale'. Input stays
+   * stopped until `resume`.
+   */
+  async drain() {
+    const s = this.state;
+    this.closing = true;
+    // A poll or discard answer that arrives now no longer applies.
+    this.generation += 1;
+    await this.saveDone;
+    await this.discardDone;
+    // Edits are only possible once Ready: an editor that never got there has none. One that
+    // was Ready and then stopped (an error clears `ready`) is judged by what it still holds.
+    if (this.disposed || !this.ed || !this.wasReady) return 'clean';
+    for (let i = 0; i < 2; i++) {
+      if (s.conflict) return 'conflict';
+      if (s.error || !s.ready) return this.ed.can_reload() ? 'clean' : 'error';
+      const r = await this.saveNow();
+      if (this.disposed || !this.ed) return 'stale';
+      if (r === undefined) break;
+      if (r !== 'saved') return r;
+    }
+    return this.ed.can_reload() ? 'clean' : 'busy';
+  }
+
+  /** After a `drain` that didn't come out clean: editing (and polling) go on. */
+  resume() {
+    if (!this.disposed) this.closing = false;
+  }
+
+  /**
+   * End this session for good: no input, frame, poll, save or answer reaches an editor any
+   * more, and the editor and its resize observer are released, once. An editor still booting
+   * is freed as soon as it arrives (`open`). Unsaved changes are not saved by this: `drain`
+   * first.
+   */
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.closing = true;
+    this.generation += 1;
+    this.state.ready = false;
+    if (this.observer) { this.observer.disconnect(); this.observer = null; }
+    const ed = this.ed;
+    this.ed = null;
+    if (ed) ed.free();
   }
 }

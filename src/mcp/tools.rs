@@ -229,8 +229,10 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "get_font_family_info",
-            "Whether font families are available and their weights/styles. paper-rs renders text \
-             with Inter (400, 700, normal and italic); other families fall back to Inter.",
+            "Whether font families are available and their weights/styles. Text renders in the \
+             bundled Inter (the default) or Geist Mono (set with fontFamily; `monospace` means \
+             Geist Mono), each 400 and 700, normal and italic, for a whole text layer; other \
+             families fall back to Inter.",
             json!({"familyNames": {"type": "array", "items": {"type": "string"}}}),
             &["familyNames"],
             true,
@@ -336,13 +338,14 @@ pub fn definitions() -> Vec<Value> {
              sketch, roughness (0 architect, 1 artist, 2 cartoonist), fillStyle (hachure, \
              cross-hatch, solid, zigzag, dots), strokeStyle (solid, dashed, dotted). Arrows also \
              take route (straight, curved, elbow) and startHead/endHead (none, arrow, triangle, \
-             dot, bar, diamond).",
+             dot, bar, diamond), and `text` as their label (drawn at the middle of the line and \
+             moving with it; get_node_info reports it as `label`).",
             json!({
                 "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "triangle", "polygon", "star", "line", "arrow", "sticky", "text"]},
                 "x": {"type": "number"}, "y": {"type": "number"},
                 "width": {"type": "number"}, "height": {"type": "number"},
                 "points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
-                "text": {"type": "string", "description": "Text for sticky and text."},
+                "text": {"type": "string", "description": "Text for sticky and text; an arrow's label."},
                 "name": {"type": "string"},
                 "parentId": {"type": "string", "description": "Frame to place the shape in."},
                 "startNodeId": {"type": "string"}, "endNodeId": {"type": "string"},
@@ -373,7 +376,8 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "set_text_content",
-            "Set the text of one or more Text or Sticky nodes (batch).",
+            "Set the text of one or more Text or Sticky nodes, or the label of arrows (batch). An \
+             empty textContent removes an arrow's label (the arrow stays).",
             json!({"updates": {"type": "array", "items": {
                 "type": "object",
                 "properties": {"nodeId": {"type": "string"}, "textContent": {"type": "string"}},
@@ -505,7 +509,9 @@ display (flex, block, none), flex-direction, flex-wrap, gap, row-gap, column-gap
 justify-content, align-items, align-self, flex-grow, overflow, background, background-color,
 background-image (url(), linear-gradient(), radial-gradient()), background-size/object-fit,
 border, border-color/width/style, border-radius (1–4 values), opacity, mix-blend-mode, color,
-font-size, font-weight, font-style, line-height, letter-spacing, text-align, text-decoration.
+font-size, font-weight, font-style, line-height, letter-spacing, text-align, text-decoration,
+font-family (the bundled Inter or Geist Mono, `monospace` = Geist Mono, anything else Inter;
+one family per text layer, so inline spans keep their layer's).
 Ignored (reported back): margin, grid, box-shadow, transform, filters, transitions.";
 
 pub const GUIDE_WHITEBOARD: &str = "\

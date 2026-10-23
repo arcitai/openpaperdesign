@@ -10,6 +10,15 @@ pub const FORMAT: &str = "paper-rs-library";
 pub const VERSION: u32 = 1;
 pub const FILE: &str = "library.json";
 
+/// Why an item with an arrow label isn't kept: this file is version 1, which an older
+/// OpenPaperDesign loads and saves without the labels. A newer version is no answer either: an
+/// older app replaces a library it can't read with its starter items on its next save.
+pub const LABELS_REFUSED: &str = "Arrows with labels can't be kept in the library yet: an older \
+    OpenPaperDesign would load them without their labels. Nothing was added.";
+/// Why an item with a font family other than Inter isn't kept, for the same reason.
+pub const FAMILIES_REFUSED: &str = "Text in a font family other than Inter can't be kept in the \
+    library yet: an older OpenPaperDesign would load it in Inter. Nothing was added.";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibItem {
     pub id: String,
@@ -49,6 +58,28 @@ impl LibItem {
         }
         d.root = self.roots.clone();
         d
+    }
+
+    /// Whether any of the item's nodes is an arrow with a label (see [`LABELS_REFUSED`]).
+    pub fn has_labels(&self) -> bool {
+        self.nodes.iter().any(|n| n.kind.label().is_some())
+    }
+
+    /// Whether any of the item's nodes has a font family other than Inter (see
+    /// [`FAMILIES_REFUSED`]).
+    pub fn has_families(&self) -> bool {
+        self.nodes.iter().any(|n| !n.text_style.family.is_default())
+    }
+
+    /// Why this item can't be kept in the library file, if it can't.
+    pub fn refusal(&self) -> Option<&'static str> {
+        if self.has_labels() {
+            Some(LABELS_REFUSED)
+        } else if self.has_families() {
+            Some(FAMILIES_REFUSED)
+        } else {
+            None
+        }
     }
 
     pub fn bounds(&self) -> Option<Rect> {
@@ -101,7 +132,13 @@ impl Library {
         lib
     }
 
+    /// Write the library. One holding an arrow label or a font family other than Inter is
+    /// refused before anything is written (whoever built it), so the file on disk stays as it
+    /// was.
     pub fn save(&self) -> std::io::Result<()> {
+        if let Some(why) = self.items.iter().find_map(LibItem::refusal) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
+        }
         let Some(p) = &self.path else { return Ok(()) };
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
@@ -290,5 +327,34 @@ mod tests {
         let it = LibItem::from_selection(&ed.doc, &[a, b], "Pair").unwrap();
         assert_eq!(it.bounds().unwrap().min(), V2::ZERO);
         assert_eq!(it.doc().root.len(), 2);
+    }
+
+    #[test]
+    fn an_item_in_another_font_family_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("paper-rs-lib-{:016x}", fastrand::u64(..)));
+        let path = dir.join(FILE);
+        let mut lib = Library::load(&path);
+        lib.save().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut text = Node::new(
+            NodeId(1),
+            NodeKind::Text {
+                text: "code".into(),
+                font_size: 14.0,
+                auto_width: true,
+                align: crate::model::TextAlign::Left,
+            },
+            Rect::new(0.0, 0.0, 40.0, 18.0),
+        );
+        let inter = item("Inter text", vec![text.clone()]);
+        assert_eq!(inter.refusal(), None, "control: Inter text is kept");
+        text.text_style.family = crate::model::FontFamily::GeistMono;
+        let mono = item("Mono text", vec![text]);
+        assert_eq!(mono.refusal(), Some(FAMILIES_REFUSED));
+        lib.items.push(mono);
+        let e = lib.save().unwrap_err();
+        assert_eq!(e.to_string(), FAMILIES_REFUSED);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file as it was");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

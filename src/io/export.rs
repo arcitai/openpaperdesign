@@ -42,8 +42,8 @@ impl Scope {
         match self {
             Scope::Selection => "Selection",
             Scope::Frames => "Each frame",
-            Scope::Page => "Page",
-            Scope::AllPages => "All pages",
+            Scope::Page => "This Paper",
+            Scope::AllPages => "All Papers",
         }
     }
     pub const ALL: [Scope; 4] = [

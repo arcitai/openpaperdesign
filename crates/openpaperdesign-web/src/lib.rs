@@ -1,11 +1,14 @@
-//! openpaperdesign-web: the upstream paper-rs editor and canvas renderer in a browser.
+//! openpaperdesign-web: the upstream paper-rs application workspace (editor, canvas renderer
+//! and egui workspace UI) in a browser.
 //!
 //! Upstream modules are compiled straight from `../../src` via `#[path]`, with module paths
-//! mirroring the upstream crate so their `use crate::...` lines resolve unchanged. Left out:
-//! the egui/winit app shell (`app`, `ui`, `render::frame`), `session` (native clocks and
-//! storage) and `mcp`. The OS clipboard is replaced by `openpaperdesign-clipboard-stub`
-//! (imported as `arboard`). The browser glue lives in `state` (host-testable) and `web`
-//! (wasm-bindgen, wasm32 only).
+//! mirroring the upstream crate so their `use crate::...` lines resolve unchanged. That
+//! includes the workspace UI (`ui`: layers, inspector, pages, palette, library, menus, tools,
+//! help) and its frame (`render::frame`: egui layout and the egui-plus-canvas painter). Left
+//! out: the winit window (`app`), `session` (native clocks and storage) and `mcp`. The OS
+//! clipboard is replaced by `openpaperdesign-clipboard-stub` (imported as `arboard`); the page's
+//! own copy/cut/paste events reach the editor through `state::WebClipboard`. The browser
+//! glue lives in `state` (host-testable) and `web` (wasm-bindgen, wasm32 only).
 
 #[path = "../../../src/assets.rs"]
 pub mod assets;
@@ -35,12 +38,15 @@ pub mod project;
 pub mod text;
 #[path = "../../../src/theme.rs"]
 pub mod theme;
+#[path = "../../../src/ui/mod.rs"]
+pub mod ui;
 #[path = "../../../src/vector.rs"]
 pub mod vector;
 
 #[path = "../../../src/render"]
 pub mod render {
     pub mod draw;
+    pub mod frame;
     pub mod gpu;
     pub mod mesh;
     pub mod rough;

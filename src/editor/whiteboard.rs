@@ -73,6 +73,50 @@ pub fn set_world_points(tx: &mut Tx, id: NodeId, pts: &[V2]) {
     }
 }
 
+/// Quick connect's arrow from `from` to `to`, leaving `from` on its side in direction `d` and
+/// entering `to` on the opposite side, routed at once. Returns its id.
+fn quick_arrow(
+    tx: &mut Tx,
+    from: NodeId,
+    to: NodeId,
+    d: V2,
+    route: Route,
+    rough: Option<Rough>,
+) -> NodeId {
+    let aid = tx.alloc_id();
+    let fixed_a = v2(0.5 + d.x * 0.5, 0.5 + d.y * 0.5);
+    let fixed_b = v2(0.5 - d.x * 0.5, 0.5 - d.y * 0.5);
+    let fix = |v: V2| connector::fixed_point(v2(v.x, v.y), Rect::new(0.0, 0.0, 1.0, 1.0));
+    let mut a = Node::new(
+        aid,
+        NodeKind::Connector {
+            points: vec![V2::ZERO, V2::ZERO],
+            start: Some(Binding {
+                node: from,
+                fixed: fix(fixed_a),
+                inside: false,
+            }),
+            end: Some(Binding {
+                node: to,
+                fixed: fix(fixed_b),
+                inside: false,
+            }),
+            route,
+            start_head: Head::None,
+            end_head: Head::Arrow,
+            label: None,
+        },
+        Rect::default(),
+    );
+    a.style.rough = rough.map(|r| Rough {
+        seed: r.seed.wrapping_add(31),
+        ..r
+    });
+    tx.insert(a, None, None);
+    update_connector(tx, aid);
+    aid
+}
+
 impl Editor {
     fn bind_dist(&self) -> f64 {
         BIND_DISTANCE_PX / self.camera.zoom
@@ -149,6 +193,7 @@ impl Editor {
                     route,
                     start_head: Head::None,
                     end_head: Head::Arrow,
+                    label: None,
                 },
                 Rect::new(world.x, world.y, 0.0, 0.0),
             );
@@ -223,12 +268,18 @@ impl Editor {
         }
     }
 
-    /// Screen-space handles of the selected connector: (end index, position). Index 2 is the
-    /// midpoint "bend" handle of a two-point connector.
+    /// Screen-space handles of the selected connector: (end index, position). 0 and 1 are its
+    /// ends. From 2 up are "bend" handles: the midpoint of a two-point connector (2; a drag
+    /// bends it into a curve), or each interior point of a curve (2 + k for its point k + 1;
+    /// a drag moves that point alone, as the first bend did: `drag_connector_mid`). A locked
+    /// connector (itself or through an ancestor) has none.
     pub fn connector_handles(&self) -> Vec<(usize, V2)> {
         let [id] = self.selection[..] else {
             return vec![];
         };
+        if self.doc.is_effectively_locked(id) {
+            return vec![];
+        }
         let Some(pts) = self.connector_points(id) else {
             return vec![];
         };
@@ -241,10 +292,45 @@ impl Editor {
                 ..
             })
         );
-        if pts.len() == 2 && !elbow {
-            out.push((2, s((pts[0] + pts[1]) * 0.5)));
+        // Where a label sits on the middle (a double-click there edits it), there is no bend
+        // handle under it; the inspector's Type can still curve the arrow. A label placed
+        // beside a short arrow's line leaves the handle free.
+        let mid = (pts[0] + *pts.last().unwrap()) * 0.5;
+        let under_label = match (self.doc.get(id), self.doc.world_rect(id)) {
+            (Some(n), Some(wr)) => {
+                crate::render::draw::label_rect(n, wr).is_some_and(|r| r.inflate(4.0).contains(mid))
+            }
+            _ => false,
+        };
+        if pts.len() == 2 && !elbow && !under_label {
+            out.push((2, s(mid)));
+        }
+        // A curve keeps its bends editable: one handle on each interior point, on the line,
+        // even under its label (a double-click there still edits the label first, and Enter
+        // does too; this is the only way to re-bend it). Straight polylines and elbows (routed
+        // automatically) have none. Where two handles meet, the first one listed is pressed.
+        let curve = matches!(
+            self.doc.get(id).map(|n| &n.kind),
+            Some(NodeKind::Connector {
+                route: Route::Curved,
+                ..
+            })
+        );
+        if pts.len() >= 3 && curve {
+            for (k, p) in pts[1..pts.len() - 1].iter().enumerate() {
+                out.push((2 + k, s(*p)));
+            }
         }
         out
+    }
+
+    /// Whether a connector gesture under way (an end or a bend being dragged) must stop: its
+    /// arrow is gone, or locked since the press, itself or through an ancestor (Lock can come
+    /// while the pointer is held, and commits what the drag had recorded so far). The caller
+    /// ends the gesture there without restoring it: nothing more is changed or recorded, and
+    /// what was recorded before stays as it is, Lock included.
+    pub(super) fn connector_gesture_stale(&self, id: NodeId) -> bool {
+        self.doc.get(id).is_none() || self.doc.is_effectively_locked(id)
     }
 
     /// Start dragging a connector handle under `pos`, if any.
@@ -257,19 +343,17 @@ impl Editor {
             return false;
         };
         let id = self.selection[0];
-        if end == 2 {
-            // Bend: insert a middle point and make the arrow curved.
+        if end >= 2 {
+            // Bend, once the press turns into a drag (`bend_connector`): a click changes
+            // nothing. Handle 2 + k is point k + 1 (a straight arrow's 2 is its new point 1).
+            let count = self.connector_points(id).map_or(0, |p| p.len());
             self.begin("Bend arrow");
-            let mut pts = self.connector_points(id).unwrap();
-            pts.insert(1, world);
-            let mut tx = self.tx();
-            if let Some(n) = tx.node_mut(id)
-                && let NodeKind::Connector { route, .. } = &mut n.kind
-            {
-                *route = Route::Curved;
-            }
-            set_world_points(&mut tx, id, &pts);
-            self.gesture = Gesture::ConnectorMid { id };
+            self.gesture = Gesture::ConnectorMid {
+                id,
+                point: end - 1,
+                count,
+                press: Some(pos),
+            };
             return true;
         }
         self.begin("Move arrow end");
@@ -281,13 +365,45 @@ impl Editor {
         true
     }
 
-    pub(super) fn drag_connector_mid(&mut self, id: NodeId, world: V2) {
+    /// Bend a two-point arrow at `world`: insert a middle point there and make it curved (the
+    /// first move of a drag from its bend handle).
+    pub(super) fn bend_connector(&mut self, id: NodeId, world: V2) {
         let Some(mut pts) = self.connector_points(id) else {
             return;
         };
-        if pts.len() >= 3 {
-            pts[1] = world;
+        if pts.len() != 2 {
+            return;
         }
+        pts.insert(1, world);
+        let mut tx = self.tx();
+        if let Some(n) = tx.node_mut(id)
+            && let NodeKind::Connector { route, .. } = &mut n.kind
+        {
+            *route = Route::Curved;
+        }
+        set_world_points(&mut tx, id, &pts);
+    }
+
+    /// Move interior point `point` of a bent arrow to `world`: the rest of a first bend's
+    /// drag, or a later drag from a curve's bend handle. Every other point keeps its place in
+    /// the world (endpoints are rerouted to their bindings); nothing else changes. Only while
+    /// the arrow is still a curve with the `count` points the drag began with, and `point` is
+    /// one of its interior points: otherwise (a stale drag) nothing is changed or recorded.
+    pub(super) fn drag_connector_mid(&mut self, id: NodeId, point: usize, count: usize, world: V2) {
+        let Some(mut pts) = self.connector_points(id) else {
+            return;
+        };
+        let curve = matches!(
+            self.doc.get(id).map(|n| &n.kind),
+            Some(NodeKind::Connector {
+                route: Route::Curved,
+                ..
+            })
+        );
+        if !curve || pts.len() != count || point == 0 || point + 1 >= pts.len() {
+            return;
+        }
+        pts[point] = world;
         let mut tx = self.tx();
         set_world_points(&mut tx, id, &pts);
         update_connector(&mut tx, id);
@@ -295,7 +411,20 @@ impl Editor {
 
     // ---------------------------------------------------------------------- quick connect
 
-    /// Screen positions of the quick-connect knobs around a single selected shape.
+    /// The shape quick-connect connects from for the selected layer `id`: a shape itself, or a
+    /// label group's shape (`layout::label_group`: one shape and its Text label). Free text,
+    /// frames and any other group have none.
+    fn quick_shape(&self, id: NodeId) -> Option<NodeId> {
+        let n = self.doc.get(id)?;
+        if n.is_group() {
+            return crate::layout::label_group(&self.doc, id).map(|(shape, _)| shape);
+        }
+        let plain = connector::bindable(n) && !n.is_frame();
+        (plain && !matches!(n.kind, NodeKind::Text { .. })).then_some(id)
+    }
+
+    /// Screen positions of the quick-connect knobs around a single selected shape or label
+    /// group.
     pub fn quick_knobs(&self) -> Vec<(usize, V2)> {
         if self.tool != Tool::Select || self.text_edit.is_some() || self.is_busy() {
             return vec![];
@@ -303,10 +432,7 @@ impl Editor {
         let [id] = self.selection[..] else {
             return vec![];
         };
-        let Some(n) = self.doc.get(id) else {
-            return vec![];
-        };
-        if !connector::bindable(n) || n.is_frame() || matches!(n.kind, NodeKind::Text { .. }) {
+        if self.quick_shape(id).is_none() {
             return vec![];
         }
         let Some(r) = self.doc.world_rect(id) else {
@@ -327,11 +453,15 @@ impl Editor {
             .collect()
     }
 
-    /// Duplicate the selected shape in direction `dir` and connect the two with an arrow.
+    /// Duplicate the selected shape in direction `dir` and connect the two with an arrow. A
+    /// label group is copied whole (see `quick_connect_label`).
     pub fn quick_connect(&mut self, dir: usize) -> Option<NodeId> {
         let [src] = self.selection[..] else {
             return None;
         };
+        if self.doc.get(src)?.is_group() {
+            return self.quick_connect_label(src, dir);
+        }
         let n = self.doc.get(src)?.clone();
         let wr = self.doc.world_rect(src)?;
         let d = QUICK_DIRS[dir];
@@ -356,39 +486,44 @@ impl Editor {
                 r.seed = r.seed.wrapping_add(7919);
             }
             tx.insert(c, parent, None);
-            let aid = tx.alloc_id();
-            let fixed_a = v2(0.5 + d.x * 0.5, 0.5 + d.y * 0.5);
-            let fixed_b = v2(0.5 - d.x * 0.5, 0.5 - d.y * 0.5);
-            let fix = |v: V2| connector::fixed_point(v2(v.x, v.y), Rect::new(0.0, 0.0, 1.0, 1.0));
-            let mut a = Node::new(
-                aid,
-                NodeKind::Connector {
-                    points: vec![V2::ZERO, V2::ZERO],
-                    start: Some(Binding {
-                        node: src,
-                        fixed: fix(fixed_a),
-                        inside: false,
-                    }),
-                    end: Some(Binding {
-                        node: cid,
-                        fixed: fix(fixed_b),
-                        inside: false,
-                    }),
-                    route,
-                    start_head: Head::None,
-                    end_head: Head::Arrow,
-                },
-                Rect::default(),
-            );
-            a.style.rough = rough.map(|r| Rough {
-                seed: r.seed.wrapping_add(31),
-                ..r
-            });
-            tx.insert(a, None, None);
-            update_connector(tx, aid);
+            let aid = quick_arrow(tx, src, cid, d, route, rough);
             (cid, aid)
         });
         let _ = arrow;
+        self.selection = vec![copy];
+        Some(copy)
+    }
+
+    /// Quick connect from a label group: the whole group (its shape and its label, copied as
+    /// Duplicate copies them, through `insert_subtrees_tx`) is placed beside it, and the arrow
+    /// joins the two shapes, never the labels. The label is copied, not cleared: an empty
+    /// label would be an invisible text layer; it is edited as any text. One undo step.
+    fn quick_connect_label(&mut self, group: NodeId, dir: usize) -> Option<NodeId> {
+        let (shape, _) = crate::layout::label_group(&self.doc, group)?;
+        let at = self
+            .doc
+            .get(group)?
+            .children
+            .iter()
+            .position(|c| *c == shape)?;
+        let wr = self.doc.world_rect(group)?;
+        let d = QUICK_DIRS[dir];
+        let off = v2(d.x * (wr.w + QUICK_GAP), d.y * (wr.h + QUICK_GAP));
+        let nodes: Vec<Node> = self
+            .doc
+            .subtree(group)
+            .into_iter()
+            .filter_map(|id| self.doc.get(id).cloned())
+            .collect();
+        let route = self.arrow_route;
+        let rough = self.doc.get(shape)?.style.rough;
+        let copy = self.edit("Quick connect", |tx| {
+            let copies = super::insert_subtrees_tx(tx, &nodes, &[group], &[wr], off, true);
+            let copy = *copies.first()?;
+            let to = *tx.doc().get(copy)?.children.get(at)?;
+            quick_arrow(tx, shape, to, d, route, rough);
+            Some(copy)
+        })?;
         self.selection = vec![copy];
         Some(copy)
     }
