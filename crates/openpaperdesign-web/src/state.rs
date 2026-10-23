@@ -1053,6 +1053,8 @@ impl WebState {
     ///   finishes it (Enter, or focus elsewhere such as a click on the canvas) or cancels it
     ///   (Escape). It is told apart only by focus, so an untouched field counts too: that is
     ///   the conservative side;
+    /// - a Theme line height or letter spacing typed and not entered whose field the last frame
+    ///   stopped drawing, until the next frame finishes it;
     /// - typing queued for an egui text field that the next layout will apply.
     fn ui_edit_pending(&self) -> bool {
         let changed = |text: &str, name: Option<&str>| {
@@ -1079,9 +1081,14 @@ impl WebState {
         let renaming = layer.is_some() || page.is_some() || title.is_some();
         // A stored rename speaks only for its own field: another focused field is judged on
         // its own (`field_editing` exempts exactly the rename's field).
+        // A line height or letter spacing typed in Theme whose field is gone (the left panel
+        // switched to Design, say) until the next frame finishes it (`design_system::
+        // begin_frame`): the field no longer has the keyboard, so it counts here.
+        let metric = ui::design_system::metric_draft_pending(&self.ctx, &self.ed);
         let draft = layer.unwrap_or(false)
             || page.unwrap_or(false)
             || title.unwrap_or(false)
+            || metric
             || self.field_editing();
         let typing = (renaming || self.field_has_keyboard())
             && self.events.iter().any(|e| {

@@ -677,6 +677,10 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
         ui.ctx().set_theme(st.appearance);
         ui.ctx().request_repaint();
     }
+    // A line height or letter spacing typed in Theme and not yet entered, whose field wasn't
+    // drawn last frame (Design chosen, panels collapsed, UI hidden): finished as losing focus
+    // finishes it, as the renames are (R171 panel finding).
+    design_system::begin_frame(ui.ctx(), ed);
     if let Some(hv) = &mut st.home {
         home::draw(ui, hv, st.native_chrome, st.translucent_sidebar);
         return egui::Rect::NOTHING;

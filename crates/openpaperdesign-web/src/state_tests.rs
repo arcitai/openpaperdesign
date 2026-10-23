@@ -8534,3 +8534,593 @@ fn r69_actual_theme_recheck_refusal_keeps_an_empty_draft_and_locked_next_row_exa
         "the draft still types"
     );
 }
+
+// ---- revision 22: Theme's line height and letter spacing, the whole-layer paragraph metrics
+// the renderer draws and the Design panel's LH and LS edit, through the style editor's own
+// fields (headless egui layout, as above).
+
+/// The layers of [`metric_fixture`]'s Paper.
+struct MetricIds {
+    /// Unicode text, 20 Regular, fixed width, line height 140%, letter spacing 1.5 px, with a
+    /// red underlined range (not a size or face, so the whole layer is 20 Regular).
+    first: crate::model::NodeId,
+    /// "Second", 20 Regular, growing to fit, Auto line height, no letter spacing.
+    second: crate::model::NodeId,
+    /// "Control", 20 Bold (another style), line height 200%, 3 px.
+    control: crate::model::NodeId,
+    /// A locked 20 Regular layer, line height 150%.
+    locked: crate::model::NodeId,
+}
+
+/// One Paper ("p") with [`MetricIds`]' layers, laid out with the left panel open.
+fn metric_fixture() -> (WebState, MetricIds) {
+    use crate::model::TextSpan;
+    let mut doc = Document::default();
+    let first = theme_layer(
+        &mut doc,
+        text_kind("Æble — øre ✓ ok", 20.0, false),
+        (100.0, 100.0, 220.0, 30.0),
+        |n| {
+            n.text_style.line_height = Some(1.4);
+            n.text_style.letter_spacing = 1.5;
+            n.text_style.spans = vec![TextSpan {
+                start: 0,
+                end: 4,
+                color: Some(RED),
+                underline: Some(true),
+                ..Default::default()
+            }];
+        },
+    );
+    let second = theme_layer(
+        &mut doc,
+        text_kind("Second", 20.0, true),
+        (100.0, 200.0, 40.0, 20.0),
+        |_| {},
+    );
+    let control = theme_layer(
+        &mut doc,
+        text_kind("Control", 20.0, true),
+        (100.0, 300.0, 80.0, 30.0),
+        |n| {
+            n.text_style.bold = true;
+            n.text_style.line_height = Some(2.0);
+            n.text_style.letter_spacing = 3.0;
+        },
+    );
+    let locked = theme_layer(
+        &mut doc,
+        text_kind("Locked", 20.0, true),
+        (100.0, 400.0, 80.0, 30.0),
+        |n| {
+            n.locked = true;
+            n.text_style.line_height = Some(1.5);
+        },
+    );
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    let ids = MetricIds {
+        first,
+        second,
+        control,
+        locked,
+    };
+    (s, ids)
+}
+
+/// Where the open style editor's `label` metric field ("Line height", "Letter spacing") shows
+/// its value, Auto or its "Mixed" hint: the first text painted right of that label, on its line.
+fn metric_field_at(s: &mut WebState, label: &str) -> (f64, f64) {
+    let text = painted_text(s);
+    let (_, l) = text
+        .iter()
+        .rev()
+        .find(|(t, _)| t.trim() == label)
+        .unwrap_or_else(|| panic!("no {label:?} painted: {text:?}"));
+    let (_, f) = text
+        .iter()
+        .filter(|(_, r)| (r.center().y - l.center().y).abs() < 4.0 && r.min.x > l.max.x)
+        .min_by(|a, b| a.1.min.x.total_cmp(&b.1.min.x))
+        .unwrap_or_else(|| panic!("nothing painted in the {label:?} field: {text:?}"));
+    centre(*f)
+}
+
+/// `value` entered into the open style editor's `label` metric field as a person does: a
+/// click on the field, Ctrl+A, the text pasted over it, Enter; laid out.
+fn theme_metric(s: &mut WebState, label: &str, value: &str) {
+    let p = metric_field_at(s, label);
+    timed_click(s, p);
+    assert!(
+        s.field_has_keyboard(),
+        "{label}: the field has the keyboard"
+    );
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+    s.paste(value);
+    step(s);
+    press(s, "Enter", "Enter");
+    timed_frames(s, 3);
+}
+
+#[test]
+fn rev22_theme_metrics_show_mixed_and_set_one_value_for_the_style_s_whole_layers_in_one_step() {
+    let (mut s, ids) = metric_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    let before_doc = s.ed.doc.clone();
+    let kept = |s: &WebState| (s.ed.history.undo_len(), s.ed.doc_stamp, s.dirty());
+    let markers = kept(&s);
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    // Inspection: the two layers differ in both, so both say Mixed (no number is made up for
+    // them), and opening the editor changes nothing.
+    let text = painted_text(&mut s);
+    let mixed = text.iter().filter(|(t, _)| t.trim() == "Mixed").count();
+    assert_eq!(mixed, 2, "{text:?}");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert_eq!(kept(&s), markers);
+    // An entry that isn't a supported value changes nothing at all.
+    for bad in ["abc", "inf", "NaN", "-5", "1001"] {
+        theme_metric(&mut s, "Line height", bad);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), before, "{bad}");
+        assert_eq!(kept(&s), markers, "{bad}");
+    }
+    for bad in ["px", "300", "-51"] {
+        theme_metric(&mut s, "Letter spacing", bad);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), before, "{bad}");
+        assert_eq!(kept(&s), markers, "{bad}");
+    }
+    assert!(ui::popup_open(&s.ctx), "the editor stays open");
+    // One value for both whole layers (not the locked one, not the other style), then a
+    // negative letter spacing, then Auto: one use of the editor.
+    let metric = |s: &WebState, id| {
+        let t = &s.ed.doc.get(id).unwrap().text_style;
+        (t.line_height, t.letter_spacing)
+    };
+    theme_metric(&mut s, "Line height", "125%");
+    assert_eq!(metric(&s, ids.first), (Some(1.25), 1.5));
+    assert_eq!(metric(&s, ids.second), (Some(1.25), 0.0));
+    assert!(ui::design_system::editing(&s.ctx, &s.ed), "a use under way");
+    assert!(s.save_snapshot().is_none(), "held while the editor is open");
+    theme_metric(&mut s, "Letter spacing", "-0.5");
+    assert_eq!(metric(&s, ids.first), (Some(1.25), -0.5));
+    assert_eq!(metric(&s, ids.second), (Some(1.25), -0.5));
+    assert!(
+        paints(&mut s, "125%") && paints(&mut s, "-0.5 px"),
+        "shown as set"
+    );
+    theme_metric(&mut s, "Line height", "Auto");
+    assert_eq!(metric(&s, ids.first), (None, -0.5));
+    assert_eq!(metric(&s, ids.second), (None, -0.5));
+    assert!(paints(&mut s, "Auto"));
+    assert!(s.save_snapshot().is_none());
+    close_picker(&mut s);
+    // Only those two layers' metrics changed, and their boxes as the layout fits them (the
+    // fixed width kept); text, ranges, colours and everything else as they were.
+    let after = s.ed.doc.clone();
+    for id in [ids.first, ids.second] {
+        let mut want = before_doc.get(id).unwrap().clone();
+        want.text_style.line_height = None;
+        want.text_style.letter_spacing = -0.5;
+        want.rect = after.get(id).unwrap().rect;
+        assert_eq!(after.get(id), Some(&want), "{id:?}");
+    }
+    let (w0, w1) = (
+        before_doc.get(ids.first).unwrap(),
+        after.get(ids.first).unwrap(),
+    );
+    assert_eq!(
+        (w1.rect.x, w1.rect.y, w1.rect.w),
+        (w0.rect.x, w0.rect.y, w0.rect.w)
+    );
+    for id in [ids.control, ids.locked] {
+        assert_eq!(after.get(id), before_doc.get(id), "{id:?}");
+    }
+    assert_eq!(after.root, before_doc.root);
+    // Saved once it closed, exactly as edited, and reopened as saved; one Undo gives the whole
+    // page as it was, one Redo the edited one.
+    let edited = page_to_json(&s.ed.page_data(0));
+    let snap = s.save_snapshot().expect("saved once the editor closed");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), edited);
+    s.save_succeeded();
+    let reopened = WebState::open(&canvas(&[sent], "p"), false, W, H).unwrap();
+    assert_eq!(page_to_json(&reopened.ed.page_data(0)), edited);
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn rev22_a_style_only_part_of_a_layer_has_offers_no_metrics_and_still_changes_size() {
+    // `text_style_fixture`'s 24 Regular is the whole "Title" and two ranges of the mixed
+    // layer: a line height or letter spacing would be the mixed layer's whole, so Theme says
+    // why and offers neither; the size still changes exactly those characters.
+    use crate::model::CharStyle;
+    let (mut s, ids, _) = text_style_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    let markers = (s.ed.history.undo_len(), s.ed.doc_stamp, s.dirty());
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    assert!(
+        paints(&mut s, ui::design_system::RANGE_METRICS),
+        "the reason is shown"
+    );
+    for label in ["Line height", "Letter spacing"] {
+        let p = metric_field_at(&mut s, label);
+        timed_click(&mut s, p);
+        assert!(!s.field_has_keyboard(), "{label}: not editable here");
+        assert!(ui::popup_open(&s.ctx));
+    }
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert_eq!(
+        (s.ed.history.undo_len(), s.ed.doc_stamp, s.dirty()),
+        markers
+    );
+    // The size is a range's: it still changes exactly the style's characters.
+    let m0 = s.ed.doc.get(ids.mixed).unwrap().clone();
+    picker_field(&mut s, "Size ");
+    type_with_autosaves(&mut s, &[("3", "Digit3"), ("2", "Digit2")]);
+    press(&mut s, "Enter", "Enter");
+    timed_frames(&mut s, 3);
+    close_picker(&mut s);
+    let m1 = s.ed.doc.get(ids.mixed).unwrap().clone();
+    let target = |i: usize| i < 4 || (7..10).contains(&i);
+    let want: Vec<CharStyle> = resolved(&m0)
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if target(i) {
+                CharStyle { size: 32.0, ..c }
+            } else {
+                c
+            }
+        })
+        .collect();
+    assert_eq!(resolved(&m1), want);
+    assert_eq!(
+        (m1.text_style.line_height, m1.text_style.letter_spacing),
+        (m0.text_style.line_height, m0.text_style.letter_spacing),
+        "the mixed layer's own metrics are untouched"
+    );
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+}
+
+/// An auto-layout frame (`direction`) holding a fitted 24 "Title" growing to fit and a
+/// rectangle after it, locked if `locked`; no instances. (R69's flow fixture, in either
+/// direction: letter spacing widens the title, which moves a sibling only across a row.)
+fn metric_flow_fixture(
+    locked: bool,
+    direction: crate::model::Direction,
+) -> (WebState, crate::model::NodeId, crate::model::NodeId) {
+    let mut doc = Document::default();
+    let frame = theme_layer(
+        &mut doc,
+        NodeKind::Frame { clip: false },
+        (100.0, 100.0, 350.0, 300.0),
+        |n| {
+            n.layout = Some(crate::model::AutoLayout {
+                direction,
+                ..Default::default()
+            });
+        },
+    );
+    let text = theme_layer(
+        &mut doc,
+        text_kind("Title", 24.0, true),
+        (10.0, 10.0, 20.0, 10.0),
+        |n| n.parent = Some(frame),
+    );
+    let sibling = theme_layer(&mut doc, NodeKind::Rect, (10.0, 50.0, 80.0, 30.0), |n| {
+        n.parent = Some(frame)
+    });
+    doc.root.retain(|id| *id == frame);
+    doc.nodes.get_mut(&frame).unwrap().children = vec![text, sibling];
+    let mut ed = Editor::new(doc);
+    ed.selection = vec![text];
+    ed.style_text("font size", |sp| sp.size = Some(24.0));
+    ed.edit("Lock control", |tx| {
+        tx.node_mut(sibling).unwrap().locked = locked
+    });
+    let page = ed.page_data(0);
+    let mut s = WebState::open(&canvas(&[page.clone()], &page.id), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    assert_eq!(s.ed.doc.is_effectively_locked(sibling), locked);
+    (s, text, sibling)
+}
+
+#[test]
+fn rev22_a_metric_that_would_move_a_locked_layer_is_refused_whole_and_its_pair_applies() {
+    use crate::model::Direction;
+    // Line height grows the title's box in a column; letter spacing widens it in a row: each
+    // would move the locked rectangle after it, so each is refused before anything changes,
+    // the reason shown. Unlocked, each applies, the rectangle follows, and one Undo/Redo
+    // gives the whole page.
+    for (label, value, direction) in [
+        ("Line height", "200%", Direction::Vertical),
+        ("Letter spacing", "20", Direction::Horizontal),
+    ] {
+        let (mut s, _, _) = metric_flow_fixture(true, direction);
+        let page = page_to_json(&s.ed.page_data(0));
+        let markers = (
+            s.ed.history.undo_len(),
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.dirty(),
+        );
+        open_theme(&mut s);
+        open_picker(&mut s, "24 · Regular");
+        theme_metric(&mut s, label, value);
+        assert!(
+            !ui::popup_open(&s.ctx),
+            "{label}: refused, the editor closes"
+        );
+        assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+        assert!(paints(&mut s, ui::design_system::INHERITED_STYLE));
+        assert_eq!(page_to_json(&s.ed.page_data(0)), page, "{label}");
+        assert_eq!(
+            (
+                s.ed.history.undo_len(),
+                format!("{:?}", s.ed.history),
+                s.ed.doc_stamp,
+                s.dirty()
+            ),
+            markers,
+            "{label}"
+        );
+        assert!(s.ed.selection.is_empty());
+        assert!(s.save_snapshot().is_none(), "{label}: nothing new to save");
+        // The unlocked pair.
+        let (mut s, _, sibling_free) = metric_flow_fixture(false, direction);
+        let before = page_to_json(&s.ed.page_data(0));
+        let place = s.ed.doc.get(sibling_free).unwrap().rect;
+        open_theme(&mut s);
+        open_picker(&mut s, "24 · Regular");
+        theme_metric(&mut s, label, value);
+        close_picker(&mut s);
+        let moved = s.ed.doc.get(sibling_free).unwrap().rect;
+        assert!(
+            (moved.x, moved.y) != (place.x, place.y),
+            "{label}: the pair really moves it"
+        );
+        let edited = page_to_json(&s.ed.page_data(0));
+        let snap = s.save_snapshot().expect("the allowed metric saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), edited);
+        s.save_succeeded();
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{label}: one step"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), edited, "{label}");
+    }
+}
+
+#[test]
+fn rev22_a_refused_first_metric_keeps_an_open_text_draft_exactly() {
+    // The R69 contract for a metric: with the target's own text being edited (a draft open),
+    // a first line height that would move the locked rectangle is refused on the preview,
+    // before the draft is finished: it stays open with its caret, nothing is offered to save,
+    // and it still types.
+    let (mut s, text, sibling) = metric_flow_fixture(true, crate::model::Direction::Vertical);
+    open_theme(&mut s);
+    s.ed.start_text_edit(text, None);
+    s.ed.insert_text("ø");
+    timed_frames(&mut s, 3);
+    open_picker(&mut s, "24 · Regular");
+    assert_eq!(s.ed.text_edit.as_ref().map(|t| t.id), Some(text));
+    let page = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    let edit = s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor));
+    let markers = (
+        s.ed.history.undo_len(),
+        format!("{:?}", s.ed.history),
+        s.ed.doc_stamp,
+        s.dirty(),
+    );
+    theme_metric(&mut s, "Line height", "200%");
+    assert!(!ui::popup_open(&s.ctx));
+    assert!(paints(&mut s, ui::design_system::INHERITED_STYLE));
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page);
+    assert_eq!(
+        s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+        edit
+    );
+    assert_eq!(
+        (
+            s.ed.history.undo_len(),
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.dirty()
+        ),
+        markers
+    );
+    assert!(s.save_snapshot().is_none(), "nothing offered to save");
+    s.ed.insert_text("x");
+    let typed = s.ed.doc.get(text).unwrap().kind.text().cloned();
+    assert!(
+        typed.is_some_and(|t| t.ends_with('x')),
+        "the draft still types"
+    );
+}
+
+// ---- revision 22 correction (run172): a metric typed in Theme and not entered, then the left
+// panel switched to Design. Before, the field vanished with its view and the entry was lost
+// (the lead's two panel probes, `r171_panel_design_switch_keeps_*_intention`, failed: not
+// applied, not kept, the page clean). Now it is finished as losing focus finishes it.
+
+/// A metric typed into the open style editor's `label` field as the lead's probe types it: a
+/// click on the field, Ctrl+A, `value` pasted; no Enter. The field keeps the keyboard and
+/// shows the typed text, and nothing is in the document yet.
+fn metric_typed(s: &mut WebState, label: &str, value: &str) {
+    let before = page_to_json(&s.ed.page_data(0));
+    let p = metric_field_at(s, label);
+    timed_click(s, p);
+    assert!(s.field_has_keyboard(), "field genuinely focused: {label}");
+    s.modifiers(false, true, false, false);
+    press(s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(s);
+    s.paste(value);
+    step(s);
+    assert!(s.field_has_keyboard(), "draft genuinely focused: {label}");
+    assert!(paints(s, value), "actual typed value painted: {label}");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "not entered yet");
+    assert!(s.unsaved_work() && !s.can_reload(), "an unfinished field");
+}
+
+/// Whether both of [`metric_fixture`]'s 20 Regular layers have the probe's value for `label`.
+fn metric_applied(s: &WebState, ids: &MetricIds, label: &str) -> bool {
+    [ids.first, ids.second].iter().all(|id| {
+        let t = &s.ed.doc.get(*id).unwrap().text_style;
+        if label == "Line height" {
+            t.line_height == Some(1.25)
+        } else {
+            t.letter_spacing == 2.5
+        }
+    })
+}
+
+#[test]
+fn r172_choosing_design_finishes_a_typed_metric_as_one_saved_undoable_step() {
+    // The lead's probe setup unchanged (focus, Ctrl+A, paste, no Enter, the actual Design
+    // label clicked); its outcome, "applied or kept", is met by applying, then checked as
+    // any edit: only the whole 20 Regular layers, one step, saved and undone whole.
+    for (label, value) in [("Line height", "125%"), ("Letter spacing", "2.5 px")] {
+        let (mut s, ids) = metric_fixture();
+        let before = page_to_json(&s.ed.page_data(0));
+        let before_doc = s.ed.doc.clone();
+        open_theme(&mut s);
+        open_picker(&mut s, "20 · Regular");
+        metric_typed(&mut s, label, value);
+        let left = s.canvas_rect().min.x;
+        let t = s.now_ms + 1000.0;
+        click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+        timed_frames(&mut s, 3);
+        assert_eq!(s.ui.left_tab, ui::LeftTab::Design, "{label}");
+        assert!(
+            metric_applied(&s, &ids, label),
+            "{label}: finished, not lost"
+        );
+        for id in [ids.control, ids.locked] {
+            assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{label}: {id:?}");
+        }
+        assert!(!ui::popup_open(&s.ctx), "{label}: its editor isn't shown");
+        assert!(
+            !ui::design_system::editing(&s.ctx, &s.ed),
+            "{label}: use ended"
+        );
+        assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+        // Saved as any change, then one Undo gives the whole page back, one Redo the edit.
+        let edited = page_to_json(&s.ed.page_data(0));
+        assert_ne!(edited, before, "{label}");
+        let snap = s.save_snapshot().expect("the finished metric saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), edited, "{label}");
+        s.save_succeeded();
+        assert!(!s.dirty(), "{label}: Saved");
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{label}: one step"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), edited, "{label}");
+        // Back in Theme, the style shows what was finished.
+        open_theme(&mut s);
+        open_picker(&mut s, "20 · Regular");
+        let shown = if label == "Line height" {
+            "125%"
+        } else {
+            "2.5 px"
+        };
+        assert!(paints(&mut s, shown), "{label}: shown as set");
+    }
+}
+
+#[test]
+fn r172_a_typed_metric_is_guarded_until_finished_and_never_reaches_a_reloaded_document() {
+    // The frame that chose Design no longer draws the field: until the next frame finishes the
+    // entry, the page counts it as unfinished work (no clean reload or leave). The explicit
+    // discard (the conflict banner's reload) in that gap replaces the document, and the typed
+    // entry is dropped with the document it was typed against: nothing reaches the new one.
+    let (mut s, ids) = metric_fixture();
+    let original = pages_now(&s);
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    metric_typed(&mut s, "Line height", "125%");
+    let left = s.canvas_rect().min.x;
+    let p = painted_at(&mut s, "Design", |r| r.max.x <= left);
+    let t = s.now_ms + 1000.0;
+    s.pointer_move(p.0, p.1, t);
+    step(&mut s);
+    click(&mut s, p, t + 5.0);
+    step(&mut s);
+    assert_eq!(s.ui.left_tab, ui::LeftTab::Design);
+    assert!(ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    assert!(
+        s.unsaved_work() && !s.can_reload(),
+        "guarded until finished"
+    );
+    s.reload(&canvas(&original, "p")).expect("explicit discard");
+    assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    timed_frames(&mut s, 3);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        page_to_json(&original[0]),
+        "nothing of the typed entry reached the reloaded document"
+    );
+    assert!(!metric_applied(&s, &ids, "Line height"));
+    assert!(!s.dirty() && s.can_reload());
+    assert!(s.save_snapshot().is_none());
+}
+
+#[test]
+fn r172_escape_still_cancels_and_an_invalid_typed_metric_finishes_as_nothing() {
+    // Escape remains the explicit cancel; an entry that isn't a value, left typed when Design
+    // is chosen, changes nothing (it never becomes Auto or a default) and leaves no draft.
+    let (mut s, _) = metric_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    let markers = (s.ed.history.undo_len(), s.ed.doc_stamp);
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    metric_typed(&mut s, "Line height", "125%");
+    press(&mut s, "Escape", "Escape");
+    timed_frames(&mut s, 3);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "Escape cancels");
+    assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    if !ui::popup_open(&s.ctx) {
+        open_picker(&mut s, "20 · Regular");
+    }
+    metric_typed(&mut s, "Letter spacing", "wide");
+    let left = s.canvas_rect().min.x;
+    let t = s.now_ms + 1000.0;
+    click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+    timed_frames(&mut s, 3);
+    assert_eq!(s.ui.left_tab, ui::LeftTab::Design);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "nothing applied");
+    assert_eq!((s.ed.history.undo_len(), s.ed.doc_stamp), markers);
+    assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    assert!(!s.dirty() && s.can_reload());
+}

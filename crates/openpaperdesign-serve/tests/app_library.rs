@@ -340,8 +340,9 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 }
 
 /// The home view through the real executable in app-library mode. The home entry and the one
-/// listed resource name the current versioned URI (`home-21`: the editor whose Theme changes a
-/// colour in use, after `home-20`'s whole-app workbench editor, `home-19`'s Paper-inspired
+/// listed resource name the current versioned URI (`home-22`: the editor whose Theme also sets
+/// a text style's line height and letter spacing, after `home-21`'s Theme changing a colour or
+/// style in use, `home-20`'s whole-app workbench editor, `home-19`'s Paper-inspired
 /// polish of the editor's and the home's tokens, `home-18`'s owner UX revision, an editor
 /// without a full-width header and the home's search drawn as one at rest, `home-9`'s quiet
 /// Home and the corrected in-panel editors of `home-10` to `home-17`: the in-label Paste, the
@@ -349,13 +350,13 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 /// bent curve's re-editable bend, a connector drag fenced by Lock, and a bend handle per curve
 /// bend). Reading it returns this source tree's unchanged view frame with its slots filled
 /// (checked here for shape only), with the view's MIME type, and changes nothing. Earlier
-/// (`home-20` included), other, query and file URIs are refused, so a fresh read can't get an
+/// (`home-21` included), other, query and file URIs are refused, so a fresh read can't get an
 /// older view. This says nothing about a view a host already has open (it isn't evicted or
 /// refreshed). A synthetic host, not a receipt of what a Codex host cached or shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() {
     use rmcp::model::ReadResourceRequestParams;
-    const HOME: &str = "ui://openpaperdesign/home-21.html";
+    const HOME: &str = "ui://openpaperdesign/home-22.html";
     const PANEL_SLOT: &str = "const opdCreatePanel = null; // __OPD_PANEL_MODULE__";
     let t = tmp();
     let (root, home) = (t.0.join("data"), t.0.join("home"));
@@ -435,8 +436,9 @@ async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() 
         "the editor slot holds this build's module or nothing"
     );
     for other in [
-        "ui://openpaperdesign/home-21.html?x",
+        "ui://openpaperdesign/home-22.html?x",
         // Earlier view URIs: never served with this server's behaviour.
+        "ui://openpaperdesign/home-21.html",
         "ui://openpaperdesign/home-20.html",
         "ui://openpaperdesign/home-19.html",
         "ui://openpaperdesign/home-18.html",

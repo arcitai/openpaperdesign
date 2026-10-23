@@ -26,6 +26,15 @@
 //!   other value a range has). One editor use is one undo step, laid out again by the existing
 //!   text layout; instances get overrides. No font family can be chosen (the renderer draws
 //!   Inter only), and no named style is created.
+//! - The same editor shows and sets the style's layers' line height (a percentage of the size,
+//!   or Auto, the font's own) and letter spacing (px), the whole-layer metrics the renderer
+//!   draws and the Design panel's LH and LS already edit (revision 22). The model has them per
+//!   layer only, so they are offered only when every one of the style's layers has the style
+//!   throughout; a style that is only part of some layer's text says so (`RANGE_METRICS`) and
+//!   nothing changes. Differing values show as Mixed, never a made-up common one; an entry
+//!   that isn't a supported value (text, infinities, beyond the Design panel's bounds) is
+//!   dropped and changes nothing. The same preview admission, locks, one-step Undo and
+//!   autosave hold as the size and face.
 //! - Font: the one family the renderer draws (Inter, bundled, in four faces). Read-only.
 //! - Named tokens and the project's `DESIGN.md` / `design.md`: not available. The document has
 //!   no token store; this view has no admitted project folder (OPD never infers one), and the
@@ -123,6 +132,8 @@ pub fn style_label((size, bold, italic): StyleKey) -> String {
 
 /// The Theme view, under the left panel's switch.
 pub fn panel(ui: &mut Ui, ed: &mut Editor) {
+    // Drawn this frame: a metric being typed here is still its field's ([`begin_frame`]).
+    ui.ctx().data_mut(|d| d.insert_temp(drawn_key(), true));
     // What is useful comes first (the Paper's own styles and colours, each selecting its
     // layers), then one short status row per thing that isn't, and the reasons folded away.
     egui::ScrollArea::vertical()
@@ -183,6 +194,7 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
     let links = inheritors(ed);
     let mut changed = None;
     let mut open = None;
+    let mut drafting = None;
     for (style, ids) in styles {
         let (row, slot) = value_row(ui, true, &style_label(style), ids.len());
         if row.clicked() {
@@ -214,50 +226,27 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
             Some(a) if a.from == style => ("kept", style),
             _ => ("style", style),
         };
-        let (change, is_open, popup) = style_editor(ui, key.with(salt), slot, style, ids.len());
+        // Its line height and letter spacing, as its targets have them: the frozen ones while
+        // its use is under way (layers coming into the style meanwhile aren't its), else the
+        // ones it has now.
+        let shown = match &active {
+            Some(a) if in_use => metrics(ed, &a.targets),
+            _ => metrics(ed, &style_targets(ed, style)),
+        };
+        let (change, is_open, popup, typing) =
+            style_editor(ui, key.with(salt), slot, style, ids.len(), &shown);
         if let Some(change) = change {
             changed = Some((style, change, popup));
         }
         if is_open {
             open = Some(style);
         }
+        if let Some((metric, text)) = typing {
+            drafting = Some((style, metric, text, popup));
+        }
     }
     if let Some((style, change, popup)) = changed {
-        let next = match active.take() {
-            Some(a) if a.now == style => {
-                // Each later change of a use is tried on a copy too: one that would reach a
-                // locked layer isn't applied, and the use ends (its earlier changes stay, one
-                // step).
-                if restyle_reaches_locked(ed, &a, change) {
-                    ed.history.seal();
-                    None
-                } else {
-                    Some(a)
-                }
-            }
-            other => {
-                if other.is_some() {
-                    ed.history.seal();
-                }
-                fresh_restyle(ed, &links, style, popup, change)
-            }
-        };
-        match next {
-            Some(mut r) => {
-                restyle(ed, &r, change);
-                r.now = match change {
-                    StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
-                    StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
-                };
-                r.stamp = ed.doc_stamp;
-                active = Some(r);
-            }
-            None => {
-                // Refused before it applies (see `reaches_locked`, `restyle_reaches_locked`).
-                egui::Popup::close_id(ui.ctx(), popup);
-                ed.status = INHERITED_STYLE.into();
-            }
-        }
+        apply_style_change(ui.ctx(), ed, &links, &mut active, style, change, popup);
     } else if active.as_ref().is_some_and(|a| open != Some(a.now)) {
         // Its editor closed (or its style left the list): that interaction is one step.
         ed.history.seal();
@@ -271,6 +260,192 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
             d.remove::<Restyle>(key);
         }
     });
+    // A metric being typed is kept with the document it is for, so a frame that no longer
+    // draws its field finishes it ([`begin_frame`]); none being typed now (entered, Escaped)
+    // leaves none.
+    ui.ctx().data_mut(|d| match drafting {
+        Some((style, metric, text, popup)) => {
+            let stamp = ed.doc_stamp;
+            d.insert_temp(
+                draft_key(),
+                MetricDraft {
+                    style,
+                    metric,
+                    text,
+                    popup,
+                    stamp,
+                },
+            );
+        }
+        None => {
+            d.remove::<MetricDraft>(draft_key());
+        }
+    });
+}
+
+/// Apply `change` to the text style `style` (its editor's popup `popup`), continuing the use
+/// under way (`active`) or beginning one: a later change of a use is tried on a preview, a
+/// first one admitted whole by [`fresh_restyle`]; a line height or letter spacing needs every
+/// target to be a whole layer. A refused change applies nothing, closes the editor and says
+/// why in the status line. The one path for the editor's fields and for a metric finished
+/// after its field went away ([`finish_metric_draft`]).
+fn apply_style_change(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    links: &HashMap<NodeId, Vec<NodeId>>,
+    active: &mut Option<Restyle>,
+    style: StyleKey,
+    change: StyleChange,
+    popup: egui::Id,
+) {
+    // Why a change is refused: a metric for a style only part of some layer has, or a locked
+    // layer it would reach.
+    let mut reason = INHERITED_STYLE;
+    let next = match active.take() {
+        Some(a) if a.now == style => {
+            // Each later change of a use is tried on a copy too: one that would reach a locked
+            // layer isn't applied, and the use ends (its earlier changes stay, one step). A
+            // metric needs every frozen target to be a whole layer.
+            if change.is_metric() && !metrics(ed, &a.targets).eligible {
+                reason = RANGE_METRICS;
+                ed.history.seal();
+                None
+            } else if restyle_reaches_locked(ed, &a, change) {
+                ed.history.seal();
+                None
+            } else {
+                Some(a)
+            }
+        }
+        other => {
+            if other.is_some() {
+                ed.history.seal();
+            }
+            let fresh = fresh_restyle(ed, links, style, popup, change);
+            if fresh.is_none()
+                && change.is_metric()
+                && !metrics(ed, &style_targets(ed, style)).eligible
+            {
+                reason = RANGE_METRICS;
+            }
+            fresh
+        }
+    };
+    match next {
+        Some(mut r) => {
+            restyle(ed, &r, change);
+            r.now = match change {
+                StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
+                StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
+                // A layer metric isn't part of the style's key: the row stays where it is.
+                StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => r.now,
+            };
+            r.stamp = ed.doc_stamp;
+            *active = Some(r);
+        }
+        None => {
+            // Refused before it applies (see `reaches_locked`, `restyle_reaches_locked`,
+            // `RANGE_METRICS`).
+            egui::Popup::close_id(ctx, popup);
+            ed.status = reason.into();
+        }
+    }
+}
+
+/// Which of a style's paragraph metrics a field edits.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Metric {
+    LineHeight,
+    LetterSpacing,
+}
+
+/// A line height or letter spacing typed into a style's editor and not yet entered (no Enter,
+/// no focus moved within the editor): its style, which metric, the text, the editor's popup and
+/// the document stamp it was typed against. Kept in egui's memory only while its field is drawn
+/// with the keyboard, so a frame that stops drawing it (the left panel switched to Design,
+/// panels collapsed, the UI hidden) can finish it as losing focus would ([`begin_frame`]);
+/// before, the field simply vanished and the entry was lost (R171 panel finding). Ephemeral UI
+/// state, never a value store: it applies only to the document it was typed against.
+#[derive(Clone)]
+struct MetricDraft {
+    style: StyleKey,
+    metric: Metric,
+    text: String,
+    popup: egui::Id,
+    stamp: u64,
+}
+
+fn draft_key() -> egui::Id {
+    egui::Id::new("opd-theme-metric-draft")
+}
+
+/// Marks a frame in which the Theme view was drawn (so its fields were too).
+fn drawn_key() -> egui::Id {
+    egui::Id::new("opd-theme-drawn")
+}
+
+/// Whether a metric typed into Theme waits to be finished for the document as it is now: an
+/// unfinished UI edit the browser host guards (no clean reload or leave over it).
+pub fn metric_draft_pending(ctx: &egui::Context, ed: &Editor) -> bool {
+    ctx.data(|d| d.get_temp::<MetricDraft>(draft_key()))
+        .is_some_and(|d| d.stamp == ed.doc_stamp)
+}
+
+/// At the start of each frame: if the Theme view wasn't drawn in the last one, a metric typed
+/// there and not entered is finished as its field losing the focus would finish it
+/// ([`finish_metric_draft`]), as the hidden renames are finished.
+pub fn begin_frame(ctx: &egui::Context, ed: &mut Editor) {
+    let drawn = ctx
+        .data_mut(|d| d.remove_temp::<bool>(drawn_key()))
+        .unwrap_or(false);
+    if !drawn {
+        finish_metric_draft(ctx, ed);
+    }
+}
+
+/// A typed metric whose field is gone, finished as Enter or a click elsewhere in its editor
+/// would finish it: a valid value applied through [`apply_style_change`] (the same preview
+/// admission, frozen targets, whole layers and locks; a refusal says why), an unchanged one or
+/// an entry that isn't a value applying nothing. Only for the document it was typed against:
+/// after any other change of it (a reload or discard, another Paper, Undo, an agent's edit) it
+/// is dropped, never applied to the new one. Its editor isn't shown any more, so its use ends
+/// here: one undo step, and the autosave free again.
+fn finish_metric_draft(ctx: &egui::Context, ed: &mut Editor) {
+    let Some(d) = ctx.data(|m| m.get_temp::<MetricDraft>(draft_key())) else {
+        return;
+    };
+    ctx.data_mut(|m| m.remove::<MetricDraft>(draft_key()));
+    if d.stamp != ed.doc_stamp {
+        return;
+    }
+    let mut active: Option<Restyle> = ctx
+        .data(|m| m.get_temp(restyle_key()))
+        .filter(|a: &Restyle| a.stamp == ed.doc_stamp);
+    let change = match d.metric {
+        Metric::LineHeight => parse_line_height(&d.text).map(StyleChange::LineHeight),
+        Metric::LetterSpacing => parse_letter_spacing(&d.text).map(StyleChange::LetterSpacing),
+    };
+    if let Some(change) = change {
+        let targets = match &active {
+            Some(a) if a.now == d.style => a.targets.clone(),
+            _ => style_targets(ed, d.style),
+        };
+        let shown = metrics(ed, &targets);
+        let unchanged = match change {
+            StyleChange::LineHeight(lh) => shown.line_height == Some(lh),
+            StyleChange::LetterSpacing(ls) => shown.letter_spacing == Some(ls),
+            StyleChange::Size(_) | StyleChange::Face { .. } => false,
+        };
+        if !unchanged {
+            let links = inheritors(ed);
+            apply_style_change(ctx, ed, &links, &mut active, d.style, change, d.popup);
+        }
+    }
+    if active.is_some() {
+        ed.history.seal();
+    }
+    ctx.data_mut(|m| m.remove::<Restyle>(restyle_key()));
+    egui::Popup::close_id(ctx, d.popup);
 }
 
 /// A text style being changed from its row's editor, from the first change until the editor
@@ -297,11 +472,101 @@ struct StyleTarget {
     ranges: Vec<(usize, usize)>,
 }
 
-/// One change from a text style's editor: its size, or its face (Inter's four).
-#[derive(Clone, Copy)]
+/// One change from a text style's editor: its size, or its face (Inter's four), which a range
+/// can take; or a paragraph metric, which only a whole text layer has (`TextStyle`'s
+/// `line_height`, a multiple of the size, `None` for the font's own, shown as Auto; and
+/// `letter_spacing`, px added after each character), as the Design panel's LH and LS edit them.
+#[derive(Clone, Copy, PartialEq)]
 enum StyleChange {
     Size(f64),
     Face { bold: bool, italic: bool },
+    LineHeight(Option<f64>),
+    LetterSpacing(f64),
+}
+
+impl StyleChange {
+    /// A whole-layer paragraph metric (not something a range of characters can have).
+    fn is_metric(self) -> bool {
+        matches!(
+            self,
+            StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_)
+        )
+    }
+}
+
+/// Why a style's line height and letter spacing can't be changed from Theme (the editor's
+/// note, and the status line if it is tried anyway).
+pub const RANGE_METRICS: &str = "Line height and letter spacing belong to a whole text layer, \
+                                 and only part of some layer's text is in this style. Set them \
+                                 per layer in the Design panel.";
+
+/// Line height and letter spacing as a style's editor shows them, read from its target layers
+/// (`None`: they differ, Mixed). `eligible` when every target is a whole text layer: only then
+/// can Theme change them.
+struct Metrics {
+    line_height: Option<Option<f64>>,
+    letter_spacing: Option<f64>,
+    eligible: bool,
+}
+
+/// [`Metrics`] of `targets` (each a whole layer or ranges of one).
+fn metrics(ed: &Editor, targets: &[StyleTarget]) -> Metrics {
+    let nodes: Vec<crate::model::Node> = targets
+        .iter()
+        .filter_map(|t| ed.doc.get(t.id).cloned())
+        .collect();
+    // The Design panel's own reading: one value only when every layer has it.
+    let line_height = inspector::uniform(&nodes, |n| n.text_style.line_height);
+    let letter_spacing = inspector::uniform(&nodes, |n| n.text_style.letter_spacing);
+    Metrics {
+        line_height,
+        letter_spacing,
+        eligible: !targets.is_empty() && targets.iter().all(|t| t.whole),
+    }
+}
+
+/// A number as the editor shows it: at most two decimals, no trailing zeros.
+fn short_number(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" { "0".into() } else { s.into() }
+}
+
+/// A line height as the editor shows it: Auto, or a percentage of the size (as the Design
+/// panel's LH shows it).
+fn line_height_text(lh: Option<f64>) -> String {
+    match lh {
+        None => "Auto".into(),
+        Some(m) => format!("{}%", short_number(m * 100.0)),
+    }
+}
+
+/// A line height as entered: "Auto" (or 0, as in the Design panel) for the font's own, or a
+/// percentage of the size up to 1000 (a "%" may follow). `None` for anything else (text,
+/// infinities, out of range): nothing is changed then.
+fn parse_line_height(s: &str) -> Option<Option<f64>> {
+    let t = s.trim().to_ascii_lowercase();
+    if t == "auto" {
+        return Some(None);
+    }
+    let n: f64 = t.trim_end_matches('%').trim().parse().ok()?;
+    if !n.is_finite() || !(0.0..=1000.0).contains(&n) {
+        return None;
+    }
+    Some((n > 0.0).then_some(n / 100.0))
+}
+
+/// A letter spacing as the editor shows it, in px.
+fn letter_spacing_text(ls: f64) -> String {
+    format!("{} px", short_number(ls))
+}
+
+/// A letter spacing as entered: px from -50 to 200, the Design panel's bounds (a "px" may
+/// follow). `None` for anything else: nothing is changed then.
+fn parse_letter_spacing(s: &str) -> Option<f64> {
+    let t = s.trim().to_ascii_lowercase();
+    let n: f64 = t.trim_end_matches("px").trim().parse().ok()?;
+    (n.is_finite() && (-50.0..=200.0).contains(&n)).then_some(n)
 }
 
 /// The faces Theme offers: the bundled Inter's four, as the renderer draws them.
@@ -444,7 +709,8 @@ fn style_groups(ed: &Editor, targets: &[StyleTarget]) -> Vec<(NodeId, &'static s
 /// A new text style use beginning with `change`, or `None` when Theme refuses it, before
 /// anything of the live editor changes. Its whole first step is tried on a preview first
 /// (`Editor::preview`, R69): ending an open text edit (which commits it, and may remove an
-/// emptied text and so reflow its frame), the targets found after that, the inheritance
+/// emptied text and so reflow its frame), the targets found after that (for a line height or
+/// letter spacing, every one a whole layer, [`RANGE_METRICS`]), the inheritance
 /// foresight ([`reaches_locked`] on [`style_groups`]) and the change with all its follow-ups;
 /// it is refused if any effectively locked layer of the live document would differ. Only an
 /// admitted use touches the live editor, by the same steps (the text edit ended, the targets
@@ -472,6 +738,10 @@ fn fresh_restyle(
         stamp: 0,
         popup,
     };
+    // A line height or letter spacing belongs to whole layers only: never a part of a subset.
+    if change.is_metric() && !metrics(&probe, &r.targets).eligible {
+        return None;
+    }
     if reaches_locked(&probe, links, &style_groups(&probe, &r.targets)) {
         return None;
     }
@@ -585,13 +855,18 @@ fn style_targets(ed: &Editor, style: StyleKey) -> Vec<StyleTarget> {
 /// it closes): a whole layer's own size or face (its ranges' values for it dropped, as the
 /// Design panel's whole-layer edits drop them), or a range style over exactly its ranges
 /// (`TextStyle::apply_range`, which keeps every other value a range has: colour, underline,
-/// strike). Text layers are laid out again (`Editor::fit_text`: width kept unless it grows to
-/// fit its text); edits inside instances become overrides.
+/// strike); or a whole layer's own line height or letter spacing, its ranges untouched (only
+/// ever whole layers: see [`RANGE_METRICS`]). Text layers are laid out again
+/// (`Editor::fit_text`: width kept unless it grows to fit its text); edits inside instances
+/// become overrides, under the Design panel's field names.
 fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
     let ids: Vec<NodeId> = r.targets.iter().map(|t| t.id).collect();
+    // The Design panel's own field names, so instance overrides are the same ones.
     let field = match change {
         StyleChange::Size(_) => "font size",
         StyleChange::Face { .. } => "font",
+        StyleChange::LineHeight(_) => "line height",
+        StyleChange::LetterSpacing(_) => "letter spacing",
     };
     let key = format!("theme text style {}:{ids:?}", style_label(r.from));
     ed.begin_coalescing("Change text style", Some(&key));
@@ -610,6 +885,7 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
                         for sp in &mut n.text_style.spans {
                             sp.size = None;
                         }
+                        n.text_style.normalize();
                     }
                     StyleChange::Face { bold, italic } => {
                         n.text_style.bold = bold;
@@ -618,9 +894,16 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
                             sp.bold = None;
                             sp.italic = None;
                         }
+                        n.text_style.normalize();
                     }
+                    // The layer's own metric, as the Design panel's LH and LS set it; its ranges
+                    // are left exactly as they are.
+                    StyleChange::LineHeight(lh) => n.text_style.line_height = lh,
+                    StyleChange::LetterSpacing(ls) => n.text_style.letter_spacing = ls,
                 }
-                n.text_style.normalize();
+            } else if change.is_metric() {
+                // Never reached: a metric is refused unless every target is a whole layer
+                // (`RANGE_METRICS`), so no range is ever given one.
             } else {
                 // Only the value that changes: a face from Regular to Bold leaves italic as the
                 // characters have it, without writing it into their ranges.
@@ -636,6 +919,7 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
                                 sp.italic = Some(italic);
                             }
                         }
+                        StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => {}
                     });
                 }
             }
@@ -661,15 +945,24 @@ fn style_glyph(ui: &Ui, slot: egui::Rect, color: egui::Color32) {
 
 /// A text style's editor: its "Aa" button at `slot`, taking no room in the row (the row stays
 /// the selecting target around it), and the small popup it opens: the style's size and Inter's
-/// four faces, nothing the renderer can't draw. Returns the change, if any, whether the popup
-/// is open, and its id. `id` is the button's own identity, independent of the row's place.
+/// four faces, nothing the renderer can't draw, then its layers' line height and letter
+/// spacing (`shown`: a value, Auto or Mixed; unavailable, with the reason, when the style is
+/// only part of some layer's text). Returns the change, if any, whether the popup is open, its
+/// id, and a metric being typed (not yet entered) with its text. `id` is the button's own
+/// identity, independent of the row's place.
 fn style_editor(
     ui: &mut Ui,
     id: egui::Id,
     slot: egui::Rect,
     style: StyleKey,
     count: usize,
-) -> (Option<StyleChange>, bool, egui::Id) {
+    shown: &Metrics,
+) -> (
+    Option<StyleChange>,
+    bool,
+    egui::Id,
+    Option<(Metric, String)>,
+) {
     let mut child = ui.new_child(egui::UiBuilder::new().id(id).max_rect(slot));
     let popup = id.with("popup");
     let open = egui::Popup::is_id_open(child.ctx(), popup);
@@ -691,6 +984,7 @@ fn style_editor(
     ));
     let (_, bold, italic) = style;
     let mut change = None;
+    let mut typing = None;
     egui::Popup::menu(&resp)
         .id(popup)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -717,8 +1011,101 @@ fn style_editor(
                 }
             });
             note(ui, "Inter only: the canvas draws its four faces.");
+            ui.add_space(4.0);
+            // The whole layers' paragraph metrics: a value, Auto, or Mixed (they differ; a value
+            // entered then sets it for all of them). Nothing is read into a common number.
+            let lh = shown.line_height.map_or(String::new(), line_height_text);
+            let (entered, draft) =
+                metric_field(ui, "Line height", &lh, "Auto or %", shown.eligible);
+            if let Some(lh) = entered.as_deref().and_then(parse_line_height)
+                && shown.line_height != Some(lh)
+            {
+                change = Some(StyleChange::LineHeight(lh));
+            }
+            typing = draft.map(|t| (Metric::LineHeight, t));
+            let ls = shown
+                .letter_spacing
+                .map_or(String::new(), letter_spacing_text);
+            let (entered, draft) = metric_field(ui, "Letter spacing", &ls, "px", shown.eligible);
+            if let Some(ls) = entered.as_deref().and_then(parse_letter_spacing)
+                && shown.letter_spacing != Some(ls)
+            {
+                change = Some(StyleChange::LetterSpacing(ls));
+            }
+            if let Some(t) = draft {
+                typing = Some((Metric::LetterSpacing, t));
+            }
+            if !shown.eligible {
+                note(ui, RANGE_METRICS);
+            }
         });
-    (change, egui::Popup::is_id_open(ui.ctx(), popup), popup)
+    (
+        change,
+        egui::Popup::is_id_open(ui.ctx(), popup),
+        popup,
+        typing,
+    )
+}
+
+/// One paragraph metric in a style's editor: its label and a text field showing `shown` (a
+/// value or Auto; empty, with "Mixed" as its hint, when the layers differ; `hint` names what
+/// it takes). Returns what was entered once the field is finished (Enter, or the focus moving
+/// on) and differs from what it showed (Escape drops it), and the text being typed while the
+/// field has the keyboard. Until it is finished nothing changes; while it isn't focused it
+/// shows the layers' value again, so a rejected entry just goes back.
+fn metric_field(
+    ui: &mut Ui,
+    label: &str,
+    shown: &str,
+    hint: &str,
+    enabled: bool,
+) -> (Option<String>, Option<String>) {
+    let id = ui.make_persistent_id(("theme-metric", label));
+    ui.horizontal(|ui| {
+        let p = theme::pal(ui);
+        let colour = if enabled { p.secondary } else { p.tertiary };
+        let size = egui::vec2(84.0, theme::FIELD_H);
+        let layout = egui::Layout::left_to_right(egui::Align::Center);
+        let name = ui
+            .allocate_ui_with_layout(size, layout, |ui| {
+                ui.label(RichText::new(label).size(theme::BODY).color(colour))
+            })
+            .inner;
+        // A typed draft only while the field has the keyboard (a popup closed meanwhile leaves
+        // none behind): otherwise it shows the layers' value.
+        let field_id = id.with("field");
+        let focused = ui.ctx().memory(|m| m.has_focus(field_id));
+        let mut draft: String = focused
+            .then(|| ui.ctx().data(|d| d.get_temp(id)))
+            .flatten()
+            .unwrap_or_else(|| shown.to_owned());
+        if !enabled && draft.is_empty() {
+            // Not editable here: say what the layers have, as text.
+            draft = "Mixed".to_owned();
+        }
+        let hint = if shown.is_empty() { "Mixed" } else { hint };
+        let field = egui::TextEdit::singleline(&mut draft)
+            .id(field_id)
+            .hint_text(hint)
+            .desired_width(84.0);
+        let r = ui.add_enabled(enabled, field).labelled_by(name.id);
+        let mut entered = None;
+        let mut typing = None;
+        if r.has_focus() {
+            ui.ctx().data_mut(|d| d.insert_temp(id, draft.clone()));
+            typing = (draft.trim() != shown).then_some(draft);
+        } else {
+            if r.lost_focus()
+                && !ui.input(|i| i.key_pressed(egui::Key::Escape))
+                && draft.trim() != shown
+            {
+                entered = Some(draft);
+            }
+            ui.ctx().data_mut(|d| d.remove::<String>(id));
+        }
+        (entered, typing)
+    })
+    .inner
 }
 
 /// A colour being changed from its swatch, from the first change until its picker closes: the
@@ -1101,6 +1488,119 @@ fn value_row(ui: &mut Ui, swatch: bool, label: &str, count: usize) -> (egui::Res
 fn select(ed: &mut Editor, ids: Vec<NodeId>) {
     ed.end_text_edit();
     ed.selection = ids;
+}
+
+/// Revision 22's paragraph metrics at the helper level: what an entry means, how a value is
+/// shown, when a style may take one, and that taking one leaves a layer's ranges alone.
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use crate::geom::Rect;
+    use crate::model::{Document, Node, TextAlign, TextSpan};
+
+    #[test]
+    fn entries_mean_the_design_panel_s_values_and_anything_else_changes_nothing() {
+        for (s, want) in [
+            ("Auto", Some(None)),
+            ("auto", Some(None)),
+            ("0", Some(None)),
+            ("0%", Some(None)),
+            ("140", Some(Some(1.4))),
+            ("140%", Some(Some(1.4))),
+            (" 12.5 % ", Some(Some(0.125))),
+            ("1000", Some(Some(10.0))),
+        ] {
+            assert_eq!(parse_line_height(s), want, "{s:?}");
+        }
+        for s in ["", "abc", "inf", "-inf", "NaN", "-5", "1000.5", "1e9", "%"] {
+            assert_eq!(parse_line_height(s), None, "{s:?}");
+        }
+        for (s, want) in [("0", 0.0), ("1.5", 1.5), ("-0.5 px", -0.5), ("-50", -50.0)] {
+            assert_eq!(parse_letter_spacing(s), Some(want), "{s:?}");
+        }
+        for s in ["", "px", "auto", "inf", "NaN", "-50.01", "200.5"] {
+            assert_eq!(parse_letter_spacing(s), None, "{s:?}");
+        }
+        // Shown as stored, to two decimals at most; an unusual value isn't rounded away by
+        // being shown (nothing is written unless something else is entered).
+        assert_eq!(line_height_text(None), "Auto");
+        assert_eq!(line_height_text(Some(1.4)), "140%");
+        assert_eq!(line_height_text(Some(1.2345)), "123.45%");
+        assert_eq!(letter_spacing_text(-0.0), "0 px");
+        assert_eq!(letter_spacing_text(-0.5), "-0.5 px");
+    }
+
+    #[test]
+    fn a_metric_is_offered_only_for_whole_layers_and_leaves_their_ranges_alone() {
+        let text = |s: &str| NodeKind::Text {
+            text: s.into(),
+            font_size: 20.0,
+            auto_width: true,
+            align: TextAlign::Left,
+        };
+        let mut doc = Document::default();
+        let whole = doc.alloc_id();
+        let mut n = Node::new(whole, text("Æble ✓"), Rect::new(0.0, 0.0, 40.0, 20.0));
+        // A colour range: not a size or face, so every character is still 20 Regular.
+        n.text_style.spans = vec![TextSpan {
+            start: 0,
+            end: 2,
+            color: Some(Color::rgb(255, 0, 0)),
+            ..Default::default()
+        }];
+        doc.nodes.insert(whole, n);
+        doc.root.push(whole);
+        let part = doc.alloc_id();
+        let mut n = Node::new(part, text("Mixed"), Rect::new(0.0, 50.0, 40.0, 20.0));
+        n.text_style.spans = vec![TextSpan {
+            start: 0,
+            end: 2,
+            size: Some(30.0),
+            ..Default::default()
+        }];
+        doc.nodes.insert(part, n);
+        doc.root.push(part);
+        let mut ed = Editor::new(doc);
+        let style = (2000, false, false);
+        let both = style_targets(&ed, style);
+        assert_eq!(both.len(), 2);
+        assert!(!metrics(&ed, &both).eligible, "part of `part` only");
+        let alone: Vec<StyleTarget> = both.iter().filter(|t| t.whole).cloned().collect();
+        assert!(metrics(&ed, &alone).eligible);
+        let spans = ed.doc.get(whole).unwrap().text_style.spans.clone();
+        let r = Restyle {
+            from: style,
+            now: style,
+            targets: alone,
+            stamp: 0,
+            popup: egui::Id::new("metric"),
+        };
+        restyle(&mut ed, &r, StyleChange::LineHeight(Some(1.5)));
+        restyle(&mut ed, &r, StyleChange::LetterSpacing(-0.5));
+        let n = ed.doc.get(whole).unwrap();
+        assert_eq!(
+            (n.text_style.line_height, n.text_style.letter_spacing),
+            (Some(1.5), -0.5)
+        );
+        assert_eq!(
+            n.text_style.spans, spans,
+            "its colour range exactly as it was"
+        );
+        let other = ed.doc.get(part).unwrap();
+        assert_eq!(
+            (
+                other.text_style.line_height,
+                other.text_style.letter_spacing
+            ),
+            (None, 0.0)
+        );
+        restyle(&mut ed, &r, StyleChange::LineHeight(None));
+        assert_eq!(
+            ed.doc.get(whole).unwrap().text_style.line_height,
+            None,
+            "Auto"
+        );
+    }
 }
 
 /// The independent R69 review's helper-level probes, kept as regressions: unchanged but for

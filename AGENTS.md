@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.90 · Updated: 2026-10-23
+Revision: 0.91 · Updated: 2026-10-23
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -792,6 +792,46 @@ engine architecture is `analysis/DESIGN.md`.
       same fixture, trigger, visible refusal and requested-font checks, and its middle
       assertions (which recorded the defect: a changed page saved, then reversed and replayed)
       adapted to the exact-state contract.
+      **Line height and letter spacing** (revision 22, run171; source only, unchecked; #14/#10
+      group 6): the style editor also shows and sets its layers' `TextStyle::line_height` (a
+      multiple of the size, `None` = Auto; shown as a percentage, 0 or "Auto" entered for Auto)
+      and `letter_spacing` (px, -50 to 200), the whole-layer metrics `src/text.rs` already
+      draws and the Design panel's LH and LS already edit, with the same bounds, meaning and
+      override field names (`line height`, `letter spacing`). Reason: Theme offered size and
+      face only, while the model and renderer had these too. `StyleChange::LineHeight` /
+      `LetterSpacing` go through the same `restyle` (the layer's own field, its ranges left
+      exactly as they are, `fit_text`, overrides, one coalesced step), `fresh_restyle`'s
+      preview admission and `restyle_reaches_locked` for later changes, so locks, inherited
+      and derived geometry, an open draft, one-step Undo and the autosave hold (web and
+      native, through `editing`) are as for size and face. They are per layer only, so
+      `Metrics::eligible` requires every frozen target to be a whole layer: otherwise the two
+      fields are disabled with `RANGE_METRICS` said, and a change is refused before anything
+      changes (never applied to a subset). Values that differ show "Mixed" (an empty field,
+      nothing made up); a field changes nothing until Enter or the focus moving on, and an
+      entry that isn't a supported value (text, infinities, beyond the bounds) is dropped.
+      Tests: `rev22_*` in the web state tests (Mixed inspection, rejected entries, one value
+      for two whole layers then Auto, one step, save/reopen; a partial style's disabled
+      metrics with size still working; locked derived geometry for each metric with unlocked
+      pairs; a refused first metric keeping an open draft) and `metric_tests` beside
+      `design_system` (entries, display, eligibility, ranges untouched). The lead's checks of
+      run171 passed (277 web, 209 serve, the native App build; formatting needed 11 hunks), and
+      its probes of an ordinary canvas click, Enter and Escape passed, but its two panel probes
+      failed: a valid value typed and not entered, then the left panel switched to Design, was
+      lost (`left_switch` changes the tab before the Theme body draws, so the field never had
+      its focus-loss frame). Run172 correction (unchecked): while a metric field has the
+      keyboard, the text is kept as `MetricDraft` (style, metric, popup, the document stamp) in
+      egui's memory; `ui::draw` calls `design_system::begin_frame` first, and when the Theme
+      view wasn't drawn in the last frame it finishes that draft as losing focus would,
+      through the one `apply_style_change` path the fields use (preview admission, frozen
+      targets, whole layers, locks; refusals said), then ends the use (one undo step, the
+      autosave free). A draft for another document state (reload or discard, another Paper,
+      Undo, an agent's edit) is dropped, never applied; an invalid one applies nothing; Escape
+      still cancels. Until it is finished, `WebState::ui_edit_pending` counts it
+      (`metric_draft_pending`), so no clean reload or leave passes over it. Affected paths:
+      `src/ui/mod.rs` (the one `begin_frame` call) and `crates/openpaperdesign-web/src/state.rs`
+      (the guard). Tests: `r172_*` (the probes' setup, finished and applied for both metrics,
+      saved, one-step Undo/Redo; the guard and an explicit discard in the gap; Escape and an
+      invalid entry).
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).
@@ -987,7 +1027,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-21.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-22.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -1096,8 +1136,15 @@ are unproven.
 and layout unchanged) with the editor whose Theme changes a colour in use wherever the Paper
 uses it (the upstream entry above). The editor's WASM changed after installed `home-20`, so
 `home-20` is refused and a cached `home-20` view can't pass for this one. It also carries
-Theme's text style change (run162). Built and rendered by the lead at bounded scope; not
-independently reviewed, installed or natively accepted.
+Theme's text style change (run162) and its R67–R69 corrections; published as `b4e9624`
+(R70's source acceptance, its Linux renders and both exact CI jobs; not installed: the Mac
+still has `6630ec4`, and its qualification archive couldn't be read by the operator).
+
+`home-22` (2026-10-23 source candidate, root `DESIGN.md` revision 22) is the same view (HTML
+and layout unchanged) with the editor whose Theme also shows and sets a text style's line
+height and letter spacing (the upstream entry above). The editor's WASM changed after
+published `home-21`, so `home-21` is refused and a cached `home-21` view can't pass for this
+one. Not built, rendered, reviewed, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
