@@ -392,6 +392,109 @@ fn errors_are_reported_not_panics() {
     }
 }
 
+/// Revision 23: the bundled families through the existing tools. The catalogue reports both and
+/// what other names render as; `fontFamily` sets a text layer's family, which is what the
+/// canvas lays out and exports (measured, not only labelled), what readback reports, and what
+/// the saved page holds (version 5) and reopens with.
+#[test]
+fn font_families_are_set_read_back_drawn_and_saved_through_the_tools() {
+    use paper_rs::model::FontFamily;
+    let mut h = host();
+    let info = call(
+        &mut h,
+        "get_font_family_info",
+        json!({"familyNames": ["Inter", "geist mono", "monospace", "Helvetica"]}),
+    );
+    let f = &info["families"];
+    assert_eq!(f[0]["available"], true);
+    assert_eq!(f[1]["available"], true);
+    assert_eq!(f[1]["name"], "Geist Mono");
+    assert_eq!(f[1]["monospace"], true);
+    assert_eq!(f[1]["styles"].as_array().unwrap().len(), 4);
+    assert_eq!(f[2]["available"], false);
+    assert_eq!(f[2]["rendersAs"], "Geist Mono");
+    assert_eq!(f[3]["available"], false);
+    assert_eq!(f[3]["rendersAs"], "Inter");
+    assert_eq!(info["bundled"], json!(["Inter", "Geist Mono"]));
+    // Two equal texts, one set to Geist Mono: its own family, and a monospaced width.
+    let mk = |h: &mut exec::SessionHost, text: &str, styles: Value| {
+        let shape = json!({"type": "text", "text": text, "x": 0, "y": 0, "styles": styles});
+        call(h, "create_shape", shape)
+    };
+    let mono = mk(
+        &mut h,
+        "iiiiii",
+        json!({"fontSize": 20, "fontFamily": "Geist Mono"}),
+    );
+    let wide = mk(
+        &mut h,
+        "MMMMMM",
+        json!({"fontSize": 20, "fontFamily": "Geist Mono"}),
+    );
+    let inter = mk(&mut h, "iiiiii", json!({"fontSize": 20}));
+    let node = |h: &exec::SessionHost, v: &Value| h.ed.doc.get(num(&v["id"])).unwrap().clone();
+    let (m, w, i) = (node(&h, &mono), node(&h, &wide), node(&h, &inter));
+    assert_eq!(m.text_style.family, FontFamily::GeistMono);
+    assert_eq!(i.text_style.family, FontFamily::Inter);
+    assert!(
+        (m.rect.w - w.rect.w).abs() < 1e-6,
+        "monospaced: {} {}",
+        m.rect.w,
+        w.rect.w
+    );
+    assert!(
+        m.rect.w > i.rect.w * 1.5,
+        "not Inter's narrow i: {} {}",
+        m.rect.w,
+        i.rect.w
+    );
+    // Readback states what the canvas draws.
+    let id = mono["id"].as_str().unwrap();
+    let styles = call(
+        &mut h,
+        "get_computed_styles",
+        json!({"nodeIds": [id, inter["id"]]}),
+    );
+    assert_eq!(styles[id]["fontFamily"], "Geist Mono");
+    assert_eq!(styles[inter["id"].as_str().unwrap()]["fontFamily"], "Inter");
+    let jsx = call(&mut h, "get_jsx", json!({"nodeId": id}));
+    assert!(
+        jsx.as_str().unwrap().contains("fontFamily: \"Geist Mono\""),
+        "{jsx}"
+    );
+    // The SVG export outlines it in Geist Mono: other outlines than the same text in Inter.
+    let svg = |h: &exec::SessionHost, v: &Value| {
+        paper_rs::io::svg::export(&h.ed.doc, Some(&[num(&v["id"])]), None).unwrap()
+    };
+    let path_of = |s: &str| {
+        s.lines()
+            .find(|l| l.contains("<path d=\"M"))
+            .map(String::from)
+    };
+    assert_ne!(path_of(&svg(&h, &mono)), path_of(&svg(&h, &inter)));
+    // update_styles to an unknown family: Inter, as always, and read back as Inter.
+    let up = call(
+        &mut h,
+        "update_styles",
+        json!({"updates": [{"nodeIds": [wide["id"]], "styles": {"fontFamily": "Comic Sans MS"}}]}),
+    );
+    assert_eq!(up["updated"], 1);
+    assert_eq!(node(&h, &wide).text_style.family, FontFamily::Inter);
+    // Saved as a version 5 page, and reopened with its family.
+    call(&mut h, "finish_working_on_nodes", json!({}));
+    let dir = h.session.project.as_ref().unwrap().dir.clone();
+    let page_id = h.ed.pages[0].id.clone();
+    let page = std::fs::read_to_string(dir.join("pages").join(format!("{page_id}.json"))).unwrap();
+    assert!(page.contains("\"version\": 5") && page.contains("\"family\": \"Geist Mono\""));
+    let file = h.session.project.as_ref().unwrap().manifest.id.clone();
+    let other = call(&mut h, "create_file", json!({"name": "Other"}));
+    call(&mut h, "open_file", json!({"fileId": other["fileId"]}));
+    assert!(h.ed.doc.nodes.is_empty(), "another project is showing");
+    call(&mut h, "open_file", json!({"fileId": file}));
+    assert_eq!(node(&h, &mono).text_style.family, FontFamily::GeistMono);
+    assert_eq!(node(&h, &inter).text_style.family, FontFamily::Inter);
+}
+
 #[test]
 fn screenshot_returns_png() {
     if paper_rs::render::gpu::Headless::new().is_err() {

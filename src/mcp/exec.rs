@@ -496,7 +496,8 @@ fn basic_info(host: &mut dyn Host, a: &Args) -> ToolResult {
         "nodeCount": doc.nodes.len(),
         "artboards": artboards,
         "otherTopLevelLayers": others,
-        "fontFamilies": ["Inter"],
+        // The bundled families text can be set to (`get_font_family_info` has their faces).
+        "fontFamilies": crate::model::FontFamily::ALL.map(|f| f.name()),
         "selectionCount": if page == ed.active_page { ed.selection.len() } else { 0 },
         "nodeIdFormat": "\"<page>:<n>\", e.g. \"".to_string() + &node_key(ed, page, NodeId(1)) + "\"",
     }))
@@ -540,6 +541,8 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
     );
     if let Some(t) = n.kind.text() {
         v["text"] = json!(t);
+        // The family it is drawn in (a whole layer's).
+        v["fontFamily"] = json!(n.text_style.family.name());
     }
     if let Some(ab) = artboard_of(doc, id) {
         v["artboardId"] = json!(node_key(ed, page, ab));
@@ -878,25 +881,55 @@ fn find_nodes(ed: &mut Editor, a: &Args) -> ToolResult {
     text(json!({"count": results.len(), "results": results}))
 }
 
+/// The bundled font catalogue for the requested names: a bundled family (Inter, Geist Mono) is
+/// available in its four faces; a generic family says which one it is drawn in; any other name
+/// isn't available, and text set to it is drawn in Inter (nothing else is loaded or claimed).
 fn font_info(a: &Args) -> ToolResult {
+    use crate::model::FontFamily;
+    let styles = json!([
+        {"weight": 400, "style": "normal"}, {"weight": 700, "style": "normal"},
+        {"weight": 400, "style": "italic"}, {"weight": 700, "style": "italic"}]);
     let fams: Vec<Value> = a
         .strs("familyNames")?
         .iter()
         .map(|f| {
-            let inter = f.trim().eq_ignore_ascii_case("inter");
-            json!({
-                "family": f,
-                "available": inter,
-                "styles": if inter { json!([
-                    {"weight": 400, "style": "normal"}, {"weight": 700, "style": "normal"},
-                    {"weight": 400, "style": "italic"}, {"weight": 700, "style": "italic"}]) } else { json!([]) },
-                "note": if inter { "" } else { "not available; text renders in Inter" },
-            })
+            let exact = FontFamily::ALL
+                .into_iter()
+                .find(|b| b.name().eq_ignore_ascii_case(f.trim()));
+            match (exact, css::bundled_family(f)) {
+                (Some(b), _) => json!({
+                    "family": f,
+                    "name": b.name(),
+                    "available": true,
+                    "monospace": b.is_monospace(),
+                    "styles": styles.clone(),
+                    "note": "",
+                }),
+                (None, Some(b)) => json!({
+                    "family": f,
+                    "available": false,
+                    "rendersAs": b.name(),
+                    "styles": [],
+                    "note": format!("a generic family: text set to it renders in {}", b.name()),
+                }),
+                (None, None) => json!({
+                    "family": f,
+                    "available": false,
+                    "rendersAs": FontFamily::Inter.name(),
+                    "styles": [],
+                    "note": "not available; text renders in Inter",
+                }),
+            }
         })
         .collect();
-    text(
-        json!({"families": fams, "weights": "fontWeight ≥ 600 renders bold, below renders regular"}),
-    )
+    let bundled: Vec<&str> = FontFamily::ALL.iter().map(|f| f.name()).collect();
+    text(json!({
+        "families": fams,
+        "bundled": bundled,
+        "weights": "fontWeight ≥ 600 renders bold, below renders regular",
+        "scope": "a family belongs to a whole text layer; a character Geist Mono lacks is drawn \
+                  in Inter",
+    }))
 }
 
 fn guide(a: &Args) -> ToolResult {

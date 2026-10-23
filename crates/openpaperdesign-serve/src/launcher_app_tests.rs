@@ -2330,6 +2330,36 @@ async fn panel_renderer_parts_are_bounded_strict_and_complete() {
         app::asset_part(&exact, "x", 2).is_err(),
         "no empty last part"
     );
+    // Revision 23: the renderer bound is 18 MiB for the bundled fonts (it was 16 MiB); the
+    // part size, the panel message bound and the host allowance stay as they were.
+    assert_eq!(app::MAX_ASSET_BYTES, 18 * 1024 * 1024);
+    assert_eq!(
+        (app::PART_BYTES, app::MAX_PANEL_MESSAGE, app::HOST_OVERHEAD),
+        (256 * 1024, 4 * 1024 * 1024, 16 * 1024)
+    );
+    let largest = vec![2u8; app::MAX_ASSET_BYTES];
+    let last = app::asset_part(&largest, "x", 71).unwrap();
+    assert_eq!(
+        (last["parts"].clone(), last["part"].clone()),
+        (json!(72), json!(71))
+    );
+    assert_eq!(last["part_bytes"], json!(app::PART_BYTES));
+    assert!(app::asset_part(&largest, "x", 72).is_err(), "no part 72");
+    // Just past the old bound is sent now; one byte past the new one isn't.
+    let past_old = vec![3u8; 16 * 1024 * 1024 + 1];
+    assert_eq!(
+        app::asset_part(&past_old, "x", 64).unwrap()["part_bytes"],
+        json!(1)
+    );
+    let e = app::asset_part(&vec![4u8; app::MAX_ASSET_BYTES + 1], "x", 0).unwrap_err();
+    assert!(e.contains("18874368"), "{e}");
+    // The view's schema offers exactly those parts.
+    let tool = app::listed_tools()
+        .into_iter()
+        .find(|t| t.name == app::ASSET)
+        .unwrap();
+    let schema = Value::Object((*tool.input_schema).clone());
+    assert_eq!(schema["properties"]["part"]["maximum"], json!(71));
     // Nothing was bound, locked or created for any of it.
     assert!(lib.l.state.lock().await.bound.is_none());
     assert!(!lib.root.join("library").exists());
@@ -2871,8 +2901,8 @@ fn panel_module_is_fixed_ordered_and_safe_to_embed() {
     assert_eq!(library.matches("<script").count(), 1, "one script element");
     assert!(library.contains("<script type=\"module\">"));
     assert_eq!(
-        HOME_URI, "ui://openpaperdesign/home-22.html",
-        "versioned for Theme's line height and letter spacing (a changed in-panel editor)"
+        HOME_URI, "ui://openpaperdesign/home-23.html",
+        "versioned for the bundled font families (a changed in-panel editor)"
     );
 }
 

@@ -17,25 +17,26 @@
 //!   coalesced undo step per picker interaction through the same transactions (instances get
 //!   the inspector's overrides), so the canvas's save, conflict and Undo are the existing ones.
 //!   No named value or store is created; gradients and text-run colours are left alone.
-//! - A text style's "Aa" button changes that style (its size, or its face among Inter's four)
-//!   wherever the Paper's text uses it (the same reason: selecting its layers edits their whole
-//!   text, not only the characters in that style). It reaches exactly the characters that had
-//!   it when the change began, on unlocked text layers: a layer whose every character has it
+//! - A text style's "Aa" button changes that style (its size, or its face among its family's
+//!   four) wherever the Paper's text uses it (the same reason: selecting its layers edits their
+//!   whole text, not only the characters in that style). It reaches exactly the characters that
+//!   had it when the change began, on unlocked text layers: a layer whose every character has it
 //!   changes its own size or face, as the Design panel's whole-layer edits do; otherwise a
 //!   range style covers exactly those characters (`TextStyle::apply_range`, keeping every
 //!   other value a range has). One editor use is one undo step, laid out again by the existing
-//!   text layout; instances get overrides. No font family can be chosen (the renderer draws
-//!   Inter only), and no named style is created.
-//! - The same editor shows and sets the style's layers' line height (a percentage of the size,
-//!   or Auto, the font's own) and letter spacing (px), the whole-layer metrics the renderer
-//!   draws and the Design panel's LH and LS already edit (revision 22). The model has them per
-//!   layer only, so they are offered only when every one of the style's layers has the style
-//!   throughout; a style that is only part of some layer's text says so (`RANGE_METRICS`) and
-//!   nothing changes. Differing values show as Mixed, never a made-up common one; an entry
-//!   that isn't a supported value (text, infinities, beyond the Design panel's bounds) is
-//!   dropped and changes nothing. The same preview admission, locks, one-step Undo and
-//!   autosave hold as the size and face.
-//! - Font: the one family the renderer draws (Inter, bundled, in four faces). Read-only.
+//!   text layout; instances get overrides. No named style is created.
+//! - The same editor shows and sets the style's font family (revision 23: Inter or Geist Mono,
+//!   the bundled families the renderer draws), and its layers' line height (a percentage of
+//!   the size, or Auto, the font's own) and letter spacing (px), the whole-layer metrics the
+//!   renderer draws and the Design panel's LH and LS already edit (revision 22). The model has
+//!   all three per layer only, so they are offered only when every one of the style's layers
+//!   has the style throughout; a style that is only part of some layer's text says so
+//!   (`RANGE_METRICS`) and nothing changes. Differing values show as Mixed, never a made-up
+//!   common one; an entry that isn't a supported value (text, infinities, beyond the Design
+//!   panel's bounds) is dropped and changes nothing. The same preview admission, locks,
+//!   one-step Undo and autosave hold as the size and face.
+//! - Fonts: the bundled families (Inter and Geist Mono, four faces each) and which of them the
+//!   Paper's text uses. Read-only; a style's family is set from its Aa editor.
 //! - Named tokens and the project's `DESIGN.md` / `design.md`: not available. The document has
 //!   no token store; this view has no admitted project folder (OPD never infers one), and the
 //!   guide reading and editing itself isn't built (R19–R21). Both are status rows with their
@@ -43,14 +44,15 @@
 
 use super::{inspector, section};
 use crate::editor::Editor;
-use crate::model::{CharStyle, Color, NodeId, NodeKind, Paint};
+use crate::model::{CharStyle, Color, FontFamily, NodeId, NodeKind, Paint};
 use crate::theme;
 use egui::{RichText, Ui};
 use std::collections::{HashMap, HashSet};
 
-/// A text style a Paper uses: its size in hundredths of a point (so equal sizes group), bold
-/// and italic.
-pub type StyleKey = (i64, bool, bool);
+/// A text style a Paper uses: its size in hundredths of a point (so equal sizes group), bold,
+/// italic and the layer's font family (two styles alike but for their family are two styles:
+/// they are drawn with different faces).
+pub type StyleKey = (i64, bool, bool, FontFamily);
 
 /// How many colours the list shows before saying how many more there are.
 const MAX_COLOURS: usize = 24;
@@ -68,7 +70,7 @@ pub fn text_styles(ed: &Editor) -> Vec<(StyleKey, Vec<NodeId>)> {
             continue;
         }
         for c in inspector::char_styles(n) {
-            let key = style_key(c);
+            let key = style_key(c, n.text_style.family);
             match out.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, ids)) if !ids.contains(&id) => ids.push(id),
                 Some(_) => {}
@@ -80,9 +82,26 @@ pub fn text_styles(ed: &Editor) -> Vec<(StyleKey, Vec<NodeId>)> {
     out
 }
 
-/// The style key of a character's resolved style.
-fn style_key(c: CharStyle) -> StyleKey {
-    ((c.size * 100.0).round() as i64, c.bold, c.italic)
+/// The style key of a character's resolved style in a layer of `family`.
+fn style_key(c: CharStyle, family: FontFamily) -> StyleKey {
+    ((c.size * 100.0).round() as i64, c.bold, c.italic, family)
+}
+
+/// The bundled families the shown Paper's text layers use, each with how many layers.
+fn families_in_use(ed: &Editor) -> Vec<(FontFamily, usize)> {
+    FontFamily::ALL
+        .into_iter()
+        .map(|f| {
+            let n = ed
+                .doc
+                .nodes
+                .values()
+                .filter(|n| matches!(n.kind, NodeKind::Text { .. }) && n.text_style.family == f)
+                .count();
+            (f, n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
 }
 
 /// Every distinct solid fill and stroke colour the shown Paper's layers use, the most used
@@ -113,8 +132,9 @@ pub fn colours(ed: &Editor) -> Vec<(Color, Vec<NodeId>)> {
     out
 }
 
-/// A text style as people read it: "48 · Bold", "13.5 · Italic".
-pub fn style_label((size, bold, italic): StyleKey) -> String {
+/// A text style as people read it: "48 · Bold", "13.5 · Italic"; another family than Inter
+/// after it, "14 · Regular · Geist Mono".
+pub fn style_label((size, bold, italic, family): StyleKey) -> String {
     let pt = size as f64 / 100.0;
     let size = if pt.fract() == 0.0 {
         format!("{pt:.0}")
@@ -127,7 +147,11 @@ pub fn style_label((size, bold, italic): StyleKey) -> String {
         (false, true) => "Italic",
         (true, true) => "Bold Italic",
     };
-    format!("{size} · {face}")
+    if family.is_default() {
+        format!("{size} · {face}")
+    } else {
+        format!("{size} · {face} · {}", family.name())
+    }
 }
 
 /// The Theme view, under the left panel's switch.
@@ -145,7 +169,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
             gap(ui);
             used_colours(ui, ed);
             gap(ui);
-            status(ui);
+            status(ui, ed);
             gap(ui);
             details(ui);
         });
@@ -176,8 +200,8 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
     header(
         ui,
         "Text styles",
-        "The sizes and faces this Paper's text uses. Choose one to select that text; its Aa \
-         button changes that style wherever this Paper uses it.",
+        "The sizes, faces and font families this Paper's text uses. Choose one to select that \
+         text; its Aa button changes that style wherever this Paper uses it.",
     );
     let key = restyle_key();
     let mut active: Option<Restyle> = ui.ctx().data(|d| d.get_temp(key));
@@ -303,10 +327,10 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
 
 /// Apply `change` to the text style `style` (its editor's popup `popup`), continuing the use
 /// under way (`active`) or beginning one: a later change of a use is tried on a preview, a
-/// first one admitted whole by [`fresh_restyle`]; a line height or letter spacing needs every
-/// target to be a whole layer. A refused change applies nothing, closes the editor and says
-/// why in the status line. The one path for the editor's fields and for a metric finished
-/// after its field went away ([`finish_draft`]).
+/// first one admitted whole by [`fresh_restyle`]; a font family, line height or letter spacing
+/// needs every target to be a whole layer. A refused change applies nothing, closes the editor
+/// and says why in the status line. The one path for the editor's fields and for a metric
+/// finished after its field went away ([`finish_draft`]).
 fn apply_style_change(
     ctx: &egui::Context,
     ed: &mut Editor,
@@ -323,8 +347,8 @@ fn apply_style_change(
         Some(a) if a.now == style => {
             // Each later change of a use is tried on a copy too: one that would reach a locked
             // layer isn't applied, and the use ends (its earlier changes stay, one step). A
-            // metric needs every frozen target to be a whole layer.
-            if change.is_metric() && !metrics(ed, &a.targets).eligible {
+            // family or metric needs every frozen target to be a whole layer.
+            if change.whole_layer() && !metrics(ed, &a.targets).eligible {
                 reason = RANGE_METRICS;
                 ed.history.seal();
                 None
@@ -341,7 +365,7 @@ fn apply_style_change(
             }
             let fresh = fresh_restyle(ed, links, style, popup, change);
             if fresh.is_none()
-                && change.is_metric()
+                && change.whole_layer()
                 && !metrics(ed, &style_targets(ed, style)).eligible
             {
                 reason = RANGE_METRICS;
@@ -352,9 +376,11 @@ fn apply_style_change(
     match next {
         Some(mut r) => {
             restyle(ed, &r, change);
+            let (size, b, i, family) = r.now;
             r.now = match change {
-                StyleChange::Size(v) => ((v * 100.0).round() as i64, r.now.1, r.now.2),
-                StyleChange::Face { bold, italic } => (r.now.0, bold, italic),
+                StyleChange::Size(v) => ((v * 100.0).round() as i64, b, i, family),
+                StyleChange::Face { bold, italic } => (size, bold, italic, family),
+                StyleChange::Family(f) => (size, b, i, f),
                 // A layer metric isn't part of the style's key: the row stays where it is.
                 StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => r.now,
             };
@@ -473,7 +499,7 @@ fn finish_draft(
         let unchanged = match change {
             StyleChange::LineHeight(lh) => shown.line_height == Some(lh),
             StyleChange::LetterSpacing(ls) => shown.letter_spacing == Some(ls),
-            StyleChange::Size(_) | StyleChange::Face { .. } => false,
+            StyleChange::Size(_) | StyleChange::Face { .. } | StyleChange::Family(_) => false,
         };
         if !unchanged {
             apply_style_change(ctx, ed, links, active, d.style, change, d.popup);
@@ -505,37 +531,40 @@ struct StyleTarget {
     ranges: Vec<(usize, usize)>,
 }
 
-/// One change from a text style's editor: its size, or its face (Inter's four), which a range
-/// can take; or a paragraph metric, which only a whole text layer has (`TextStyle`'s
-/// `line_height`, a multiple of the size, `None` for the font's own, shown as Auto; and
-/// `letter_spacing`, px added after each character), as the Design panel's LH and LS edit them.
+/// One change from a text style's editor: its size, or its face (its family's four), which a
+/// range can take; or what only a whole text layer has: its font family (`TextStyle::family`)
+/// or a paragraph metric (`line_height`, a multiple of the size, `None` for the font's own,
+/// shown as Auto; and `letter_spacing`, px added after each character), as the Design panel's
+/// Font, LH and LS edit them.
 #[derive(Clone, Copy, PartialEq)]
 enum StyleChange {
     Size(f64),
     Face { bold: bool, italic: bool },
+    Family(FontFamily),
     LineHeight(Option<f64>),
     LetterSpacing(f64),
 }
 
 impl StyleChange {
-    /// A whole-layer paragraph metric (not something a range of characters can have).
-    fn is_metric(self) -> bool {
+    /// A whole layer's own value (not something a range of characters can have): its family or
+    /// a paragraph metric.
+    fn whole_layer(self) -> bool {
         matches!(
             self,
-            StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_)
+            StyleChange::Family(_) | StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_)
         )
     }
 }
 
-/// Why a style's line height and letter spacing can't be changed from Theme (the editor's
-/// note, and the status line if it is tried anyway).
-pub const RANGE_METRICS: &str = "Line height and letter spacing belong to a whole text layer, \
-                                 and only part of some layer's text is in this style. Set them \
-                                 per layer in the Design panel.";
+/// Why a style's font family, line height and letter spacing can't be changed from Theme (the
+/// editor's note, and the status line if it is tried anyway).
+pub const RANGE_METRICS: &str = "Font family, line height and letter spacing belong to a whole \
+                                 text layer, and only part of some layer's text is in this \
+                                 style. Set them per layer in the Design panel.";
 
 /// Line height and letter spacing as a style's editor shows them, read from its target layers
 /// (`None`: they differ, Mixed). `eligible` when every target is a whole text layer: only then
-/// can Theme change them.
+/// can Theme change them, or the targets' family.
 struct Metrics {
     line_height: Option<Option<f64>>,
     letter_spacing: Option<f64>,
@@ -602,7 +631,7 @@ fn parse_letter_spacing(s: &str) -> Option<f64> {
     (n.is_finite() && (-50.0..=200.0).contains(&n)).then_some(n)
 }
 
-/// The faces Theme offers: the bundled Inter's four, as the renderer draws them.
+/// The faces Theme offers: each bundled family's four, as the renderer draws them.
 const FACES: [(&str, bool, bool); 4] = [
     ("Regular", false, false),
     ("Bold", true, false),
@@ -771,8 +800,9 @@ fn fresh_restyle(
         stamp: 0,
         popup,
     };
-    // A line height or letter spacing belongs to whole layers only: never a part of a subset.
-    if change.is_metric() && !metrics(&probe, &r.targets).eligible {
+    // A family, line height or letter spacing belongs to whole layers only: never a part of a
+    // subset.
+    if change.whole_layer() && !metrics(&probe, &r.targets).eligible {
         return None;
     }
     if reaches_locked(&probe, links, &style_groups(&probe, &r.targets)) {
@@ -807,6 +837,34 @@ fn locked_differ(ed: &Editor, probe: &Editor) -> bool {
         .nodes
         .keys()
         .any(|id| ed.doc.is_effectively_locked(*id) && probe.doc.get(*id) != ed.doc.get(*id))
+}
+
+/// Whether `edit`, a whole-layer typography change of the text layers `ids` from the Design
+/// panel (its Font), would change any effectively locked layer, found as Theme finds it for
+/// its own family (R67–R69): the inheritance foresight ([`reaches_locked`] on the layers' font
+/// and text box, [`style_groups`]) and `edit` itself tried on a preview (`Editor::preview`:
+/// the document, open transaction and text edit as they stand, so an open draft's commit and
+/// every fit, override and fixup the edit brings count), compared by [`locked_differ`]. A
+/// locked layer among `ids` counts too. Nothing of the live editor is touched.
+pub(super) fn text_edit_reaches_locked(
+    ed: &Editor,
+    ids: &[NodeId],
+    edit: impl FnOnce(&mut Editor),
+) -> bool {
+    let targets: Vec<StyleTarget> = ids
+        .iter()
+        .map(|&id| StyleTarget {
+            id,
+            whole: true,
+            ranges: Vec::new(),
+        })
+        .collect();
+    if reaches_locked(ed, &inheritors(ed), &style_groups(ed, &targets)) {
+        return true;
+    }
+    let mut probe = ed.preview();
+    edit(&mut probe);
+    locked_differ(ed, &probe)
 }
 
 /// A row's swatch or "Aa" whose change Theme refuses (`reason`): drawn quietly by `paint`, the
@@ -845,7 +903,8 @@ fn style_targets(ed: &Editor, style: StyleKey) -> Vec<StyleTarget> {
         if ed.doc.is_effectively_locked(id) {
             continue;
         }
-        let at = |i: usize| style_key(n.text_style.char_style(i, *font_size, Color::INK));
+        let family = n.text_style.family;
+        let at = |i: usize| style_key(n.text_style.char_style(i, *font_size, Color::INK), family);
         let len = text.chars().count();
         if len == 0 {
             // No characters: the layer's own style is the one listed.
@@ -888,8 +947,8 @@ fn style_targets(ed: &Editor, style: StyleKey) -> Vec<StyleTarget> {
 /// it closes): a whole layer's own size or face (its ranges' values for it dropped, as the
 /// Design panel's whole-layer edits drop them), or a range style over exactly its ranges
 /// (`TextStyle::apply_range`, which keeps every other value a range has: colour, underline,
-/// strike); or a whole layer's own line height or letter spacing, its ranges untouched (only
-/// ever whole layers: see [`RANGE_METRICS`]). Text layers are laid out again
+/// strike); or a whole layer's own font family, line height or letter spacing, its ranges
+/// untouched (only ever whole layers: see [`RANGE_METRICS`]). Text layers are laid out again
 /// (`Editor::fit_text`: width kept unless it grows to fit its text); edits inside instances
 /// become overrides, under the Design panel's field names.
 fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
@@ -898,6 +957,7 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
     let field = match change {
         StyleChange::Size(_) => "font size",
         StyleChange::Face { .. } => "font",
+        StyleChange::Family(_) => "font family",
         StyleChange::LineHeight(_) => "line height",
         StyleChange::LetterSpacing(_) => "letter spacing",
     };
@@ -929,18 +989,20 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
                         }
                         n.text_style.normalize();
                     }
-                    // The layer's own metric, as the Design panel's LH and LS set it; its ranges
-                    // are left exactly as they are.
+                    // The layer's own family or metric, as the Design panel's Font, LH and LS
+                    // set it; its ranges (sizes, faces, colours, marks) are left exactly as
+                    // they are, and its text too.
+                    StyleChange::Family(f) => n.text_style.family = f,
                     StyleChange::LineHeight(lh) => n.text_style.line_height = lh,
                     StyleChange::LetterSpacing(ls) => n.text_style.letter_spacing = ls,
                 }
-            } else if change.is_metric() {
-                // Never reached: a metric is refused unless every target is a whole layer
-                // (`RANGE_METRICS`), so no range is ever given one.
+            } else if change.whole_layer() {
+                // Never reached: a family or metric is refused unless every target is a whole
+                // layer (`RANGE_METRICS`), so no range is ever given one.
             } else {
                 // Only the value that changes: a face from Regular to Bold leaves italic as the
                 // characters have it, without writing it into their ranges.
-                let (_, was_bold, was_italic) = r.now;
+                let (_, was_bold, was_italic, _) = r.now;
                 for &(a, b) in &t.ranges {
                     n.text_style.apply_range(a, b, |sp| match change {
                         StyleChange::Size(v) => sp.size = Some(v),
@@ -952,7 +1014,9 @@ fn restyle(ed: &mut Editor, r: &Restyle, change: StyleChange) {
                                 sp.italic = Some(italic);
                             }
                         }
-                        StyleChange::LineHeight(_) | StyleChange::LetterSpacing(_) => {}
+                        StyleChange::Family(_)
+                        | StyleChange::LineHeight(_)
+                        | StyleChange::LetterSpacing(_) => {}
                     });
                 }
             }
@@ -977,11 +1041,11 @@ fn style_glyph(ui: &Ui, slot: egui::Rect, color: egui::Color32) {
 }
 
 /// A text style's editor: its "Aa" button at `slot`, taking no room in the row (the row stays
-/// the selecting target around it), and the small popup it opens: the style's size and Inter's
-/// four faces, nothing the renderer can't draw, then its layers' line height and letter
-/// spacing (`shown`: a value, Auto or Mixed; unavailable, with the reason, when the style is
-/// only part of some layer's text). `id` is the button's own identity, independent of the
-/// row's place.
+/// the selecting target around it), and the small popup it opens: the style's size, its
+/// family's four faces and the bundled families, nothing the renderer can't draw, then its
+/// layers' line height and letter spacing (`shown`: a value, Auto or Mixed; the family and
+/// metrics unavailable, with the reason, when the style is only part of some layer's text).
+/// `id` is the button's own identity, independent of the row's place.
 fn style_editor(
     ui: &mut Ui,
     id: egui::Id,
@@ -1009,7 +1073,7 @@ fn style_editor(
         "Change {label} wherever this Paper's text uses it ({count} {layers}), as one undo \
          step. Locked layers keep theirs."
     ));
-    let (_, bold, italic) = style;
+    let (_, bold, italic, family) = style;
     let mut change = None;
     let mut typing = None;
     let mut drawn = false;
@@ -1039,7 +1103,12 @@ fn style_editor(
                     }
                 }
             });
-            note(ui, "Inter only: the canvas draws its four faces.");
+            // The bundled families, the style's own selected: a whole layer's value, so only
+            // offered when every layer in the style has it throughout (the note below says why
+            // not otherwise).
+            if let Some(f) = family_choice(ui, family, shown.eligible) {
+                change = Some(StyleChange::Family(f));
+            }
             ui.add_space(4.0);
             // The whole layers' paragraph metrics: a value, Auto, or Mixed (they differ; a value
             // entered then sets it for all of them). Nothing is read into a common number.
@@ -1075,6 +1144,30 @@ fn style_editor(
         typing,
         drawn,
     }
+}
+
+/// The bundled font families as one row of choices, `now` selected (unavailable, in the
+/// tertiary colour, unless `enabled`). Returns another family chosen. Each choice is an
+/// ordinary focusable button with its family's name, so it is reached and pressed from the
+/// keyboard like the faces above it.
+pub(super) fn family_choice(ui: &mut Ui, now: FontFamily, enabled: bool) -> Option<FontFamily> {
+    let mut chosen = None;
+    ui.horizontal_wrapped(|ui| {
+        for f in FontFamily::ALL {
+            let on = f == now;
+            let b = egui::Button::selectable(on, f.name());
+            let r = ui.add_enabled(enabled, b);
+            let r = if f.is_monospace() {
+                r.on_hover_text("Monospaced, for code, data and labels. Bundled (SIL OFL 1.1).")
+            } else {
+                r.on_hover_text("The default family. Bundled (SIL OFL 1.1).")
+            };
+            if r.clicked() && !on {
+                chosen = Some(f);
+            }
+        }
+    });
+    chosen
 }
 
 /// What one style's editor did this frame.
@@ -1406,20 +1499,39 @@ fn locked_swatch(ui: &Ui, swatch: egui::Rect, c: Color) {
         .rect(swatch, 3.0, super::c32(c), edge, egui::StrokeKind::Inside);
 }
 
-/// One status row each: the font the canvas draws, and the two things Theme can't do here.
-fn status(ui: &mut Ui) {
+/// The Fonts status row's value and tooltip: the bundled families, and which of them the shown
+/// Paper's text layers use (`in_use`, from [`families_in_use`]).
+pub fn fonts_status(in_use: &[(FontFamily, usize)]) -> (String, String) {
+    let value = FontFamily::ALL.map(|f| f.name()).join(" · ");
+    let used = if in_use.is_empty() {
+        "No text on this Paper.".to_owned()
+    } else {
+        let list: Vec<String> = in_use
+            .iter()
+            .map(|(f, n)| {
+                let layers = if *n == 1 { "layer" } else { "layers" };
+                format!("{} ({n} {layers})", f.name())
+            })
+            .collect();
+        format!("This Paper's text uses {}.", list.join(" and "))
+    };
+    let tip = format!(
+        "Bundled with the app (SIL OFL 1.1), each in Regular, Bold, Italic and Bold Italic. The \
+         canvas draws these only; a character Geist Mono lacks is drawn in Inter. {used} A \
+         style's Aa button, or the Design panel's Font, sets a layer's family."
+    );
+    (value, tip)
+}
+
+/// One status row each: the fonts the canvas draws, and the two things Theme can't do here.
+fn status(ui: &mut Ui, ed: &Editor) {
     header(
         ui,
         "System",
         "What this canvas's design system has, and what it hasn't.",
     );
-    status_row(
-        ui,
-        "Font",
-        "Inter · 4 faces",
-        "Inter Regular, Bold, Italic and Bold Italic, bundled (SIL OFL 1.1). The canvas draws \
-         these faces only.",
-    );
+    let (value, tip) = fonts_status(&families_in_use(ed));
+    status_row(ui, "Fonts", &value, &tip);
     status_row(
         ui,
         "Named tokens",
@@ -1444,8 +1556,8 @@ fn details(ui: &mut Ui) {
         .show(ui, |ui| {
             note(
                 ui,
-                "Fonts: the canvas draws the bundled Inter faces only, so another family \
-                 can't be chosen.",
+                "Fonts: the canvas draws the bundled Inter and Geist Mono faces only; no system \
+                 or uploaded font can be chosen. A family belongs to a whole text layer.",
             );
             note(
                 ui,
@@ -1605,7 +1717,7 @@ mod metric_tests {
         doc.nodes.insert(part, n);
         doc.root.push(part);
         let mut ed = Editor::new(doc);
-        let style = (2000, false, false);
+        let style = (2000, false, false, FontFamily::Inter);
         let both = style_targets(&ed, style);
         assert_eq!(both.len(), 2);
         assert!(!metrics(&ed, &both).eligible, "part of `part` only");
@@ -1644,6 +1756,101 @@ mod metric_tests {
             None,
             "Auto"
         );
+    }
+
+    /// Revision 23: a family is part of a style's identity and, like a metric, a whole layer's
+    /// value. Setting it keeps the layer's text and ranges, lays it out in the new faces, and is
+    /// refused for a style only part of some layer has.
+    #[test]
+    fn a_family_is_a_whole_layer_value_that_keeps_text_and_ranges() {
+        let text = |s: &str| NodeKind::Text {
+            text: s.into(),
+            font_size: 20.0,
+            auto_width: true,
+            align: TextAlign::Left,
+        };
+        let mut doc = Document::default();
+        let whole = doc.alloc_id();
+        let mut n = Node::new(whole, text("Æøå✓ ok"), Rect::new(0.0, 0.0, 40.0, 20.0));
+        n.text_style.spans = vec![TextSpan {
+            start: 0,
+            end: 2,
+            color: Some(Color::rgb(255, 0, 0)),
+            ..Default::default()
+        }];
+        doc.nodes.insert(whole, n);
+        doc.root.push(whole);
+        let part = doc.alloc_id();
+        let mut n = Node::new(part, text("Mixed"), Rect::new(0.0, 50.0, 40.0, 20.0));
+        n.text_style.spans = vec![TextSpan {
+            start: 0,
+            end: 2,
+            size: Some(30.0),
+            ..Default::default()
+        }];
+        doc.nodes.insert(part, n);
+        doc.root.push(part);
+        let mut ed = Editor::new(doc);
+        let inter = (2000, false, false, FontFamily::Inter);
+        let mono = (2000, false, false, FontFamily::GeistMono);
+        // Both layers have 20 Regular Inter (one only partly): not eligible, so refused whole,
+        // before anything changes.
+        let before = ed.doc.clone();
+        let links = inheritors(&ed);
+        let family = StyleChange::Family(FontFamily::GeistMono);
+        assert!(fresh_restyle(&mut ed, &links, inter, egui::Id::new("f"), family).is_none());
+        assert_eq!(ed.doc, before, "nothing changed");
+        // The whole layer alone: its family changes, its text, range and box width rule stay.
+        let alone: Vec<StyleTarget> = style_targets(&ed, inter)
+            .into_iter()
+            .filter(|t| t.whole)
+            .collect();
+        let r = Restyle {
+            from: inter,
+            now: inter,
+            targets: alone,
+            stamp: 0,
+            popup: egui::Id::new("f"),
+        };
+        let w0 = ed.doc.get(whole).unwrap().rect.w;
+        restyle(&mut ed, &r, family);
+        let n = ed.doc.get(whole).unwrap();
+        assert_eq!(n.text_style.family, FontFamily::GeistMono);
+        assert_eq!(n.kind.text().map(String::as_str), Some("Æøå✓ ok"));
+        assert_eq!(
+            n.text_style.spans,
+            before.get(whole).unwrap().text_style.spans
+        );
+        assert_ne!(n.rect.w, w0, "laid out again in Geist Mono's advances");
+        assert_eq!(
+            ed.doc.get(part),
+            before.get(part),
+            "the other layer untouched"
+        );
+        // Now its own style: listed apart from Inter's, labelled with its family.
+        let styles = text_styles(&ed);
+        assert!(
+            styles
+                .iter()
+                .any(|(k, ids)| *k == mono && ids == &vec![whole])
+        );
+        assert!(
+            styles
+                .iter()
+                .all(|(k, ids)| *k != inter || !ids.contains(&whole))
+        );
+        assert_eq!(style_label(mono), "20 · Regular · Geist Mono");
+        assert_eq!(style_label(inter), "20 · Regular");
+        assert_eq!(style_targets(&ed, mono).len(), 1);
+        // Inspection names what is in use, and changes nothing.
+        let doc = ed.doc.clone();
+        let (value, tip) = fonts_status(&families_in_use(&ed));
+        assert_eq!(value, "Inter · Geist Mono");
+        assert!(
+            tip.contains("Inter (1 layer) and Geist Mono (1 layer)"),
+            "{tip}"
+        );
+        assert_eq!(ed.doc, doc);
     }
 }
 
@@ -1735,7 +1942,7 @@ mod r69_review {
             fresh_restyle(
                 &mut ed,
                 &links,
-                (2400, false, false),
+                (2400, false, false, FontFamily::Inter),
                 egui::Id::new("r69"),
                 StyleChange::Size(32.0)
             )
@@ -1765,7 +1972,7 @@ mod r69_review {
         let r = fresh_restyle(
             &mut ed,
             &links,
-            (2400, false, false),
+            (2400, false, false, FontFamily::Inter),
             egui::Id::new("r69"),
             StyleChange::Size(32.0),
         )
@@ -1829,10 +2036,12 @@ mod r69_review {
         ed.insert_text("  ");
         let before = snapshot(&ed);
         let links = inheritors(&ed);
+        // (Styles carry their family since revision 23; Inter is these layers'.)
+        let style = (1200, false, false, FontFamily::Inter);
         let proposed = Restyle {
-            from: (1200, false, false),
-            now: (1200, false, false),
-            targets: style_targets(&ed, (1200, false, false)),
+            from: style,
+            now: style,
+            targets: style_targets(&ed, style),
             stamp: 0,
             popup: egui::Id::new("r69-cleanup"),
         };
@@ -1843,7 +2052,7 @@ mod r69_review {
         let result = fresh_restyle(
             &mut ed,
             &links,
-            (1200, false, false),
+            style,
             egui::Id::new("r69-cleanup"),
             StyleChange::Size(18.0),
         );

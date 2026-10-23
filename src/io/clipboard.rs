@@ -15,9 +15,15 @@
 //! anything happens ([`Content::Refused`]). It is recognized by its top-level `type` member,
 //! read with serde as far as the text is JSON, so a cut-off or trailing-text payload in any
 //! formatting or key order is refused too, never pasted as a text layer instead.
+//!
+//! Layers holding a font family other than Inter are written as [`LABELLED_TYPE`] version
+//! [`FAMILY_VERSION`] (labels or not): a reader of version 1 only refuses it, as it refuses any
+//! version it doesn't know, rather than pasting the layers in Inter. A version 1 or
+//! `paper-rs/clipboard` payload naming another family, and any payload naming a family this
+//! build doesn't have, is refused the same way, before anything is registered.
 
 use crate::geom::{Rect, V2};
-use crate::model::{Node, NodeId, Paint};
+use crate::model::{FontFamily, Node, NodeId, Paint};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -25,9 +31,13 @@ use std::collections::HashMap;
 pub const TYPE: &str = "paper-rs/clipboard";
 /// The layer payload with arrow labels. Not `TYPE`, so no reader of `TYPE` alone takes it.
 pub const LABELLED_TYPE: &str = "openpaperdesign/clipboard";
-/// The only version of [`LABELLED_TYPE`] this reader understands. A change of what it holds
-/// gets a new version, which earlier readers refuse.
+/// The version of [`LABELLED_TYPE`] with arrow labels and Inter text only. A change of what
+/// it holds gets a new version, which earlier readers refuse.
 pub const LABELLED_VERSION: u64 = 1;
+/// The version of [`LABELLED_TYPE`] whose layers may have a font family other than Inter
+/// (`text_style.family`); otherwise the same fields as version 1. Written only when a layer
+/// has one, so every other payload keeps its type, version and bytes.
+pub const FAMILY_VERSION: u64 = 2;
 /// The fields of a labelled payload: anything else is from a writer this reader doesn't know.
 const LABELLED_FIELDS: [&str; 7] = [
     "type", "version", "nodes", "roots", "world", "page", "assets",
@@ -113,11 +123,15 @@ pub struct Payload {
     pub assets: HashMap<String, String>,
 }
 
-/// The payload for these layers: [`LABELLED_TYPE`] (version [`LABELLED_VERSION`]) when one of
-/// them is an arrow with a label, otherwise `TYPE`, byte for byte as before.
+/// The payload for these layers: [`LABELLED_TYPE`] version [`FAMILY_VERSION`] when one of them
+/// has a font family other than Inter, else version [`LABELLED_VERSION`] when one is an arrow
+/// with a label, otherwise `TYPE`, byte for byte as before.
 pub fn encode(nodes: &[Node], roots: &[NodeId], world: &[Rect], page: Option<&str>) -> String {
+    let family = nodes.iter().any(|n| !n.text_style.family.is_default());
     let labelled = nodes.iter().any(|n| n.kind.label().is_some());
-    let (kind, version) = if labelled {
+    let (kind, version) = if family {
+        (LABELLED_TYPE, Some(FAMILY_VERSION))
+    } else if labelled {
         (LABELLED_TYPE, Some(LABELLED_VERSION))
     } else {
         (TYPE, None)
@@ -163,6 +177,11 @@ pub fn decode(text: &str) -> Content {
         if let Some(c) = decode_labelled(t) {
             return c;
         }
+        if let Some(why) = plain_family(t) {
+            return Content::Refused(format!(
+                "The clipboard's layers can't be pasted: {why}. Nothing was pasted."
+            ));
+        }
         if let Ok(p) = serde_json::from_str::<Payload>(t)
             && p.kind == TYPE
         {
@@ -207,6 +226,8 @@ fn register_assets(p: &Payload) {
 struct Header {
     /// A top-level `type` is [`LABELLED_TYPE`].
     labelled: bool,
+    /// A top-level `type` is [`TYPE`].
+    plain: bool,
     /// How many top-level `type` and `version` members it has (more than one is ambiguous).
     types: usize,
     versions: usize,
@@ -236,6 +257,9 @@ impl<'de> serde::de::Visitor<'de> for HeaderProbe<'_> {
                     let v = map.next_value::<serde_json::Value>()?;
                     if v.as_str() == Some(LABELLED_TYPE) {
                         self.0.borrow_mut().labelled = true;
+                    }
+                    if v.as_str() == Some(TYPE) {
+                        self.0.borrow_mut().plain = true;
                     }
                 }
                 "version" => {
@@ -348,14 +372,25 @@ fn decode_labelled(t: &str) -> Option<Content> {
     let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(t) else {
         return refused("they aren't complete".into());
     };
-    match fields.get("version").and_then(|v| v.as_u64()) {
-        Some(LABELLED_VERSION) => {}
+    let version = match fields.get("version").and_then(|v| v.as_u64()) {
+        Some(v @ (LABELLED_VERSION | FAMILY_VERSION)) => v,
         Some(v) => {
             return refused(format!(
                 "they are in format version {v}, which this OpenPaperDesign doesn't read"
             ));
         }
         None => return refused("they have no valid format version".into()),
+    };
+    // Every family named is one this build has, and only version 2 holds one besides Inter.
+    match families(fields.get("nodes")) {
+        Err(why) => return refused(why),
+        Ok(Some(f)) if version < FAMILY_VERSION => {
+            return refused(format!(
+                "they use the font family {}, which their format version {version} can't hold",
+                f.name()
+            ));
+        }
+        Ok(_) => {}
     }
     if let Some(k) = fields
         .keys()
@@ -381,6 +416,173 @@ fn decode_labelled(t: &str) -> Option<Content> {
         let _ = crate::assets::register(bytes);
     }
     Some(Content::Layers(p))
+}
+
+/// The font families a payload's layers (`nodes`, as JSON) name: an error when one isn't the
+/// exact name of a family this build has, else the first one other than Inter, if any.
+fn families(nodes: Option<&serde_json::Value>) -> Result<Option<FontFamily>, String> {
+    let mut other = None;
+    for n in nodes.and_then(|n| n.as_array()).into_iter().flatten() {
+        let Some(f) = n.get("text_style").and_then(|t| t.get("family")) else {
+            continue;
+        };
+        match f.as_str().and_then(FontFamily::from_name) {
+            None => {
+                return Err(format!(
+                    "they name the font family {f}, which this app doesn't have"
+                ));
+            }
+            Some(known) if !known.is_default() => {
+                other.get_or_insert(known);
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(other)
+}
+
+/// Where [`FamilyProbe`] is in a layer payload: its top level, its `nodes` list, one node, or
+/// one node's `text_style`.
+#[derive(Clone, Copy)]
+enum Level {
+    Top,
+    Nodes,
+    Node,
+    Style,
+}
+
+/// Every `nodes[*].text_style.family` member of a layer payload, each value as written (`None`
+/// when the text ends inside it), read
+/// with serde member by member as far as the text is JSON (as [`Header`] reads the top level):
+/// a cut-off text still shows a family read before its end, and every repeated `text_style` or
+/// `family` member is seen, not only the last (which is all `Value` keeps). Names are compared
+/// as decoded, so an escaped spelling of `family` or `text_style` is the same member. Only
+/// members count: a layer's text, a name or any other string that merely contains those words
+/// is never taken for one.
+#[derive(Clone, Copy)]
+struct FamilyProbe<'a> {
+    found: &'a std::cell::RefCell<Vec<Option<serde_json::Value>>>,
+    level: Level,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for FamilyProbe<'_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for FamilyProbe<'_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if let Level::Nodes = self.level {
+            let node = FamilyProbe {
+                level: Level::Node,
+                ..self
+            };
+            while seq.next_element_seed(node)?.is_some() {}
+        } else {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        }
+        Ok(())
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            let inner = match (self.level, key.as_str()) {
+                (Level::Top, "nodes") => Some(Level::Nodes),
+                (Level::Node, "text_style") => Some(Level::Style),
+                _ => None,
+            };
+            match inner {
+                Some(level) => map.next_value_seed(FamilyProbe { level, ..self })?,
+                None if matches!(self.level, Level::Style) && key == "family" => {
+                    // Counted before its value is read: a text cut off inside it still names
+                    // a family (one that can't be read).
+                    self.found.borrow_mut().push(None);
+                    let v = map.next_value::<serde_json::Value>()?;
+                    if let Some(last) = self.found.borrow_mut().last_mut() {
+                        *last = Some(v);
+                    }
+                }
+                None => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `family` members of `t`'s layers ([`FamilyProbe`]): as much of it as is JSON (its errors
+/// only end the reading).
+fn family_members(t: &str) -> Vec<Option<serde_json::Value>> {
+    use serde::de::DeserializeSeed;
+    let found = std::cell::RefCell::new(Vec::new());
+    let mut de = serde_json::Deserializer::from_str(t);
+    let probe = FamilyProbe {
+        found: &found,
+        level: Level::Top,
+    };
+    let _ = probe.deserialize(&mut de);
+    found.into_inner()
+}
+
+/// Why a `paper-rs/clipboard` payload (unversioned: this writer never puts a font family in
+/// one) that names a family isn't pasted; `None` for any other text, decoded as before. Each
+/// `family` member counts, read member by member before anything else ([`family_members`]), so
+/// neither a cut-off text (R177: the same payload without its final brace became a text layer)
+/// nor a repeated `text_style` hiding the first one (likewise) slips by: one besides Inter, or
+/// one this build doesn't have, is refused whatever follows. A payload naming only Inter is
+/// taken only whole and with no member named twice.
+fn plain_family(t: &str) -> Option<String> {
+    if !header(t).plain {
+        return None;
+    }
+    let named = family_members(t);
+    if named.is_empty() {
+        return None;
+    }
+    for f in &named {
+        let Some(f) = f else {
+            return Some("they name a font family that isn't complete".into());
+        };
+        match f.as_str().and_then(FontFamily::from_name) {
+            None => {
+                return Some(format!(
+                    "they name the font family {f}, which this app doesn't have"
+                ));
+            }
+            Some(known) if !known.is_default() => {
+                return Some(format!(
+                    "they use the font family {}, which their format ({TYPE}) can't hold",
+                    known.name()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    check_unambiguous(t).err()
 }
 
 /// The payload's images: every one its layers use is in it, and every one it holds is whole
@@ -484,4 +686,274 @@ pub fn bounds(world: &[Rect]) -> Option<Rect> {
 
 pub fn center_offset(world: &[Rect], at: V2) -> V2 {
     bounds(world).map_or(V2::ZERO, |b| (at - b.center()).round())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NodeKind, TextAlign};
+    use serde_json::{Value, json};
+
+    /// One text layer in `family` (with an image fill when `image` names one).
+    fn text_layer(family: FontFamily, image: Option<&str>) -> Node {
+        let mut n = Node::new(
+            NodeId(1),
+            NodeKind::Text {
+                text: "Æøå✓ ok".into(),
+                font_size: 18.0,
+                auto_width: true,
+                align: TextAlign::Left,
+            },
+            Rect::new(10.0, 10.0, 80.0, 24.0),
+        );
+        n.text_style.family = family;
+        if let Some(asset) = image {
+            n.style.fills.push(Paint::Image {
+                asset: asset.into(),
+                mode: Default::default(),
+                opacity: 1.0,
+            });
+        }
+        n
+    }
+
+    fn payload(n: &Node) -> String {
+        encode(std::slice::from_ref(n), &[n.id], &[n.rect], None)
+    }
+
+    fn refused(c: Content) -> String {
+        match c {
+            Content::Refused(why) => why,
+            Content::Layers(_) => panic!("pasted as layers"),
+            Content::Foreign(..) => panic!("pasted as foreign layers"),
+            Content::Text(_) => panic!("pasted as text"),
+        }
+    }
+
+    #[test]
+    fn inter_payloads_keep_their_format_and_another_family_gets_version_2() {
+        // Inter: `paper-rs/clipboard`, unversioned, no family: as before families existed.
+        let inter = payload(&text_layer(FontFamily::Inter, None));
+        assert!(
+            inter.starts_with(&format!("{{\"type\":\"{TYPE}\",\"nodes\"")),
+            "{inter}"
+        );
+        assert!(!inter.contains("family") && !inter.contains("\"version\""));
+        // Geist Mono: the OpenPaperDesign type, version 2, and it pastes as itself.
+        let mono = payload(&text_layer(FontFamily::GeistMono, None));
+        let head = format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{FAMILY_VERSION},");
+        assert!(mono.starts_with(&head), "{mono}");
+        assert!(mono.contains("\"family\":\"Geist Mono\""));
+        let Content::Layers(p) = decode(&mono) else {
+            panic!("pastes")
+        };
+        assert_eq!(p.nodes, vec![text_layer(FontFamily::GeistMono, None)]);
+        // A labelled arrow alongside: still version 2 (version 1 has no families).
+        let mut arrow = Node::new(
+            NodeId(2),
+            NodeKind::Connector {
+                points: vec![V2::ZERO, crate::geom::v2(40.0, 0.0)],
+                start: None,
+                end: None,
+                route: Default::default(),
+                start_head: Default::default(),
+                end_head: Default::default(),
+                label: Some("writes".into()),
+            },
+            Rect::new(0.0, 0.0, 40.0, 0.0),
+        );
+        let both = encode(
+            &[text_layer(FontFamily::GeistMono, None), arrow.clone()],
+            &[NodeId(1), NodeId(2)],
+            &[Rect::new(10.0, 10.0, 80.0, 24.0), arrow.rect],
+            None,
+        );
+        assert!(both.starts_with(&head), "{both}");
+        // A labelled arrow alone: version 1, exactly as before.
+        arrow.id = NodeId(3);
+        let labelled = encode(
+            std::slice::from_ref(&arrow),
+            &[arrow.id],
+            &[arrow.rect],
+            None,
+        );
+        let v1 = format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{LABELLED_VERSION},");
+        assert!(labelled.starts_with(&v1) && !labelled.contains("family"));
+    }
+
+    #[test]
+    fn an_underdeclared_or_unknown_family_is_refused_before_anything_is_registered() {
+        // A unique image so its registration can be told apart.
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([17, 174, 91, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let bytes = bytes.into_inner();
+        let id = crate::assets::hash(&bytes);
+        let b64 = crate::assets::base64(&bytes);
+        let mono = text_layer(FontFamily::GeistMono, Some(&id));
+        let with_image = |v: &mut Value| v["assets"] = json!({ id.clone(): b64.clone() });
+        let base: Value = serde_json::from_str(&payload(&mono)).unwrap();
+        let edit = |f: &dyn Fn(&mut Value)| {
+            let mut v = base.clone();
+            with_image(&mut v);
+            f(&mut v);
+            v.to_string()
+        };
+        let family = |f: Value| edit(&move |v| v["nodes"][0]["text_style"]["family"] = f.clone());
+        let cases: Vec<(&str, String)> = vec![
+            // An older writer's version 1 can't hold a family: it never wrote one.
+            (
+                "version 1",
+                edit(&|v| v["version"] = json!(LABELLED_VERSION)),
+            ),
+            // Unknown or misspelt, at the family version.
+            ("unknown", family(json!("Helvetica"))),
+            ("spelling", family(json!("geist mono"))),
+            ("not text", family(json!(4))),
+            // Unversioned `paper-rs/clipboard` with a family (known or not).
+            (
+                "plain known",
+                edit(&|v| {
+                    v["type"] = json!(TYPE);
+                    v.as_object_mut().unwrap().remove("version");
+                }),
+            ),
+            (
+                "plain unknown",
+                edit(&|v| {
+                    v["type"] = json!(TYPE);
+                    v.as_object_mut().unwrap().remove("version");
+                    v["nodes"][0]["text_style"]["family"] = json!("Comic Sans");
+                }),
+            ),
+            // A version this reader doesn't know.
+            ("version 3", edit(&|v| v["version"] = json!(3))),
+        ];
+        for (what, text) in cases {
+            let why = refused(decode(&text));
+            assert!(why.contains("can't be pasted"), "{what}: {why}");
+            assert!(
+                crate::assets::get(&id).is_none(),
+                "{what}: nothing registered"
+            );
+        }
+        // A family named twice can't hide one behind the other.
+        let plain = edit(&|v| {
+            v["type"] = json!(TYPE);
+            v.as_object_mut().unwrap().remove("version");
+            v["nodes"][0]["text_style"]["family"] = json!("Inter");
+        });
+        let repeated = "\"family\":\"Geist Mono\",\"family\":\"Inter\"";
+        let twice = plain.replacen("\"family\":\"Inter\"", repeated, 1);
+        assert_ne!(twice, plain);
+        refused(decode(&twice));
+        assert!(crate::assets::get(&id).is_none());
+        // The family payload itself, with its image: pasted, the image registered.
+        let Content::Layers(p) = decode(&edit(&|_| {})) else {
+            panic!("the version 2 payload pastes")
+        };
+        assert_eq!(p.nodes[0].text_style.family, FontFamily::GeistMono);
+        assert!(crate::assets::get(&id).is_some());
+    }
+
+    /// R177's probe inputs, byte for byte: an underdeclared `paper-rs/clipboard` payload naming
+    /// Geist Mono (refused before), the same cut off by its final brace, and one whose real
+    /// `text_style` is followed by a second, empty one. The last two became a text layer.
+    const UNDERDECLARED: &str = r##"{"type":"paper-rs/clipboard","nodes":[{"id":1,"name":"Text","type":"text","text":"Æøå✓","font_size":20.0,"auto_width":true,"align":"left","rect":{"x":0.0,"y":0.0,"w":80.0,"h":24.0},"style":{"fills":[{"type":"solid","color":"#1c1c1e"}],"stroke":null,"stroke_width":1.0,"corner_radius":0.0,"opacity":1.0},"visible":true,"locked":false,"text_style":{"bold":false,"italic":false,"family":"Geist Mono","letter_spacing":0.0}}],"roots":[1],"world":[{"x":0.0,"y":0.0,"w":80.0,"h":24.0}],"page":null,"assets":{}}"##;
+    const CUT_AFTER_FAMILY: &str = r##"{"type":"paper-rs/clipboard","nodes":[{"id":1,"name":"Text","type":"text","text":"Æøå✓","font_size":20.0,"auto_width":true,"align":"left","rect":{"x":0.0,"y":0.0,"w":80.0,"h":24.0},"style":{"fills":[{"type":"solid","color":"#1c1c1e"}],"stroke":null,"stroke_width":1.0,"corner_radius":0.0,"opacity":1.0},"visible":true,"locked":false,"text_style":{"bold":false,"italic":false,"family":"Geist Mono","letter_spacing":0.0}}],"roots":[1],"world":[{"x":0.0,"y":0.0,"w":80.0,"h":24.0}],"page":null,"assets":{}"##;
+    const HIDDEN_BY_REPEAT: &str = r##"{"type":"paper-rs/clipboard","nodes":[{"id":1,"name":"Text","type":"text","text":"Æøå✓","font_size":20.0,"auto_width":true,"align":"left","rect":{"x":0.0,"y":0.0,"w":80.0,"h":24.0},"style":{"fills":[{"type":"solid","color":"#1c1c1e"}],"stroke":null,"stroke_width":1.0,"corner_radius":0.0,"opacity":1.0},"visible":true,"locked":false,"text_style":{"family":"Geist Mono"},"text_style":{}}],"roots":[1],"world":[{"x":0.0,"y":0.0,"w":80.0,"h":24.0}],"page":null,"assets":{}}"##;
+
+    #[test]
+    fn a_cut_off_or_repeated_underdeclared_family_is_refused_never_pasted_as_text() {
+        assert_eq!(CUT_AFTER_FAMILY, &UNDERDECLARED[..UNDERDECLARED.len() - 1]);
+        // A unique image in the payload: refused payloads register nothing.
+        let img = image::RgbaImage::from_pixel(2, 3, image::Rgba([91, 17, 174, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let bytes = bytes.into_inner();
+        let id = crate::assets::hash(&bytes);
+        let assets = format!(
+            "\"assets\":{{\"{id}\":\"{}\"}}",
+            crate::assets::base64(&bytes)
+        );
+        let with_image = |t: &str| t.replacen("\"assets\":{}", &assets, 1);
+        let escaped_key = |t: &str| t.replacen("\"family\":", r#""fam\u0069ly":"#, 1);
+        let escaped_family = escaped_key(CUT_AFTER_FAMILY);
+        assert_ne!(
+            escaped_family, CUT_AFTER_FAMILY,
+            "the family key really is escaped"
+        );
+        let escaped_style =
+            HIDDEN_BY_REPEAT.replacen(r#","text_style":{}"#, r#","text_st\u0079le":{}"#, 1);
+        assert_ne!(
+            escaped_style, HIDDEN_BY_REPEAT,
+            "the text_style key really is escaped"
+        );
+        let cases: Vec<(&str, String)> = vec![
+            ("complete (the paired control)", UNDERDECLARED.into()),
+            ("cut after its family", CUT_AFTER_FAMILY.into()),
+            ("a repeated text_style hides it", HIDDEN_BY_REPEAT.into()),
+            ("cut, with its image", with_image(CUT_AFTER_FAMILY)),
+            ("repeated, with its image", with_image(HIDDEN_BY_REPEAT)),
+            // The same members spelled with escapes are the same members.
+            ("cut, escaped family", escaped_family),
+            ("repeated, escaped text_style", escaped_style),
+            (
+                "repeated family member",
+                UNDERDECLARED.replacen(
+                    r#""family":"Geist Mono""#,
+                    r#""family":"Geist Mono","family":"Inter""#,
+                    1,
+                ),
+            ),
+            // Cut off inside the family's own value: still a family, one that isn't complete.
+            (
+                "cut inside its family",
+                UNDERDECLARED[..UNDERDECLARED.find("Geist Mo").unwrap() + 8].to_string(),
+            ),
+        ];
+        for (what, text) in cases {
+            assert!(header(&text).plain, "{what}: its type is read");
+            let why = match decode(&text) {
+                Content::Refused(why) => why,
+                Content::Text(_) => panic!("{what}: pasted as a text layer"),
+                Content::Layers(_) => panic!("{what}: pasted as layers"),
+                Content::Foreign(..) => panic!("{what}: pasted as foreign layers"),
+            };
+            assert!(why.contains("can't be pasted"), "{what}: {why}");
+            assert!(why.contains("font family"), "{what}: {why}");
+            assert!(
+                crate::assets::get(&id).is_none(),
+                "{what}: nothing registered"
+            );
+        }
+        // Controls, decoded as before: the same historical payload without a family pastes; cut
+        // off, it is the text it always was; prose naming a family is text; a layer whose own
+        // text spells out a family member is a layer; and the version 2 payload pastes.
+        let historical = UNDERDECLARED.replacen(r#""family":"Geist Mono","#, "", 1);
+        assert!(!historical.contains("family"));
+        let Content::Layers(p) = decode(&historical) else {
+            panic!("the historical Inter payload pastes")
+        };
+        assert_eq!(p.nodes[0].text_style.family, FontFamily::Inter);
+        let cut = &historical[..historical.len() - 1];
+        assert!(matches!(decode(cut), Content::Text(t) if t == cut));
+        let prose = r#"Set "text_style":{"family":"Geist Mono"} in the payload"#;
+        assert!(matches!(decode(prose), Content::Text(t) if t == prose));
+        let mut spelled = text_layer(FontFamily::Inter, None);
+        if let NodeKind::Text { text, .. } = &mut spelled.kind {
+            *text = r#""text_style":{"family":"Geist Mono"}"#.into();
+        }
+        let p = payload(&spelled);
+        assert!(p.starts_with(&format!("{{\"type\":\"{TYPE}\"")));
+        let Content::Layers(back) = decode(&p) else {
+            panic!("a layer's own text is never taken for a member")
+        };
+        assert_eq!(back.nodes, vec![spelled]);
+        let Content::Layers(v2) = decode(&payload(&text_layer(FontFamily::GeistMono, None))) else {
+            panic!("the version 2 payload pastes")
+        };
+        assert_eq!(v2.nodes[0].text_style.family, FontFamily::GeistMono);
+        assert!(crate::assets::get(&id).is_none());
+    }
 }

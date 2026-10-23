@@ -18,7 +18,8 @@ pub const LEGACY_FORMAT: &str = "paper-rs";
 
 pub const PROJECT_VERSION: u32 = 1;
 /// v1: legacy single file. v2: page file inside a project. v3: fill layers (`fills`). A page is
-/// written as v3 unless it needs v4 ([`PAGE_VERSION_LABELS`]).
+/// written as v3 unless it needs v4 ([`PAGE_VERSION_LABELS`]) or v5
+/// ([`PAGE_VERSION_FAMILIES`]).
 pub const PAGE_VERSION: u32 = 3;
 /// v4: arrow labels (a connector's `label`). Only a page with at least one label is written as
 /// v4, so every other page keeps its v3 bytes and stays readable by older readers, and an
@@ -27,8 +28,14 @@ pub const PAGE_VERSION: u32 = 3;
 /// refusal is a deliberate downgrade limit: a labelled page doesn't open in a reader without
 /// labels.
 pub const PAGE_VERSION_LABELS: u32 = 4;
+/// v5: a text layer's font family other than Inter (`text_style.family`, see
+/// [`crate::model::FontFamily`]). Only a page with such a layer is written as v5, so every
+/// Inter page keeps its v3 or v4 bytes; an older reader (one that knows labels but not
+/// families) refuses a v5 page as newer instead of drawing its layers in Inter and saving them
+/// without their family. As for labels, that refusal is the deliberate downgrade limit.
+pub const PAGE_VERSION_FAMILIES: u32 = 5;
 /// The newest page version this build reads.
-pub const PAGE_VERSION_MAX: u32 = PAGE_VERSION_LABELS;
+pub const PAGE_VERSION_MAX: u32 = PAGE_VERSION_FAMILIES;
 
 #[derive(Debug)]
 pub enum FormatError {
@@ -139,7 +146,8 @@ struct PageFile {
 }
 
 /// Page migrations, indexed by source version: `PAGE_STEPS[0]` turns v1 into v2.
-const PAGE_STEPS: &[fn(Value) -> Value] = &[page_v1_to_v2, page_v2_to_v3, page_v3_to_v4];
+const PAGE_STEPS: &[fn(Value) -> Value] =
+    &[page_v1_to_v2, page_v2_to_v3, page_v3_to_v4, page_v4_to_v5];
 /// Formats accepted as older versions of a page.
 const PAGE_ALIASES: &[&str] = &[LEGACY_FORMAT];
 
@@ -172,9 +180,19 @@ fn page_v2_to_v3(mut v: Value) -> Value {
     v
 }
 
-/// The page version `doc` needs: v4 when an arrow has a label, else v3.
+/// Whether `doc` has a layer whose font family isn't Inter (what needs page version 5).
+pub fn has_font_family(doc: &Document) -> bool {
+    doc.nodes
+        .values()
+        .any(|n| !n.text_style.family.is_default())
+}
+
+/// The page version `doc` needs: v5 when a layer has a font family other than Inter, else v4
+/// when an arrow has a label, else v3.
 pub fn page_version_for(doc: &Document) -> u32 {
-    if doc.nodes.values().any(|n| n.kind.label().is_some()) {
+    if has_font_family(doc) {
+        PAGE_VERSION_FAMILIES
+    } else if doc.nodes.values().any(|n| n.kind.label().is_some()) {
         PAGE_VERSION_LABELS
     } else {
         PAGE_VERSION
@@ -183,6 +201,11 @@ pub fn page_version_for(doc: &Document) -> u32 {
 
 /// v3 → v4: v4 adds the optional arrow label only, so a v3 page is already a v4 page.
 fn page_v3_to_v4(v: Value) -> Value {
+    v
+}
+
+/// v4 → v5: v5 adds the optional font family only, so a v4 page is already a v5 page.
+fn page_v4_to_v5(v: Value) -> Value {
     v
 }
 
@@ -206,6 +229,7 @@ pub fn page_to_json(p: &PageData) -> String {
 pub fn page_from_json(s: &str) -> Result<PageData, FormatError> {
     let v: Value = serde_json::from_str(s).map_err(FormatError::Json)?;
     check_labels(&v)?;
+    check_families(&v)?;
     let v = migrate(v, PAGE_FORMAT, PAGE_VERSION_MAX, PAGE_ALIASES, PAGE_STEPS)?;
     let f: PageFile = serde_json::from_value(v).map_err(FormatError::Json)?;
     let max_id = f.nodes.iter().map(|n| n.id.0).max().unwrap_or(0);
@@ -257,6 +281,47 @@ fn check_labels(v: &Value) -> Result<(), FormatError> {
         }
     }
     Ok(())
+}
+
+/// A font family is a text-style field of page v5: each one stored must be the exact name of a
+/// family this build has (an unknown or misspelt one is refused, never read as Inter or any
+/// other family and saved over), and one other than Inter in a page that declares an older
+/// version (or none) is refused, since a reader without families would have drawn and saved
+/// it as Inter. An explicit "Inter" means what its absence means, at any version.
+fn check_families(v: &Value) -> Result<(), FormatError> {
+    let version = v.get("version").and_then(Value::as_u64).unwrap_or(1);
+    let Some(nodes) = v.get("nodes").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for n in nodes {
+        let Some(family) = n.get("text_style").and_then(|t| t.get("family")) else {
+            continue;
+        };
+        let id = n.get("id").map_or_else(String::new, |i| format!(" {i}"));
+        let known = family
+            .as_str()
+            .and_then(crate::model::FontFamily::from_name);
+        let Some(known) = known else {
+            return Err(FormatError::Invalid(format!(
+                "layer{id} names the font family {family}, which this app doesn't have \
+                 (it has {})",
+                family_names()
+            )));
+        };
+        if !known.is_default() && version < u64::from(PAGE_VERSION_FAMILIES) {
+            return Err(FormatError::Invalid(format!(
+                "layer{id} uses the font family {}, which needs page version \
+                 {PAGE_VERSION_FAMILIES}; this page says version {version}",
+                known.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The bundled families' names, for messages ("Inter, Geist Mono").
+pub fn family_names() -> String {
+    crate::model::FontFamily::ALL.map(|f| f.name()).join(", ")
 }
 
 /// Check the format tag and run the migration chain up to `current`.
@@ -480,16 +545,20 @@ mod tests {
             page_from_json(&x.to_string()),
             Err(FormatError::Invalid(_))
         ));
-        // Newer than v4 is refused as before.
+        // Newer than this build's newest (v5 since font families) is refused as before; a
+        // labelled page that says v5 reads (v5 has labels too) and is written back as v4.
         let mut y: Value = serde_json::from_str(&s).unwrap();
-        y["version"] = json!(5);
+        y["version"] = json!(6);
         assert!(matches!(
             page_from_json(&y.to_string()),
             Err(FormatError::TooNew {
-                version: 5,
-                supported: 4
+                version: 6,
+                supported: 5
             })
         ));
+        y["version"] = json!(5);
+        let p = page_from_json(&y.to_string()).unwrap();
+        assert_eq!(page_to_json(&p), s);
         // An unlabelled page that says v4 reads as before (and is written back as v3).
         let mut z: Value = serde_json::from_str(&page_to_json(&arrow_page(None))).unwrap();
         z["version"] = json!(4);
@@ -512,8 +581,9 @@ mod tests {
             json!(4_294_967_299_u64),
             json!(4_294_967_300_u64),
             json!(8_589_934_596_u64),
+            json!(4_294_967_301_u64),
             json!(u64::MAX),
-            json!(5),
+            json!(6),
             json!(0),
             json!(-1),
             json!(3.0),
@@ -522,11 +592,12 @@ mod tests {
         ] {
             assert!(with(bad.clone()).is_err(), "{bad} must be refused");
         }
+        // Newer than v5 (the newest since font families; it was v4 before).
         assert!(matches!(
-            with(json!(5)),
+            with(json!(6)),
             Err(FormatError::TooNew {
-                version: 5,
-                supported: 4
+                version: 6,
+                supported: 5
             })
         ));
         // Legitimate older pages still migrate: an unlabelled v3, and v1/v2 through their steps.
@@ -542,6 +613,132 @@ mod tests {
         let mut m: Value = serde_json::from_str(&Manifest::new("M").to_json()).unwrap();
         m["version"] = json!(4_294_967_297_u64);
         assert!(Manifest::from_json(&m.to_string()).is_err());
+    }
+
+    /// One page with one Unicode text layer in `family` (and, with `label`, a labelled arrow).
+    fn text_page(family: crate::model::FontFamily, label: bool) -> PageData {
+        use crate::geom::Rect;
+        use crate::model::{Color, NodeKind, TextAlign, TextSpan};
+        let mut p = arrow_page(label.then_some("writes"));
+        if !label {
+            p.doc.nodes.clear();
+            p.doc.root.clear();
+        }
+        let id = NodeId(2);
+        let mut n = Node::new(
+            id,
+            NodeKind::Text {
+                text: "Æble — øre ✓".into(),
+                font_size: 20.0,
+                auto_width: false,
+                align: TextAlign::Left,
+            },
+            Rect::new(10.0, 20.0, 160.0, 24.0),
+        );
+        n.text_style.family = family;
+        n.text_style.line_height = Some(1.4);
+        n.text_style.spans = vec![TextSpan {
+            start: 0,
+            end: 4,
+            color: Some(Color::rgb(255, 0, 0)),
+            underline: Some(true),
+            ..Default::default()
+        }];
+        p.doc.nodes.insert(id, n);
+        p.doc.root.push(id);
+        p.doc.next_id = 3;
+        p
+    }
+
+    #[test]
+    fn only_a_page_with_another_font_family_is_written_as_v5_and_reads_back_exactly() {
+        use crate::model::FontFamily;
+        // Inter pages keep their versions and bytes: no `family` key, v3 (or v4 with a label).
+        let inter = page_to_json(&text_page(FontFamily::Inter, false));
+        assert!(
+            inter.contains("\"version\": 3") && !inter.contains("family"),
+            "{inter}"
+        );
+        let labelled = page_to_json(&text_page(FontFamily::Inter, true));
+        assert!(labelled.contains("\"version\": 4") && !labelled.contains("family"));
+        // Geist Mono: v5 with the family's name, everything else (text, range, metric, fixed
+        // box) read back exactly, and written back byte for byte.
+        for label in [false, true] {
+            let p = text_page(FontFamily::GeistMono, label);
+            let s = page_to_json(&p);
+            assert!(s.contains("\"version\": 5"), "{s}");
+            assert!(s.contains("\"family\": \"Geist Mono\""), "{s}");
+            let back = page_from_json(&s).unwrap();
+            assert_eq!(back, p);
+            assert_eq!(page_to_json(&back), s);
+            // Back to Inter: written back as the Inter page it now is.
+            let mut cleared = back.clone();
+            for n in cleared.doc.nodes.values_mut() {
+                n.text_style.family = FontFamily::Inter;
+            }
+            let want = if label { &labelled } else { &inter };
+            assert_eq!(&page_to_json(&cleared), want);
+        }
+        // A v3/v4 page holding an explicit "Inter" reads as Inter (and is written without it).
+        let mut v: Value = serde_json::from_str(&inter).unwrap();
+        v["nodes"][0]["text_style"]["family"] = json!("Inter");
+        assert_eq!(
+            page_to_json(&page_from_json(&v.to_string()).unwrap()),
+            inter
+        );
+    }
+
+    #[test]
+    fn a_font_family_an_older_reader_would_drop_or_this_one_lacks_is_refused_not_read() {
+        use crate::model::FontFamily;
+        let s = page_to_json(&text_page(FontFamily::GeistMono, false));
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(&s).unwrap();
+            f(&mut v);
+            page_from_json(&v.to_string())
+        };
+        assert!(with(&|_| {}).is_ok(), "control: the v5 page itself");
+        // Declared older than v5 (an older writer never writes it; an older reader loses it).
+        for old in [json!(3), json!(4), Value::Null] {
+            let e = with(&|v| {
+                if old.is_null() {
+                    v.as_object_mut().unwrap().remove("version");
+                } else {
+                    v["version"] = old.clone();
+                }
+            })
+            .unwrap_err();
+            assert!(
+                matches!(e, FormatError::Invalid(ref m) if m.contains("version 5")),
+                "{old}: {e}"
+            );
+        }
+        // A family this build doesn't have, or not exactly its name, or not a name at all: refused
+        // (never read as Inter or a near match, so never saved over).
+        for bad in [
+            json!("Helvetica"),
+            json!("geist mono"),
+            json!("GeistMono"),
+            json!(""),
+            json!(5),
+            json!(null),
+            json!({"name": "Geist Mono"}),
+        ] {
+            let e = with(&|v| v["nodes"][0]["text_style"]["family"] = bad.clone()).unwrap_err();
+            assert!(
+                matches!(e, FormatError::Invalid(ref m) if m.contains("font family")),
+                "{e}"
+            );
+        }
+        // Newer than v5 still refused; an unsupported raw version still checked before the rest.
+        assert!(matches!(
+            with(&|v| v["version"] = json!(6)),
+            Err(FormatError::TooNew {
+                version: 6,
+                supported: 5
+            })
+        ));
+        assert!(with(&|v| v["version"] = json!(4_294_967_301_u64)).is_err());
     }
 
     #[test]

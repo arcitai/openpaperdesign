@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-23: the local source candidate's `home-22` view (unqualified; Theme also sets a text style's line height and letter spacing), after `home-21` (Theme changes a colour or text style in use, and the plugin's new architecture mark; published as `b4e9624` with R70's source acceptance, Linux renders and exact CI, not installed), after `home-20`, the whole-app workbench's first slice (contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch), installed on the Mac as `6630ec4` on 2026-10-22 with its loaded view unproven, and `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision. Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-23: the local source candidate's `home-23` view (unqualified; the editor draws, edits and saves a text layer's bundled font family, Inter or Geist Mono, and its renderer may be up to 18 MiB, sent in the same 256 KiB parts), after `home-22` (Theme also sets a text style's line height and letter spacing; its source `55638b0` passed the lead's checks and R72's review, not installed), after `home-21` (Theme changes a colour or text style in use, and the plugin's new architecture mark; published as `b4e9624` with R70's source acceptance, Linux renders and exact CI, not installed), after `home-20`, the whole-app workbench's first slice (contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch), installed on the Mac as `6630ec4` on 2026-10-22 with its loaded view unproven, and `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision. Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -255,7 +255,9 @@ primary and this panel is optional ("Edit in this view").
   before any lock, file, lease, switch or mount. The browser link is never a substitute.
   Nothing is fetched by URL or evaluated. No CSP, CORS, framing or outbound domain is added.
 - **Renderer transfer.** `openpaperdesign_app_editor_asset {part}` sends the packaged wasm in
-  sequential 262,144-byte parts, base64, 16 MiB at most. `part` must be a whole number. Each
+  sequential 262,144-byte parts, base64, 18 MiB at most (16 MiB until the 2026-10-23 source
+  candidate embedded the Geist Mono faces; the view's `panel.js` checks the same bound and
+  part count, 72). `part` must be a whole number. Each
   answer names the renderer's identity, size, part count, offset and length. The view checks
   them against its own module and stops on any mismatch or when the person leaves. It then
   calls the glue's `__wbg_init({module_or_path: bytes})`.
@@ -362,7 +364,8 @@ installed check.
   order, and exactly the images the pages use (base64, content-hash ids). Bounds: 32 MiB of
   text, 200 pages, 100 000 nodes per page and 200 000 in all, 256 images of at most 16 MiB, 64
   nesting levels. The contained manifest and pages must be exactly `paper-rs-project` version
-  1 and `paper-rs-page` version 3, checked on the raw JSON before any upstream parsing or
+  1 and `paper-rs-page` version 3 (4 for a page with arrow labels, 5 since 2026-10-23 for a page
+  with a font family other than Inter, as upstream writes them), checked on the raw JSON before any upstream parsing or
   migration (upstream would treat a malformed version as 1, narrow it and subtract from it);
   older and legacy versions aren't supported in canvas files. Each page's JSON must match what
   upstream writes back from it (numbers by value, node order by id), so an unknown, legacy or

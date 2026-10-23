@@ -28,8 +28,9 @@ const OPD_PANEL = Object.freeze({
   RELEASE: 'openpaperdesign_app_page_release',
   ASSET_NAME: 'openpaperdesign_web_bg.wasm',
   PART_BYTES: 262144,
-  MAX_PARTS: 64,
-  MAX_BYTES: 16 * 1024 * 1024,
+  // The server's `MAX_ASSET_BYTES` (18 MiB since the bundled Geist Mono faces), in parts.
+  MAX_PARTS: 72,
+  MAX_BYTES: 18 * 1024 * 1024,
   // The server's own limit for a page message (`MAX_PANEL_MESSAGE`), and the allowance within
   // it for what a host adds around a forwarded request (`HOST_OVERHEAD`).
   MAX_MESSAGE: 4 * 1024 * 1024,

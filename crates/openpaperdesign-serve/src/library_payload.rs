@@ -39,8 +39,8 @@
 use super::{MAX_ASSET_BYTES, MAX_ASSETS, MAX_MANIFEST_BYTES, MAX_PAGES, NewDocument, valid_id};
 use crate::{Kind, page_prefix, plain, valid_page_id};
 use paper_rs::project::format::{
-    PAGE_FORMAT, PAGE_VERSION, PAGE_VERSION_LABELS, PROJECT_FORMAT, PROJECT_VERSION,
-    page_from_json, page_to_json,
+    PAGE_FORMAT, PAGE_VERSION, PAGE_VERSION_FAMILIES, PAGE_VERSION_LABELS, PROJECT_FORMAT,
+    PROJECT_VERSION, page_from_json, page_to_json,
 };
 use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData, PageRef};
 use serde_json::{Map, Value, json};
@@ -214,19 +214,22 @@ fn check_file_version(v: &Value, format: &str, version: u32, what: &str) -> Resu
 }
 
 /// A contained page's raw `format` and `version`, as [`check_file_version`]: `paper-rs-page` 3,
-/// or 4, the version upstream writes only for a page with arrow labels. The write-back
-/// comparison then refuses a v4 page without a label (upstream writes it back as v3), and
-/// upstream itself refuses a label in a page that says v3, so neither kind of page is
-/// misread or loses anything.
+/// or 4, the version upstream writes only for a page with arrow labels, or 5, the one it writes
+/// only for a page with a font family other than Inter. The write-back comparison then refuses
+/// a v4 page without a label or a v5 page without such a family (upstream writes them back as
+/// an older version), and upstream itself refuses a label or family in a page that says an
+/// older version, so no kind of page is misread or loses anything.
 fn check_page_version(v: &Value, what: &str) -> Result<(), String> {
     if v.get("format").and_then(Value::as_str) != Some(PAGE_FORMAT) {
         return Err(format!("{what} isn't a {PAGE_FORMAT:?} file"));
     }
     let version = v.get("version").and_then(Value::as_u64);
-    if version != Some(u64::from(PAGE_VERSION)) && version != Some(u64::from(PAGE_VERSION_LABELS)) {
+    let known = [PAGE_VERSION, PAGE_VERSION_LABELS, PAGE_VERSION_FAMILIES];
+    if !known.iter().any(|k| version == Some(u64::from(*k))) {
         return Err(format!(
             "{what} must have version {PAGE_VERSION}, or {PAGE_VERSION_LABELS} for a page with \
-             arrow labels (older, newer or malformed versions aren't supported in canvas files)"
+             arrow labels, or {PAGE_VERSION_FAMILIES} for a page with a font family other than \
+             Inter (older, newer or malformed versions aren't supported in canvas files)"
         ));
     }
     Ok(())
@@ -1070,12 +1073,13 @@ mod tests {
         let (_t, _dir, v) = exported();
         // Page versions upstream's migration would mis-handle (zero underflows, 2^32 + 2
         // narrows to 2, a string or float would count as 1), older and newer ones alike. (4 is
-        // the labelled-page version: see the next test.)
+        // the labelled-page version and 5 the font-family one: see the next tests.)
         for bad in [
             json!(0),
             json!(2),
-            json!(5),
+            json!(6),
             json!(4_294_967_298_u64),
+            json!(4_294_967_301_u64),
             json!("3"),
             json!(3.0),
             json!(-3),
@@ -1185,6 +1189,86 @@ mod tests {
                 .filter(|r| r["id"] != json!(id))
                 .all(|r| r["version"] == json!(3))
         );
+    }
+
+    /// Font families (page version 5, revision 23): a page with a Geist Mono text layer is
+    /// exported as version 5 and imported whole, its family included; the same layer in a page
+    /// that says version 3 or 4 (which an older reader would draw and save in Inter), a page
+    /// without a family that says 5 (which upstream never writes) and a family this build
+    /// doesn't have are refused, not rewritten.
+    #[test]
+    fn a_page_with_a_font_family_is_version_5_and_nothing_else_is() {
+        use paper_rs::geom::Rect;
+        use paper_rs::model::{FontFamily, Node, NodeKind, TextAlign};
+        let (_t, dir, _) = canvas();
+        let p = paper_rs::project::Project::open(&dir).unwrap();
+        let id = p.manifest.pages[0].id.clone();
+        let mut page = p.load_page(&id).unwrap();
+        let tid = page.doc.alloc_id();
+        let mut n = Node::new(
+            tid,
+            NodeKind::Text {
+                text: "let x = 1; ✓".into(),
+                font_size: 14.0,
+                auto_width: true,
+                align: TextAlign::Left,
+            },
+            Rect::new(0.0, 80.0, 90.0, 18.0),
+        );
+        n.text_style.family = FontFamily::GeistMono;
+        page.doc.nodes.insert(tid, n);
+        page.doc.root.push(tid);
+        p.save_page(&page).unwrap();
+        let e = export(&dir).unwrap();
+        let back = validate(&e.text).unwrap();
+        let family = back
+            .pages
+            .iter()
+            .find(|q| q.id == id)
+            .and_then(|q| q.doc.get(tid))
+            .map(|n| n.text_style.family);
+        assert_eq!(family, Some(FontFamily::GeistMono), "the family, exactly");
+        let v: Value = serde_json::from_str(&e.text).unwrap();
+        let at = v["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|r| r["id"] == json!(id))
+            .unwrap();
+        assert_eq!(
+            v["pages"][at]["version"],
+            json!(5),
+            "only the page with a family"
+        );
+        assert!(
+            v["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != at)
+                .all(|(_, r)| r["version"] == json!(3))
+        );
+        // Declared older: refused (an older reader would have lost the family).
+        for older in [3, 4] {
+            let mut x = v.clone();
+            x["pages"][at]["version"] = json!(older);
+            refused(&x, "needs page version 5");
+        }
+        // A family this build doesn't have: refused, never read as Inter.
+        let mut x = v.clone();
+        let nodes = x["pages"][at]["nodes"].as_array_mut().unwrap();
+        let text = nodes
+            .iter_mut()
+            .find(|n| n["type"] == json!("text"))
+            .unwrap();
+        text["text_style"]["family"] = json!("Helvetica");
+        refused(&x, "font family");
+        // Version 5 without a family: upstream writes it back as 3, so it is refused.
+        let (_t2, _dir2, plain) = exported();
+        let mut x = plain.clone();
+        x["pages"][0]["version"] = json!(5);
+        refused(&x, "version");
     }
 
     #[test]

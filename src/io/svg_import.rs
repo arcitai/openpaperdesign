@@ -1,6 +1,7 @@
 //! SVG import through usvg: every shape becomes an editable vector layer with its fill
 //! (solid, linear or radial gradient), stroke and opacity; embedded raster images become
-//! image-filled rectangles; text is converted to outlines (using the bundled Inter faces).
+//! image-filled rectangles; text is converted to outlines (using the bundled faces: Geist Mono
+//! where the SVG asks for it or for `monospace`, Inter otherwise).
 
 use crate::geom::{Rect, V2, v2};
 use crate::model::{
@@ -209,17 +210,20 @@ fn walk(g: &usvg::Group, opacity: f32, out: &mut Vec<Node>) {
     }
 }
 
+/// usvg's options with only the bundled faces as its fonts: every face of every bundled family
+/// (`font-family="Geist Mono"` and the generic `monospace` are outlined in Geist Mono), Inter for
+/// the other generic families and for any family the app doesn't have. No system font is read.
 fn options() -> usvg::Options<'static> {
     let mut o = usvg::Options::default();
     let db = o.fontdb_mut();
-    for i in 0..4u8 {
+    for i in 0..crate::text::FACE_COUNT as u8 {
         db.load_font_data(crate::text::face_bytes(i).to_vec());
     }
     db.load_font_data(crate::theme::INTER_MEDIUM.to_vec());
     db.load_font_data(crate::theme::INTER_SEMIBOLD.to_vec());
     db.set_sans_serif_family("Inter");
     db.set_serif_family("Inter");
-    db.set_monospace_family("Inter");
+    db.set_monospace_family(crate::model::FontFamily::GeistMono.name());
     o.font_family = "Inter".into();
     o
 }
@@ -305,6 +309,31 @@ mod tests {
         let doc = import_page(SVG, "logo").unwrap();
         doc.validate().unwrap();
         assert_eq!(doc.root.len(), 1);
+    }
+
+    #[test]
+    fn svg_text_is_outlined_in_the_bundled_family_it_names() {
+        // Five i's and five M's: one width in Geist Mono (named, or the generic monospace),
+        // two in Inter (the fallback for a family the app doesn't have).
+        let width = |family: &str, s: &str| {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="60"><text x="0" y="40" font-size="30" font-family="{family}">{s}</text></svg>"#
+            );
+            let nodes = parse(&svg).unwrap();
+            Rect::union_all(&nodes.iter().map(|n| n.rect).collect::<Vec<_>>())
+                .unwrap()
+                .w
+        };
+        for mono in ["Geist Mono", "monospace"] {
+            let (i, m) = (width(mono, "iiiii"), width(mono, "MMMMM"));
+            // Outline boxes, not advances: the last glyph's ink differs a little.
+            assert!((i - m).abs() < 30.0 * 0.6, "{mono}: {i} {m}");
+            assert!(i > 30.0 * 2.5, "{mono}: monospaced i's are wide: {i}");
+        }
+        for other in ["Inter", "Helvetica"] {
+            let (i, m) = (width(other, "iiiii"), width(other, "MMMMM"));
+            assert!(m > 2.0 * i, "{other} is outlined in Inter: {i} {m}");
+        }
     }
 
     #[test]

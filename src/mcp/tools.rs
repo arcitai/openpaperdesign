@@ -229,8 +229,10 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "get_font_family_info",
-            "Whether font families are available and their weights/styles. paper-rs renders text \
-             with Inter (400, 700, normal and italic); other families fall back to Inter.",
+            "Whether font families are available and their weights/styles. Text renders in the \
+             bundled Inter (the default) or Geist Mono (set with fontFamily; `monospace` means \
+             Geist Mono), each 400 and 700, normal and italic, for a whole text layer; other \
+             families fall back to Inter.",
             json!({"familyNames": {"type": "array", "items": {"type": "string"}}}),
             &["familyNames"],
             true,
@@ -507,7 +509,9 @@ display (flex, block, none), flex-direction, flex-wrap, gap, row-gap, column-gap
 justify-content, align-items, align-self, flex-grow, overflow, background, background-color,
 background-image (url(), linear-gradient(), radial-gradient()), background-size/object-fit,
 border, border-color/width/style, border-radius (1–4 values), opacity, mix-blend-mode, color,
-font-size, font-weight, font-style, line-height, letter-spacing, text-align, text-decoration.
+font-size, font-weight, font-style, line-height, letter-spacing, text-align, text-decoration,
+font-family (the bundled Inter or Geist Mono, `monospace` = Geist Mono, anything else Inter;
+one family per text layer, so inline spans keep their layer's).
 Ignored (reported back): margin, grid, box-shadow, transform, filters, transitions.";
 
 pub const GUIDE_WHITEBOARD: &str = "\

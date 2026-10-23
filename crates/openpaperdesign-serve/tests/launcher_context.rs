@@ -644,8 +644,9 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
     // header, full-height panels, and the home's search drawn as one at rest); `home-19` the
     // Paper-inspired polish of the editor's and the home's tokens; `home-20` the whole-app
     // workbench (contextual Design reveal, one Canvas title, All Projects menu, Design/Theme);
-    // `home-21` Theme's change of a colour in use; `home-22` its line height and letter spacing.
-    const HOME: &str = "ui://openpaperdesign/home-22.html";
+    // `home-21` Theme's change of a colour in use; `home-22` its line height and letter spacing;
+    // `home-23` a text layer's bundled font family (Inter or Geist Mono).
+    const HOME: &str = "ui://openpaperdesign/home-23.html";
     for meta in metas {
         let (ok, s) = call(c, "openpaperdesign_home", json!({}), meta.clone()).await;
         assert!(ok, "{s}");
@@ -693,9 +694,10 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
             "the slot holds the packaged font, byte for byte"
         );
         for other in [
-            "ui://openpaperdesign/home-22.html?x",
+            "ui://openpaperdesign/home-23.html?x",
             // Earlier view URIs are no longer served, so a fresh read can't get an older view.
             // A view a host already has open isn't evicted or refreshed by this.
+            "ui://openpaperdesign/home-22.html",
             "ui://openpaperdesign/home-21.html",
             "ui://openpaperdesign/home-20.html",
             "ui://openpaperdesign/home-19.html",
@@ -736,7 +738,7 @@ async fn pure_home(c: &Client, metas: &[RequestMetaObject], ws: &str, url: Optio
 /// session's workspace state alone. Every other tool keeps per-call admission and retirement.
 #[tokio::test]
 async fn synthetic_home_and_view_are_pure_and_leave_the_pinned_binding_alone() {
-    const HOME: &str = "ui://openpaperdesign/home-22.html";
+    const HOME: &str = "ui://openpaperdesign/home-23.html";
     let f = Fixture::new();
     let c = f.host().await;
 

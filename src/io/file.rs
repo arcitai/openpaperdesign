@@ -79,8 +79,9 @@ pub fn from_str(s: &str) -> Result<(Document, Option<Camera>), FileError> {
     }
 }
 
-/// [`to_string`], refusing a document with an arrow label: version 1 has no labels, so the
-/// file would lose them in an older reader and be refused by this one.
+/// [`to_string`], refusing a document with an arrow label or a font family other than Inter:
+/// version 1 has neither, so the file would lose them in an older reader and be refused by this
+/// one.
 pub fn to_string_checked(doc: &Document, camera: Option<&Camera>) -> Result<String, FileError> {
     if doc.nodes.values().any(|n| n.kind.label().is_some()) {
         return Err(FileError::Invalid(
@@ -89,14 +90,22 @@ pub fn to_string_checked(doc: &Document, camera: Option<&Camera>) -> Result<Stri
                 .into(),
         ));
     }
+    if crate::project::format::has_font_family(doc) {
+        return Err(FileError::Invalid(
+            "a font family other than Inter can't be saved in a single .paper-rs file; keep the \
+             canvas in a project instead. Nothing was written."
+                .into(),
+        ));
+    }
     Ok(to_string(doc, camera))
 }
 
 /// Write atomically (temp file + rename) so a crash never leaves a truncated document.
 ///
-/// This single-file format is version 1, which has no arrow labels: a document with a label is
-/// refused (nothing is written) rather than saved where a reader would read past its labels or
-/// refuse them. Projects keep labels (page version 4).
+/// This single-file format is version 1, which has no arrow labels or font families: a
+/// document with a label or a family other than Inter is refused (nothing is written) rather
+/// than saved where a reader would read past them or refuse them. Projects keep labels (page
+/// version 4) and families (page version 5).
 pub fn save(path: &Path, doc: &Document, camera: Option<&Camera>) -> Result<(), FileError> {
     let text = to_string_checked(doc, camera)?;
     let tmp = path.with_extension("paper-rs.tmp");
@@ -146,6 +155,28 @@ mod tests {
         let broken =
             r#"{"format":"paper-rs","version":1,"name":"x","next_id":1,"root":[5],"nodes":[]}"#;
         assert!(matches!(from_str(broken), Err(FileError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_single_file_refuses_a_font_family_it_cant_hold() {
+        let mut ed = demo::showcase();
+        assert!(
+            to_string_checked(&ed.doc, None).is_ok(),
+            "control: an Inter document"
+        );
+        let id = *ed
+            .doc
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n.kind, crate::model::NodeKind::Text { .. }))
+            .expect("the showcase has text")
+            .0;
+        ed.doc.nodes.get_mut(&id).unwrap().text_style.family = crate::model::FontFamily::GeistMono;
+        let e = to_string_checked(&ed.doc, None).unwrap_err();
+        assert!(e.to_string().contains("font family"), "{e}");
+        // And a v1 file naming it (as an older writer never would) isn't read.
+        let unchecked = to_string(&ed.doc, None);
+        assert!(matches!(from_str(&unchecked), Err(FileError::Invalid(_))));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.91 · Updated: 2026-10-23
+Revision: 0.93 · Updated: 2026-10-23
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -661,8 +661,8 @@ engine architecture is `analysis/DESIGN.md`.
       text styles and colours (`text_styles`, `colours`, read through
       `inspector::char_styles` and the node styles); choosing one only selects its layers
       (`Editor::selection`), so edits go through the existing Design panel. Then one status
-      row each (`status_row`) for the font (the bundled Inter faces; the renderer draws no
-      other family), named tokens (no token store in `Document`) and `DESIGN.md` (no admitted
+      row each (`status_row`) for the font (the bundled Inter faces then; since revision 23
+      the Fonts row, both bundled families, below), named tokens (no token store in `Document`) and `DESIGN.md` (no admitted
       project route, and the guide reading/editing isn't built), reasons in tooltips and a
       folded Details. Nothing is invented. (Run144 replaced its first, paragraph-heavy layout,
       which filled a 320 × 240 sheet.)
@@ -831,7 +831,76 @@ engine architecture is `analysis/DESIGN.md`.
       `src/ui/mod.rs` (the one `begin_frame` call) and `crates/openpaperdesign-web/src/state.rs`
       (the guard). Tests: `r172_*` (the probes' setup, finished and applied for both metrics,
       saved, one-step Undo/Redo; the guard and an explicit discard in the gap; Escape and an
-      invalid entry).
+      invalid entry). Run174 (R71-F1; R72 accepted it): a draft whose own editor's fields
+      weren't drawn while Theme was (an earlier row's Aa opened its editor in this one's
+      place) is finished the same way in `used_text_styles`, into the use under way; tests
+      `r174_*`.
+      **Bundled font families** (revision 23, run176; source only, unchecked; owner #6/#10/#14
+      typography): a text layer's `TextStyle::family` (`FontFamily`, `src/model/paint.rs`:
+      Inter, the default and what every earlier document has, or Geist Mono; a closed set,
+      stored by name, omitted when Inter). Reason: Theme's Font row and MCP could only say
+      "Inter only"; the owner's typography order asked for a real family choice, offline and
+      bundled. A family is a whole layer's (no span has one), so a style only part of some
+      layer has offers it disabled with `RANGE_METRICS` (now naming the family too), as for
+      the metrics.
+      - `src/text.rs`: eight bundled faces (`FACE_COUNT`; Inter's ids 0–3 unchanged, Geist
+        Mono's 4–7: `face_id_in`, `family_of`, `face_bytes`, `face_of`), so every glyph cache,
+        draw op, outline (GPU, SVG, PDF) and advance is keyed by the whole face, never
+        `id & 3`. `layout_rich` uses the layer's family for faces, advances and natural line
+        metrics (`line_height_in`, `ascent_in`; `line_height`/`ascent` stay Inter's). A
+        character the family lacks (Geist Mono has no ✓) is that character's matching Inter
+        face, glyph and advance (`glyph_in`, carried through wrapping, carets, hit tests and
+        drawing); one neither has is the requested face's `?`. Tessellation tolerance is per
+        face. The four Geist Mono files are `include_bytes!` of `assets/fonts/GeistMono-*.ttf`
+        (THIRD_PARTY.md has their provenance); nothing is loaded at run time.
+      - `src/ui/design_system.rs`: `StyleKey` carries the family (two families are two rows;
+        another family's label ends in it, "14 · Regular · Geist Mono"); the Aa editor's
+        `family_choice` row (ordinary selectable buttons, keyboard-reachable) sends
+        `StyleChange::Family` through the same `apply_style_change` / `fresh_restyle` preview
+        / `restyle_reaches_locked` / `restyle` path (override field `font family`, mapped to
+        the `font` group in `src/editor/structure.rs` `override_key`, so instances sync and
+        overrides are what `copy_props` already copies), one coalesced step with size, face and
+        metrics. The Fonts status row (`fonts_status`) lists the bundled families and which
+        the Paper's text layers use.
+      - `src/ui/inspector.rs`: the Text section's Font row (`combo_mixed`, Mixed when the
+        selected layers differ) sets the selected layers' family through `inspector::apply`
+        (one step, `fit_text`); `WHOLE_LAYER_FONT` says so while a text range is selected.
+        Run179 correction (a parent real-widget probe: choosing Geist Mono for an unlocked
+        auto-layout title moved its locked sibling, y 49.04 → 51.2 in a column, x 68.96 → 92
+        in a row, with no refusal): `set_family` first tries that same `apply` on
+        `Editor::preview` through `design_system::text_edit_reaches_locked` (Theme's
+        `reaches_locked` foresight on `style_groups`, then `locked_differ`; an open text draft
+        and its commit included), and refuses the whole change with `INHERITED_STYLE` before
+        anything live changes if an effectively locked layer would. Same `apply`, history and
+        overrides otherwise; other inspector fields are unchanged.
+      - Formats: page version 5 (`project::format::PAGE_VERSION_FAMILIES`, `has_font_family`,
+        `check_families`: only a page with a family other than Inter is written as v5; an
+        older reader refuses it as newer; a family in a page declaring an older version, or one
+        this build doesn't have, is refused, never read as Inter); the single `.paper-rs` file
+        refuses a family (`io::file::to_string_checked`); clipboard `openpaperdesign/clipboard`
+        version 2 (`io::clipboard::FAMILY_VERSION`; version 1 and unversioned payloads stay
+        byte-exact, and either naming another family, or any naming an unknown one, is
+        `Content::Refused` before any image is registered); the library's canvas file
+        (`crates/openpaperdesign-serve/src/library_payload.rs`) admits page v5 for such a page
+        only (its write-back comparison refuses a v5 page without one); the native shape
+        Library (`src/library.rs` `LibItem::refusal`, `FAMILIES_REFUSED`; `src/ui/library.rs`
+        Add) refuses such an item as it refuses labelled arrows (its version-1 file has no
+        version an older reader refuses).
+      - MCP (`src/mcp/css.rs`, `exec.rs`, `tools.rs`): `fontFamily` sets a text layer's family
+        (`font_family`: the first bundled name or generic in the list, `monospace` = Geist
+        Mono, anything else Inter as before); `get_computed_styles`/`get_jsx` and
+        `get_node_info` report it; `get_font_family_info` lists both families' four faces and
+        what any other name renders as; `get_basic_info`'s `fontFamilies` is the bundled list.
+        `src/io/svg_import.rs`: usvg's fontdb has all eight faces, `monospace` is Geist Mono.
+      - Serve: the renderer bound `MAX_ASSET_BYTES` is 18 MiB (was 16; panel.js `MAX_BYTES`
+        and `MAX_PARTS` 72 match; parts, panel message, host allowance and image limits
+        unchanged), and the home URI is `home-23`.
+      - Not built: per-range families, system or uploaded fonts, named font tokens or Apply,
+        Excalidraw's code font. Tests (added, not run by the writer): `text.rs` (faces, Inter
+        unchanged, Geist Mono metrics, monospace widths, ✓ fallback), `paint.rs`,
+        `project/format.rs`, `io/file.rs`, `io/clipboard.rs`, `io/svg_import.rs`,
+        `mcp/css.rs`, `design_system.rs` `metric_tests`, `tests/mcp.rs`, the web state tests'
+        `r176_*`, `launcher_app_tests.rs` and `panel.test.mjs` (the 18 MiB bound).
     - `src/ui/rail.rs`: seven families (`FAMILIES`: Pointer = Select, Laser; Hand on its own),
       `Rail::members` `[Tool; 7]`; `ROW_GAP` 2 → 1 so 320 × 240 still fits 24 px rows; the
       arrow glyph is drawn at its target's near edge (targets unchanged).
@@ -908,7 +977,7 @@ engine architecture is `analysis/DESIGN.md`.
   - a marked block's info string must be exactly `json` (any case): `json custom-v2` is
     `ReadOnly::Format`.
   Reason: the admitted guide/value codec any later source reader/editor needs (rev2 §8–9).
-  It is not a source link: reading, creating or saving a project's guide, Theme's connection, named tokens, font families and Apply stay gated on the real model-call
+  It is not a source link: reading, creating or saving a project's guide, Theme's connection, named tokens (font tokens included) and Apply stay gated on the real model-call
   admission and enforceable revocation proof; no Theme, MCP or file route uses it. Same Editor,
   Session, save, binding and lease; no new dependency or store.
 - Upstream sync: `git fetch upstream`, merge the upstream default branch into a branch cut
@@ -1027,7 +1096,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-22.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-23.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -1144,7 +1213,15 @@ still has `6630ec4`, and its qualification archive couldn't be read by the opera
 and layout unchanged) with the editor whose Theme also shows and sets a text style's line
 height and letter spacing (the upstream entry above). The editor's WASM changed after
 published `home-21`, so `home-21` is refused and a cached `home-21` view can't pass for this
-one. Not built, rendered, reviewed, installed or natively accepted here.
+one. Its source (`55638b0`, with the R71 correction) passed the lead's checks, renders and
+R72's review; not installed or natively accepted.
+
+`home-23` (2026-10-23 source candidate, root `DESIGN.md` revision 23) is the same view (HTML
+and layout unchanged) with the editor that draws, edits and saves a text layer's bundled font
+family (the upstream entry above). The editor's WASM changed (it now embeds the Geist Mono
+faces, within the renderer bound of 18 MiB), so `home-22` is refused and a cached `home-22`
+view can't pass for this one. Not built, rendered, reviewed, installed or natively accepted
+here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,

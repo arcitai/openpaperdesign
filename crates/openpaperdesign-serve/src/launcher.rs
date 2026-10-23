@@ -136,9 +136,12 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Paper uses it (DESIGN.md revision 21; a changed in-panel WASM editor again, after installed
 /// `home-20`; HTML and layout unchanged); `home-22` carries the editor whose Theme also shows
 /// and sets a text style's line height and letter spacing (DESIGN.md revision 22; a changed
-/// in-panel WASM editor again, after published `home-21`; HTML and layout unchanged). No
-/// earlier URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-22.html";
+/// in-panel WASM editor again, after published `home-21`; HTML and layout unchanged);
+/// `home-23` carries the editor that draws, edits and saves a text layer's bundled font family,
+/// Inter or Geist Mono (DESIGN.md revision 23; a changed in-panel WASM editor, now up to
+/// 18 MiB with the Geist Mono faces, after `home-22`; HTML and layout unchanged). No earlier
+/// URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-23.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's

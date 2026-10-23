@@ -7,8 +7,8 @@ use crate::editor::vector_ops::BoolOp;
 use crate::editor::{AppRequest, Editor};
 use crate::geom::v2;
 use crate::model::{
-    Align, AutoLayout, BlendMode, Cap, Color, Constraint, Direction, ImageMode, Join, Node, NodeId,
-    NodeKind, Paint, Sizing, Stop, StrokeAlign, TextAlign,
+    Align, AutoLayout, BlendMode, Cap, Color, Constraint, Direction, FontFamily, ImageMode, Join,
+    Node, NodeId, NodeKind, Paint, Sizing, Stop, StrokeAlign, TextAlign,
 };
 use crate::theme;
 use egui::{RichText, Ui};
@@ -1253,10 +1253,31 @@ fn auto_layout(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], first: &Node) {
     });
 }
 
+/// What the Design panel's Font says while a text range is selected: a family is the whole
+/// layer's, so choosing one there sets the layer's, not the range's.
+pub const WHOLE_LAYER_FONT: &str = "The font applies to the whole layer.";
+
+/// The Design panel's Font: `family` for every selected text layer `ids`, as one coalesced
+/// [`apply`] (laid out again by `fit_text`, overrides marked as before). A new family can
+/// change a layer's box, and with it an auto layout or group around it or a component's
+/// instances, so it is admitted as Theme admits its own family: tried whole on a preview first
+/// (`design_system::text_edit_reaches_locked`, an open text draft included) and, if any
+/// effectively locked layer would change, refused before anything of the live editor does
+/// (its document, history, stamp, selection and text edit stay), the reason in the status line.
+fn set_family(ed: &mut Editor, ids: &[NodeId], family: FontFamily) {
+    let change = |ed: &mut Editor| apply(ed, "font family", ids, |n| n.text_style.family = family);
+    if super::design_system::text_edit_reaches_locked(ed, ids, change) {
+        ed.status = super::design_system::INHERITED_STYLE.into();
+        return;
+    }
+    change(ed);
+}
+
 /// Typography. One text layer shows the style at the caret (or of the whole layer); several
 /// show each value they share and Mixed for the rest, and the toggles that can't show Mixed
 /// (bold, italic) are left out while they differ. Underline and strikethrough live in text
-/// ranges, so they are offered for one layer at a time.
+/// ranges, so they are offered for one layer at a time. The font family (revision 23) is a
+/// whole layer's: one of the bundled families, Mixed when the layers differ.
 fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
     let first = &nodes[0];
     let one = nodes.len() == 1;
@@ -1271,6 +1292,19 @@ fn text_section(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
             );
         }
     });
+    // The layers' family, from the bundled ones; choosing one sets it on every selected layer as
+    // one undo step, laid out again in its faces ([`set_family`]).
+    let family = uniform(nodes, |n| n.text_style.family);
+    let families: Vec<(FontFamily, &str)> = FontFamily::ALL.map(|f| (f, f.name())).to_vec();
+    row(ui, "Font", |ui| {
+        let w = ui.available_width();
+        if let Some(f) = combo_mixed(ui, "font-family", family, &families, w) {
+            set_family(ed, ids, f);
+        }
+    });
+    if editing_range {
+        hint(ui, WHOLE_LAYER_FONT);
+    }
     let cs = ed.current_char_style();
     // (size, colour, bold, italic) as one layer shows them, or as every character of the
     // selected layers has them, their text ranges included (the same styles the layout draws):

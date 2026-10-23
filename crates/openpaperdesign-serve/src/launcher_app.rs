@@ -102,7 +102,12 @@ pub(super) const TOOLS: [&str; 19] = [
 /// The packaged renderer goes to the in-panel editor in parts of this many bytes (the last one
 /// shorter), in order; a renderer larger than `MAX_ASSET_BYTES` isn't sent at all.
 pub(super) const PART_BYTES: usize = 256 * 1024;
-pub(super) const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
+/// The largest renderer sent: 18 MiB (revision 23; it was 16 MiB). The renderer embeds every
+/// bundled font face, and Geist Mono's four (613,604 bytes) took the measured 16,460,800-byte
+/// renderer past the old 16 MiB. A fixed bound for this closed bundle, checked at both ends
+/// (the view's `panel.js` refuses a larger one too), not room for a font loader; the parts, the
+/// panel message bound, the host allowance and the library's own image limit are unchanged.
+pub(super) const MAX_ASSET_BYTES: usize = 18 * 1024 * 1024;
 /// The largest page message the in-panel editor exchanges, counted as the serialized JSON
 /// (UTF-8, escaping included): a page read's result, or a save's arguments. A deliberately
 /// conservative choice, well below the 64 MiB page limit, because the host's message limits
@@ -335,7 +340,9 @@ fn tools() -> Vec<Value> {
             "description": "For the home view's own editor: one part of this build's packaged \
                 renderer (WebAssembly), base64. Parts are 262144 bytes, numbered from 0. Reads \
                 no canvas and no file.",
-            "inputSchema": doc(json!({"part": {"type": "integer", "minimum": 0, "maximum": 63}}), &["part"])}),
+            // The last part of the largest renderer sent (71: 18 MiB in 256 KiB parts).
+            "inputSchema": doc(json!({"part": {"type": "integer", "minimum": 0,
+                "maximum": MAX_ASSET_BYTES.div_ceil(PART_BYTES) - 1}}), &["part"])}),
         json!({"name": PAGE, "_meta": app,
             "description": "For the home view's own editor: the page of the canvas this view \
                 shows. Without page_id: its active page (else its first), and the result names \

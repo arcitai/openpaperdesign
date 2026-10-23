@@ -5713,12 +5713,13 @@ fn rev20_the_theme_view_shows_what_is_supported_and_names_what_is_blocked() {
         .collect();
     // The useful rows first, then one short status row each (run144: the long font paragraph
     // that filled a 320 × 240 sheet became a row; the reasons are tooltips and Details).
+    // Revision 23: the font row names the two bundled families, Inter and Geist Mono.
     for wanted in [
         "Text styles",
         "24 · Regular",
         "Colours",
-        "Font",
-        "Inter · 4 faces",
+        "Fonts",
+        "Inter · Geist Mono",
         "Named tokens",
         "Not available",
         "DESIGN.md",
@@ -6235,8 +6236,9 @@ fn browser_copy_cut_and_paste_events_carry_labelled_arrows_with_their_labels() {
     assert_eq!(t.ed.doc, before);
     t.run(Action::Redo);
     assert_eq!(t.ed.doc, pasted);
-    // Another version: refused with a reason, nothing pasted, no text layer.
-    let newer = text.replacen("\"version\":1,", "\"version\":2,", 1);
+    // Another version: refused with a reason, nothing pasted, no text layer. (Version 2 is
+    // the font-family payload since revision 23, so the unknown one is now 3.)
+    let newer = text.replacen("\"version\":1,", "\"version\":3,", 1);
     let steps = t.ed.history.undo_len();
     t.paste(&newer);
     assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
@@ -9237,4 +9239,653 @@ fn r174_escape_or_an_invalid_entry_before_the_earlier_aa_changes_nothing() {
         assert!(!s.dirty() && s.can_reload(), "{label} {value}");
         assert!(s.save_snapshot().is_none(), "{label} {value}");
     }
+}
+
+// ---- revision 23: the bundled font families (Inter, the default, and Geist Mono), chosen in
+// Theme's text style editor and the Design panel's Text section, drawn in their own faces,
+// saved as page version 5 and copied as clipboard version 2. Real widgets, headless egui
+// layout; nothing renders.
+
+/// The faces a text layer is laid out in, as the renderer draws it.
+fn faces(n: &Node) -> Vec<crate::text::FaceId> {
+    crate::text::layout_node(n)
+        .unwrap()
+        .glyphs
+        .iter()
+        .map(|g| g.face)
+        .collect()
+}
+
+#[test]
+fn r176_theme_family_size_and_metric_in_one_editor_use_are_one_saved_undoable_step() {
+    use crate::model::FontFamily;
+    let (s, ids) = metric_fixture();
+    // The growing layer reads "iiiiii" here: "Second" at 24 is within a pixel as wide in
+    // either family, Inter's narrow i's are not, so its width tells the families apart.
+    let mut page = s.ed.page_data(0);
+    page.doc.nodes.get_mut(&ids.second).unwrap().kind = text_kind("iiiiii", 20.0, true);
+    let mut s = WebState::open(&canvas(&[page], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    let before = page_to_json(&s.ed.page_data(0));
+    let before_doc = s.ed.doc.clone();
+    let steps = s.ed.history.undo_len();
+    open_theme(&mut s);
+    // Inspection names both bundled families and changes nothing.
+    assert!(paints(&mut s, "Inter · Geist Mono"), "the Fonts row");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    open_picker(&mut s, "20 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    assert!(ui::popup_open(&s.ctx), "a family keeps the editor open");
+    let family = |s: &WebState, id| s.ed.doc.get(id).unwrap().text_style.family;
+    assert_eq!(family(&s, ids.first), FontFamily::GeistMono);
+    assert_eq!(family(&s, ids.second), FontFamily::GeistMono);
+    assert!(s.save_snapshot().is_none(), "held while the editor is open");
+    // The same use goes on with a size and a line height (the row moves; the editor stays).
+    picker_channel(&mut s, "Size ", "24");
+    theme_metric(&mut s, "Line height", "125%");
+    assert!(ui::popup_open(&s.ctx));
+    close_picker(&mut s);
+    assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+    assert_eq!(s.ed.history.undo_len(), steps + 1, "one step");
+    let after = s.ed.doc.clone();
+    for id in [ids.first, ids.second] {
+        let (n0, n1) = (before_doc.get(id).unwrap(), after.get(id).unwrap());
+        assert_eq!(n1.text_style.family, FontFamily::GeistMono, "{id:?}");
+        assert_eq!(n1.kind.font_size(), Some(24.0));
+        assert_eq!(n1.text_style.line_height, Some(1.25));
+        assert_eq!(n1.kind.text(), n0.kind.text(), "the text, byte for byte");
+        assert_eq!(n1.text_style.spans, n0.text_style.spans, "its ranges kept");
+        assert_eq!(n1.text_style.letter_spacing, n0.text_style.letter_spacing);
+        // Drawn in Geist Mono's faces; a check mark Geist Mono lacks in Inter's regular face.
+        let text = n1.kind.text().unwrap();
+        for (f, c) in faces(n1).into_iter().zip(text.chars()) {
+            let want = if crate::text::has_glyph(FontFamily::GeistMono, c) {
+                4
+            } else {
+                0
+            };
+            assert_eq!(f, want, "{c:?} in {id:?}");
+        }
+    }
+    // The fixed-width layer kept its width; the growing one is Geist Mono's width, not Inter's.
+    let (f0, f1) = (
+        before_doc.get(ids.first).unwrap(),
+        after.get(ids.first).unwrap(),
+    );
+    assert_eq!(
+        (f1.rect.x, f1.rect.y, f1.rect.w),
+        (f0.rect.x, f0.rect.y, f0.rect.w)
+    );
+    let second = after.get(ids.second).unwrap();
+    let mono_w = crate::text::layout_node(second).unwrap().width;
+    let mut as_inter = second.clone();
+    as_inter.text_style.family = FontFamily::Inter;
+    let inter_w = crate::text::layout_node(&as_inter).unwrap().width;
+    assert!(
+        (second.rect.w - mono_w.max(1.0)).abs() < 1e-6,
+        "fitted to its own advances"
+    );
+    assert!(
+        (mono_w - inter_w).abs() > 1.0,
+        "not Inter's width: {mono_w} {inter_w}"
+    );
+    // Every glyph of "iiiiii" has Geist Mono's one advance.
+    let l = crate::text::layout_node(second).unwrap();
+    assert!(
+        l.glyphs
+            .windows(2)
+            .all(|w| (w[0].advance - w[1].advance).abs() < 1e-9)
+    );
+    for id in [ids.control, ids.locked] {
+        assert_eq!(after.get(id), before_doc.get(id), "{id:?}");
+    }
+    // Saved once it closed as a version 5 page, which reopens exactly.
+    let edited = page_to_json(&s.ed.page_data(0));
+    assert!(edited.contains("\"version\": 5") && edited.contains("\"family\": \"Geist Mono\""));
+    let snap = s.save_snapshot().expect("saved once the editor closed");
+    let sent = sent_page(&snap);
+    assert_eq!(page_to_json(&sent), edited);
+    s.save_succeeded();
+    assert!(!s.dirty());
+    let reopened = WebState::open(&canvas(&[sent], "p"), false, W, H).unwrap();
+    assert_eq!(page_to_json(&reopened.ed.page_data(0)), edited);
+    // One Undo: the whole page as it was (Inter, version 3 again); one Redo: as edited.
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    assert!(!before.contains("family") && before.contains("\"version\": 3"));
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    // The style is now listed as its own, with its family; its editor shows it selected.
+    open_picker(&mut s, "24 · Regular · Geist Mono");
+    assert!(paints(&mut s, "125%"));
+    close_picker(&mut s);
+}
+
+#[test]
+fn r176_a_family_for_a_style_only_part_of_a_layer_is_unavailable_and_changes_nothing() {
+    // `text_style_fixture`'s 24 Regular is the whole "Title" and two ranges of the mixed
+    // layer: a family would be the mixed layer's whole, so it is offered disabled, with the
+    // reason, and choosing it does nothing at all.
+    let (mut s, _, _) = text_style_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    let markers = (
+        s.ed.history.undo_len(),
+        format!("{:?}", s.ed.history),
+        s.ed.doc_stamp,
+        s.dirty(),
+    );
+    open_theme(&mut s);
+    open_picker(&mut s, "24 · Regular");
+    assert!(paints(&mut s, ui::design_system::RANGE_METRICS));
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    assert!(ui::popup_open(&s.ctx), "nothing happened; the editor stays");
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert_eq!(
+        (
+            s.ed.history.undo_len(),
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.dirty()
+        ),
+        markers
+    );
+    assert!(
+        s.ed.doc
+            .nodes
+            .values()
+            .all(|n| n.text_style.family.is_default())
+    );
+    close_picker(&mut s);
+    assert!(s.save_snapshot().is_none());
+}
+
+#[test]
+fn r176_a_family_that_would_move_a_locked_layer_is_refused_with_a_live_draft_and_its_pair_applies()
+{
+    use crate::model::{Direction, FontFamily};
+    // Geist Mono's natural line height grows the title's box in a column, and its advances
+    // widen it in a row: each would move the locked rectangle after it. With the title's own
+    // text being edited, the refusal is found on the preview before the draft is finished: the
+    // page, history, stamp, selection and caret stay, nothing is offered to save, and the draft
+    // still types. Unlocked, the family applies and the rectangle follows, as one step.
+    for direction in [Direction::Vertical, Direction::Horizontal] {
+        let (mut s, text, sibling) = metric_flow_fixture(true, direction);
+        open_theme(&mut s);
+        s.ed.start_text_edit(text, None);
+        s.ed.insert_text("ø");
+        timed_frames(&mut s, 3);
+        open_picker(&mut s, "24 · Regular");
+        let page = page_to_json(&s.ed.page_data(0));
+        let control = s.ed.doc.get(sibling).unwrap().clone();
+        let markers = (
+            format!("{:?}", s.ed.history),
+            s.ed.doc_stamp,
+            s.ed.selection.clone(),
+            s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+        );
+        let t = s.now_ms + 1000.0;
+        click_front_label(&mut s, "Geist Mono", t);
+        timed_frames(&mut s, 3);
+        assert!(
+            !ui::popup_open(&s.ctx),
+            "{direction:?}: refused, the editor closes"
+        );
+        assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), page, "{direction:?}");
+        assert_eq!(s.ed.doc.get(sibling), Some(&control));
+        assert_eq!(
+            (
+                format!("{:?}", s.ed.history),
+                s.ed.doc_stamp,
+                s.ed.selection.clone(),
+                s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+            ),
+            markers,
+            "{direction:?}"
+        );
+        assert!(s.save_snapshot().is_none(), "{direction:?}");
+        assert_eq!(
+            s.ed.doc.get(text).unwrap().text_style.family,
+            FontFamily::Inter
+        );
+        s.ed.insert_text("x");
+        let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
+        assert!(typed.ends_with('x'), "the draft still types: {typed}");
+        // The unlocked pair.
+        let (mut s, text, free) = metric_flow_fixture(false, direction);
+        let before = page_to_json(&s.ed.page_data(0));
+        let place = s.ed.doc.get(free).unwrap().rect;
+        open_theme(&mut s);
+        open_picker(&mut s, "24 · Regular");
+        let t = s.now_ms + 1000.0;
+        click_front_label(&mut s, "Geist Mono", t);
+        close_picker(&mut s);
+        assert_eq!(
+            s.ed.doc.get(text).unwrap().text_style.family,
+            FontFamily::GeistMono
+        );
+        let moved = s.ed.doc.get(free).unwrap().rect;
+        assert!(
+            (moved.x, moved.y) != (place.x, place.y),
+            "{direction:?}: it really moves"
+        );
+        let edited = page_to_json(&s.ed.page_data(0));
+        let snap = s.save_snapshot().expect("the allowed family saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), edited);
+        s.save_succeeded();
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{direction:?}: one step"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+    }
+}
+
+#[test]
+fn r176_a_family_a_locked_instance_inherits_is_refused_and_overriding_instances_keep_theirs() {
+    use crate::model::FontFamily;
+    // A locked instance of `second` inherits its font (and its text box): the 20 Regular row is
+    // refused whole, so no family can reach it (R67/R68).
+    let (mut s, ids) = metric_fixture();
+    let (_, child) = instance_of(&mut s, ids.second, true);
+    let child_before = s.ed.doc.get(child).unwrap().clone();
+    open_theme(&mut s);
+    assert_refused(&mut s, "20 · Regular", ui::design_system::INHERITED_STYLE);
+    assert_eq!(s.ed.doc.get(child), Some(&child_before));
+    // Its child overriding both `font` and `size` (its own 18, its own box): the main and the
+    // other whole layer take Geist Mono, the locked instance and its child stay exactly.
+    let (mut s, ids) = metric_fixture();
+    let (instance, child) = instance_of(&mut s, ids.second, false);
+    s.ed.selection = vec![child];
+    s.ed.style_text("font size", |sp| sp.size = Some(18.0));
+    s.ed.begin("Keep instance text size");
+    s.ed.mark_overrides(&[child], "size");
+    s.ed.commit();
+    s.ed.edit("Lock instance", |tx| {
+        tx.node_mut(instance).unwrap().locked = true
+    });
+    s.ed.selection.clear();
+    timed_frames(&mut s, 4);
+    let (child_before, root_before) = (
+        s.ed.doc.get(child).unwrap().clone(),
+        s.ed.doc.get(instance).unwrap().clone(),
+    );
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    close_picker(&mut s);
+    for id in [ids.first, ids.second] {
+        let n = s.ed.doc.get(id).unwrap();
+        assert_eq!(n.text_style.family, FontFamily::GeistMono, "{id:?}");
+    }
+    assert_eq!(
+        s.ed.doc.get(child),
+        Some(&child_before),
+        "its own font and box"
+    );
+    assert_eq!(s.ed.doc.get(instance), Some(&root_before));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+}
+
+#[test]
+fn r176_a_typed_metric_after_a_family_finishes_in_the_same_step_when_design_is_chosen() {
+    use crate::model::FontFamily;
+    // The family moves the row (20 Regular → 20 Regular · Geist Mono); a line height typed and
+    // not entered is then finished into the same use when Design is chosen (R72's transition),
+    // reaching exactly the frozen targets: one Undo takes both back.
+    let (mut s, ids) = metric_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 2);
+    metric_typed(&mut s, "Line height", "125%");
+    let left = s.canvas_rect().min.x;
+    let t = s.now_ms + 1000.0;
+    click_label_in(&mut s, "Design", |r| r.max.x <= left, t);
+    timed_frames(&mut s, 3);
+    assert_eq!(s.ui.left_tab, ui::LeftTab::Design);
+    assert!(
+        metric_applied(&s, &ids, "Line height"),
+        "finished, not lost"
+    );
+    for id in [ids.first, ids.second] {
+        assert_eq!(
+            s.ed.doc.get(id).unwrap().text_style.family,
+            FontFamily::GeistMono
+        );
+    }
+    for id in [ids.control, ids.locked] {
+        assert_eq!(
+            s.ed.doc.get(id).unwrap().text_style.family,
+            FontFamily::Inter
+        );
+    }
+    assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+    let edited = page_to_json(&s.ed.page_data(0));
+    let snap = s.save_snapshot().expect("saves as any change");
+    assert_eq!(page_to_json(&sent_page(&snap)), edited);
+    s.save_succeeded();
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(
+        page_to_json(&s.ed.page_data(0)),
+        before,
+        "one step for both"
+    );
+}
+
+#[test]
+fn r176_the_design_panel_font_sets_the_selected_layers_family_in_one_step() {
+    use crate::model::FontFamily;
+    let (mut s, ids) = metric_fixture();
+    let before = page_to_json(&s.ed.page_data(0));
+    let before_doc = s.ed.doc.clone();
+    s.ed.selection = vec![ids.second];
+    timed_frames(&mut s, 3);
+    assert!(paints(&mut s, "Font"), "the Text section's Font row");
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Inter", t);
+    timed_frames(&mut s, 2);
+    let t = s.now_ms + 1000.0;
+    click_front_label(&mut s, "Geist Mono", t);
+    timed_frames(&mut s, 3);
+    let n = s.ed.doc.get(ids.second).unwrap().clone();
+    assert_eq!(n.text_style.family, FontFamily::GeistMono);
+    assert!(
+        faces(&n).iter().all(|f| *f == 4),
+        "drawn in Geist Mono Regular"
+    );
+    let fitted = crate::text::layout_node(&n).unwrap().width;
+    assert!(
+        (n.rect.w - fitted.max(1.0)).abs() < 1e-6,
+        "fitted to Geist Mono"
+    );
+    // Only the selected layer.
+    for id in [ids.first, ids.control, ids.locked] {
+        assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{id:?}");
+    }
+    let edited = page_to_json(&s.ed.page_data(0));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
+    s.run(Action::Redo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), edited);
+}
+
+#[test]
+fn r176_a_geist_mono_layer_copies_as_version_2_pastes_whole_and_an_older_payload_is_refused() {
+    use crate::io::clipboard::{FAMILY_VERSION, LABELLED_TYPE, LABELLED_VERSION};
+    use crate::model::FontFamily;
+    let (mut s, ids) = metric_fixture();
+    s.ed.selection = vec![ids.first];
+    s.ed.edit("Geist Mono", |tx| {
+        tx.node_mut(ids.first).unwrap().text_style.family = FontFamily::GeistMono
+    });
+    let original = s.ed.doc.get(ids.first).unwrap().clone();
+    let text = s.copy(false).expect("the copy event gets the payload");
+    let head = format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{FAMILY_VERSION},");
+    assert!(text.starts_with(&head), "{text}");
+    // Pasted in another canvas: the layer with its family, text and ranges, in one step.
+    let mut t = state();
+    let (before, steps) = (t.ed.doc.clone(), t.ed.history.undo_len());
+    t.paste(&text);
+    assert_eq!(t.ed.history.undo_len(), steps + 1);
+    let [pasted] = t.ed.selection[..] else {
+        panic!("one layer pasted")
+    };
+    let p = t.ed.doc.get(pasted).unwrap();
+    assert_eq!(p.text_style, original.text_style);
+    assert_eq!(p.kind.text(), original.kind.text());
+    let after = t.ed.doc.clone();
+    // The same payload declared as version 1 (an older writer never wrote one): refused, as
+    // an older reader refuses version 2; nothing pasted, no text layer.
+    let older = text.replacen(
+        &head,
+        &format!("{{\"type\":\"{LABELLED_TYPE}\",\"version\":{LABELLED_VERSION},"),
+        1,
+    );
+    t.paste(&older);
+    assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
+    assert_eq!(t.ed.doc, after, "nothing pasted");
+    assert_eq!(t.ed.history.undo_len(), steps + 1);
+    // Declared as the unversioned `paper-rs/clipboard` and cut by its final brace: refused
+    // the same way, never pasted as a text layer of the JSON.
+    let plain = text.replacen(
+        &head,
+        &format!("{{\"type\":\"{}\",", crate::io::clipboard::TYPE),
+        1,
+    );
+    t.ed.status.clear();
+    t.paste(&plain[..plain.len() - 1]);
+    assert!(t.ed.status.contains("can't be pasted"), "{}", t.ed.status);
+    assert_eq!(t.ed.doc, after, "nothing pasted");
+    assert_eq!(t.ed.history.undo_len(), steps + 1);
+    t.run(Action::Undo);
+    assert_eq!(t.ed.doc, before);
+}
+
+// ---- run179: the Design panel's Font admits a family as Theme does. The parent's real-widget
+// probe (`lead_font_design_preserves_a_locked_autolayout_sibling`, on an exact source copy)
+// failed: choosing Geist Mono for an unlocked auto-layout title moved its locked sibling
+// (y 49.0390625 → 51.2 in a column, x 68.9609375 → 92 in a row), and the whole page, history
+// and stamp changed with no refusal. Its paired unlocked control passed. Both are kept here
+// without the probe's evidence file writes; the refusal is strengthened to the whole state.
+
+/// The parent probe's Design Font use: `id` selected, the Text section's Font row (its
+/// selected "Inter") opened, Geist Mono chosen, laid out.
+fn design_font(s: &mut WebState, id: crate::model::NodeId) {
+    s.ed.selection = vec![id];
+    timed_frames(s, 3);
+    assert!(paints(s, "Font"), "the Design Text section's Font row");
+    let t = s.now_ms + 1000.0;
+    click_front_label(s, "Inter", t);
+    timed_frames(s, 2);
+    let t = s.now_ms + 1000.0;
+    click_front_label(s, "Geist Mono", t);
+    timed_frames(s, 3);
+}
+
+/// What a refused Design change must leave as it was: the history, document stamp, selection,
+/// unsaved state and the open text edit with its caret.
+fn design_markers(
+    s: &WebState,
+) -> (
+    String,
+    u64,
+    Vec<crate::model::NodeId>,
+    bool,
+    Option<(crate::model::NodeId, usize, Option<usize>)>,
+) {
+    (
+        format!("{:?}", s.ed.history),
+        s.ed.doc_stamp,
+        s.ed.selection.clone(),
+        s.dirty(),
+        s.ed.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor)),
+    )
+}
+
+#[test]
+fn r179_the_design_font_refuses_a_family_that_would_move_a_locked_auto_layout_sibling() {
+    use crate::model::{Direction, FontFamily};
+    for direction in [Direction::Vertical, Direction::Horizontal] {
+        let (mut s, text, sibling) = metric_flow_fixture(true, direction);
+        s.ed.selection = vec![text];
+        timed_frames(&mut s, 3);
+        let before = page_to_json(&s.ed.page_data(0));
+        let control = s.ed.doc.get(sibling).unwrap().clone();
+        let markers = design_markers(&s);
+        design_font(&mut s, text);
+        // The probe's own assertion: the locked sibling exactly as it was.
+        assert_eq!(s.ed.doc.get(sibling), Some(&control), "{direction:?}");
+        assert!(s.ed.doc.get(sibling).unwrap().locked);
+        // Refused whole, before anything changed, and said why.
+        assert_eq!(page_to_json(&s.ed.page_data(0)), before, "{direction:?}");
+        assert_eq!(design_markers(&s), markers, "{direction:?}");
+        assert_eq!(
+            s.ed.doc.get(text).unwrap().text_style.family,
+            FontFamily::Inter
+        );
+        assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+        assert!(s.save_snapshot().is_none(), "{direction:?}");
+    }
+}
+
+#[test]
+fn r179_the_design_font_unlocked_pair_really_applies_in_one_step() {
+    use crate::model::{Direction, FontFamily};
+    // The probe's passing control, in both directions: Geist Mono applies, the same fit and
+    // reflow move the unlocked sibling, and one Undo/Redo gives the whole page back.
+    for direction in [Direction::Vertical, Direction::Horizontal] {
+        let (mut s, text, sibling) = metric_flow_fixture(false, direction);
+        s.ed.selection = vec![text];
+        timed_frames(&mut s, 3);
+        let before = page_to_json(&s.ed.page_data(0));
+        let control = s.ed.doc.get(sibling).unwrap().clone();
+        design_font(&mut s, text);
+        assert_eq!(
+            s.ed.doc.get(text).unwrap().text_style.family,
+            FontFamily::GeistMono
+        );
+        assert_ne!(
+            s.ed.doc.get(sibling),
+            Some(&control),
+            "{direction:?}: the same fitting and reflow are exercised"
+        );
+        assert!(s.ed.status.is_empty(), "{direction:?}: {}", s.ed.status);
+        let after = page_to_json(&s.ed.page_data(0));
+        let snap = s.save_snapshot().expect("the allowed family saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), after);
+        s.save_succeeded();
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{direction:?}: one Undo"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            after,
+            "{direction:?}: one Redo"
+        );
+    }
+}
+
+#[test]
+fn r179_a_refused_design_font_keeps_an_open_text_draft_and_an_allowed_one_applies() {
+    use crate::model::{Direction, FontFamily};
+    // The title's own text being edited (a draft open): the dry run includes the draft's
+    // commit, and the refusal finishes nothing. The page, history, stamp, selection and caret
+    // stay, nothing is offered to save, and the draft still types.
+    let (mut s, text, sibling) = metric_flow_fixture(true, Direction::Vertical);
+    s.ed.selection = vec![text];
+    s.ed.start_text_edit(text, None);
+    s.ed.insert_text("ø");
+    timed_frames(&mut s, 3);
+    let page = page_to_json(&s.ed.page_data(0));
+    let control = s.ed.doc.get(sibling).unwrap().clone();
+    let markers = design_markers(&s);
+    assert!(markers.4.is_some(), "a draft is open");
+    design_font(&mut s, text);
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), page);
+    assert_eq!(s.ed.doc.get(sibling), Some(&control));
+    assert_eq!(design_markers(&s), markers);
+    assert!(s.save_snapshot().is_none(), "nothing offered to save");
+    s.ed.insert_text("x");
+    let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
+    assert!(typed.ends_with("øx"), "the draft still types: {typed}");
+    // Unlocked, the same draft: the family applies to the whole layer, the sibling follows,
+    // and the draft stays open and types.
+    let (mut s, text, free) = metric_flow_fixture(false, Direction::Vertical);
+    s.ed.selection = vec![text];
+    s.ed.start_text_edit(text, None);
+    s.ed.insert_text("ø");
+    timed_frames(&mut s, 3);
+    let place = s.ed.doc.get(free).unwrap().rect;
+    design_font(&mut s, text);
+    let n = s.ed.doc.get(text).unwrap();
+    assert_eq!(n.text_style.family, FontFamily::GeistMono);
+    assert!(
+        n.kind.text().unwrap().ends_with('ø'),
+        "the draft's text kept"
+    );
+    assert_ne!(s.ed.doc.get(free).unwrap().rect, place, "it really moves");
+    assert_eq!(s.ed.text_edit.as_ref().map(|t| t.id), Some(text));
+    s.ed.insert_text("x");
+    let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
+    assert!(typed.ends_with("øx"), "the draft still types: {typed}");
+}
+
+#[test]
+fn r179_the_design_font_refuses_a_locked_instance_inheriting_its_box_and_admits_an_overriding_one()
+{
+    use crate::model::FontFamily;
+    // R68's fixture: a locked instance whose child overrides only `font` still takes the
+    // main's new text box, so Geist Mono for the main is refused whole, the reason said.
+    let (mut s, ids, instance, child) = r68_font_override_fixture(false);
+    s.ed.selection = vec![ids.whole];
+    timed_frames(&mut s, 3);
+    let before = page_to_json(&s.ed.page_data(0));
+    let (child_before, root_before) = (
+        s.ed.doc.get(child).unwrap().clone(),
+        s.ed.doc.get(instance).unwrap().clone(),
+    );
+    let markers = design_markers(&s);
+    design_font(&mut s, ids.whole);
+    assert_eq!(s.ed.status, ui::design_system::INHERITED_STYLE);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before);
+    assert_eq!(design_markers(&s), markers);
+    assert_eq!(s.ed.doc.get(child), Some(&child_before));
+    assert_eq!(s.ed.doc.get(instance), Some(&root_before));
+    assert_eq!(
+        s.ed.doc.get(ids.whole).unwrap().text_style.family,
+        FontFamily::Inter
+    );
+    // Overriding both `font` and `size`, the locked instance keeps everything: the main takes
+    // Geist Mono, in one step.
+    let (mut s, ids, instance, child) = r68_font_override_fixture(true);
+    s.ed.selection = vec![ids.whole];
+    timed_frames(&mut s, 3);
+    let before = page_to_json(&s.ed.page_data(0));
+    let (child_before, root_before) = (
+        s.ed.doc.get(child).unwrap().clone(),
+        s.ed.doc.get(instance).unwrap().clone(),
+    );
+    design_font(&mut s, ids.whole);
+    assert_eq!(
+        s.ed.doc.get(ids.whole).unwrap().text_style.family,
+        FontFamily::GeistMono
+    );
+    assert_eq!(
+        s.ed.doc.get(child),
+        Some(&child_before),
+        "its own font and box"
+    );
+    assert_eq!(s.ed.doc.get(instance), Some(&root_before));
+    s.run(Action::Undo);
+    step(&mut s);
+    assert_eq!(page_to_json(&s.ed.page_data(0)), before, "one step");
 }

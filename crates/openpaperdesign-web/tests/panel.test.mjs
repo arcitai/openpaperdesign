@@ -283,7 +283,9 @@ test('a wrong, mixed, out-of-order, short or oversized part stops the transfer w
     ['out of order', (p) => ({ ...p, part: p.part + 1 }), /out of order or incomplete/],
     ['short data', (p) => ({ ...p, data: p.data.slice(0, 8) }), /isn't the length it says/],
     ['changed count', (p, i) => (i === 1 ? { ...p, bytes: p.bytes + PART, parts: p.parts + 1 } : p), /doesn't match the earlier parts/],
-    ['oversized', (p) => ({ ...p, bytes: 17 * 1024 * 1024, parts: 68 }), /unexpected size/],
+    // One byte past the 18 MiB bound (revision 23: the bundled Geist Mono faces), in 73 parts.
+    ['oversized', (p) => ({ ...p, bytes: 18 * 1024 * 1024 + 1, parts: 73 }), /unexpected size/],
+    ['too many parts', (p) => ({ ...p, bytes: 18 * 1024 * 1024, parts: 73 }), /unexpected size/],
     ['fractional size', (p) => ({ ...p, bytes: p.bytes + 0.5 }), /unexpected size/],
     ['not base64', (p) => ({ ...p, data: '%%%%' }), /isn't the length it says/],
   ]) {
@@ -305,6 +307,22 @@ test('a wrong, mixed, out-of-order, short or oversized part stops the transfer w
   c.engine.init = async () => { throw new Error('WebAssembly.instantiate(): Refused to compile or instantiate WebAssembly module because \'unsafe-eval\' is not allowed'); };
   await assert.rejects(c.panel.open({ binding: BINDING, refs: c.refs }).started, /Refused to compile/);
   assert.equal(c.srv.named(T.CANVAS).length, 0);
+});
+
+test('the renderer bound is exactly 18 MiB in 72 parts: that size passes the size check, one byte more does not', async () => {
+  // At the bound the size is accepted; the transfer then stops at the first part this fake
+  // server doesn't have (its renderer is smaller), never with "unexpected size".
+  for (const [bytes, parts, want] of [
+    [18 * 1024 * 1024, 72, /out of order or incomplete/],
+    [16 * 1024 * 1024 + 1, 65, /out of order or incomplete/],
+    [18 * 1024 * 1024 + 1, 73, /unexpected size/],
+  ]) {
+    const srv = fakeServer();
+    srv.override[T.ASSET] = (a) => ok({ ...srv.part(a.part), bytes, parts });
+    const t = setup(srv);
+    await assert.rejects(t.panel.open({ binding: BINDING, refs: t.refs }).started, want, `${bytes}`);
+    assert.equal(t.engine.inits.length, 0, `${bytes}: nothing compiled`);
+  }
 });
 
 test('leaving during the transfer stops it; leaving during the first read releases the mount it got', async () => {
