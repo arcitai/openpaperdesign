@@ -581,7 +581,8 @@ fn a_grouped_diagram_saves_reopens_and_exports_with_its_labels_and_bindings() {
 #[test]
 fn connector_label_format_an_unlabelled_page_stays_v3_and_a_label_needs_v4() {
     use paper_rs::project::format::{
-        FormatError, PAGE_VERSION, PAGE_VERSION_LABELS, page_from_json, page_to_json,
+        FormatError, PAGE_VERSION, PAGE_VERSION_LABELS, PAGE_VERSION_MAX, page_from_json,
+        page_to_json,
     };
     let mut e = editor(1000.0, 700.0);
     let a = rect(&mut e, 100.0, 100.0, 160.0, 80.0);
@@ -616,8 +617,16 @@ fn connector_label_format_an_unlabelled_page_stays_v3_and_a_label_needs_v4() {
         *label = None;
     }
     assert_eq!(unlabelled, e.doc.nodes);
-    // A newer page version is still refused, not misread.
-    v["version"] = serde_json::json!(PAGE_VERSION_LABELS + 1);
+    // The newest version this reader has (v5 since the font families, which holds labels too):
+    // the same labelled page declared at it reads exactly and is written back as the v4 it
+    // needs, byte for byte. (This step once used v4 + 1 as its newer version; that is v5 now.)
+    v["version"] = serde_json::json!(PAGE_VERSION_MAX);
+    let current = serde_json::to_string(&v).unwrap();
+    let read_current = page_from_json(&current).unwrap();
+    assert_eq!(read_current.doc, read.doc);
+    assert_eq!(page_to_json(&read_current), again);
+    // A page version newer than that is still refused, not misread.
+    v["version"] = serde_json::json!(PAGE_VERSION_MAX + 1);
     let newer = serde_json::to_string(&v).unwrap();
     assert!(matches!(
         page_from_json(&newer),
@@ -1599,12 +1608,13 @@ fn labelled_arrows_copy_cut_and_paste_with_their_labels_and_the_native_library_r
     e.doc.validate().unwrap();
 }
 
-/// R15: a labelled clipboard payload is checked whole before anything happens. Another version,
-/// no version, an unknown field, a cut-off text, a node twice, a child or root missing, a layer
-/// outside the copied tree, a cycle, positions that don't match the layers or no layers at all
-/// are refused with a reason: no layer, no text layer instead, no undo step, the selection and
-/// the clipboard as they were, and no image of the payload registered. A whole payload pastes,
-/// its image registered (controls). Labels are kept exactly (Unicode over lines, blank, empty).
+/// R15: a labelled clipboard payload is checked whole before anything happens. A version this
+/// reader doesn't have, no version, an unknown field, a cut-off text, a node twice, a child or
+/// root missing, a layer outside the copied tree, a cycle, positions that don't match the layers
+/// or no layers at all are refused with a reason: no layer, no text layer instead, no undo step,
+/// the selection and the clipboard as they were, and no image of the payload registered. A whole
+/// payload pastes, its image registered, and declared at the newest version it reads as the
+/// same layers (controls). Labels are kept exactly (Unicode over lines, blank, empty).
 /// And what a reader of `paper-rs/clipboard` alone does with it, step by step in this tree's
 /// own code of that path: its type isn't that one, it isn't an Excalidraw scene and it isn't
 /// SVG, so such a reader can only take the whole JSON as plain text (an earlier OpenPaperDesign
@@ -1680,8 +1690,14 @@ fn labelled_clipboard_payloads_are_checked_whole_and_keep_their_labels_exactly()
         v["roots"] = json!([]);
         v["world"] = json!([]);
     });
+    // The newest version this reader has: `FAMILY_VERSION` (2, the font families, a superset of
+    // version 1). This list once refused a literal 2 as unknown; the unknown one is past it now.
+    let newest = clipboard::FAMILY_VERSION;
     let mut cases: Vec<(&str, String)> = vec![
-        ("version 2", mutate(&|v| v["version"] = json!(2))),
+        (
+            "a version past the newest",
+            mutate(&|v| v["version"] = json!(newest + 1)),
+        ),
         ("version 0", mutate(&|v| v["version"] = json!(0))),
         ("version \"1\"", mutate(&|v| v["version"] = json!("1"))),
         ("no version", no_version),
@@ -1746,6 +1762,20 @@ fn labelled_clipboard_payloads_are_checked_whole_and_keep_their_labels_exactly()
     let refused_id = paper_rs::assets::hash(&refused_png);
     let registered = paper_rs::assets::get(&refused_id).is_some();
     assert!(!registered, "no image of a refused payload registered");
+    // Control: the same labelled Inter payload declared at the newest version reads as exactly
+    // the same layers as the copy, and written again it is the copy's version 1, byte for byte.
+    let mut at_newest = parsed.clone();
+    at_newest["version"] = json!(newest);
+    let (Content::Layers(now), Content::Layers(then)) = (
+        clipboard::decode(&at_newest.to_string()),
+        clipboard::decode(&whole),
+    ) else {
+        panic!("version {newest} and the copy both read as layers")
+    };
+    assert_eq!(now.nodes, then.nodes);
+    assert_eq!((&now.roots, &now.world), (&then.roots, &then.world));
+    let again = clipboard::encode(&now.nodes, &now.roots, &now.world, now.page.as_deref());
+    assert_eq!(again, whole, "written again as version 1");
     // Control: the whole payload, with its image, pastes in one step and registers the image.
     let kept = with_image(parsed.clone(), &kept_png).to_string();
     *cap.borrow_mut() = Some(kept);
@@ -1938,9 +1968,13 @@ fn labelled_clipboard_images_are_checked_whole_and_a_paste_after_a_refusal_says_
     other.run(Action::Undo);
     assert_eq!(other.doc, doc);
 
-    // A refusal, then the whole payload: pasted with its image fill, and said so.
-    *cap.borrow_mut() = Some(mutate(&|v| v["version"] = json!(2)));
+    // A refusal, then the whole payload: pasted with its image fill, and said so. The refusal
+    // is a version past the newest this reader has (`FAMILY_VERSION`, 2 since the font
+    // families; this step once used a literal 2, which is a supported version now).
+    let newest = clipboard::FAMILY_VERSION;
+    *cap.borrow_mut() = Some(mutate(&|v| v["version"] = json!(newest + 1)));
     other.run(Action::Paste);
+    assert_eq!(other.doc, doc, "nothing pasted");
     let said = other.status.contains("Nothing was pasted");
     assert!(said, "{}", other.status);
     *cap.borrow_mut() = Some(whole.clone());
@@ -1964,6 +1998,23 @@ fn labelled_clipboard_images_are_checked_whole_and_a_paste_after_a_refusal_says_
     assert_eq!(other.doc, doc, "one undo step");
     other.run(Action::Redo);
     assert_eq!(other.doc, full);
+    // Control: the same payload declared at the newest version (a superset of version 1) pastes
+    // the same way: its image fill and label exactly, in one step, and said so.
+    *cap.borrow_mut() = Some(mutate(&|v| v["version"] = json!(newest)));
+    let steps = other.history.undo_len();
+    other.run(Action::Paste);
+    assert_eq!(other.history.undo_len(), steps + 1, "one step");
+    assert_eq!(other.status, "Pasted 2 layer(s)", "the paste is said");
+    let pasted = other.selection.clone();
+    let copy = *pasted
+        .iter()
+        .find(|p| matches!(other.doc.get(**p).unwrap().kind, NodeKind::Rect))
+        .expect("the filled rectangle");
+    assert_eq!(&other.doc.get(copy).unwrap().style, style, "its image fill");
+    let arrow_copy = arrow_in(&other, &pasted);
+    assert_eq!(label_of(&other, arrow_copy).as_deref(), Some("loads"));
+    other.run(Action::Undo);
+    assert_eq!(other.doc, full, "one undo step");
 }
 
 /// R48-F1: a member named twice in a labelled payload is ambiguous and refused before anything
