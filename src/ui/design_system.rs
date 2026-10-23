@@ -192,6 +192,10 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         note(ui, "No text on this Paper.");
     }
     let links = inheritors(ed);
+    // The metric typed last frame and not entered, and whether its editor's fields are drawn
+    // this frame (else it has gone, see below).
+    let prior = ui.ctx().data(|d| d.get_temp::<MetricDraft>(draft_key()));
+    let mut prior_drawn = false;
     let mut changed = None;
     let mut open = None;
     let mut drafting = None;
@@ -233,17 +237,31 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
             Some(a) if in_use => metrics(ed, &a.targets),
             _ => metrics(ed, &style_targets(ed, style)),
         };
-        let (change, is_open, popup, typing) =
-            style_editor(ui, key.with(salt), slot, style, ids.len(), &shown);
-        if let Some(change) = change {
+        let frame = style_editor(ui, key.with(salt), slot, style, ids.len(), &shown);
+        let popup = frame.popup;
+        if frame.drawn && prior.as_ref().is_some_and(|d| d.popup == popup) {
+            prior_drawn = true;
+        }
+        if let Some(change) = frame.change {
             changed = Some((style, change, popup));
         }
-        if is_open {
+        if frame.open {
             open = Some(style);
         }
-        if let Some((metric, text)) = typing {
+        if let Some((metric, text)) = frame.typing {
             drafting = Some((style, metric, text, popup));
         }
+    }
+    // A metric typed and not entered whose editor's fields weren't drawn this frame went
+    // without its field losing the focus: another style's Aa opened its editor in its place
+    // (only one is open at a time; an earlier row's closes this one before it is drawn), or its
+    // row lost its editor. It is finished as that focus loss would finish it, into the use under
+    // way, so it and that use's earlier changes are one step when it ends below (R71). Escape,
+    // which closes the editor, still drops it.
+    if let Some(d) = prior.filter(|_| !prior_drawn)
+        && !ui.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        finish_draft(ui.ctx(), ed, &links, &mut active, &d);
     }
     if let Some((style, change, popup)) = changed {
         apply_style_change(ui.ctx(), ed, &links, &mut active, style, change, popup);
@@ -261,8 +279,8 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
         }
     });
     // A metric being typed is kept with the document it is for, so a frame that no longer
-    // draws its field finishes it ([`begin_frame`]); none being typed now (entered, Escaped)
-    // leaves none.
+    // draws its field finishes it (above, or [`begin_frame`] when Theme isn't drawn); none
+    // being typed now (entered, Escaped, finished) leaves none.
     ui.ctx().data_mut(|d| match drafting {
         Some((style, metric, text, popup)) => {
             let stamp = ed.doc_stamp;
@@ -288,7 +306,7 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
 /// first one admitted whole by [`fresh_restyle`]; a line height or letter spacing needs every
 /// target to be a whole layer. A refused change applies nothing, closes the editor and says
 /// why in the status line. The one path for the editor's fields and for a metric finished
-/// after its field went away ([`finish_metric_draft`]).
+/// after its field went away ([`finish_draft`]).
 fn apply_style_change(
     ctx: &egui::Context,
     ed: &mut Editor,
@@ -363,8 +381,9 @@ enum Metric {
 /// no focus moved within the editor): its style, which metric, the text, the editor's popup and
 /// the document stamp it was typed against. Kept in egui's memory only while its field is drawn
 /// with the keyboard, so a frame that stops drawing it (the left panel switched to Design,
-/// panels collapsed, the UI hidden) can finish it as losing focus would ([`begin_frame`]);
-/// before, the field simply vanished and the entry was lost (R171 panel finding). Ephemeral UI
+/// panels collapsed, the UI hidden: [`begin_frame`]; another style's editor opened in its
+/// place: `used_text_styles`) can finish it as losing focus would; before, the field simply
+/// vanished and the entry was lost (R171 panel finding, R71 Aa finding). Ephemeral UI
 /// state, never a value store: it applies only to the document it was typed against.
 #[derive(Clone)]
 struct MetricDraft {
@@ -403,13 +422,8 @@ pub fn begin_frame(ctx: &egui::Context, ed: &mut Editor) {
     }
 }
 
-/// A typed metric whose field is gone, finished as Enter or a click elsewhere in its editor
-/// would finish it: a valid value applied through [`apply_style_change`] (the same preview
-/// admission, frozen targets, whole layers and locks; a refusal says why), an unchanged one or
-/// an entry that isn't a value applying nothing. Only for the document it was typed against:
-/// after any other change of it (a reload or discard, another Paper, Undo, an agent's edit) it
-/// is dropped, never applied to the new one. Its editor isn't shown any more, so its use ends
-/// here: one undo step, and the autosave free again.
+/// A typed metric whose Theme view is gone, finished ([`finish_draft`]). Its editor isn't
+/// shown any more, so its use ends here: one undo step, and the autosave free again.
 fn finish_metric_draft(ctx: &egui::Context, ed: &mut Editor) {
     let Some(d) = ctx.data(|m| m.get_temp::<MetricDraft>(draft_key())) else {
         return;
@@ -421,12 +435,37 @@ fn finish_metric_draft(ctx: &egui::Context, ed: &mut Editor) {
     let mut active: Option<Restyle> = ctx
         .data(|m| m.get_temp(restyle_key()))
         .filter(|a: &Restyle| a.stamp == ed.doc_stamp);
+    finish_draft(ctx, ed, &inheritors(ed), &mut active, &d);
+    if active.is_some() {
+        ed.history.seal();
+    }
+    ctx.data_mut(|m| m.remove::<Restyle>(restyle_key()));
+    egui::Popup::close_id(ctx, d.popup);
+}
+
+/// A typed metric `d` whose field is gone, finished as Enter or a click elsewhere in its editor
+/// would finish it, continuing the use under way (`active`): a valid value applied through
+/// [`apply_style_change`] (the same preview admission, frozen targets, whole layers and locks;
+/// a refusal says why), an unchanged one or an entry that isn't a value applying nothing. Only
+/// for the document it was typed against: after any other change of it (a reload or discard,
+/// another Paper, Undo, an agent's edit) it is dropped, never applied to the new one. The
+/// caller ends the use.
+fn finish_draft(
+    ctx: &egui::Context,
+    ed: &mut Editor,
+    links: &HashMap<NodeId, Vec<NodeId>>,
+    active: &mut Option<Restyle>,
+    d: &MetricDraft,
+) {
+    if d.stamp != ed.doc_stamp {
+        return;
+    }
     let change = match d.metric {
         Metric::LineHeight => parse_line_height(&d.text).map(StyleChange::LineHeight),
         Metric::LetterSpacing => parse_letter_spacing(&d.text).map(StyleChange::LetterSpacing),
     };
     if let Some(change) = change {
-        let targets = match &active {
+        let targets = match &*active {
             Some(a) if a.now == d.style => a.targets.clone(),
             _ => style_targets(ed, d.style),
         };
@@ -437,15 +476,9 @@ fn finish_metric_draft(ctx: &egui::Context, ed: &mut Editor) {
             StyleChange::Size(_) | StyleChange::Face { .. } => false,
         };
         if !unchanged {
-            let links = inheritors(ed);
-            apply_style_change(ctx, ed, &links, &mut active, d.style, change, d.popup);
+            apply_style_change(ctx, ed, links, active, d.style, change, d.popup);
         }
     }
-    if active.is_some() {
-        ed.history.seal();
-    }
-    ctx.data_mut(|m| m.remove::<Restyle>(restyle_key()));
-    egui::Popup::close_id(ctx, d.popup);
 }
 
 /// A text style being changed from its row's editor, from the first change until the editor
@@ -947,9 +980,8 @@ fn style_glyph(ui: &Ui, slot: egui::Rect, color: egui::Color32) {
 /// the selecting target around it), and the small popup it opens: the style's size and Inter's
 /// four faces, nothing the renderer can't draw, then its layers' line height and letter
 /// spacing (`shown`: a value, Auto or Mixed; unavailable, with the reason, when the style is
-/// only part of some layer's text). Returns the change, if any, whether the popup is open, its
-/// id, and a metric being typed (not yet entered) with its text. `id` is the button's own
-/// identity, independent of the row's place.
+/// only part of some layer's text). `id` is the button's own identity, independent of the
+/// row's place.
 fn style_editor(
     ui: &mut Ui,
     id: egui::Id,
@@ -957,12 +989,7 @@ fn style_editor(
     style: StyleKey,
     count: usize,
     shown: &Metrics,
-) -> (
-    Option<StyleChange>,
-    bool,
-    egui::Id,
-    Option<(Metric, String)>,
-) {
+) -> EditorFrame {
     let mut child = ui.new_child(egui::UiBuilder::new().id(id).max_rect(slot));
     let popup = id.with("popup");
     let open = egui::Popup::is_id_open(child.ctx(), popup);
@@ -985,10 +1012,12 @@ fn style_editor(
     let (_, bold, italic) = style;
     let mut change = None;
     let mut typing = None;
+    let mut drawn = false;
     egui::Popup::menu(&resp)
         .id(popup)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
+            drawn = true;
             ui.set_min_width(180.0);
             let mut size = style.0 as f64 / 100.0;
             let r = ui.add_sized(
@@ -1039,12 +1068,27 @@ fn style_editor(
                 note(ui, RANGE_METRICS);
             }
         });
-    (
+    EditorFrame {
         change,
-        egui::Popup::is_id_open(ui.ctx(), popup),
+        open: egui::Popup::is_id_open(ui.ctx(), popup),
         popup,
         typing,
-    )
+        drawn,
+    }
+}
+
+/// What one style's editor did this frame.
+struct EditorFrame {
+    /// A finished change to the style.
+    change: Option<StyleChange>,
+    /// Whether its popup is open after this frame.
+    open: bool,
+    popup: egui::Id,
+    /// A metric being typed (not yet entered) and its text.
+    typing: Option<(Metric, String)>,
+    /// Whether the popup's fields were drawn this frame. A field that was being typed in and
+    /// isn't drawn has gone without a focus-loss frame (another style's editor replaced it).
+    drawn: bool,
 }
 
 /// One paragraph metric in a style's editor: its label and a text field showing `shown` (a

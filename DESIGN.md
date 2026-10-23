@@ -55,9 +55,12 @@ comment 6347896307); this summary doesn't replace them, and no issue is closed b
   also shows and sets its layers' line height and letter spacing (the whole-layer metrics
   the renderer and the Design panel already have; see Theme below). The lead's web, serve and
   native build checks of its first version passed, and two of its probes failed (a typed,
-  unentered value lost when switching the left panel to Design); that is corrected in
-  source, unchecked. Pending: the lead's affected checks and renders, a fresh independent
-  review, production build and CI, and any native or Mac check.
+  unentered value lost when switching the left panel to Design). That correction (`ca5aa61`)
+  passed the lead's source and rendered checks; its independent R71 review found one more
+  loss (a typed, unentered value dropped when an earlier style's Aa opens its editor in
+  place of this one), not accepted, now corrected in source, unchecked. Pending: the lead's
+  affected checks and renders, a fresh independent review, production build and CI, and any
+  native or Mac check.
 
 **#10's seven groups** (owner brief; Mac re-test targets once the loaded build is known):
 

@@ -9124,3 +9124,117 @@ fn r172_escape_still_cancels_and_an_invalid_typed_metric_finishes_as_nothing() {
     assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
     assert!(!s.dirty() && s.can_reload());
 }
+
+// ---- revision 22 correction (run174): a metric typed and not entered, then the visible
+// earlier 20 Bold Aa opened. Before, Bold's editor closed the 20 Regular one before its field
+// had a focus-loss frame, and the entry was dropped (R71-F1: the lead's
+// `r71_opening_another_aa_finishes_or_keeps_the_typed_metric` and both
+// `r71_diag_switch_earlier_aa_*` failed: not applied, not kept, the page clean). Now it is
+// finished as that focus loss would finish it, for its own style only.
+
+#[test]
+fn r174_opening_the_earlier_aa_finishes_a_typed_metric_for_its_own_style() {
+    // The lead's sequence unchanged (focus, Ctrl+A, paste, no Enter, the actual earlier
+    // 20 Bold Aa clicked); its outcome, "applied or kept", is met by applying, then checked as
+    // any edit: only the whole 20 Regular layers, Bold's own editor and values, one step,
+    // saved and undone whole.
+    for (label, value) in [("Line height", "125%"), ("Letter spacing", "2.5 px")] {
+        let (mut s, ids) = metric_fixture();
+        let before = page_to_json(&s.ed.page_data(0));
+        let before_doc = s.ed.doc.clone();
+        let steps = s.ed.history.undo_len();
+        open_theme(&mut s);
+        open_picker(&mut s, "20 · Regular");
+        metric_typed(&mut s, label, value);
+        open_picker(&mut s, "20 · Bold");
+        timed_frames(&mut s, 3);
+        assert!(
+            metric_applied(&s, &ids, label),
+            "{label}: finished, not lost"
+        );
+        // Its frozen whole-layer targets only: the colour range of the first exactly as it
+        // was, the other metric untouched; Bold and the locked layer exactly as they were.
+        let spans = |d: &Document| d.get(ids.first).unwrap().text_style.spans.clone();
+        assert_eq!(spans(&s.ed.doc), spans(&before_doc), "{label}");
+        for id in [ids.first, ids.second] {
+            let (now, was) = (
+                &s.ed.doc.get(id).unwrap().text_style,
+                &before_doc.get(id).unwrap().text_style,
+            );
+            if label == "Line height" {
+                assert_eq!(now.letter_spacing, was.letter_spacing, "{label}: {id:?}");
+            } else {
+                assert_eq!(now.line_height, was.line_height, "{label}: {id:?}");
+            }
+        }
+        for id in [ids.control, ids.locked] {
+            assert_eq!(s.ed.doc.get(id), before_doc.get(id), "{label}: {id:?}");
+        }
+        // Bold's editor opened as asked, with its own values; the finished use is over.
+        assert!(ui::popup_open(&s.ctx), "{label}: Bold's editor is open");
+        assert!(paints(&mut s, "200%"), "{label}: Bold's line height");
+        assert!(paints(&mut s, "3 px"), "{label}: Bold's letter spacing");
+        assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+        assert_eq!(s.ed.history.undo_len(), steps + 1, "{label}: one step");
+        assert!(s.unsaved_work() && s.dirty(), "{label}: not falsely clean");
+        // Saved as any change, then one Undo gives the whole page back, one Redo the edit.
+        close_picker(&mut s);
+        assert!(!ui::design_system::editing(&s.ctx, &s.ed), "{label}");
+        let edited = page_to_json(&s.ed.page_data(0));
+        assert_ne!(edited, before, "{label}");
+        let snap = s.save_snapshot().expect("the finished metric saves");
+        assert_eq!(page_to_json(&sent_page(&snap)), edited, "{label}");
+        s.save_succeeded();
+        assert!(!s.dirty(), "{label}: Saved");
+        s.run(Action::Undo);
+        step(&mut s);
+        assert_eq!(
+            page_to_json(&s.ed.page_data(0)),
+            before,
+            "{label}: one step"
+        );
+        s.run(Action::Redo);
+        step(&mut s);
+        assert_eq!(page_to_json(&s.ed.page_data(0)), edited, "{label}");
+        // Back in 20 Regular's editor, the style shows what was finished.
+        open_picker(&mut s, "20 · Regular");
+        assert!(paints(&mut s, value), "{label}: shown as set");
+    }
+}
+
+#[test]
+fn r174_escape_or_an_invalid_entry_before_the_earlier_aa_changes_nothing() {
+    // Escape remains the explicit cancel, and an entry that isn't a value finishes as nothing,
+    // when the earlier Aa is opened afterwards: no change, no draft, no step.
+    for (label, value, escape) in [
+        ("Line height", "125%", true),
+        ("Letter spacing", "2.5 px", true),
+        ("Line height", "tall", false),
+        ("Letter spacing", "wide", false),
+    ] {
+        let (mut s, _) = metric_fixture();
+        let before = page_to_json(&s.ed.page_data(0));
+        let markers = (s.ed.history.undo_len(), s.ed.doc_stamp);
+        open_theme(&mut s);
+        open_picker(&mut s, "20 · Regular");
+        metric_typed(&mut s, label, value);
+        if escape {
+            press(&mut s, "Escape", "Escape");
+            timed_frames(&mut s, 3);
+            assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+        }
+        open_picker(&mut s, "20 · Bold");
+        timed_frames(&mut s, 3);
+        assert!(
+            ui::popup_open(&s.ctx),
+            "{label} {value}: Bold's editor is open"
+        );
+        assert!(paints(&mut s, "200%"), "{label} {value}");
+        assert_eq!(page_to_json(&s.ed.page_data(0)), before, "{label} {value}");
+        assert_eq!((s.ed.history.undo_len(), s.ed.doc_stamp), markers);
+        assert!(!ui::design_system::metric_draft_pending(&s.ctx, &s.ed));
+        close_picker(&mut s);
+        assert!(!s.dirty() && s.can_reload(), "{label} {value}");
+        assert!(s.save_snapshot().is_none(), "{label} {value}");
+    }
+}
