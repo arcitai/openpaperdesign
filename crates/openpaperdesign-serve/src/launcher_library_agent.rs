@@ -22,7 +22,10 @@
 //!   calls after a close or switch. A stale binding is refused with no effect.
 //!
 //! The binding is a stale-view check, not a credential, like everywhere else in the library.
-//! Library authority stays where it is: `PLUGIN_DATA` and the per-canvas lease.
+//! Library authority stays where it is: `PLUGIN_DATA` and the per-canvas lease. Since issue
+//! #23 another process may have the same canvas open: opening it here takes its editing (see
+//! `library`, "Editing"), and a design tool's change from a window that lost the editing is
+//! refused before anything is written, with how to take it back.
 
 use super::*;
 use crate::agent::SESSION_ARG;
@@ -91,8 +94,10 @@ pub(super) fn agent_tools() -> Vec<Value> {
         json!({"name": AGENT_CURRENT, "inputSchema": none,
             "annotations": {"readOnlyHint": true},
             "description": "The canvas open in this OpenPaperDesign window: its id, name, \
-                binding (pass it to the design tools), pages and whether an editor is open on \
-                it. Reading it counts as reading no page."}),
+                binding (pass it to the design tools), pages, whether an editor is open on it, \
+                and `editing`: \"here\", or \"elsewhere\" when another OpenPaperDesign view \
+                opened it later and edits it (changes from here are then refused, unwritten). \
+                Reading it counts as reading no page."}),
         json!({"name": AGENT_CREATE,
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "description": "Create a new, empty canvas in the app library and open it here \
@@ -103,10 +108,13 @@ pub(super) fn agent_tools() -> Vec<Value> {
             }, "required": ["name"], "additionalProperties": false}}),
         json!({"name": AGENT_OPEN,
             "annotations": {"readOnlyHint": false, "destructiveHint": false},
-            "description": "Open a library canvas here, so the design tools work on it. Opening \
-                the canvas already open is a no-op. Refused while the open canvas has an editor \
-                that may hold unsaved changes, or when another OpenPaperDesign window has the \
-                canvas open.",
+            "description": "Open a library canvas here, so the design tools work on it, and take \
+                its editing: if another OpenPaperDesign view (another chat or panel) has it \
+                open, that one becomes read-only (its unsaved change stays there). Opening the \
+                canvas already open here takes its editing back if another view took it. \
+                Refused while the open canvas here has an editor that may hold unsaved changes \
+                (to switch to another canvas), or while another OpenPaperDesign window is in \
+                the middle of a save of it (try again).",
             "inputSchema": {"type": "object", "properties": {"id": id},
                 "required": ["id"], "additionalProperties": false}}),
         json!({"name": AGENT_CLOSE,
@@ -286,6 +294,9 @@ impl Launcher {
                 "panel_editors": b.mounts.len(),
                 "browser_link_given": b.editor_opened,
             },
+            // Issue #23: "here" while this window has the canvas's editing; "elsewhere" when a
+            // view opened later took it (changes from here are then refused, unwritten).
+            "editing": if b.server.editing_here(None) { "here" } else { "elsewhere" },
             "next": NEXT,
         }))
     }

@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.94 · Updated: 2026-10-23
+Revision: 0.96 · Updated: 2026-10-24
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -907,6 +907,12 @@ engine architecture is `analysis/DESIGN.md`.
         Mono, anything else Inter as before); `get_computed_styles`/`get_jsx` and
         `get_node_info` report it; `get_font_family_info` lists both families' four faces and
         what any other name renders as; `get_basic_info`'s `fontFamilies` is the bundled list.
+        R74-N1 correction (metadata only): `write_html`'s tool description still said "Font
+        family is always Inter." and left `font-family` out of its text styles; it now names
+        the input, the two bundled families and generics, inheritance from containers, Inter
+        for a text element's own list naming neither, the one family per text layer (a family
+        on an inline element inside text isn't applied) and that this CSS fallback differs from
+        a saved page's refusal of an unknown family. No parser or behaviour change.
         `src/io/svg_import.rs`: usvg's fontdb has all eight faces, `monospace` is Geist Mono.
       - Serve: the renderer bound `MAX_ASSET_BYTES` is 18 MiB (was 16; panel.js `MAX_BYTES`
         and `MAX_PARTS` 72 match; parts, panel message, host allowance and image limits
@@ -1112,7 +1118,7 @@ LICENSE files, and the plugin's `NOTICE.md`, intact.
 Sidebar home (issue #6, `docs/openpaperdesign/plugin-b2b.md`): four things are answered
 before workspace admission:
 - `openpaperdesign_home`, which refuses arguments.
-- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-23.html`).
+- The home view resource (`HOME_URI`, currently `ui://openpaperdesign/home-24.html`).
 - The read-only native inventory `openpaperdesign_projects` (only `projectId`).
 - `openpaperdesign_choose_folder` (`{}` only): the host directory picker
   (`openai/elicitation/create`, `directory` resource input) for a client that advertises
@@ -1237,7 +1243,16 @@ and layout unchanged) with the editor that draws, edits and saves a text layer's
 family (the upstream entry above). The editor's WASM changed (it now embeds the Geist Mono
 faces, within the renderer bound of 18 MiB), so `home-22` is refused and a cached `home-22`
 view can't pass for this one. Not built, rendered, reviewed, installed or natively accepted
-here.
+here. (Since accepted at source scope as `53c1c52`, R75; not installed.)
+
+`home-24` (2026-10-24/25 source candidate, issue #23, root `DESIGN.md` revision 24) carries
+the local multiple-view editing (the app library entry below): the in-panel editor module
+changed (`session.js` read-only state, Edit here, input settling and the handover, `page.js`
+`claimStep` and `offerStep`, `editor.js` banners, `panel.js` `_app_claim`, `_app_draft`,
+`editing` and `handover`), the renderer (`web.rs` `handover` and `resume_unfinished`, the
+adapter's own exports over upstream's editor; a new renderer identity) and the view's HTML (the
+read-only leave reason), so `home-23` is refused and a cached `home-23` view can't pass for this
+one. Not built, rendered, reviewed, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
@@ -1312,23 +1327,225 @@ inventory and the app-only `openpaperdesign_app_{canvases,create,open,editor,clo
 canvas, lease or binding)
 and in-panel editor tools (`_app_editor_asset`, `_app_canvas`, `_app_canvas_revision`,
 `_app_canvas_save`, the per-page `_app_page`, `_app_page_revision`, `_app_page_save`,
-`_app_ready`, `_app_page_release`), plus the agent's library controls and
+`_app_ready`, `_app_page_release`, and issue #23's `_app_claim` and `_app_draft`), plus the agent's library controls and
 binding-guarded upstream design tools (below),
 are answered, with strict argument keys and types; every project route (including the
 `_ui_*` actions, the picker and the upstream design tools) is refused without admission or
 state change, and a workspace process refuses the `_app_*` and `_library_*` names the same way. One binding per
 process (the page-id layout registry forbids a second slot). Each canvas needs a permanent
-per-id lease: nonblocking `File::try_lock` on a regular single-link lock file, taken before
+per-id lease: `File::try_lock` on a regular single-link lock file, taken before
 `Project::open` (its stale-temp cleanup) or any write, rechecked (handle and path identity, link
 count, library folders) by a guard on every browser and MCP access; a failed check fences that
 canvas for good, and the next action retires it. Lock files are never removed, truncated or
-replaced, and never exported. The lease moves into the binding and is dropped only after
+replaced, and never exported. The lease's handle moves into the binding and is dropped only after
 retirement drained it, also at the normal end of the service: when stdio closes or the service
 fails, `main` runs `Launcher::shutdown`, which refuses any later create/bind/install and retires
 the final binding (started writer and rollback drained, queued and late writers refused) in an
 owned task spawned before any wait, even for the state lock, before its lease drops (both
-modes); same id is a checked no-op; busy, invalid or failing targets keep the
-current canvas and URL. It is advisory: no protection from other programs, no OS sandbox.
+modes); busy, invalid or failing targets keep the current canvas and URL. It is advisory: no
+protection from other programs, no OS sandbox. Issue #23 (owner, 2026-10-23: the newest view
+edits; 2026-10-24 source candidate, unqualified; this replaced the exclusive per-binding lease,
+deliberately): several processes may bind the same canvas. The lease's lock is held only around
+an open (until its binding claimed the editing), each write (revision check, commit, rollback;
+`library::Editing::admit` from `Server::start_write`, and `lock_write` from the agent host's
+reload to its commit), a whole-canvas snapshot read (shared), a rename or export of a canvas not
+open here, and a claim or release; each wait is bounded (one second), and only a longer hold
+(a long save, a kept `Broken` lease, an older OpenPaperDesign holding it for its binding's life)
+is busy. `locks/<id>.editor` names the one view that may write: `<token>:<view>` (a random
+editing identity per binding, since binding ids are per process, and the view: panel mount
+`m<n>`, browser tab `t<n>` from `POST /api/view`, sent back as `X-OPD-View`), or `<token>` alone
+between a binding's open and its first view. An open, create or import claims it for the
+binding, and every new mount or tab for itself, whoever had it (never a hunt for the old view);
+so of two tabs or two mounts of one chat only the newer edits (correction 184, after the lead's
+qualification found both editing). `_app_claim` / `POST /api/claim` (the view's Edit here) or
+opening the canvas again takes it back; no other call does. Every write re-checks it under the
+lease: a non-editing view's browser or panel save (late, delayed or reconnected ones too) is
+`423` with nothing written. Only the chat's agent (its MCP binding) acts for its binding
+without a view, admitted while any view of that binding edits; an agent's change once another
+binding edits is undone with nothing written or acknowledged (its non-saving calls, such as
+selection, still run). On a library canvas every browser mutation (canvas and page saves,
+Claim, the handover's answer and actions, `/api/view/release`) needs an issued, live view
+(R78-01, `Server::tab_of`): missing `428`, malformed `400`, never issued or released `410`,
+whatever the ETag; a headerless read is told it doesn't edit (`view: "missing"`); `app.js`
+doesn't start without its view and releases it on `pagehide`. A workspace project (no
+`Server.editing`) has no views, as before. Every mutating panel call (save, Claim, `_app_draft`)
+is cancel-aware and rechecks its mount's lifetime under the writer fence (R78-05), as the
+browser's do their tab's. Reads need no editing; the revision polls (and the canvas read,
+`X-OPD-Editing`) say `editing` and `handover`. The polls run in every editor state (unsaved,
+unfinished, conflict), so a view learns it lost the editing; nothing is loaded over unsaved
+work. Handover (R78-03): a claim records the view it took the editing from as pending in
+`locks/<id>.handover` (offers' metadata and the views waited for; each offer's canvas in
+`locks/<id>.offer-<o>`, never a canvas file) until it answers (`POST /api/draft`, `_app_draft`
+`answer`: its whole canvas from the renderer's `handover()`, every page with content and
+without an open gesture's or text edit's transaction, `changed`, and its unfinished edits as
+continuations, or nothing) or ends (release or retirement mark it `ended`). Several offers wait
+side by side (at most 8). The editing view acts on one by its id under `start_write` (fence,
+lifetime, editing under the lease; R78-04): `apply` reads the offer under that hold and saves
+its canvas on its base (`409` if anything was saved since, kept) then removes it, and once
+committed answers `applied` with the revision even if the removal fails (`left` says why);
+`keep` makes a new library canvas from it (`create_document`, this canvas's images,
+`check_document`); `dismiss`; `stop` (a pending view). The renderer's `resume_unfinished` takes a
+continuation up as an open field or text edit (not committed), answering `""` or why not.
+A text continuation (run 189, R79-01..03) carries the layer exactly as it is being typed
+(`live`: text, ranges as `on_insert`/`on_delete` moved them, box, overrides; `caret`,
+`anchor`) and, for a layer that was there, that layer as the edit began (`base`); a new text's
+`layer`, `parent`, `index`. `resume_text` checks before any transaction: an existing layer is
+taken up only over a node equal to `base`, never effectively locked (a newer accepted save
+of it, or a lock, refuses); a new one only where its id is free, under a present, unlocked
+frame or group, and its id is reserved in the same undoable step (`next_id`, which the
+settled canvas rolled back, so later creation never reuses it; Undo/Redo restore it). Older
+packets without `base`/`live` are refused. No continuation replaces an edit of its kind under
+way here (`DRAFT_HERE`). The Session (`session.js`, R79-04) keeps a committed Apply's
+continuations (`applied`, `appliedPending`) until they are taken up onto the canvas it was
+applied to (`openApplied`: loaded first, only while this view edits and nothing is unsaved or
+being typed here; each await checked against its editor), shows them to continue or dismiss,
+hands them on in a read-only answer, and never offers a committed offer for Apply again
+(`committed`); `reloadNow` says whether it loaded. Run 190 (R80): a kept continuation opens
+only on exactly the revision its Apply committed (`openApplied`: any other loaded revision, an
+agent's rename or a save here since, keeps it with a reason); Canvas, Paper and layer name
+continuations carry the name they were typed over (`base`) and are refused over a newer one
+(`NEWER_NAME`; without `base`, `LEGACY_NAME`). Leaving (`drain`) waits for any started offer
+action, its load and take-up (`track`, `actionsEnded`), and answers `pending` while a kept
+continuation is this view's only copy (Home keeps the editor with its reason and Leave without
+saving; `holdsWork` is the browser page's leave guard). A continuation for another Paper is
+checked on that Paper's document before it is shown (`page_doc`; Theme's admission on an editor
+of that document alone), since showing a Paper is itself a saved change: a refusal changes
+nothing here. That needed one minimal upstream split in `src/ui/design_system.rs`
+(`check_style_field`, the document checks of `resume_style_field` without its installation),
+run 190, Opus 5.5. Run 191: an offer action with no answer (thrown, timed out, Codex error or
+unreadable: transport status 0) is `unknown`, never `failed`; every answered status keeps its
+meaning. An unanswered Apply copies the offer's unfinished edits before it is sent and keeps
+them exactly (`uncertain`), neither applied again, opened nor called saved, shown with Dismiss
+(on the offer's own row, without Continue here, while the record lists it), counted by
+`holdsWork`, and `drain` answers `uncertain` (Home keeps the editor) until the person
+dismisses them. Run 192 (R81-01): no poll settles it, since an answer read before the Apply,
+or while it still runs on the server (reads aren't fenced against writes), can list the offer
+the Apply then consumes; an absent offer or a newer revision is no proof either. R81-02: kept
+continuations (`applied`, `uncertain`) are never handed on as plain edits stripped of the
+revision they require or of their unknown outcome. Run 193 (R82-01): a read-only view hands
+them on, through the ordinary guarded answer, as kept recoveries `{kind: "recovery", v: 1, id,
+state: "applied"|"unknown", revision, packets}` (`recoveries`, `recoveryOf`): original identity,
+state, the exact revision an applied one needs, and the packets exactly as offered. The server
+keeps them as opaque continuations (`check_offer`, `NewOffer`). Its copy stops counting as this
+view's only one only once the server acknowledges that answer (`handed`, with the offer it made).
+The editing view continues an applied one only on exactly its revision, through the adapter's
+own checks; an unknown one, or a `v` it doesn't know, is never opened (dismiss only), and an
+offer carrying an unknown-version recovery isn't applied or kept (`unsupported`). Applying or
+keeping an offer that carries recoveries adopts them with their own state and revision (handed
+on again unchanged; never moved onto a kept canvas). After an Apply with nothing of its own to
+open, the committed canvas is loaded.
+Run 194 (R83) makes that safe against this version's destructive consumers, through the same
+record: recoveries are handed over on their own (`handOver`; this server refuses an answer mixing
+them with a canvas, change or other edit: 400), so nothing an older editor can apply, keep or
+take up rides with them; the view's own change and drafts wait there (it isn't clean)
+and go on its next answer once they are resolved. An Apply, Keep or Dismiss of an offer carrying
+recoveries must name every one it resolves (`resolved`; panel: a JSON list as text, as
+`unfinished`), else `426 Upgrade Required` and nothing changes (`offer_guard`); a named action
+records receipts `{offer, recovery}` in the same checked record write that removes the offer
+(`Handover.resolved`, at most 32, optional so records before run 194 read). The
+holding view lets a copy go only on a receipt for its own acknowledged offer and that id
+(`settleHanded`); its offer gone without one (a claim, a full record) makes it
+the holder again and it answers again; leaving a read-only view first re-reads the record
+(`confirmHanded`). A claim bumps a holder generation (`holderGen`), so an answer acknowledged
+while it runs marks nothing handed, and resets the holder again on success (R83-01).
+Run 195 (R84-01): those guards run only in this version's server and Session, so an older
+OpenPaperDesign process on its own server (the run-193 producer mixes a recovery into its
+change or unfinished name; the run-192 reader's Apply commits only the change, its Continue
+takes only the name, and both remove the whole offer) is kept off the record instead. This
+version writes the handover record only as `{"format": 2, "handover": {offers, pending,
+resolved}}` (`library.rs` `HANDOVER_FORMAT`), and keeps it when empty; the older parser needs
+`offers` at the top, so for it the record is unreadable, which it never overwrites. Activation:
+this version's first successfully persisted write of the record for the canvas (from any claim,
+so a view of it opening or taking the editing; an answer; a stop waiting). A claim that took
+the editing (`200`) but whose handover write then failed (its note says so) or was put back has
+not activated it: the older record stays readable to older processes (run 196, R85-01; tested
+in `library_compat_tests.rs`). Lifetime: from then on, for good (nothing
+removes it; an older process can't). Before that, an older record (`offers`/`pending` at the
+top, receipts optional) reads as before and is carried over whole at that first change, as a
+checked record change (rollback restores the older bytes; a failed rollback is `Broken`, the
+lease kept). Another `format` is unknown: never read as empty or overwritten (a claim stands
+with its note, everything else refused). After activation an older server refuses its own
+answer, Apply, Keep, Dismiss and stop waiting before anything is written (`403`, "unreadable"),
+its claim stands with its note and writes no handover, its views are shown no offer, and its
+release or close leaves the record. So an older producer's answer after activation stays in its
+own view (it isn't clean there; leaving warns), and one it made before activation is in the
+record for this version's newest view, whatever the older view's next poll then drops; an
+older reader can't hand anything over or receive anything once activated (an old-client
+limitation, its note saying the earlier view "isn't waited for" is its own). Nothing is promised
+for older processes among themselves before activation. Tested with the exact run-192/193
+library compiled as a test-only module (`crates/openpaperdesign-serve/src/library_192.rs`,
+`library_compat_tests.rs`) and the exact run-192 and run-193 Sessions (`tests/legacy/`,
+hash-pinned) over shared record bytes. An editor process before run 194 sharing a record not
+yet activated can still dismiss a recovery-only offer on its own backend (its banner shows it as
+a value it can't open, with Dismiss): a deliberate discard; with the holding view alive it is
+handed over again. Inspector and Theme values now carry their layers as
+in the canvas handed over (`bases`, `put_bases`) and are taken up only over them unchanged
+(`check_bases`: `NEWER_FIELD`; without `bases`, `LEGACY_FIELD`), as text and names already
+are. The offer's canvas is the server's (the record or the canonical files), never held here.
+Unfinished literal values move too (run 186): `inspector` (`page`, `ids`, `label`, `nth`, raw
+`text`) and `theme-metric` (`style` as `{size (hundredths), bold, italic, family}`, `metric`
+`size`/`line-height`/`letter-spacing`, `page`, raw `text`, and its use, `design_system::StyleUse`:
+`from`, the style the open use began with, and `targets`, its frozen characters `[{node, whole,
+ranges}]`; a use not begun is its style's characters then). The receiving view checks every
+target is present, not effectively locked and still in `style` here (else refused: its change
+wasn't applied here), then installs exactly that use as its open `Restyle`, so further typing
+reaches only those characters, never another layer that already had the new style (the lead's
+A/B 20→2 with an unrelated 2 pt C; before, the next view's `style_targets` took C in). Its undo
+steps there are that view's own (the canvas it came with holds the earlier views' part). This needs one minimal upstream hook,
+`src/ui/field_drafts.rs`, since egui 0.36.2's `DragValue` keeps its typed text private
+(`EditState`): the Design panel's number fields and Theme's Size pass a `custom_parser` (egui's
+own parse, `parse_number`) that sees the raw text, and a resume is taken up as a person would
+(the field focused once it can take focus, not in a popup's disabled sizing pass, then a
+Command+A and one `Event::Paste` into it), with `resume_outcome()` saying `""`, `still opening`
+or why it didn't show (30 frames). Theme's line height and letter spacing are its own
+`metric_field` text edits (`metric_draft`, `resume_style_field`: the style's popup opened,
+the raw text put in its field). Targets are checked as the canvas is here first (page; every
+layer present and not effectively locked; the style on the shown Paper, not all locked,
+`INHERITED_STYLE`, `RANGE_METRICS`, no other Theme use under way). Nothing touches `DESIGN.md`,
+tokens or the document; a field-kind offer is never dismissed by Continue here (`session.js`
+`continued`, `fieldOutcome`: a field that never showed reopens Continue here with its reason),
+and one of names only after the editor's next frames, once every name is still open there as
+typed (`namesOpen`, by the editor's own `handover`; else it stays listed, run 196). Names taken
+up together (a Canvas name, a Paper's, a layer's) stay open side by side: a name field asks for
+the keyboard only while no other name field has it (`ui/mod.rs` `other_name_field_focused`), so
+none is finished by another taking the keyboard, and a Paper or layer rename taken up shows its
+rows (`show_name_rows`: the left panel on Design, the Papers list unfolded, the layer rows;
+for a layer also exactly the groups and frames holding it, `ui::reveal_layer`, other folded
+groups untouched: R86-02, run 197), since a rename whose rows aren't drawn is finished as
+losing focus does (the parent's run-195 Linux runtime: one Continue here saved a legacy offer's
+Paper name before any key, the left panel closed; R86-02: a layer in a group folded in the
+receiving view, by the same path). Enter or Escape then finishes or drops the one with the
+keyboard only; two names of the same kind can't both be open (`DRAFT_HERE`): Continue here
+opens what it can and keeps the rest waiting, per edit (`openedHere`, `offerItems`: each of the
+offer's edits by its place, R86-01, run 197), so once the open one is finished or cancelled
+Continue here in the same view takes up only the rest, never what it opened before; the banner
+says what was opened and what still waits (`offerProgress`), and the offer, whole and without
+a receipt, goes only once all of it has been opened here (a waiting kept recovery stays held to
+its own revision and base: after a newer save it is refused, still listed). A field's value
+taken up but never shown can be continued again (`fieldOutcome`),
+and the page gives the keyboard back to its own mount's canvas after a continuation
+(`ui.focusEditor`, never for a disposed mount or replaced editor). Released mounts and tabs mark
+their pending entry ended. Claim outcomes are typed, the same over `POST /api/claim` and the
+panel's `_app_claim` (`Server::claim_within`, `edit_refusal`, `api_refusal`): `200` taken (with
+`note` when its handover bookkeeping failed after the editor record was committed: it is taken;
+a `Broken` fence then is in the note too; the note never promises that a handover still
+arrives (R85-01, run 196): a record it can't read was left as it is and nothing can be handed
+over to this view while it stays so, and a write that failed leaves a handover "not confirmed
+here"); `503` busy (fence or lease wait timed out, nothing
+changed, retry), a cancelled panel call, or `Broken`/fenced (writes disabled until restart);
+`410` released, retired, stale or not live view or mount; `403` the canvas no longer checks
+out or its editor record couldn't be taken (validation); `500` its write failed and was put back; `423` stays the save refusal of a
+non-editing view. No flattening to `409`. Run 194: an Apply, Keep or Dismiss of an offer
+carrying kept recoveries that doesn't name them all is `426 Upgrade Required` (an older editor
+on this server; nothing changed), on both transports. An older server's own refusal of a
+format-2 record is its `403`. Record changes are checked transactions (R78-06,
+`replace_record`): a failed sync puts the bytes back; a failed put-back fences the server
+(`Broken`, naming the record). A `Broken` write's hold poisons the lease (R78-02,
+`Lease::poison`): its exclusive lock stays for the handle's life; later shared reads read under
+it and no unlock, claim or record change frees it. Retirement clears the record only if it names
+that binding (a non-editor's close takes nothing). An abnormal process end leaves a record naming
+nobody live; nothing waits for it. Rename from the list refuses a canvas whose record names any
+editor (open it here first); export by id reads it under its lease as last saved.
 Create/import write through the checked commit with every new folder's parent synced, finish
 preparation before the old binding retires, run in an owned task, remove only what is still
 theirs (naming what stays or may not be durably removed) and are never retried; a lost reply is
@@ -1347,7 +1564,7 @@ come only from the file or the canvas's own `assets/`, never the process image r
 reads one saved snapshot under the lease and the writer fence and says it holds saved content
 without direction or tokens; it names the shown `binding` or a listed `id` (never both): the
 open canvas by id goes through its binding's fence, any other under its own lease taken for the
-read (busy is refused). Rename (`_app_rename`, `id` and a 1–60 character name) changes the
+read (a long hold elsewhere is refused as busy). Rename (`_app_rename`, `id` and a 1–60 character name) changes the
 manifest's name and modified time only: the open canvas through its binding's
 `start_write`/`commit_fenced` (rollback, `Broken`), any other under its own lease with one
 `commit_fenced` of `project.json` through that canvas's own `Broken` in the `Library`: if its
@@ -1380,8 +1597,10 @@ acknowledgements, one commit with rollback/`Broken`, lifecycle fence for queued 
 A caller-supplied session field is refused. A stale or missing binding is refused with no
 effect. The model library controls take no `force`/`replace`: a canvas with a mounted panel or a
 given link is never switched or closed by the agent. Only `_library_editor` hands out the
-loopback link (a link given); no other agent result carries the URL or token. Cross-process
-ownership stays the lease's (busy is refused, never transferred). The panel and browser editor
+loopback link (a link given); no other agent result carries the URL or token. Across processes
+(issue #23) an agent's open takes the canvas's editing like any open; `_library_current` reports
+`editing` (`here`/`elsewhere`), and a change from a window that lost it is refused unwritten with
+how to take it back (the agent never takes it on its own; the skill says ask). The panel and browser editor
 see agent commits through their revision polls; their stale saves are 409 conflicts. Never add
 a parallel editing API, drawing DSL or document format here: reuse upstream's commands and
 renderer, and keep the adapter to binding, authority, transport and hosting.
@@ -1409,7 +1628,17 @@ cancellation is observed before and during admission and before the fence is tak
 save always finishes, and retirement waits. Panel messages are capped at 4 MiB as sent: a read as the whole tool result in
 its JSON-RPC response, a save as its whole `tools/call` request, each escaping counted, plus a
 fixed 16 KiB host allowance (not a known host limit), separately from the 64 MiB page limit;
-larger pages stay browser-only, untouched, and no mount is registered for them. `panel: true` on create/open/import/
+larger pages stay browser-only, untouched, and no mount is registered for them. That browser
+editor must then draw them: a minimal upstream renderer edit (run 188, #6; `src/render/gpu.rs`
+`upload`/`split_for_buffers`, needed because the upstream renderer put each frame's screen
+batches and the cached world geometry in one buffer each) keeps every vertex or index buffer
+within the device's own `max_buffer_size`, cutting a larger list at triangle boundaries into
+several buffers, every triangle drawn as before by the same draws, in order. The lead's page of
+30,000 rounded root frames, zoomed to fit, drew 270,000,160 B of frame-name labels into one
+screen vertex buffer, over WebGL2's 256 MiB (`scene::large_canvas_tests`); wgpu made it
+invalid, `create_buffer_init` panicked during `start`, and the page stayed at Loading. Nothing
+is culled, dropped or limited; how fast such a page draws, and other device ceilings (memory),
+are unproven. `panel: true` on create/open/import/
 editor returns no link and gives none; mounted panels and a given link both make Close/Switch
 need `force`. Leaving (Home) drains (wait for the save in flight, save what is left, require
 `can_reload`); conflict, failed/unanswered save or an edit under way keep the editor, resumed,
@@ -1434,7 +1663,12 @@ selection unchanged. With the module, New file, Open, Import and Open current fi
 `panel: true` and mount the editor directly in the view: no result screen, no "Edit in this
 view", no `ui/open-link`, and nothing on this path marks a browser link as given. The editor
 fills the view edge to edge (no heading, frame, fixed-height stage, Close/Export/Full
-screen/browser buttons, Details or footer); upstream's own top bar shows the file name
+screen/browser buttons, Details or footer; the one exception, run 186 for #6 owner comment
+6388936169: a canvas its panel refused as too large, `413` before any mount, offers `ed-too-large`
+"Open in the browser editor", which asks `openpaperdesign_app_editor {binding}` for exactly that
+view's binding and canvas, validates the loopback link, and sends `ui/open-link`; generation,
+handle and attempt checked after each await, never taken for a load, no bound raised, nothing
+copied); upstream's own top bar shows the file name
 (`canvas.name`, separate from the page name) and its "All projects" is the way home. Every
 status goes to a status live region for assistive technology and diagnostics; how it shows is
 `opdStatusKind` (editor.js, shared with the browser page): stable healthy states (Ready, Saved,

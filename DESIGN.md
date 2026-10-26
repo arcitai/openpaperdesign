@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 23 · 2026-10-23 · The one canonical visual and interaction direction for the OPD app
+Revision: 24 · 2026-10-25 · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file is the
@@ -23,7 +23,7 @@ The owner's explicit priority governs every choice below, and wins where a refer
 - The same restraint applies to Home, the editor, the tools, the inspector, type and spacing,
   in light, dark and narrow layouts. Airiness never shrinks the drawing room below usable.
 
-## Where things stand (revision 23, 2026-10-23)
+## Where things stand (revision 24, 2026-10-24)
 
 One place to find the current brief and what is left. The full criteria stay in the issues
 themselves and the owner comments they link (#10's seven groups, comment 6314311252; #14's
@@ -65,7 +65,20 @@ comment 6347896307); this summary doesn't replace them, and no issue is closed b
   `fontFamily`, and saved (see Theme below). Nothing of it has been built, run or reviewed:
   pending are the lead's placement of the four Geist Mono files and their licence, every
   check, the measured renderer size (bound 18 MiB), renders, a fresh independent review,
-  production build and CI, and any native or Mac check.
+  production build and CI, and any native or Mac check. (Since then accepted at source scope
+  as `53c1c52`, R75, with Linux packaging and exact CI; not installed.)
+- **Local after it (revision 24, written in source, unqualified): several views of one
+  canvas** (issue #23; see its section below). The same library canvas may be open in several
+  Codex chats, panels or browser tabs; the view opened last edits it (another tab or panel of
+  the same chat too), the others are read-only, keep what they hold and hand it over to the
+  editing view, which recovers it there. The lead's 2026-10-24 Linux qualification of the
+  first version found two tabs and two panels of one chat both editing, and an unfinished edit
+  hiding the loss of the editing; the independent R78 review of the next found six more gaps
+  (an unidentified request treated as the chat's, a failed rollback's lock let go by a read,
+  unfinished work only recoverable in the old view, Apply's result after its save, released
+  views acting, record changes left half done). The 2026-10-25 correction (below) is in source
+  with Node and Rust checks only. Pending: its renders and real tabs/panels, the two real
+  chats, a fresh independent review, production build and CI, and any native or Mac check.
 
 **#10's seven groups** (owner brief; Mac re-test targets once the loaded build is known):
 
@@ -92,10 +105,132 @@ comment 6347896307); this summary doesn't replace them, and no issue is closed b
 - **#12** (sensitive files and distribution checks): its implementation admission wasn't
   established by this bounded reconciliation (not an owner rejection); it stays unassigned,
   with its full issue scope unchanged. Nothing is implemented for it here.
-- **#2** (collaboration) deliberately deferred; **#7**'s older extra work separately
+- **#23** (a canvas blocked by a hidden or stale view; several local views): revision 24
+  below, in source only. Its acceptance needs the actual two chats/panels and browser windows.
+- **#2** (collaboration: remote and cloud) deliberately deferred; **#7**'s older extra work separately
   specified, not closed in bulk; **#16** awaits the full Foundation assessment (its evidence
   is the gap); **#18**
   (standalone app), **#19** (screenshots and site) and **#20** (deploy) stay unfinished or held.
+
+## Several views of one canvas (revision 24, issue #23; in source, unqualified)
+
+The owner (2026-10-23) couldn't find the old chat or panel that kept a canvas, and opening it
+anywhere else was refused ("Close it there first"). That refusal is gone. The same library
+canvas may be open in several local views at once (Codex chats, panels, browser tabs), always
+the one set of files in the library: no copy, no second store, no cloud.
+
+- **The newest view edits.** Opening a canvas (from Home, or an agent's open) makes the view
+  that shows it its editing view, whoever had it: every view counts, so a second browser tab or
+  a reopened panel of the same chat takes it from the first. A view hidden in another chat or
+  tab, closed, disconnected or ended never blocks it, and nobody has to find it.
+- **Earlier views are read-only, and say so, whatever they hold.** A view that lost the editing
+  learns it within about a second, also with an unsaved change, an unfinished field (a name
+  being typed) or a conflict, and shows one quiet banner over the workspace, in the conflict
+  note's place and style (Light, Dark and narrow alike): "Another OpenPaperDesign view (one
+  opened after this one) is editing this canvas now.", with **Edit here** (and, when it holds
+  something unsaved, **Reload (discard my unsaved change)**). Its input stops; it keeps showing
+  what the editing view saves when it holds nothing unsaved. Its status line says "Read-only:
+  another view is editing this canvas" until it edits again. A late save or call from it is
+  refused, unwritten, and never takes the editing back; only Edit here (or opening the canvas
+  again) does. A browser tab the canvas's editor doesn't know (closed, from before a restart,
+  or a request naming no view) changes nothing and says so (reload it).
+- **What it holds is handed over, and recovered in the new view.** The read-only view hands the
+  editing view what it has (never into the canvas) and says so: its whole canvas as it stands
+  (without an edit still under way), and each unfinished edit as it is, the Canvas name, a
+  Paper's or a layer's name still being typed (their text, taken up only over the name it was
+  typed over, never over one renamed since), a text layer being typed (exactly
+  as it is: its text, its colours and other ranges as typing moved them, caret and selection;
+  taken up only over that same text as it was, never over a newer change of it or a locked
+  layer, and a new text keeps its own layer id there), or a value still being typed in a Design panel number field or a Theme text
+  style's size, line height or letter spacing (its raw text as typed, also one that isn't a
+  value yet, such as "-", with the field it is in: its Paper, layers and label, or its text
+  style; revision 24, run 186; taken up only over its layers exactly as they were, never over
+  a newer change of them, run 192). A drag or a held key already under way still gets its release, so it ends
+  as the person ends it and is handed over then. The editing view shows a banner of the same
+  kind, one row per view that handed something over ("Another OpenPaperDesign view lost the
+  editing of this canvas with an unsaved change, the Canvas name "D" still being typed, and
+  handed it over here"), with what can be done here: **Apply** (saves it onto the version it was
+  made on, only while the editing view has nothing unsaved itself; its unfinished edits then
+  open here as they were typed there, still unfinished, once exactly the version it saved is
+  shown here and nothing is being typed here; until then they are kept, listed as applied, to
+  continue or dismiss, never opened over a newer change, and the change is never applied twice;
+  leaving the editor while they are kept, or while an Apply is still answered, keeps it open
+  with the reason, unless they are dismissed or it is left without saving; an Apply that gets
+  no answer is said to be unknown, maybe saved, never applied again by itself, and its
+  unfinished edits are kept here exactly until dismissed, keeping the editor open the same way,
+  whatever the record shows meanwhile; when another view takes the editing, kept edits go to
+  it as kept recoveries with what guards them, on their own (the old view's other unsaved work
+  follows once they are taken up or dismissed there), listed there to continue (an applied one,
+  only on the version it was applied to) or dismiss (an unknown one is never opened); the old
+  view keeps its copy until the editing view has taken them up, kept or dismissed them, never
+  merely because they left the record (Edit here); editors older than this can't open them,
+  and on this version can't apply, keep or dismiss an offer carrying them; once this version
+  has opened the canvas, an older OpenPaperDesign process on its own can't read the handover
+  any more, so it neither consumes nor rewrites what is waiting there: what such a view had not
+  handed over yet stays in that view, and what it had handed over waits for this version's
+  newest view),
+  **Continue here** (just its unfinished
+  edits, onto this canvas), **Keep as a new canvas** (a separate canvas with the same pages and
+  content: what conflicts is recovered whole, never merged) and **Dismiss**. Several views'
+  offers wait side by side, and they stay if their views close. Once an unfinished edit is open
+  here (Continue here, or Apply with one), the keyboard is the editor's at once, so Enter and
+  Escape reach it (the button that asked is gone). Several names continued at once (a Paper's
+  name and the Canvas name, say) all open as their fields, the Paper list shown for a Paper's
+  (and a layer's row, inside the groups holding it, which open for it), each still being typed:
+  one has the keyboard, Enter or Escape finishes or drops only that one and the next gets it;
+  none is finished or saved by opening, and the offer goes only once they are all open as
+  typed. Two names of the same kind (two Canvas names) can't both be open: the first opens, and
+  the row says what was opened and what still waits, with Continue here still there; once the
+  first is finished or cancelled, Continue here opens the rest, never the first again (one
+  typed over a name since saved here isn't opened over it, and stays listed).
+  A field's value opens in its own field: its
+  layers selected in the Design panel, or its style's editor opened in Theme, the field focused
+  with the text in it, nothing applied that typing it wouldn't apply (a Theme size updates its
+  style as it is typed there too, in the use still under way, unsaved) and nothing finished. A
+  Theme value goes on as the same change: exactly the characters it was changing there, never
+  text that only now shares the style it was changed to. Undo here takes back what was done
+  here (the canvas it came with holds what was done there). Its
+  offer stays listed (dismiss it when done). One that can't open here (its Paper, layers or
+  style aren't here, a layer is locked, its Theme change wasn't applied here, the field didn't
+  show, its text or name was changed here since, the same kind of edit is being typed here)
+  says why, opens nothing, changes nothing here (not even which Paper is shown) and can
+  be continued again.
+- **Taking the editing back says what happened.** Edit here either edits here (and says what
+  of its bookkeeping didn't happen, if any: the editing is taken all the same) or says the
+  server's own reason it wasn't taken: busy for a moment (try again), this view closed here,
+  or writes disabled after a failure (restart). Nothing is changed by a refusal.
+- **A canvas too large for the panel opens in its browser editor.** The panel refuses a canvas
+  larger than it can carry before showing anything, and says so, with **Open in the browser
+  editor** beside Back to files: the same canvas and files, through the app's own local link
+  for that view's binding, opened by Codex. Asking is never taken for a load (the browser tab
+  says Ready itself); a failure stays shown, with the button to try again. Nothing is copied
+  and no limit is raised.
+- **Waiting for a view, honestly.** Right after taking the editing, the new view waits for the
+  view it took it from to answer. A live one answers within about a second. One that hasn't
+  after a few seconds is shown: "Waiting for the view that was editing before to hand over what
+  it has: it hasn't answered yet (it may be hidden, asleep or disconnected, and answers when it
+  runs again; if its window ended, anything unsaved there is gone)", with **Stop waiting**. One
+  that closed without answering is said to have closed. Whatever it sends later still arrives.
+- **Nothing is lost or overwritten.** A change in a read-only view also stays there, on screen,
+  unsaved, with its undo history. A save already under way finishes first (the new view waits
+  for it, at most about a second, and loads it). Edit here takes the editing back (and takes
+  back what that view handed over); its next save is checked against the canvas as saved
+  meanwhile, so a change made in the other view is a conflict (its banner comes back), never
+  overwritten. Leaving a read-only view with an unsaved change asks first, as for a conflict.
+  Applying a handed-over change says what was saved, also if tidying up after it failed. A
+  write that couldn't be undone keeps the canvas locked to that window until it closes.
+- **Closing is safe.** Closing a view that isn't editing never takes the editing from the one
+  that is. An agent of a chat whose canvas another chat now edits is told its change was
+  refused, unwritten, and how to edit there again; it never takes the editing on its own.
+- **The honest limits.** A change that only lived in a view whose window or host ended before
+  it answered (a crash, a closed chat) was never saved and can't be recovered from anywhere
+  else. A view that is hidden or asleep answers only when it runs again (the editing view can
+  stop waiting). A value still being typed in any other field there (a colour picker's, the
+  library's or a palette's) can't move (it is named "a value still being typed", and stays
+  there); neither can more than the one field that has the keyboard there; undo history stays in the view where
+  it was made (an applied change is one new state here, as any change from elsewhere).
+- Rename from Home of a canvas another view is editing asks to open it first; export reads it
+  as last saved. Remote collaboration and cloud sync stay #2's.
 
 ## The plugin's mark (revision 21, issue #8; implemented, display unproven)
 

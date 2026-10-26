@@ -261,7 +261,8 @@ fn used_text_styles(ui: &mut Ui, ed: &mut Editor) {
             Some(a) if in_use => metrics(ed, &a.targets),
             _ => metrics(ed, &style_targets(ed, style)),
         };
-        let frame = style_editor(ui, key.with(salt), slot, style, ids.len(), &shown);
+        let page = ed.active_page_id().to_string();
+        let frame = style_editor(ui, key.with(salt), slot, style, ids.len(), &shown, &page);
         let popup = frame.popup;
         if frame.drawn && prior.as_ref().is_some_and(|d| d.popup == popup) {
             prior_drawn = true;
@@ -429,6 +430,165 @@ pub fn metric_draft_pending(ctx: &egui::Context, ed: &Editor) -> bool {
         .is_some_and(|d| d.stamp == ed.doc_stamp)
 }
 
+/// The metric typed into a text style's editor and not entered, for a host that hands it over
+/// (issue #23, R78-03): its style, `"line-height"` or `"letter-spacing"`, and the raw text.
+/// Only for the document it was typed against.
+pub fn metric_draft(ctx: &egui::Context, ed: &Editor) -> Option<(StyleKey, &'static str, String)> {
+    let d = ctx
+        .data(|m| m.get_temp::<MetricDraft>(draft_key()))
+        .filter(|d| d.stamp == ed.doc_stamp)?;
+    let metric = match d.metric {
+        Metric::LineHeight => "line-height",
+        Metric::LetterSpacing => "letter-spacing",
+    };
+    Some((d.style, metric, d.text))
+}
+
+/// The label a text style's size field has for a handover (`field_drafts::FieldTarget`).
+pub fn theme_size_label(style: StyleKey) -> String {
+    format!(
+        "Theme size {}/{}/{}/{}",
+        style.0,
+        style.1,
+        style.2,
+        style.3.name()
+    )
+}
+
+/// A text style metric another editor handed over, waiting for its style's editor to be drawn.
+#[derive(Clone)]
+struct MetricResume {
+    style: StyleKey,
+    metric: Metric,
+    text: String,
+}
+
+fn metric_resume_key() -> egui::Id {
+    egui::Id::new("opd-theme-metric-resume")
+}
+
+fn take_metric_resume(ctx: &egui::Context, style: StyleKey) -> Option<(Metric, String)> {
+    let r = ctx.data(|d| d.get_temp::<MetricResume>(metric_resume_key()))?;
+    if r.style != style {
+        return None;
+    }
+    ctx.data_mut(|d| d.remove::<MetricResume>(metric_resume_key()));
+    Some((r.metric, r.text))
+}
+
+/// Why a handed-over Theme value isn't taken up: its use's characters don't have its style here.
+const UNAPPLIED_USE: &str = "the layers its change is for don't have that text style here (its \
+                             change wasn't applied here: apply it first)";
+
+/// Take up a value typed into a text style's editor in another editor of the same canvas
+/// (issue #23, R78-03): `field` is `"size"`, `"line-height"` or `"letter-spacing"`, `text` the
+/// raw text as typed there (also one that isn't a value yet), `held` the use it belongs to
+/// there ([`style_use`]). The style's editor opens in the Theme view with that text in that
+/// field, unfinished, as that same use (run 186): its frozen characters, never whatever else has
+/// the style here (a layer already in the style it was changed to stays out of it, as it did
+/// there). Enter or the focus moving on finishes it here, through the same admission as typing
+/// it here (locks, whole layers, each change tried on a preview); Escape drops it. Its undo
+/// steps here are this view's (what it made there is the canvas it came with). Refused, with
+/// why, when the style isn't on the shown Paper, when a layer of the use is missing or locked
+/// here or no longer has that style where the use changes it (its change wasn't applied here),
+/// when changing it would change a locked layer (`INHERITED_STYLE`), for a metric of a use only
+/// part of some layer has (`RANGE_METRICS`), or while another Theme change is under way. The
+/// caller shows the Theme view.
+pub fn resume_style_field(
+    ctx: &egui::Context,
+    ed: &Editor,
+    held: StyleUse,
+    field: &str,
+    text: String,
+) -> Result<(), &'static str> {
+    if editing(ctx, ed) {
+        return Err("another Theme change is under way here; finish it first");
+    }
+    check_style_field(ed, &held, field)?;
+    let style = held.now;
+    let metric = match field {
+        "line-height" => Some(Metric::LineHeight),
+        "letter-spacing" => Some(Metric::LetterSpacing),
+        _ => None,
+    };
+    // Its editor, as its row draws it while that use is under way: the use itself, kept as a
+    // change of it here keeps it (`Restyle`), so its next change reaches exactly its targets.
+    let popup = restyle_key().with(("style", held.from)).with("popup");
+    let r = Restyle {
+        from: held.from,
+        now: style,
+        targets: held.targets,
+        stamp: ed.doc_stamp,
+        popup,
+    };
+    ctx.data_mut(|d| d.insert_temp(restyle_key(), r));
+    egui::Popup::open_id(ctx, popup);
+    match metric {
+        Some(metric) => ctx.data_mut(|d| {
+            d.insert_temp(
+                metric_resume_key(),
+                MetricResume {
+                    style,
+                    metric,
+                    text,
+                },
+            );
+        }),
+        None => super::field_drafts::resume(
+            ctx,
+            super::field_drafts::FieldTarget {
+                page: ed.active_page_id().to_string(),
+                ids: Vec::new(),
+                label: theme_size_label(style),
+                nth: 0,
+            },
+            text,
+        ),
+    }
+    ctx.request_repaint();
+    Ok(())
+}
+
+/// Whether [`resume_style_field`] would take `held` up on `ed`'s shown Paper (everything it
+/// checks of the document; not whether another Theme change is under way, which is the live
+/// editor's). Nothing changes: a host checks a Paper that isn't shown on an editor of its
+/// document alone, before showing it (R80-03, run 190).
+pub fn check_style_field(ed: &Editor, held: &StyleUse, field: &str) -> Result<(), &'static str> {
+    let style = held.now;
+    if !text_styles(ed).iter().any(|(s, _)| *s == style) {
+        return Err("that text style isn't on the shown Paper here");
+    }
+    if held.targets.is_empty() {
+        return Err("it doesn't say which layers its change is for");
+    }
+    let here = style_targets(ed, style);
+    for t in &held.targets {
+        let Some(n) = ed.doc.get(t.id) else {
+            return Err("a layer its change is for isn't in this canvas here");
+        };
+        if ed.doc.is_effectively_locked(t.id) {
+            return Err("a layer its change is for is locked here");
+        }
+        let len = n.kind.text().map_or(0, |s| s.chars().count());
+        if !still_in_style(&here, t, len) {
+            return Err(UNAPPLIED_USE);
+        }
+    }
+    let links = inheritors(ed);
+    if !links.is_empty() && reaches_locked(ed, &links, &style_groups(ed, &held.targets)) {
+        return Err(INHERITED_STYLE);
+    }
+    let metric = match field {
+        "size" => false,
+        "line-height" | "letter-spacing" => true,
+        _ => return Err("that isn't a text style's field"),
+    };
+    if metric && !metrics(ed, &held.targets).eligible {
+        return Err(RANGE_METRICS);
+    }
+    Ok(())
+}
+
 /// At the start of each frame: if the Theme view wasn't drawn in the last one, a metric typed
 /// there and not entered is finished as its field losing the focus would finish it
 /// ([`finish_metric_draft`]), as the hidden renames are finished.
@@ -517,11 +677,60 @@ struct Restyle {
 /// One unlocked text layer's characters in a style: all of them (`whole`: the change goes to
 /// the layer's own size or face, as the Design panel's whole-layer edits do), or these char
 /// ranges `[a, b)` (the change is a range style over exactly them, as a selection's is).
-#[derive(Clone)]
-struct StyleTarget {
-    id: NodeId,
-    whole: bool,
-    ranges: Vec<(usize, usize)>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleTarget {
+    pub id: NodeId,
+    pub whole: bool,
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// A text style's change as a host hands it over (issue #23, R78-03, run 186): the style its
+/// use began with (`from`), the one it has now (`now`, its row's), and the exact characters it
+/// changes (`targets`, frozen when the use began). A use not begun yet (nothing applied, say an
+/// entry that isn't a value) is its style's own characters now, `from` and `now` the same.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleUse {
+    pub from: StyleKey,
+    pub now: StyleKey,
+    pub targets: Vec<StyleTarget>,
+}
+
+/// The use a value typed in `style`'s editor belongs to ([`StyleUse`]): the use under way when
+/// it is that style's (its row's style now, or the one it began with, which the field still names
+/// the frame its first change applies), else the style's own characters now.
+pub fn style_use(ctx: &egui::Context, ed: &Editor, style: StyleKey) -> StyleUse {
+    let active = ctx
+        .data(|d| d.get_temp::<Restyle>(restyle_key()))
+        .filter(|a| a.stamp == ed.doc_stamp && (a.now == style || a.from == style));
+    match active {
+        Some(a) => StyleUse {
+            from: a.from,
+            now: a.now,
+            targets: a.targets,
+        },
+        None => StyleUse {
+            from: style,
+            now: style,
+            targets: style_targets(ed, style),
+        },
+    }
+}
+
+/// Whether every character `t` names has the style here, as `here` (that style's targets here)
+/// finds them: a whole layer only as a whole layer, a range only inside the characters in it
+/// (`len` the layer's characters).
+fn still_in_style(here: &[StyleTarget], t: &StyleTarget, len: usize) -> bool {
+    let Some(h) = here.iter().find(|h| h.id == t.id) else {
+        return false;
+    };
+    if t.whole {
+        return h.whole;
+    }
+    let inside = |i: usize| h.ranges.iter().any(|&(x, y)| x <= i && i < y);
+    !t.ranges.is_empty()
+        && t.ranges
+            .iter()
+            .all(|&(a, b)| a < b && b <= len && (h.whole || (a..b).all(inside)))
 }
 
 /// One change from a text style's editor: its size, or its face (its family's four), which a
@@ -1065,6 +1274,7 @@ fn style_editor(
     style: StyleKey,
     count: usize,
     shown: &Metrics,
+    page: &str,
 ) -> EditorFrame {
     let mut child = ui.new_child(egui::UiBuilder::new().id(id).max_rect(slot));
     let popup = id.with("popup");
@@ -1097,15 +1307,38 @@ fn style_editor(
         .show(|ui| {
             drawn = true;
             ui.set_min_width(180.0);
+            // A metric another editor handed over and this one takes up (`resume_style_field`),
+            // once its field can take the focus: not in the invisible, disabled sizing pass egui
+            // gives a popup the frame it opens.
+            let resume = if ui.is_sizing_pass() {
+                None
+            } else {
+                take_metric_resume(ui.ctx(), style)
+            };
             let mut size = style.0 as f64 / 100.0;
+            // Its raw text, for a handover, as the Design panel's number fields
+            // (`field_drafts`).
+            let size_target = super::field_drafts::FieldTarget {
+                page: page.to_string(),
+                ids: Vec::new(),
+                label: theme_size_label(style),
+                nth: 0,
+            };
+            super::field_drafts::before(ui, &size_target);
+            let typed = std::cell::RefCell::new(None);
             let r = ui.add_sized(
                 egui::vec2(100.0, theme::FIELD_H),
                 egui::DragValue::new(&mut size)
                     .speed(0.5)
                     .range(1.0..=1000.0)
                     .max_decimals(2)
-                    .prefix("Size "),
+                    .prefix("Size ")
+                    .custom_parser(|s| {
+                        *typed.borrow_mut() = Some(s.to_string());
+                        super::field_drafts::parse_number(s)
+                    }),
             );
+            super::field_drafts::after(ui.ctx(), &r, size_target, typed.into_inner());
             if r.changed() && (size * 100.0).round() as i64 != style.0 {
                 changes.push(StyleChange::Size(size));
             }
@@ -1127,8 +1360,15 @@ fn style_editor(
             // The whole layers' paragraph metrics: a value, Auto, or Mixed (they differ; a value
             // entered then sets it for all of them). Nothing is read into a common number.
             let lh = shown.line_height.map_or(String::new(), line_height_text);
-            let (entered, draft) =
-                metric_field(ui, "Line height", &lh, "Auto or %", shown.eligible);
+            let take = |m: Metric| resume.clone().filter(|(r, _)| *r == m).map(|(_, t)| t);
+            let (entered, draft) = metric_field(
+                ui,
+                "Line height",
+                &lh,
+                "Auto or %",
+                shown.eligible,
+                take(Metric::LineHeight),
+            );
             if let Some(lh) = entered.as_deref().and_then(parse_line_height)
                 && shown.line_height != Some(lh)
             {
@@ -1138,7 +1378,14 @@ fn style_editor(
             let ls = shown
                 .letter_spacing
                 .map_or(String::new(), letter_spacing_text);
-            let (entered, draft) = metric_field(ui, "Letter spacing", &ls, "px", shown.eligible);
+            let (entered, draft) = metric_field(
+                ui,
+                "Letter spacing",
+                &ls,
+                "px",
+                shown.eligible,
+                take(Metric::LetterSpacing),
+            );
             if let Some(ls) = entered.as_deref().and_then(parse_letter_spacing)
                 && shown.letter_spacing != Some(ls)
             {
@@ -1211,8 +1458,15 @@ fn metric_field(
     shown: &str,
     hint: &str,
     enabled: bool,
+    resume: Option<String>,
 ) -> (Option<String>, Option<String>) {
     let id = ui.make_persistent_id(("theme-metric", label));
+    // Taken up from another editor (issue #23): the field opens with that raw text, unfinished,
+    // as if it had been typed here (Enter or the focus moving on finishes it, Escape drops it).
+    if let Some(text) = resume.filter(|_| enabled) {
+        ui.ctx().data_mut(|d| d.insert_temp(id, text));
+        ui.ctx().memory_mut(|m| m.request_focus(id.with("field")));
+    }
     ui.horizontal(|ui| {
         let p = theme::pal(ui);
         let colour = if enabled { p.secondary } else { p.tertiary };

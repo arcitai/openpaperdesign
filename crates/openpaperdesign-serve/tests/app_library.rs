@@ -86,11 +86,27 @@ async fn http(
     if_match: Option<&str>,
     body: &str,
 ) -> (u16, Option<String>, String) {
+    http_in(port, method, path, token, None, if_match, body).await
+}
+
+/// [`http`] from browser tab `view` (its `X-OPD-View`).
+async fn http_in(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    view: Option<&str>,
+    if_match: Option<&str>,
+    body: &str,
+) -> (u16, Option<String>, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
-    let im = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
+    let mut im = if_match.map_or(String::new(), |m| format!("If-Match: {m}\r\n"));
+    if let Some(v) = view {
+        im.push_str(&format!("X-OPD-View: {v}\r\n"));
+    }
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n{im}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -109,8 +125,27 @@ async fn http(
     (status, etag, body.to_string())
 }
 
-/// The browser editor's load-change-save of the active page; returns the page id.
+/// The browser editor's load-change-save of the active page in a newly opened tab (issued its
+/// own view, which takes the editing); returns the page id.
 async fn edit(port: u16, token: &str) -> String {
+    let view = tab(port, token).await;
+    let (status, page, answer) = try_edit(port, token, &view).await;
+    assert_eq!(status, 200, "{answer}");
+    page
+}
+
+/// A new browser tab of the editor at `port`: its issued view.
+async fn tab(port: u16, token: &str) -> String {
+    let (st, _, body) = http(port, "POST", "/api/view", token, None, "").await;
+    assert_eq!(st, 200, "{body}");
+    serde_json::from_str::<Value>(&body).unwrap()["view"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// [`edit`] in tab `view`, reporting the save's status and answer instead of asserting it.
+async fn try_edit(port: u16, token: &str, view: &str) -> (u16, String, String) {
     let (_, _, project) = http(port, "GET", "/api/project", token, None, "").await;
     let page = serde_json::from_str::<Value>(&project).unwrap()["active_page"]
         .as_str()
@@ -131,9 +166,27 @@ async fn edit(port: u16, token: &str) -> String {
     );
     data.doc.root.push(id);
     let body = paper_rs::project::format::page_to_json(&data);
-    let (st, _, answer) = http(port, "PUT", &path, token, tag.as_deref(), &body).await;
-    assert_eq!(st, 200, "{answer}");
-    page
+    let (st, _, answer) =
+        http_in(port, "PUT", &path, token, Some(view), tag.as_deref(), &body).await;
+    (st, page, answer)
+}
+
+/// Whether browser tab `view` is told it has the canvas's editing (issue #23).
+async fn editing(port: u16, token: &str, view: &str) -> bool {
+    let (st, _, body) = http_in(
+        port,
+        "GET",
+        "/api/canvas/revision",
+        token,
+        Some(view),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    serde_json::from_str::<Value>(&body).unwrap()["editing"]
+        .as_bool()
+        .expect("the revision says whether this view edits")
 }
 
 async fn nodes(port: u16, token: &str, page: &str) -> usize {
@@ -160,11 +213,16 @@ async fn open_when_free(c: &Client, id: &str) -> Value {
     panic!("the canvas stayed busy");
 }
 
-/// Two processes on one library: create and edit in one, busy in the other until closed,
-/// a different canvas meanwhile, then the saved edit in a fresh process; an ended process
-/// releases its canvas. No request carries metadata.
+/// Issue #23 with two real processes on one library (two Codex chats, the synthetic way: no
+/// Codex host, panel or browser renderer). This replaces the old one-canvas-at-a-time
+/// expectation, deliberately: B opens the canvas A has open (no refusal, nothing to find or
+/// close in A first) and edits it; A's view is read-only (its save refused, unwritten) while it
+/// keeps reading what B saves; A's Edit here takes the editing back, and B is then refused. A
+/// different canvas is independent; B, not editing, closes without taking A's editing; and A,
+/// editing, ends without closing: a fresh process opens the canvas at once, with every saved
+/// edit. No request carries metadata.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_processes_share_the_library_one_canvas_at_a_time() {
+async fn two_processes_view_one_canvas_and_the_newest_open_edits() {
     let t = tmp();
     let (root, home) = (t.0.join("data"), t.0.join("home"));
     std::fs::create_dir_all(&root).unwrap();
@@ -176,48 +234,77 @@ async fn two_processes_share_the_library_one_canvas_at_a_time() {
         .unwrap();
     let id = created["canvas"]["id"].as_str().unwrap().to_string();
     let (port, token) = url(&created);
-    let page = edit(port, &token).await;
-    let e = call(&b, "openpaperdesign_app_open", json!({"id": id}))
-        .await
-        .unwrap_err();
-    assert!(e.contains("another OpenPaperDesign window"), "{e}");
-    let other = call(&b, "openpaperdesign_app_create", json!({"name": "Other"}))
+    let va = tab(port, &token).await;
+    let (st, page, answer) = try_edit(port, &token, &va).await;
+    assert_eq!(st, 200, "{answer}");
+    // B opens the same canvas while A has it open: B (its tab) edits it now.
+    let in_b = call(&b, "openpaperdesign_app_open", json!({"id": id}))
         .await
         .unwrap();
-    let other_id = other["canvas"]["id"].as_str().unwrap().to_string();
+    assert_eq!(in_b["editing"], "here");
+    let (pb, tb) = url(&in_b);
+    let vb = tab(pb, &tb).await;
+    assert_eq!(nodes(pb, &tb, &page).await, 1, "A's saved edit, in B");
+    assert!(!editing(port, &token, &va).await && editing(pb, &tb, &vb).await);
+    let file = root
+        .join("library/v1/canvases")
+        .join(&id)
+        .join("pages")
+        .join(format!("{page}.json"));
+    let before = std::fs::read(&file).unwrap();
+    let (st, _, answer) = try_edit(port, &token, &va).await;
+    assert_eq!(st, 423, "A is read-only: {answer}");
+    // R78-01: without its view, the same current-revision save is refused too.
+    let (_, _, project) = http(port, "GET", "/api/project", &token, None, "").await;
+    let active = serde_json::from_str::<Value>(&project).unwrap()["active_page"].clone();
+    assert_eq!(active.as_str(), Some(page.as_str()));
+    let path = format!("/api/pages/{page}");
+    let (_, tag, current) = http(port, "GET", &path, &token, None, "").await;
+    let (st, _, answer) = http(port, "PUT", &path, &token, tag.as_deref(), &current).await;
+    assert_eq!(
+        st, 428,
+        "a headerless save is never the binding's: {answer}"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), before, "nothing written");
+    let (st, _, _) = try_edit(pb, &tb, &vb).await;
+    assert_eq!(st, 200);
     assert_eq!(
         nodes(port, &token, &page).await,
-        1,
-        "A's canvas is unaffected"
+        2,
+        "B's saved edit shows in A"
     );
-    // Each view names the binding it was shown (close) or confirmed replacing (switch).
+    // A's Edit here: A edits again, B is refused.
+    let (st, _, body) = http_in(port, "POST", "/api/claim", &token, Some(&va), None, "").await;
+    assert_eq!(st, 200, "{body}");
+    assert!(editing(port, &token, &va).await && !editing(pb, &tb, &vb).await);
+    let (st, _, _) = try_edit(pb, &tb, &vb).await;
+    assert_eq!(st, 423, "B is read-only now");
+    let (st, _, _) = try_edit(port, &token, &va).await;
+    assert_eq!(st, 200);
+    // A different canvas meanwhile, in B.
     let shown = |v: &Value| v["binding"].as_str().unwrap().to_string();
-    call(
-        &a,
-        "openpaperdesign_app_close",
-        json!({"binding": shown(&created), "force": true}),
-    )
-    .await
-    .unwrap();
-    let in_b = call(
+    let other = call(
         &b,
-        "openpaperdesign_app_open",
-        json!({"id": id, "force": true, "replace": shown(&other)}),
+        "openpaperdesign_app_create",
+        json!({"name": "Other", "force": true, "replace": shown(&in_b)}),
     )
     .await
     .unwrap();
-    let (pb, tb) = url(&in_b);
-    assert_eq!(
-        nodes(pb, &tb, &page).await,
-        1,
-        "the saved edit, in another process"
+    let other_id = other["canvas"]["id"].as_str().unwrap().to_string();
+    assert!(
+        editing(port, &token, &va).await,
+        "B's switch away left A editing"
     );
-    // B ends without closing: its canvas becomes free for a fresh process.
-    b.cancel().await.unwrap();
+    assert_eq!(nodes(port, &token, &page).await, 3);
+    // A, editing, ends without closing: a fresh process opens the canvas at once.
+    a.cancel().await.unwrap();
     let c = library(&root, &home).await;
     let reopened = open_when_free(&c, &id).await;
+    assert_eq!(reopened["editing"], "here");
     let (pc, tc) = url(&reopened);
-    assert_eq!(nodes(pc, &tc, &page).await, 1);
+    assert_eq!(nodes(pc, &tc, &page).await, 3, "every saved edit");
+    edit(pc, &tc).await;
+    assert_eq!(nodes(pc, &tc, &page).await, 4);
     let listed = call(&c, "openpaperdesign_app_canvases", json!({}))
         .await
         .unwrap();
@@ -233,7 +320,7 @@ async fn two_processes_share_the_library_one_canvas_at_a_time() {
         .await
         .unwrap_err();
     assert!(e.contains("runs the app library"), "{e}");
-    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
     c.cancel().await.unwrap();
 }
 
@@ -340,8 +427,9 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 }
 
 /// The home view through the real executable in app-library mode. The home entry and the one
-/// listed resource name the current versioned URI (`home-23`: the editor that draws, edits and
-/// saves a text layer's bundled font family, after `home-22`'s Theme setting a text style's
+/// listed resource name the current versioned URI (`home-24`: issue #23's multiple views, the
+/// newest open editing and an earlier view read-only with Edit here, after `home-23`'s editor
+/// that draws, edits and saves a text layer's bundled font family, `home-22`'s Theme setting a text style's
 /// line height and letter spacing, `home-21`'s Theme changing a colour or
 /// style in use, `home-20`'s whole-app workbench editor, `home-19`'s Paper-inspired
 /// polish of the editor's and the home's tokens, `home-18`'s owner UX revision, an editor
@@ -351,13 +439,13 @@ async fn an_agent_edits_a_library_canvas_through_the_real_executable() {
 /// bent curve's re-editable bend, a connector drag fenced by Lock, and a bend handle per curve
 /// bend). Reading it returns this source tree's unchanged view frame with its slots filled
 /// (checked here for shape only), with the view's MIME type, and changes nothing. Earlier
-/// (`home-22` included), other, query and file URIs are refused, so a fresh read can't get an
+/// (`home-23` included), other, query and file URIs are refused, so a fresh read can't get an
 /// older view. This says nothing about a view a host already has open (it isn't evicted or
 /// refreshed). A synthetic host, not a receipt of what a Codex host cached or shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() {
     use rmcp::model::ReadResourceRequestParams;
-    const HOME: &str = "ui://openpaperdesign/home-23.html";
+    const HOME: &str = "ui://openpaperdesign/home-24.html";
     const PANEL_SLOT: &str = "const opdCreatePanel = null; // __OPD_PANEL_MODULE__";
     let t = tmp();
     let (root, home) = (t.0.join("data"), t.0.join("home"));
@@ -437,8 +525,9 @@ async fn the_library_home_view_is_served_only_under_its_current_versioned_uri() 
         "the editor slot holds this build's module or nothing"
     );
     for other in [
-        "ui://openpaperdesign/home-23.html?x",
+        "ui://openpaperdesign/home-24.html?x",
         // Earlier view URIs: never served with this server's behaviour.
+        "ui://openpaperdesign/home-23.html",
         "ui://openpaperdesign/home-22.html",
         "ui://openpaperdesign/home-21.html",
         "ui://openpaperdesign/home-20.html",

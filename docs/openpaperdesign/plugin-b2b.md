@@ -1,6 +1,6 @@
 # B2b: the standalone `openpaperdesign` Codex plugin — 2026-10-12
 
-Updated 2026-10-23: the local source candidate's `home-23` view (unqualified; the editor draws, edits and saves a text layer's bundled font family, Inter or Geist Mono, and its renderer may be up to 18 MiB, sent in the same 256 KiB parts), after `home-22` (Theme also sets a text style's line height and letter spacing; its source `55638b0` passed the lead's checks and R72's review, not installed), after `home-21` (Theme changes a colour or text style in use, and the plugin's new architecture mark; published as `b4e9624` with R70's source acceptance, Linux renders and exact CI, not installed), after `home-20`, the whole-app workbench's first slice (contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch), installed on the Mac as `6630ec4` on 2026-10-22 with its loaded view unproven, and `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision. Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
+Updated 2026-10-24: the local source candidate's `home-24` view (unqualified, not built, rendered or installed; issue #23: the same canvas open in several local views, the newest view edits (a second tab or panel of the same chat too), an earlier view read-only with Edit here, what it holds kept and handed over, unfinished edits included, for the editing view to apply, continue, keep as a new canvas or dismiss; R78's six corrections 2026-10-25, and run 186's four the same day: the keyboard after Continue here, unfinished Design panel and Theme field values, typed claim outcomes, and a too-large canvas's browser editor; see "Several views" below), after `home-23` (the editor draws, edits and saves a text layer's bundled font family, Inter or Geist Mono, and its renderer may be up to 18 MiB, sent in the same 256 KiB parts; accepted source `53c1c52`, not installed), after `home-22` (Theme also sets a text style's line height and letter spacing; its source `55638b0` passed the lead's checks and R72's review, not installed), after `home-21` (Theme changes a colour or text style in use, and the plugin's new architecture mark; published as `b4e9624` with R70's source acceptance, Linux renders and exact CI, not installed), after `home-20`, the whole-app workbench's first slice (contextual Design reveal, one Canvas title, the All Projects menu, Export and zoom in the right bar, separate Select and Hand, the Design/Theme switch), installed on the Mac as `6630ec4` on 2026-10-22 with its loaded view unproven, and `home-19`'s Paper-inspired polish and `home-18`'s owner UX revision. Installed qualification on exact `0078487` is from 2026-10-13; prior results retain their original provenance.
 
 Scope: [issue #1](https://github.com/arcitai/openpaperdesign/issues/1), slice B2b, on top
 of B1 (`browser-edit-b1.md`) and B2a (`agent-edit-b2a.md`). It is a small local plugin. The
@@ -39,7 +39,11 @@ surface Codex grants, Home and the full workspace alike.
   panel (`panel: true`); the result's binding is mounted directly: no result screen, no "Edit in
   this view", no `ui/open-link`, so no browser link is given on this path.
 - **The editor is the workspace.** It fills the view edge to edge, with no heading, frame,
-  fixed-height stage, Close/Export/Full screen/browser buttons, Details or footer. Upstream's own
+  fixed-height stage, Close/Export/Full screen/browser buttons, Details or footer. One exception
+  (run 186, #6 owner comment 6388936169): a canvas the panel refused as too large (`413`, before
+  any mount) offers "Open in the browser editor", which asks `openpaperdesign_app_editor
+  {binding}` for that view's own binding and canvas and sends its loopback link to `ui/open-link`
+  (never taken for a load; no bound raised; nothing copied). Upstream's own
   Canvas identity (since `home-18` at its left panel's top, or floating over the canvas while
   that panel is closed; there is no full-width header) shows the file name (the canvas
   envelope's `canvas.name`, separate from the Paper's name) and its "All projects" leads home. Every status goes to a live region; by the shared
@@ -266,7 +270,15 @@ primary and this panel is optional ("Edit in this view").
   - `_app_page {binding}` reads the manifest's active page (else its first) and returns a
     `mount` number;
   - `_app_page`, `_app_page_revision` and `_app_page_save` then name that `page_id` and `mount`;
-  - `_app_ready` and `_app_page_release` complete the set.
+  - `_app_ready` and `_app_page_release` complete the set;
+  - since issue #23, each mount is a view of its own: a new mount takes the canvas's editing,
+    `_app_canvas` and `_app_canvas_revision` say whether this mount has it (`editing`) and the
+    revision poll the handover record (`handover`), `_app_claim {binding, mount}` is the view's
+    Edit here, and `_app_draft {binding, mount, action}` answers the handover (`answer`, with
+    `if_match`, `text` its whole canvas, `changed`, `unfinished`) or acts by `id` (`apply`,
+    `keep`, `dismiss`, `stop`; see "Several views, the newest edits" below); a save from a mount
+    that isn't editing is 423, unwritten, and every one of these from a released mount is
+    refused under the writer fence, also when it was already waiting.
 
   The server compares the binding and the mount; it checks `page_id` only as a page of the
   canvas (keeping to one page is the view's own rule). A save is one transaction: 409 with the
@@ -336,15 +348,78 @@ installed check.
   at most 1 MiB, at least one page, and the active page among them. Others are reported as
   skipped. Nothing is created, opened or locked.
 - **Lease.** Before anything opens or writes a canvas (including upstream `Project::open`,
-  whose stale-temp cleanup deletes every matching temporary file), the process takes a
-  nonblocking exclusive `File::try_lock` on the canvas's lease file. That file must be a
-  regular, single-link file; after locking, its handle and path must be the same file. A
-  canvas held elsewhere is reported busy, and the current canvas, URL and lease stay. Opening
-  the canvas already open is a checked no-op. The lease moves into the binding; a switch or
-  close retires the old server (admission closed, started writers and rollback drained)
-  before its lease is dropped. Process exit releases it. Lock files are never removed,
-  truncated, replaced or exported. The lock is advisory: it coordinates OpenPaperDesign
-  processes only.
+  whose stale-temp cleanup deletes every matching temporary file), the process takes the
+  exclusive `File::try_lock` on the canvas's lease file. That file must be a regular,
+  single-link file; after locking, its handle and path must be the same file. Since issue #23
+  (2026-10-24, source candidate, unqualified) the lock is no longer held for a binding's whole
+  life: the binding keeps the lease's handle and takes the lock only around an open (until it
+  claimed the canvas's editing, below), each write (the revision check against the files on
+  disk, the commit and its rollback), a whole-canvas snapshot read (shared) and a claim or
+  release of the editing. Each wait for it is bounded (one second); only a longer hold by
+  another process (a long save, a save there it couldn't undo, which it keeps the canvas
+  closed for, or an older OpenPaperDesign that keeps a canvas for as long as it has it open) is
+  reported busy, with the current canvas, URL and lease kept. A switch or close retires the old
+  server (admission closed, started writers and rollback drained) before its lease is dropped.
+  Lock files are never removed, truncated, replaced or exported. The lock is advisory: it
+  coordinates OpenPaperDesign processes only.
+- **Several views, the newest edits (issue #23).** Each Codex chat or panel runs its own
+  process; several may have the same canvas open (one set of files, never copied), and one
+  process's binding may have several views (browser tabs, panel mounts). Exactly one view may
+  write it: the one named in `<root>/library/v1/locks/<id>.editor` (`<token>:<view>`, a random
+  editing identity per binding, since binding ids are only unique per process, and its view, a
+  mount `m<n>` or a tab `t<n>` from `POST /api/view` sent back as `X-OPD-View`; written whole
+  under the lease). Opening, creating or importing a canvas claims it for the new binding, and
+  each new mount or tab for itself, whoever had it: a view hidden in another chat or tab,
+  closed, disconnected or ended is never a reason to refuse, and nobody has to find it. Every
+  write (browser, in-panel or agent) re-reads the record under the lease; a view that isn't the
+  editor is refused before anything is read or written (HTTP and in-panel `423`, late and
+  delayed requests too, and none of them takes the editing back). Only the chat's agent (its
+  MCP binding) acts for its binding without a view (admitted while any of its views edits;
+  otherwise an agent's change is undone and its session observes nothing): every browser
+  request that changes a library canvas needs an issued, live view (missing `428`, malformed
+  `400`, never issued or released `410`, whatever its revision), and a tab that can't get one
+  doesn't start. The view keeps what it holds on screen, read-only, with Edit here (`POST
+  /api/claim`, `_app_claim`, or opening the canvas again) to take the editing back; its next save
+  is then revision-checked as always, so a change saved meanwhile is a conflict, never an
+  overwrite. A claim's answer is typed, the same on both transports (run 186): `200` taken, with
+  a `note` when the editor record was committed but its handover bookkeeping then failed (it is
+  taken all the same); `503` busy (nothing changed, try again), a cancelled panel call, or a
+  fenced (`Broken`) window; `410` a released, retired or stale view or mount; `403` the canvas no
+  longer checks out; `500` the record's write failed and was put back. The view says the
+  server's own reason. Kept recoveries (run 193) are handed over on their own (run 194), and an
+  Apply, Keep or Dismiss of an offer carrying them must name every one it resolves
+  (`resolved`: a JSON list as text in `_app_draft`, a list in `POST /api/draft/*`), else `426
+  Upgrade Required` with nothing changed; a named one leaves receipts (`resolved` in the
+  handover record) by which the view that handed them over lets its copy go. Since run 195 the
+  handover record is versioned (`{"format": 2, "handover": {...}}`, kept once written): from the
+  first successfully written record of this version's claim, answer or stop waiting on a canvas
+  (a claim that took the editing but whose record write failed hasn't written it, and says
+  so: its note never promises that a handover still arrives), an OpenPaperDesign from before
+  run 195 on its own server finds it unreadable, so it refuses its answer, Apply, Keep, Dismiss
+  and stop waiting (`403`) before anything is written and never rewrites it; its claim stands
+  with a note. An older record is carried over whole at that first change; an unknown `format`
+  is never overwritten. Meanwhile it answers the handover (`POST /api/draft`, `_app_draft` `answer`): its
+  whole canvas as it stands without an edit still under way, whether that is a change, and each
+  unfinished edit as a continuation (a name or text still being typed, with its text; since run
+  186 also a value typed in a Design panel number field or a Theme text style's size, line height
+  or letter spacing, raw, with its Paper and layers or its style, taken up in that field here,
+  unfinished, with Continue here's offer kept until dismissed), kept in
+  `<root>/library/v1/locks/<id>.handover` and `<id>.offer-<o>` under the lease, never a canvas
+  file. The view that took the editing waits for it (pending, shown after a few seconds, "Stop
+  waiting"; ended once that view closes). The editing view is told (the revision poll's
+  `handover`) and acts on each offer by id under a save's admission: apply (a save on its
+  revision, 409 with the offer kept once anything was saved since; once committed it says so
+  even if tidying up failed), keep as a new canvas, continue its unfinished edits here, or
+  dismiss. Every record change is checked and put back on failure; one that can't be put back
+  fences the window (`Broken`), and a fenced window keeps the canvas's lease until it closes,
+  through reads too. Reads never need the editing: every view keeps following what is saved (the
+  revision polls, which run whatever the editor holds, also say `editing` and `handover`). A close or a process's normal end clears
+  the record only if it still names that binding, so closing a view that isn't editing never
+  takes the editing from the one that is. A process that ends abnormally leaves its record
+  naming nobody live: nothing waits for it, and the next open claims it. What was only in an
+  ended view's memory (an unsaved change in a window whose host went away) was never on disk and
+  can't be recovered. Rename from the list of a canvas some view is editing is refused (open it
+  here, then rename); export by id reads it as last saved.
 - **Identity checks on access.** A guard re-checks the library folders and the lease (handle,
   path, link count) before every browser API request, every MCP call on the canvas's loopback
   server, `open_editor`-style identity reads and export. The first failure fences that canvas
@@ -396,7 +471,8 @@ installed check.
   link was given, and never claims it saved browser memory. Import reads the chosen file's text
   only. Export asks the view to download the text, or says it can't; Codex never confirms a
   saved file. Stale-result, expected-identity and exact-URL guards are as before.
-- **Shared views.** Several views (sidebar, chat tabs) share the process's one binding. Each
+- **Shared views.** Several views (sidebar, chat tabs) share the process's one binding (each
+  is its own editing view since issue #23, above). Each
   binding has an identity, `binding` (`<canvas id>.<n>`, unique in the process), in every
   editor result. `_app_close` and `_app_export` require it, `_app_editor` takes it for the
   readiness poll, and a confirmed switch (`force`) on create, open or import sends `replace`,

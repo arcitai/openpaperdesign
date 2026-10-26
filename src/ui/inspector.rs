@@ -76,14 +76,25 @@ fn num_field(
     width: f32,
 ) -> Option<f64> {
     let mut v = value;
+    // The raw text typed into it, as its parser sees it (the same parse), for a host that hands
+    // an unfinished value over (`field_drafts`, issue #23).
+    let ids = ed.top_selection();
+    let target = super::field_drafts::target(ui.ctx(), ed, prefix, &ids);
+    super::field_drafts::before(ui, &target);
+    let typed = std::cell::RefCell::new(None);
     let r = ui.add_sized(
         egui::vec2(width, theme::FIELD_H),
         egui::DragValue::new(&mut v)
             .speed(speed)
             .range(range)
             .max_decimals(2)
-            .prefix(prefix),
+            .prefix(prefix)
+            .custom_parser(|s| {
+                *typed.borrow_mut() = Some(s.to_string());
+                super::field_drafts::parse_number(s)
+            }),
     );
+    super::field_drafts::after(ui.ctx(), &r, target, typed.into_inner());
     seal_on_release(ed, &r);
     (r.changed() && v != value).then_some(v)
 }
@@ -1740,13 +1751,22 @@ fn layer(ui: &mut Ui, ed: &mut Editor, ids: &[NodeId], nodes: &[Node]) {
         match uniform(nodes, |n| n.style.opacity) {
             Some(opacity) => {
                 let mut op = opacity * 100.0;
+                // As `num_field`: its raw text, for a handover (`field_drafts`).
+                let target = super::field_drafts::target(ui.ctx(), ed, "Opacity", ids);
+                super::field_drafts::before(ui, &target);
+                let typed = std::cell::RefCell::new(None);
                 let r = ui.add_sized(
                     egui::vec2(w, theme::FIELD_H),
                     egui::DragValue::new(&mut op)
                         .range(0.0..=100.0)
                         .suffix("%")
-                        .speed(0.5),
+                        .speed(0.5)
+                        .custom_parser(|s| {
+                            *typed.borrow_mut() = Some(s.to_string());
+                            super::field_drafts::parse_number(s)
+                        }),
                 );
+                super::field_drafts::after(ui.ctx(), &r, target, typed.into_inner());
                 if r.changed() {
                     apply(ed, "opacity", ids, |n| n.style.opacity = op / 100.0);
                 }

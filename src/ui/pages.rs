@@ -202,7 +202,8 @@ fn page_row(
             if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 ed.rename_page(idx, &name);
             }
-        } else if !r.has_focus() {
+        } else if !r.has_focus() && !super::other_name_field_focused(ui.ctx(), st, r.id) {
+            // (Not while another name field has the keyboard: see `other_name_field_focused`.)
             r.request_focus();
             // While it takes the focus, the list scrolls (as little as needed, at once) to show
             // it: a rename asked for from elsewhere (the inspector's, the identity's) may name a

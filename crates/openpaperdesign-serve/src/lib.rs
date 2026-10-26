@@ -50,6 +50,13 @@ pub mod guide;
 #[doc(hidden)]
 pub mod launcher;
 pub(crate) mod library;
+/// Test-only: `library.rs` exactly as it was frozen for runs 192 and 193 (the handover of an
+/// older OpenPaperDesign process sharing a library canvas), so tests run that old code against
+/// records the current one writes (R84-01, run 195). Never part of a build of the product;
+/// see `library_compat_tests.rs` for its provenance and hash.
+#[cfg(test)]
+#[allow(dead_code, unused, clippy::all)]
+mod library_192;
 mod lifecycle;
 #[cfg(test)]
 mod test_support;
@@ -162,8 +169,37 @@ pub struct Server {
     held: HeldPages,
     /// The app library's identity check for this project, if it is a library canvas.
     guard: Option<Guard>,
+    /// A library canvas's editing (issue #23, see `library`): every write takes its lease and
+    /// must be the canvas's editor; a snapshot read takes the lease shared.
+    editing: Option<Arc<library::Editing>>,
+    /// The browser tabs that opened this binding's editor (`POST /api/view`): each is a view of
+    /// its own (`t<n>`), as each in-panel editor mount is (`m<n>`), live until it is released.
+    views: Views,
     editor: EditorState,
 }
+
+/// The browser views this binding issued (R78-01): numbered, each with its lifetime flag (as a
+/// panel mount has), kept after release so a released view is told apart from one never issued.
+#[derive(Default)]
+struct Views {
+    next: std::sync::atomic::AtomicU64,
+    issued: std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+}
+
+/// The most browser views one binding issues (tabs opened, reloads included).
+const MAX_VIEWS: usize = 4096;
+
+/// A library canvas's browser request names no view (R78-01): it can't change anything.
+const VIEW_MISSING: &str = "This editor tab didn't say which view of the canvas it is \
+    (X-OPD-View), so it can't change this canvas; it may be from an older OpenPaperDesign. \
+    Reload this tab to edit here. Nothing was written.";
+const VIEW_MALFORMED: &str = "This editor tab's view (X-OPD-View) isn't one this canvas's \
+    editor issues. Reload this tab to edit here. Nothing was written.";
+const VIEW_UNISSUED: &str = "This editor tab's view wasn't issued by this canvas's editor (it \
+    may be from before OpenPaperDesign restarted or the canvas was reopened). Reload this tab to \
+    edit here. Nothing was written.";
+const VIEW_RELEASED: &str = "This editor tab was closed (its view was released), so it changes \
+    nothing any more. Nothing was written.";
 
 /// Fully loaded but not yet active. Preparation has no effect on the layout registry.
 /// The launcher retires its old server before consuming this value.
@@ -481,6 +517,7 @@ impl Server {
             cfg.port,
             cfg.token,
             None,
+            None,
         )
         .map(PreparedServer::activate)
     }
@@ -515,18 +552,27 @@ impl Server {
             "only supported on Unix (Linux, macOS)".into(),
         ));
         #[cfg(unix)]
-        Self::open_unix(project, BundleSource::Embedded(files), port, token, None)
+        Self::open_unix(
+            project,
+            BundleSource::Embedded(files),
+            port,
+            token,
+            None,
+            None,
+        )
     }
 
     /// Like [`Server::prepare_embedded`], for an app-library canvas: `guard` (its library and
     /// lease check, see `library::guard`) runs before upstream `Project::open` and then before
-    /// every browser and MCP read and write.
+    /// every browser and MCP read and write; `editing` admits every write (see `library`,
+    /// "Editing"). Prepared under the lease the open holds.
     pub(crate) fn prepare_library(
         project: PathBuf,
         files: EmbeddedBundle,
         port: u16,
         token: String,
         guard: Guard,
+        editing: Arc<library::Editing>,
     ) -> Result<PreparedServer, OpenError> {
         #[cfg(not(unix))]
         return Err(OpenError::Unsafe(
@@ -539,6 +585,7 @@ impl Server {
             port,
             token,
             Some(guard),
+            Some(editing),
         )
     }
 
@@ -549,6 +596,7 @@ impl Server {
         port: u16,
         token: String,
         guard: Option<Guard>,
+        editing: Option<Arc<library::Editing>>,
     ) -> Result<PreparedServer, OpenError> {
         if let Some(g) = &guard {
             g().map_err(OpenError::Unsafe)?;
@@ -586,6 +634,7 @@ impl Server {
             broken.clone(),
             held.clone(),
             guard.clone(),
+            editing.clone(),
         )
         .map_err(|e| OpenError::NotAProject(dir.clone(), e))?;
         let p = port;
@@ -604,6 +653,8 @@ impl Server {
             broken,
             held,
             guard,
+            editing,
+            views: Views::default(),
             editor: EditorState::default(),
         })))
     }
@@ -615,9 +666,426 @@ impl Server {
     /// Permanently close admission, wait for the current writer (including rollback), and
     /// release this host's page ids. Queued and late HTTP/stdio calls cannot execute, and
     /// browser saves check the same fence. Retained handles stay retired; this is idempotent.
+    /// A library canvas's editing record is cleared after that, only if it still names this
+    /// binding (`library::Editing::release`): closing a view that isn't editing never takes the
+    /// editing from the view that is.
     pub async fn retire(&self) {
         self.lifecycle.retire(&self.held).await;
         self.calls.stop();
+        if let Some(e) = &self.editing {
+            e.release(&self.broken);
+        }
+    }
+
+    /// Take a library canvas's editing for this binding (an open, or a view's Edit here; see
+    /// `library`, "Editing"), under this binding's writer fence (bounded, as a save's start):
+    /// a write of this binding under way finishes first, and none is started meanwhile.
+    /// Without editing (a workspace project), there is nothing to take.
+    /// `view` (a panel mount `m<n>` or a browser tab `t<n>` of this binding) takes it: its saves
+    /// are then the only ones of this binding admitted, and every other view of it is read-only
+    /// too (issue #23: the newest view edits, within one binding as across processes). Without
+    /// a view (an open, an agent's open), the binding takes it, for its next view to take.
+    /// `live` is the view's lifetime (a mount's, a tab's), checked again under the fence: a
+    /// claim of a view released while it waited never runs (R78-05).
+    /// Its outcome keeps the condition (R185 CLAIM contract, the same statuses for the panel and
+    /// the browser): `503` the canvas stayed busy (the writer fence or the lease: it couldn't
+    /// start, nothing changed, try again) or this window's writes are fenced (`Broken`: nothing
+    /// written, the files named); `410` the binding retired or the view was released while it
+    /// waited (permanent: nothing changed); `403` a library, lease or folder check failed (the
+    /// canvas is fenced); `500` the editing record couldn't be written and was put back (nothing
+    /// changed). Once the record names this view the claim stands: `Claimed::note` then says
+    /// what of the handover bookkeeping after it didn't happen (fenced too, when it couldn't be
+    /// put back), never a refusal.
+    pub(crate) async fn claim(
+        &self,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Claimed, ApiError> {
+        self.claim_within(SAVE_START, view, live).await
+    }
+
+    /// [`Server::claim`] with its own bound on the wait for the writer fence.
+    pub(crate) async fn claim_within(
+        &self,
+        start_within: std::time::Duration,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Claimed, ApiError> {
+        let Some(e) = &self.editing else {
+            return Ok(Claimed { note: None });
+        };
+        let _write = tokio::time::timeout(start_within, self.lifecycle.write.lock())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the canvas was busy for too long, so editing wasn't taken here; nothing was \
+                     changed. Try again",
+                )
+            })?;
+        self.lifecycle.check_active().map_err(|_| {
+            ApiError::new(
+                StatusCode::GONE,
+                "this canvas was closed here (its editor ended), so editing wasn't taken; nothing \
+                 was changed",
+            )
+        })?;
+        check_live(live)?;
+        self.check()?;
+        let note = e.claim(&self.broken, view).map_err(edit_refusal)?;
+        Ok(Claimed { note })
+    }
+
+    /// A browser tab of this binding's editor opened (`POST /api/view`): it is issued a view of
+    /// its own (`t<n>`, live until released) and, as the newest view, takes the editing (see
+    /// [`Server::claim`]). If that is refused now (the canvas busy), the tab is still its own
+    /// view, read-only, and says so. `None` when this binding issued all the views it can.
+    pub(crate) async fn open_tab(&self) -> Option<String> {
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let view = {
+            let mut issued = self.views.issued.lock().unwrap();
+            if issued.len() >= MAX_VIEWS {
+                return None;
+            }
+            let n = self
+                .views
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .saturating_add(1);
+            let view = format!("t{n}");
+            issued.insert(view.clone(), live.clone());
+            view
+        };
+        let _ = self.claim(Some(&view), Some(&live)).await;
+        Some(view)
+    }
+
+    /// A browser tab left (`POST /api/view/release`, as the page goes away): its view changes
+    /// nothing any more (every later request naming it is refused as released), and a save of
+    /// it already under way finishes first. If it was still to hand over, it is marked ended.
+    pub(crate) async fn release_tab(&self, view: &str) {
+        if let Some(l) = self.views.issued.lock().unwrap().get(view) {
+            l.store(false, std::sync::atomic::Ordering::Release);
+        }
+        self.release_view(view).await;
+    }
+
+    /// A view of this binding left (a tab's release, a panel mount's): after any write of it
+    /// under way (the writer fence), a pending handover of it is marked ended.
+    pub(crate) async fn release_view(&self, view: &str) {
+        let Some(e) = &self.editing else {
+            return;
+        };
+        let _write = self.lifecycle.write.lock().await;
+        if self.lifecycle.check_active().is_ok() && self.check().is_ok() {
+            e.release_view(&self.broken, view);
+        }
+    }
+
+    /// The browser view a library canvas's request names (R78-01): an issued, live tab, or the
+    /// exact refusal (missing, malformed, never issued, released). Every library mutation of the
+    /// HTTP API needs one: a missing or bad header is never taken for the binding. A workspace
+    /// project has no views (`None`, as before).
+    fn tab_of(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<(String, Arc<std::sync::atomic::AtomicBool>)>, ApiError> {
+        if self.editing.is_none() {
+            return Ok(None);
+        }
+        let Some(raw) = headers.get(VIEW_HEADER) else {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_REQUIRED,
+                VIEW_MISSING,
+            ));
+        };
+        let Some(view) = raw.to_str().ok().filter(|v| valid_view(v)) else {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, VIEW_MALFORMED));
+        };
+        match self.views.issued.lock().unwrap().get(view) {
+            None => Err(ApiError::new(StatusCode::GONE, VIEW_UNISSUED)),
+            Some(l) if !l.load(std::sync::atomic::Ordering::Acquire) => {
+                Err(ApiError::new(StatusCode::GONE, VIEW_RELEASED))
+            }
+            Some(l) => Ok(Some((view.to_string(), l.clone()))),
+        }
+    }
+
+    /// For a read: the issued, live browser view a request names, if any (a read needs none; a
+    /// library read without one is told it doesn't edit).
+    fn tab_read(&self, headers: &HeaderMap) -> Option<String> {
+        self.tab_of(headers).ok().flatten().map(|(v, _)| v)
+    }
+
+    /// Whether a library canvas's browser view (none: a request that named none) edits it now;
+    /// a workspace project is always edited here.
+    fn tab_editing(&self, view: Option<&str>) -> bool {
+        match &self.editing {
+            None => true,
+            Some(e) => view.is_some_and(|v| e.here(Some(v))),
+        }
+    }
+
+    /// Whether this binding (with `view`, that view of it) may write its canvas now: always for
+    /// a workspace project; for a library canvas, whether its record names it (a hint for the
+    /// views; every write checks it again under the lease).
+    pub(crate) fn editing_here(&self, view: Option<&str>) -> bool {
+        self.editing.as_ref().is_none_or(|e| e.here(view))
+    }
+
+    /// The editing's view of a write's admission (see [`Server::start_write`]): with `view`,
+    /// only that view of this binding may write.
+    fn admit_edit(&self, view: Option<&str>) -> Result<Option<library::Hold>, ApiError> {
+        let Some(e) = &self.editing else {
+            return Ok(None);
+        };
+        e.admit(&self.broken, view).map(Some).map_err(edit_refusal)
+    }
+
+    /// The handover record (issue #23's new-view recovery, see `library::Editing::answer`) as
+    /// `view` sees it, for a revision poll: `null` when nothing waits.
+    pub(crate) fn handover_json(&self, view: Option<&str>) -> serde_json::Value {
+        self.editing
+            .as_ref()
+            .and_then(|e| e.handover(view))
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// `view`, which lost the editing, answers the handover (see `library::Editing::answer`):
+    /// with `offer`, what it has unsaved, checked first (its canvas a whole canvas save, every
+    /// page with its content, bounded and parsed as a save is; its continuations bounded JSON
+    /// objects); without, that it has nothing. Admitted under the writer fence with its lifetime
+    /// (`live`) checked again there (R78-05). Nothing in the canvas changes. Returns the
+    /// offer's id.
+    pub(crate) async fn answer(
+        &self,
+        view: &str,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        offer: Option<library::NewOffer>,
+    ) -> Result<Option<String>, ApiError> {
+        let Some(e) = &self.editing else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "only a library canvas hands over between views; nothing was handed over",
+            ));
+        };
+        if let Some(o) = &offer {
+            check_offer(o)?;
+        }
+        let _write = tokio::time::timeout(SAVE_START, self.lifecycle.write.lock())
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the canvas was busy; the change wasn't handed over and stays in its view",
+                )
+            })?;
+        self.admit()?;
+        check_live(live)?;
+        self.check()?;
+        e.answer(&self.broken, view, offer).map_err(edit_refusal)
+    }
+
+    /// The editing `view` applies offer `id` (R78-04): admitted as one write of that view (the
+    /// writer fence, its lifetime, its editing under the lease's exclusive lock), the offer is
+    /// read under that same hold (so a dismissal or replacement queued before it is seen: `404`,
+    /// nothing written), its canvas saved on the revision it was made on (strict: a change
+    /// saved since is `409`, nothing written, the offer kept), and then removed from the
+    /// handover record, all before the hold goes. Once the save is committed the result says
+    /// so (`Applied::revision`), whether or not the offer could be removed after it
+    /// (`Applied::left`): a removal that failed leaves the offer waiting (dismiss it), never a
+    /// refusal for a change that was written.
+    pub(crate) async fn apply_offer(
+        &self,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        id: &str,
+        resolved: &[String],
+    ) -> Result<Applied, ApiError> {
+        let e = self.library_editing()?;
+        let (write, hold) = self.start_write(SAVE_START, live, view).await?;
+        let _write = write;
+        let hold = hold.ok_or_else(|| forbidden("no editing hold".into()))?;
+        let (offer, canvas) = self.offer_for(e, &hold, id)?;
+        let recoveries = offer_guard(&offer, resolved)?;
+        let Some(canvas) = canvas.filter(|_| offer.changed) else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "that view handed over no finished change to apply; nothing was written",
+            ));
+        };
+        let save = parse_canvas_save(&canvas)?;
+        let revision = self.commit_canvas(save, &offer.base)?;
+        // Committed: nothing below turns it into a refusal.
+        let left = e
+            .remove_offer(&hold, &self.broken, id, &recoveries)
+            .err()
+            .map(|e| e.message());
+        Ok(Applied { revision, left })
+    }
+
+    /// The editing `view` keeps offer `id`'s canvas as a new library canvas (R78-03: a change
+    /// that conflicts, or one to keep apart, is recovered whole, never merged into this
+    /// canvas), with this canvas's images; then the offer leaves the handover record (as for
+    /// Apply, a removal that failed is said, the new canvas stays). Admitted as `apply_offer`
+    /// is. Returns the new canvas's id and name.
+    pub(crate) async fn keep_offer(
+        &self,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        id: &str,
+        resolved: &[String],
+    ) -> Result<Kept, ApiError> {
+        let e = self.library_editing()?;
+        let (write, hold) = self.start_write(SAVE_START, live, view).await?;
+        let _write = write;
+        let hold = hold.ok_or_else(|| forbidden("no editing hold".into()))?;
+        let (offer, canvas) = self.offer_for(e, &hold, id)?;
+        // The new canvas is only the offer's settled canvas: its kept recoveries go with Keep
+        // only to an editor that says it holds them (R83-02).
+        let recoveries = offer_guard(&offer, resolved)?;
+        let Some(canvas) = canvas else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "that view handed over no canvas to keep; nothing was created",
+            ));
+        };
+        let doc = self.kept_document(&canvas)?;
+        let name = doc.manifest.name.clone();
+        let canvas_id = e.keep_as_canvas(&hold, doc).map_err(edit_refusal)?;
+        let left = e
+            .remove_offer(&hold, &self.broken, id, &recoveries)
+            .err()
+            .map(|e| e.message());
+        Ok(Kept {
+            id: canvas_id,
+            name,
+            left,
+        })
+    }
+
+    /// The editing `view` dismisses offer `id`, under the same admission (`404` when it waits no
+    /// more: nothing else is removed). Its unsaved work stays in the view that handed it over,
+    /// if that view is still open.
+    pub(crate) async fn dismiss_offer(
+        &self,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        id: &str,
+        resolved: &[String],
+    ) -> Result<(), ApiError> {
+        let e = self.library_editing()?;
+        let (write, hold) = self.start_write(SAVE_START, live, view).await?;
+        let _write = write;
+        let hold = hold.ok_or_else(|| forbidden("no editing hold".into()))?;
+        let (offer, _) = self.offer_for(e, &hold, id)?;
+        let recoveries = offer_guard(&offer, resolved)?;
+        e.remove_offer(&hold, &self.broken, id, &recoveries)
+            .map_err(edit_refusal)
+    }
+
+    /// The editing `view` stops waiting for pending view `id` (it may be hidden, asleep,
+    /// disconnected or ended): under the same admission. What that view has stays there, and
+    /// is handed over if it answers later.
+    pub(crate) async fn stop_waiting(
+        &self,
+        view: Option<&str>,
+        live: Option<&std::sync::atomic::AtomicBool>,
+        id: &str,
+    ) -> Result<(), ApiError> {
+        let e = self.library_editing()?;
+        let (write, hold) = self.start_write(SAVE_START, live, view).await?;
+        let _write = write;
+        let hold = hold.ok_or_else(|| forbidden("no editing hold".into()))?;
+        match e.stop_waiting(&hold, &self.broken, id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "that view isn't waited for any more; nothing was changed",
+            )),
+            Err(e) => Err(edit_refusal(e)),
+        }
+    }
+
+    fn library_editing(&self) -> Result<&Arc<library::Editing>, ApiError> {
+        self.editing.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "only a library canvas hands over between views; nothing was changed",
+            )
+        })
+    }
+
+    /// Offer `id`, under the caller's hold: `404` when it waits no more.
+    fn offer_for(
+        &self,
+        e: &library::Editing,
+        hold: &library::Hold,
+        id: &str,
+    ) -> Result<(library::Offer, Option<String>), ApiError> {
+        e.find_offer(hold, id).map_err(edit_refusal)?.ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "that handed-over change isn't waiting any more (it was applied, kept, dismissed \
+                 or replaced); nothing was changed",
+            )
+        })
+    }
+
+    /// A new canvas from an offer's whole canvas (every page with its content) and this
+    /// canvas's images, named after it ("… (handed over)").
+    fn kept_document(&self, canvas: &str) -> Result<library::NewDocument, ApiError> {
+        let save = parse_canvas_save(canvas)?;
+        let bad =
+            |m: &str| ApiError::new(StatusCode::BAD_REQUEST, format!("{m}; nothing was created"));
+        let current = self.project()?.manifest;
+        let base = save.name.clone().unwrap_or_else(|| current.name.clone());
+        let suffix = " (handed over)";
+        let keep = library::MAX_NAME_CHARS.saturating_sub(suffix.chars().count());
+        let name: String = base.chars().take(keep).collect::<String>() + suffix;
+        let mut manifest = Manifest::new(&name);
+        let mut pages = Vec::with_capacity(save.pages.len());
+        let mut refs = Vec::with_capacity(save.pages.len());
+        for p in save.pages {
+            let Some(mut page) = p.page else {
+                return Err(bad("the handed-over canvas is missing a page's content"));
+            };
+            page.name = p.name.clone();
+            page.doc.name = p.name.clone();
+            refs.push(PageRef {
+                id: p.id,
+                name: p.name,
+            });
+            pages.push(page);
+        }
+        manifest.pages = refs;
+        manifest.active_page = Some(save.active);
+        let assets = read_assets(&self.dir).map_err(|e| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("this canvas's images couldn't be read ({e}); nothing was created"),
+            )
+        })?;
+        Ok(library::NewDocument {
+            manifest,
+            pages,
+            assets,
+        })
+    }
+
+    /// The shared lease for a snapshot read of a library canvas (no other process's write half
+    /// done in it).
+    fn read_lease(&self) -> Result<Option<library::Hold>, ApiError> {
+        let Some(e) = &self.editing else {
+            return Ok(None);
+        };
+        e.read().map(Some).map_err(|e| {
+            let status = match e {
+                library::EditError::Failed(_) => StatusCode::FORBIDDEN,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            ApiError::new(status, e.message())
+        })
     }
 
     /// Run a tool call against this project's host, exactly as `/mcp` does (same policy,
@@ -677,6 +1145,7 @@ impl Server {
     pub(crate) async fn saved_snapshot(&self) -> Result<library::payload::Exported, String> {
         let _write = self.lifecycle.write.lock().await;
         self.lifecycle.check_active()?;
+        let _read = self.read_lease().map_err(|e| e.msg)?;
         check_root(&self.dir, self.root_id)?;
         self.check_guard()?;
         check_project_dir(&self.dir)?;
@@ -718,6 +1187,197 @@ impl Server {
             pages,
         })
     }
+}
+
+/// A refusal of a library canvas's editing as an API error: `423 Locked` when another view
+/// edits (nothing was read or written), 503 when the lease stayed busy, 403 when a check failed.
+fn edit_refusal(e: library::EditError) -> ApiError {
+    let status = match e {
+        library::EditError::NotEditing => StatusCode::LOCKED,
+        library::EditError::Busy | library::EditError::Fenced(_) => StatusCode::SERVICE_UNAVAILABLE,
+        library::EditError::Failed(_) => StatusCode::FORBIDDEN,
+        library::EditError::Record(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError::new(status, e.message())
+}
+
+/// A claim that took the editing (see [`Server::claim`]); `note`: what of its handover
+/// bookkeeping didn't happen after it, if anything.
+pub(crate) struct Claimed {
+    pub note: Option<String>,
+}
+
+/// A view's lifetime (a panel mount's, a browser tab's), checked under the writer fence: one
+/// released while its call waited never acts (R78-05).
+fn check_live(live: Option<&std::sync::atomic::AtomicBool>) -> Result<(), ApiError> {
+    if live.is_some_and(|l| !l.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "this editor was left (released) before this could start; it was not run and \
+             nothing was changed",
+        ));
+    }
+    Ok(())
+}
+
+/// An offer as a view sends it, checked before anything is kept: a canvas is a whole canvas
+/// save (every page with its content), bounded and parsed as a save is; a change needs one;
+/// continuations are bounded JSON objects.
+/// Whether continuation `c` is a kept recovery (an editor's `{kind: "recovery", id, …}`, run
+/// 193), and its id. The server checks only its kind and id; what it guards is the editors'.
+fn recovery_id(c: &serde_json::Value) -> Option<&str> {
+    (c.get("kind")?.as_str()? == "recovery")
+        .then(|| c.get("id")?.as_str())
+        .flatten()
+}
+
+/// Why an offer carrying kept recoveries isn't applied, kept or dismissed for an editor that
+/// doesn't say it holds them (R83-03, run 194).
+const RECOVERY_UNHELD: &str = "this handed-over change carries kept unfinished edits that this \
+    editor doesn't keep (an older OpenPaperDesign), so it can't be applied, kept or dismissed \
+    here; open the canvas in a newer OpenPaperDesign to continue or dismiss them; nothing was \
+    changed";
+
+/// The kept recoveries offer `o` carries, admitted for an action that says it resolves them
+/// (`resolved`: applies, keeps or dismisses them, R83): every one must be named, else `426
+/// Upgrade Required` and nothing changes (an older editor, which would consume the offer and
+/// leave its recoveries nowhere: it doesn't know them). Returns their ids, for receipts.
+fn offer_guard(o: &library::Offer, resolved: &[String]) -> Result<Vec<String>, ApiError> {
+    let ids: Vec<String> = o
+        .unfinished
+        .iter()
+        .filter_map(recovery_id)
+        .map(str::to_string)
+        .collect();
+    if ids.iter().any(|i| !resolved.contains(i)) {
+        return Err(ApiError::new(StatusCode::UPGRADE_REQUIRED, RECOVERY_UNHELD));
+    }
+    Ok(ids)
+}
+
+/// An action's `resolved` list (run 194): the kept recoveries' ids it says it resolves.
+pub(crate) fn resolved_of(v: Option<&serde_json::Value>) -> Result<Vec<String>, ApiError> {
+    let bad = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "`resolved` is a list of up to 16 ids; nothing was changed",
+        )
+    };
+    let Some(v) = v else {
+        return Ok(Vec::new());
+    };
+    let list = v.as_array().ok_or_else(bad)?;
+    if list.len() > library::MAX_CONTINUATIONS {
+        return Err(bad());
+    }
+    list.iter()
+        .map(|x| {
+            x.as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 64)
+                .map(str::to_string)
+                .ok_or_else(bad)
+        })
+        .collect()
+}
+
+fn check_offer(o: &library::NewOffer) -> Result<(), ApiError> {
+    let bad = |m: &str| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{m}; nothing was handed over"),
+        )
+    };
+    if o.canvas.len() > MAX_PAGE_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "this change is too large to hand over; it stays in its view",
+        ));
+    }
+    if o.canvas.is_empty() {
+        if o.changed {
+            return Err(bad("a finished change comes with its canvas"));
+        }
+    } else if parse_canvas_save(&o.canvas)?
+        .pages
+        .iter()
+        .any(|p| p.page.is_none())
+    {
+        return Err(bad("a handed-over canvas carries every page's content"));
+    }
+    if o.canvas.is_empty() && o.unfinished.is_empty() {
+        return Err(bad("there is nothing to hand over"));
+    }
+    let size: usize = o.unfinished.iter().map(|c| c.to_string().len()).sum();
+    if o.unfinished.len() > library::MAX_CONTINUATIONS
+        || size > library::MAX_CONTINUATION_BYTES
+        || o.unfinished.iter().any(|c| !c.is_object())
+    {
+        return Err(bad(
+            "its unfinished edits are not what an editor hands over",
+        ));
+    }
+    if o.base.is_empty() || o.base.len() > 64 {
+        return Err(bad("the revision it was made on is missing"));
+    }
+    // A kept recovery is handed over on its own (R83, run 194): with a canvas, a change or
+    // another unfinished edit, an editor that doesn't know it could apply, keep or take up the
+    // rest and drop the whole offer, recovery and all.
+    let recoveries = o
+        .unfinished
+        .iter()
+        .filter(|c| recovery_id(c).is_some())
+        .count();
+    if recoveries > 0 && (!o.canvas.is_empty() || o.changed || recoveries != o.unfinished.len()) {
+        return Err(bad(
+            "a kept recovery is handed over on its own, without a canvas, change or other edit",
+        ));
+    }
+    Ok(())
+}
+
+/// An applied offer (see [`Server::apply_offer`]): the canvas revision written, and why the
+/// offer couldn't be removed afterwards, if it couldn't (it then still waits).
+pub(crate) struct Applied {
+    pub revision: String,
+    pub left: Option<String>,
+}
+
+/// An offer kept as a new canvas (see [`Server::keep_offer`]).
+pub(crate) struct Kept {
+    pub id: String,
+    pub name: String,
+    pub left: Option<String>,
+}
+
+/// A canvas's image files (`assets/`, plain files only, bounded), for a canvas made from it.
+fn read_assets(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let assets = dir.join(ASSETS_DIR);
+    if !plain(&assets, Kind::Dir)? {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&assets).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            return Err("an image's file name isn't text".into());
+        };
+        // Not a file, or a commit's temporary file (`.<name>.<pid>-<n>.tmp`).
+        if name.starts_with('.') || !plain(&path, Kind::File)? {
+            continue;
+        }
+        if out.len() >= library::MAX_ASSETS {
+            return Err("more images than a canvas can have".into());
+        }
+        let len = std::fs::symlink_metadata(&path)
+            .map_err(|e| e.to_string())?
+            .len();
+        if len > library::MAX_ASSET_BYTES {
+            return Err(format!("{name} is larger than an image can be"));
+        }
+        out.push((name, std::fs::read(&path).map_err(|e| e.to_string())?));
+    }
+    Ok(out)
 }
 
 /// See [`Server::canvas_files`].
@@ -916,6 +1576,17 @@ pub fn router(s: Arc<Server>) -> Router {
         .route("/api/canvas", get(get_canvas).put(put_canvas))
         .route("/api/canvas/revision", get(get_canvas_revision))
         .route("/api/ready", axum::routing::post(post_ready))
+        .route("/api/claim", axum::routing::post(post_claim))
+        .route("/api/view", axum::routing::post(post_view))
+        .route("/api/view/release", axum::routing::post(post_view_release))
+        .route("/api/draft", axum::routing::post(post_draft))
+        .route("/api/draft/apply", axum::routing::post(post_draft_apply))
+        .route("/api/draft/keep", axum::routing::post(post_draft_keep))
+        .route("/api/draft/stop", axum::routing::post(post_draft_stop))
+        .route(
+            "/api/draft/dismiss",
+            axum::routing::post(post_draft_dismiss),
+        )
         .nest_service(
             MCP_PATH,
             tower::ServiceBuilder::new()
@@ -1254,6 +1925,8 @@ impl Server {
                 )
             })?;
         self.admit()?;
+        // Across processes too: no other OpenPaperDesign process's write half done in it.
+        let _read = self.read_lease()?;
         let f = self.canvas_files()?;
         let revision_now = f.revision();
         let m = &f.project.manifest;
@@ -1315,29 +1988,33 @@ impl Server {
     /// bounded (`SAVE_START`): a save that couldn't start, or whose caller stopped waiting
     /// before it started, never runs. Once it holds the fence nothing awaits any more, so a
     /// started save always finishes its commit or rollback, and retirement waits for it.
-    /// Returns the revision of the bytes written.
+    /// Returns the revision of the bytes written. (The routes call [`Server::save_page_within`]
+    /// with the requesting view; this is the same save without one.)
+    #[cfg(test)]
     pub(crate) async fn save_page(
         &self,
         id: &str,
         if_match: &str,
         body: &str,
     ) -> Result<String, ApiError> {
-        self.save_page_within(SAVE_START, None, id, if_match, body)
+        self.save_page_within(SAVE_START, None, None, id, if_match, body)
             .await
     }
 
     /// [`Server::save_page`] for an editor whose lifetime can be revoked (`live`, an in-panel
     /// editor's mount): it is checked again under the writer fence, so a save of an editor
     /// that was released before the save started never runs. Revoke it, then
-    /// [`Server::drain_writer`], to know no save of that editor is still under way.
+    /// [`Server::drain_writer`], to know no save of that editor is still under way. `view` is
+    /// that editor's own view (`m<n>`): only the view that has the editing saves.
     pub(crate) async fn save_page_while(
         &self,
         live: &std::sync::atomic::AtomicBool,
+        view: &str,
         id: &str,
         if_match: &str,
         body: &str,
     ) -> Result<String, ApiError> {
-        self.save_page_within(SAVE_START, Some(live), id, if_match, body)
+        self.save_page_within(SAVE_START, Some(live), Some(view), id, if_match, body)
             .await
     }
 
@@ -1347,12 +2024,14 @@ impl Server {
         drop(self.lifecycle.write.lock().await);
     }
 
-    /// [`Server::save_page`] with its own bound on the wait for the writer fence and an
-    /// optional revocable editor lifetime (see [`Server::save_page_while`]).
+    /// [`Server::save_page`] with its own bound on the wait for the writer fence, an optional
+    /// revocable editor lifetime and an optional view of its own (see
+    /// [`Server::save_page_while`]; a browser tab sends its view too).
     pub(crate) async fn save_page_within(
         &self,
         start_within: std::time::Duration,
         live: Option<&std::sync::atomic::AtomicBool>,
+        view: Option<&str>,
         id: &str,
         if_match: &str,
         body: &str,
@@ -1363,7 +2042,10 @@ impl Server {
                 format!("the page is larger than {MAX_PAGE_BYTES} bytes; nothing was written"),
             ));
         }
-        let _write = self.start_write(start_within, live).await?;
+        let (write, hold) = self.start_write(start_within, live, view).await?;
+        // Declared in this order so the editing's hold goes first, after the commit.
+        let _write = write;
+        let _hold = hold;
         let mut p = self.project()?;
         let name = page_ref(&p, id)?;
         // Strict: the save must be based on the revision on disk now (whoever wrote it: the
@@ -1423,12 +2105,17 @@ impl Server {
     /// the binding meanwhile) and the editor's own lifetime (`live`: it may have been released
     /// meanwhile). Once this returns the save has started: its caller awaits nothing more, so
     /// it runs to its commit or rollback, and retirement and a release (`drain_writer`) wait
-    /// for it.
+    /// for it. For a library canvas the write is then admitted by its editing (`admit_edit`:
+    /// the lease's exclusive lock across processes, and this binding must still be the
+    /// canvas's editor, and with `view`, exactly that view of it; else `423 Locked`, nothing read
+    /// or written), held until the caller's commit or rollback is done (the returned hold,
+    /// dropped first).
     async fn start_write(
         &self,
         start_within: std::time::Duration,
         live: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<tokio::sync::MutexGuard<'_, ()>, ApiError> {
+        view: Option<&str>,
+    ) -> Result<(tokio::sync::MutexGuard<'_, ()>, Option<library::Hold>), ApiError> {
         #[cfg(test)]
         test_support::hit(&self.dir, "browser_queued");
         let write = tokio::time::timeout(start_within, self.lifecycle.write.lock())
@@ -1448,29 +2135,36 @@ impl Server {
                  and nothing was written",
             ));
         }
+        // Fenced writes are refused as every save refuses them (`503`, the files named), before
+        // the lease (which a fenced binding keeps, `Lease::poison`) is asked.
+        refuse_if_broken(&self.broken)
+            .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        let hold = self.admit_edit(view)?;
         #[cfg(test)]
         test_support::hit(&self.dir, "save_started");
-        Ok(write)
+        Ok((write, hold))
     }
 
     /// Save the canvas from `body` (a canvas save, see [`parse_canvas_save`]), only if
     /// `if_match` is the canvas revision on disk now. Like [`Server::save_page`]: the same
     /// bounded start, fence, checks, commit, rollback and `Broken` rule. Returns the canvas
-    /// revision of what was written.
+    /// revision of what was written. (As `save_page`, without a view; the routes name theirs.)
+    #[cfg(test)]
     pub(crate) async fn save_canvas(&self, if_match: &str, body: &str) -> Result<String, ApiError> {
-        self.save_canvas_within(SAVE_START, None, if_match, body)
+        self.save_canvas_within(SAVE_START, None, None, if_match, body)
             .await
     }
 
     /// [`Server::save_canvas`] for an editor whose lifetime can be revoked (as
-    /// [`Server::save_page_while`]).
+    /// [`Server::save_page_while`]), of its own `view`.
     pub(crate) async fn save_canvas_while(
         &self,
         live: &std::sync::atomic::AtomicBool,
+        view: &str,
         if_match: &str,
         body: &str,
     ) -> Result<String, ApiError> {
-        self.save_canvas_within(SAVE_START, Some(live), if_match, body)
+        self.save_canvas_within(SAVE_START, Some(live), Some(view), if_match, body)
             .await
     }
 
@@ -1490,6 +2184,7 @@ impl Server {
         &self,
         start_within: std::time::Duration,
         live: Option<&std::sync::atomic::AtomicBool>,
+        view: Option<&str>,
         if_match: &str,
         body: &str,
     ) -> Result<String, ApiError> {
@@ -1503,7 +2198,17 @@ impl Server {
             ));
         }
         let save = parse_canvas_save(body)?;
-        let _write = self.start_write(start_within, live).await?;
+        let (write, hold) = self.start_write(start_within, live, view).await?;
+        // Declared in this order so the editing's hold goes first, after the commit.
+        let _write = write;
+        let _hold = hold;
+        self.commit_canvas(save, if_match)
+    }
+
+    /// The part of a canvas save after its admission (`start_write`, whose fence and hold the
+    /// caller keeps until this returns): the strict revision check, every check against the
+    /// canvas as it is now, and the one commit. Nothing after the commit can fail.
+    fn commit_canvas(&self, save: CanvasSave, if_match: &str) -> Result<String, ApiError> {
         let f = self.canvas_files()?;
         let current = f.revision();
         if if_match != current {
@@ -1605,7 +2310,10 @@ impl Server {
     /// change; an editor of this canvas sees a new canvas revision (a clean one reloads, a dirty
     /// one's next save is a conflict, nothing merges).
     pub(crate) async fn rename_canvas(&self, name: &str) -> Result<(), ApiError> {
-        let _write = self.start_write(SAVE_START, None).await?;
+        let (write, hold) = self.start_write(SAVE_START, None, None).await?;
+        // Declared in this order so the editing's hold goes first, after the commit.
+        let _write = write;
+        let _hold = hold;
         let mut p = self.project()?;
         p.manifest.name = name.to_string();
         p.manifest.modified = now_ms();
@@ -1706,7 +2414,15 @@ async fn put_page(
             "If-Match with the page revision is required",
         );
     };
-    match s.save_page(&id, &if_match, &body).await {
+    let tab = match s.tab_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let (view, live) = split_tab(&tab);
+    match s
+        .save_page_within(SAVE_START, live, view, &id, &if_match, &body)
+        .await
+    {
         Ok(rev) => (
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
@@ -1718,8 +2434,210 @@ async fn put_page(
     }
 }
 
+/// A browser tab's own view (`X-OPD-View`, issued by `POST /api/view`, issue #23): `t<n>`. On a
+/// library canvas every mutation needs an issued, live one (`Server::tab_of`, R78-01); the
+/// chat's agent writes through its MCP binding, never through these routes.
+const VIEW_HEADER: header::HeaderName = header::HeaderName::from_static("x-opd-view");
+
+/// A view as a client sends it back: `t` and 1 to 20 digits.
+fn valid_view(v: &str) -> bool {
+    v.strip_prefix('t')
+        .is_some_and(|n| !n.is_empty() && n.len() <= 20 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A resolved tab as the writes take it: its view and lifetime.
+fn split_tab(
+    tab: &Option<(String, Arc<std::sync::atomic::AtomicBool>)>,
+) -> (Option<&str>, Option<&std::sync::atomic::AtomicBool>) {
+    match tab {
+        Some((v, l)) => (Some(v.as_str()), Some(l.as_ref())),
+        None => (None, None),
+    }
+}
+
+/// A browser tab of the editor opened (issue #23): it is issued its own view and, as the newest
+/// view, takes the canvas's editing (any other tab or panel of it, here or in another window, is
+/// read-only from now on). It carries nothing. Refused (`503`) when no view can be issued: the
+/// tab then can't edit, and says so.
+async fn post_view(State(s): State<Arc<Server>>) -> Response {
+    if let Err(e) = s.admit() {
+        return e.into_response();
+    }
+    let Some(view) = s.open_tab().await else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this canvas's editor has issued as many views as it can; close and reopen the \
+             canvas to edit here",
+        );
+    };
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "view": view, "editing": s.tab_editing(Some(&view)) }).to_string(),
+    )
+        .into_response()
+}
+
+/// The tab is going away (`POST /api/view/release`): its view changes nothing any more.
+async fn post_view_release(State(s): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    match s.tab_of(&headers) {
+        Ok(Some((view, _))) => {
+            s.release_tab(&view).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// A tab that lost the editing answers the handover (`POST /api/draft`, see
+/// [`Server::answer`]): `{base, canvas, changed, unfinished}` (what it has unsaved), or `{}`
+/// when it has nothing. Returns the offer's id.
+async fn post_draft(State(s): State<Arc<Server>>, headers: HeaderMap, body: String) -> Response {
+    let tab = match s.tab_of(&headers) {
+        Ok(Some(t)) => t,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "nothing is handed over here"),
+        Err(e) => return e.into_response(),
+    };
+    let offer = match parse_offer(&body) {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    match s.answer(&tab.0, Some(&tab.1), offer).await {
+        Ok(id) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "offer": id }).to_string(),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// An answer's body: `{}` (nothing to hand over) or `{base, canvas, changed, unfinished}`.
+pub(crate) fn parse_offer(body: &str) -> Result<Option<library::NewOffer>, ApiError> {
+    let bad = |m: &str| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{m}; nothing was handed over"),
+        )
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| bad("the answer isn't JSON"))?;
+    let o = v
+        .as_object()
+        .ok_or_else(|| bad("the answer isn't an object"))?;
+    if o.is_empty() {
+        return Ok(None);
+    }
+    let text = |k: &str| {
+        o.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let offer = library::NewOffer {
+        base: text("base").ok_or_else(|| bad("`base` is required"))?,
+        canvas: text("canvas").unwrap_or_default(),
+        changed: o
+            .get("changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        unfinished: match o.get("unfinished") {
+            None => Vec::new(),
+            Some(u) => u
+                .as_array()
+                .cloned()
+                .ok_or_else(|| bad("`unfinished` is a list"))?,
+        },
+    };
+    Ok((!offer.canvas.is_empty() || !offer.unfinished.is_empty()).then_some(offer))
+}
+
+/// An offer action's body: `{"id": "<offer or pending id>"}`.
+fn action_id(body: &str) -> Result<String, ApiError> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|i| library::valid_id(i))
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "the change to act on (`id`) is required; nothing was changed",
+            )
+        })
+}
+
+/// What the editing tab does with a handed-over change or a pending view (R78-03/04): apply,
+/// keep as a new canvas, dismiss, or stop waiting. Each needs this tab's issued, live view and
+/// the change's (or view's) `id`.
+async fn post_draft_action(
+    s: &Arc<Server>,
+    headers: &HeaderMap,
+    body: &str,
+    action: &str,
+) -> Response {
+    let tab = match s.tab_of(headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let (view, live) = split_tab(&tab);
+    let id = match action_id(body) {
+        Ok(i) => i,
+        Err(e) => return e.into_response(),
+    };
+    // The kept recoveries the action says it resolves (`{"id", "resolved": [...]}`, R83).
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let resolved = match resolved_of(parsed.as_ref().and_then(|v| v.get("resolved"))) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let json = |v: serde_json::Value| {
+        ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+    };
+    match action {
+        "apply" => match s.apply_offer(view, live, &id, &resolved).await {
+            Ok(a) => json(serde_json::json!({
+                "applied": true, "revision": a.revision, "left": a.left,
+            })),
+            Err(e) => e.into_response(),
+        },
+        "keep" => match s.keep_offer(view, live, &id, &resolved).await {
+            Ok(k) => json(serde_json::json!({
+                "kept": {"id": k.id, "name": k.name}, "left": k.left,
+            })),
+            Err(e) => e.into_response(),
+        },
+        "dismiss" => match s.dismiss_offer(view, live, &id, &resolved).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => e.into_response(),
+        },
+        _ => match s.stop_waiting(view, live, &id).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => e.into_response(),
+        },
+    }
+}
+
+async fn post_draft_apply(State(s): State<Arc<Server>>, h: HeaderMap, body: String) -> Response {
+    post_draft_action(&s, &h, &body, "apply").await
+}
+
+async fn post_draft_keep(State(s): State<Arc<Server>>, h: HeaderMap, body: String) -> Response {
+    post_draft_action(&s, &h, &body, "keep").await
+}
+
+async fn post_draft_dismiss(State(s): State<Arc<Server>>, h: HeaderMap, body: String) -> Response {
+    post_draft_action(&s, &h, &body, "dismiss").await
+}
+
+async fn post_draft_stop(State(s): State<Arc<Server>>, h: HeaderMap, body: String) -> Response {
+    post_draft_action(&s, &h, &body, "stop").await
+}
+
 /// The whole canvas, for the editors (see [`Server::canvas`]); its revision is the ETag.
-async fn get_canvas(State(s): State<Arc<Server>>) -> Response {
+async fn get_canvas(State(s): State<Arc<Server>>, headers: HeaderMap) -> Response {
     let read = match s.canvas().await {
         Ok(c) => c,
         Err(e) => return e.into_response(),
@@ -1729,6 +2647,13 @@ async fn get_canvas(State(s): State<Arc<Server>>) -> Response {
             [
                 (header::CONTENT_TYPE, "application/json".to_string()),
                 (header::ETAG, read.revision.clone()),
+                // Whether this view may save it (issue #23; see `library`, "Editing"; a library
+                // request naming no issued view is told it doesn't): the body stays exactly
+                // the canvas the editor loads.
+                (
+                    EDITING_HEADER,
+                    editing_value(&s, s.tab_read(&headers).as_deref()).to_string(),
+                ),
             ],
             body.to_string(),
         )
@@ -1737,13 +2662,68 @@ async fn get_canvas(State(s): State<Arc<Server>>) -> Response {
     }
 }
 
-/// The canvas revision only (cheap polling for the editors).
-async fn get_canvas_revision(State(s): State<Arc<Server>>) -> Response {
+/// Whether a library canvas's view (or binding) has its editing (`here`) or another view has it
+/// (`elsewhere`); a workspace project is always `here`. A hint for the editors, read with the
+/// canvas and its revision; every save checks it again.
+const EDITING_HEADER: header::HeaderName = header::HeaderName::from_static("x-opd-editing");
+
+fn editing_value(s: &Server, view: Option<&str>) -> &'static str {
+    if s.tab_editing(view) {
+        "here"
+    } else {
+        "elsewhere"
+    }
+}
+
+/// The canvas revision only (cheap polling for the editors), whether this view has the canvas's
+/// editing (`editing`, see [`EDITING_HEADER`]), and the handover record (`handover`, see
+/// [`Server::handover_json`]; `view` says why a request naming no usable view can't edit:
+/// `missing`, `malformed`, `unissued` or `released`).
+async fn get_canvas_revision(State(s): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    let (view, problem) = match s.tab_of(&headers) {
+        Ok(t) => (t.map(|(v, _)| v), serde_json::Value::Null),
+        Err(e) => (
+            None,
+            serde_json::json!(match e.status {
+                StatusCode::PRECONDITION_REQUIRED => "missing",
+                StatusCode::BAD_REQUEST => "malformed",
+                _ if e.msg == VIEW_RELEASED => "released",
+                _ => "unissued",
+            }),
+        ),
+    };
     match s.canvas_revision() {
         Ok(rev) => (
             [(header::ETAG, rev.clone())],
             [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "revision": rev }).to_string(),
+            serde_json::json!({
+                "revision": rev,
+                "editing": s.tab_editing(view.as_deref()),
+                "handover": s.handover_json(view.as_deref()),
+                "view": problem,
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The browser editor's Edit here (issue #23): take the canvas's editing for this tab (its
+/// issued, live `X-OPD-View`; a library request naming none is refused, R78-01; see
+/// [`Server::claim`]). It carries nothing; a refusal changes nothing.
+async fn post_claim(State(s): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    // Admission (a retired binding: `410`) is the claim's own, under its fence.
+    let tab = match s.tab_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let (view, live) = split_tab(&tab);
+    // The refusal as it came (see `Server::claim`), never a blanket conflict.
+    match s.claim(view, live).await {
+        Ok(c) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "editing": true, "note": c.note }).to_string(),
         )
             .into_response(),
         Err(e) => e.into_response(),
@@ -1759,7 +2739,15 @@ async fn put_canvas(State(s): State<Arc<Server>>, headers: HeaderMap, body: Stri
             "If-Match with the canvas revision is required",
         );
     };
-    match s.save_canvas(&if_match, &body).await {
+    let tab = match s.tab_of(&headers) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    let (view, live) = split_tab(&tab);
+    match s
+        .save_canvas_within(SAVE_START, live, view, &if_match, &body)
+        .await
+    {
         Ok(rev) => (
             StatusCode::OK,
             [(header::ETAG, rev.clone())],
@@ -2385,7 +3373,13 @@ mod tests {
         let before = disk(&p.dir);
         let held = s.lifecycle.write.lock().await;
         let e = s
-            .save_canvas_within(std::time::Duration::from_millis(20), None, &rev, &body)
+            .save_canvas_within(
+                std::time::Duration::from_millis(20),
+                None,
+                None,
+                &rev,
+                &body,
+            )
             .await
             .err()
             .unwrap();
@@ -2394,7 +3388,7 @@ mod tests {
         drop(held);
         let released = std::sync::atomic::AtomicBool::new(false);
         let e = s
-            .save_canvas_while(&released, &rev, &body)
+            .save_canvas_while(&released, "m1", &rev, &body)
             .await
             .err()
             .unwrap();

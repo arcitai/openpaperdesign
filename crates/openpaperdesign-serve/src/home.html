@@ -331,6 +331,7 @@
     <div id="ed-alert" class="ed-alert" role="alert" hidden>
       <span id="ed-alert-text"></span>
       <button id="ed-leave" class="btn" type="button" hidden>Leave without saving</button>
+      <button id="ed-too-large" class="btn" type="button" hidden>Open in the browser editor</button>
       <button id="ed-home" class="btn" type="button" hidden>Back to files</button>
     </div>
   </section>
@@ -1517,6 +1518,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
     $('ed-alert').hidden = true;
     $('ed-leave').hidden = true;
     $('ed-home').hidden = true;
+    $('ed-too-large').hidden = true;
   }
   // Every status of the editor goes to the live region (assistive technology, checks). Stable
   // healthy ones (Ready, Saved, Saving…) show nothing more while no problem is unresolved;
@@ -1628,9 +1630,70 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       // Without a workspace there is no "All projects" button: the note has the way back.
       stayReason = true;
       $('ed-home').hidden = false;
+      // Too large for this panel (413, refused before anything was mounted; #6): the same
+      // canvas, through this same binding, in its browser editor (`openBrowserFor`).
+      if (e && e.status === 413) {
+        browserFor = Object.freeze({ g, h, binding, id });
+        $('ed-too-large').disabled = false;
+        $('ed-too-large').hidden = false;
+      }
       announce(why, g);
     });
   }
+
+  // A canvas too large for this panel (#6, owner comment 6388936169): its browser editor, for
+  // exactly the binding whose panel open was refused (`browserFor`: that view generation, its
+  // failed editor and binding). The link is the app library's own editor result for that
+  // binding (`openpaperdesign_app_editor` with `binding`: refused if another canvas is open by
+  // then) and goes to the host's `ui/open-link`; the canvas, its lease, saves and conflicts stay
+  // the browser editor's own, the same files. No bound is raised and nothing is copied. One
+  // request at a time; a reply that belongs to an older attempt, view or editor changes nothing.
+  // Asking is never taken for a load: the browser tab says Ready itself. A failure stays shown,
+  // with the button to try again; Back to files still leaves (its close isn't forced, so a
+  // browser tab already editing keeps its binding).
+  let browserFor = null;
+  let browserAttempt = 0;
+  $('ed-too-large').onclick = async () => {
+    const f = browserFor;
+    const mine = () => f && panelHandle === f.h && panelBinding === f.binding && f.g === gen;
+    if (!mine()) return;
+    const attempt = ++browserAttempt;
+    const still = () => attempt === browserAttempt && mine();
+    const say = (text) => { edReason(text); announce(text, f.g); };
+    $('ed-too-large').disabled = true;
+    say('Asking for this canvas\'s browser editor…');
+    const r = await rpc('tools/call', { name: 'openpaperdesign_app_editor', arguments: { binding: f.binding } }, 60000);
+    if (!still()) return;
+    let url = null;
+    let why = null;
+    if (r.timeout) why = 'Codex didn\'t answer, so the browser editor wasn\'t opened. Try again.';
+    else if (r.error) why = 'Codex didn\'t run the request' + errorCode(r.error) + ', so the browser editor wasn\'t opened. Try again.';
+    else {
+      const text = firstText(r.result);
+      let v = null;
+      try { v = JSON.parse(text); } catch { v = null; }
+      if (r.result && r.result.isError) {
+        why = 'The browser editor wasn\'t opened: ' + String(text || 'refused').slice(0, 300);
+      } else if (!v || typeof v !== 'object' || v.binding !== f.binding || libraryMismatch(v, f.id)) {
+        why = 'Codex answered for another canvas than this one, so nothing was opened.';
+      } else if (v.browser_editor !== 'built in' || typeof v.url !== 'string' || !EDITOR_URL.test(v.url)) {
+        why = 'This canvas has no local browser editor link, so nothing was opened.';
+      } else {
+        url = v.url;
+      }
+    }
+    if (!url) {
+      $('ed-too-large').disabled = false;
+      say(why);
+      return;
+    }
+    const o = await rpc('ui/open-link', { url });
+    if (!still()) return;
+    $('ed-too-large').disabled = false;
+    if (o.timeout) say('Codex didn\'t answer the request to open the browser editor. Press Open in the browser editor to try again.');
+    else if (o.error || (o.result && o.result.isError)) say('Codex didn\'t open the link' + errorCode(o.error) + '. Press Open in the browser editor to try again.');
+    else say('Codex was asked to open this canvas in its browser editor (the same canvas, saved in your library). That doesn\'t confirm it loaded: the browser tab shows Ready when it has. If nothing opens, press the button again.');
+  };
 
   // A departure (Home, the explicit discard, the host's teardown) belongs to the view and the
   // editor it started from (R25-F1): that view's generation, the editor's handle and its
@@ -1667,7 +1730,10 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       setEditorBusy(false);
       const why = {
         conflict: 'Still open: this canvas was changed elsewhere (a Paper, the list of Papers or the shown Paper), so your last change isn\'t saved. Reload from the banner (that drops your change), or leave without saving.',
+        readonly: 'Still open: another OpenPaperDesign view (opened after this one) is editing this canvas, so your last change here isn\'t saved. Choose Edit here in the banner to save it from this view, or leave without saving.',
         busy: 'Still open: an edit is still under way. Finish it, then try again.',
+        pending: 'Still open: a change handed over from another view was applied here, but its unfinished edits aren\'t open here yet, and this view holds their only copy. Continue or dismiss them from the banner (choose Edit here first if this view is read-only), or leave without saving to drop them.',
+        uncertain: 'Still open: applying a change handed over from another view got no answer, so it may or may not have been saved, and this view holds the only copy of its unfinished edits. Dismiss them from the banner (choose Edit here first if this view is read-only), or leave without saving to drop them.',
         failed: 'Still open: your last change couldn\'t be saved yet; it is being retried. Try again, or leave without saving.',
         unreachable: 'Still open: Codex didn\'t confirm your last save, so it may not be saved. Try again, or leave without saving.',
         error: 'Still open: the renderer stopped with a change that isn\'t saved. Leave without saving to drop it.',

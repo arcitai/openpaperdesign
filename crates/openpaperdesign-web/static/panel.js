@@ -3,7 +3,8 @@
 // bridge instead of HTTP. It only runs inlined in the home view's one module, after the
 // wasm-bindgen glue, session.js, page.js and editor.js (openpaperdesign-mcp assembles them in
 // that order; see `panel_module` in launcher.rs), whose names it uses: `__wbg_init`, `start`,
-// `Session`, `frameStep`, `saveStep`, `discardStep`, `opdMountEditor`, `opdBrowserEnv`,
+// `Session`, `frameStep`, `saveStep`, `discardStep`, `claimStep`, `offerStep`, `opdMountEditor`,
+// `opdBrowserEnv`,
 // `opdIsMac` and `OPD_WASM_IDENTITY`. Nothing is fetched by URL, evaluated or stored.
 //
 // - The renderer comes from the server in fixed, numbered parts (`openpaperdesign_app_editor_
@@ -24,6 +25,10 @@ const OPD_PANEL = Object.freeze({
   CANVAS: 'openpaperdesign_app_canvas',
   REVISION: 'openpaperdesign_app_canvas_revision',
   SAVE: 'openpaperdesign_app_canvas_save',
+  // Edit here (issue #23): take the canvas's editing back for this view.
+  CLAIM: 'openpaperdesign_app_claim',
+  // Issue #23's hand-over of an unsaved change between views (offer, apply, dismiss).
+  DRAFT: 'openpaperdesign_app_draft',
   READY: 'openpaperdesign_app_ready',
   RELEASE: 'openpaperdesign_app_page_release',
   ASSET_NAME: 'openpaperdesign_web_bg.wasm',
@@ -57,7 +62,7 @@ export function opdCreatePanel(opts) {
     init: (bytes) => __wbg_init({ module_or_path: bytes }),
     start,
   };
-  const lib = opts.lib || { Session, frameStep, saveStep, discardStep };
+  const lib = opts.lib || { Session, frameStep, saveStep, discardStep, claimStep, offerStep };
   const mountEditor = opts.mount || opdMountEditor;
   const env = opts.env || opdBrowserEnv(window);
   const mac = opdIsMac(opts.nav !== undefined ? opts.nav : navigator);
@@ -192,6 +197,8 @@ export function opdCreatePanel(opts) {
         pages: v.pages,
       }),
       revision: v.revision,
+      // Issue #23: whether this view has the canvas's editing (absent from an older server).
+      editing: typeof v.editing === 'boolean' ? v.editing : undefined,
     });
     h.started = (async () => {
       say('Loading the editor…');
@@ -206,7 +213,13 @@ export function opdCreatePanel(opts) {
       const first = await call(P.CANVAS, { binding });
       if (first.ok && Number.isInteger(first.ok.mount)) h.mount = first.ok.mount;
       if (!live()) { await release(); return 'left'; }
-      if (!first.ok) throw new Error(describe(first));
+      if (!first.ok) {
+        // The refusal's own status goes with it (413: too large for this panel, the host shows
+        // its browser-editor route; nothing was mounted).
+        const failed = new Error(describe(first));
+        if (first.refused && Number.isInteger(first.refused.status)) failed.status = first.refused.status;
+        throw failed;
+      }
       const v = first.ok;
       if (!readable(v) || !Number.isInteger(v.mount) || v.mount < 1) {
         await release();
@@ -246,7 +259,53 @@ export function opdCreatePanel(opts) {
         if (!r.ok || r.ok.binding !== binding || typeof r.ok.revision !== 'string') {
           throw new Error(r.ok ? 'Codex answered for another canvas.' : describe(r));
         }
-        return r.ok.revision;
+        const out = {
+          revision: r.ok.revision,
+          editing: typeof r.ok.editing === 'boolean' ? r.ok.editing : undefined,
+        };
+        // The handover record (null or an object), absent from an older server.
+        if ('handover' in r.ok && (r.ok.handover === null || typeof r.ok.handover === 'object')) {
+          out.handover = r.ok.handover;
+        }
+        return out;
+      };
+      // Issue #23's handover (see session.js): one call through this mount, its refusal status
+      // as it came, its answer as `body`.
+      const draftCall = async (args) => {
+        if (requestBytes(P.DRAFT, Object.assign({}, ids, args)) > P.MAX_MESSAGE) {
+          return { ok: false, status: 413 };
+        }
+        const r = await call(P.DRAFT, Object.assign({}, ids, args));
+        if (r.ok && r.ok.binding === binding) return { ok: true, status: 200, body: r.ok };
+        if (r.refused) {
+          return { ok: false, status: Number.isInteger(r.refused.status) ? r.refused.status : 0 };
+        }
+        return { ok: false, status: 0 };
+      };
+      const answer = (offer, base) => draftCall(offer
+        ? {
+          action: 'answer', if_match: base, text: offer.canvas, changed: Boolean(offer.changed),
+          unfinished: JSON.stringify(offer.unfinished || []),
+        }
+        : { action: 'answer' });
+      // `resolved`: the kept recoveries the action says it resolves (run 194, R83), a JSON list
+      // as text (the panel's arguments are strings, numbers and booleans, as `unfinished`).
+      const withResolved = (args, resolved) => (Array.isArray(resolved) && resolved.length
+        ? Object.assign(args, { resolved: JSON.stringify(resolved) }) : args);
+      const applyOffer = (id, resolved) => draftCall(withResolved({ action: 'apply', id }, resolved));
+      const keepOffer = (id, resolved) => draftCall(withResolved({ action: 'keep', id }, resolved));
+      const dismissOffer = (id, resolved) => draftCall(withResolved({ action: 'dismiss', id }, resolved));
+      const stopWaiting = (id) => draftCall({ action: 'stop', id });
+      // Edit here: the canvas's editing back for this view (issue #23); a refusal changes
+      // nothing, and no answer counts as a refusal (the next poll tells which it was).
+      const claim = async () => {
+        const r = await call(P.CLAIM, ids);
+        if (r.ok && r.ok.binding === binding && r.ok.editing === true) {
+          // Taken; what of its bookkeeping after didn't happen, if anything (R185 CLAIM contract).
+          return { ok: true, note: typeof r.ok.note === 'string' ? r.ok.note : null };
+        }
+        const status = r.refused && Number.isInteger(r.refused.status) ? r.refused.status : 0;
+        return { ok: false, status, error: describe(r.ok ? { fail: 'unreadable answer' } : r) };
       };
       const seed = crypto.getRandomValues(new Uint32Array(2));
       h.mounted = mountEditor({
@@ -267,7 +326,9 @@ export function opdCreatePanel(opts) {
         background: keptBackground,
         onBackground: (b) => { if (live() && onBackground) onBackground(b); },
         onName: (n) => { if (live() && onName) onName(n); },
-        transport: { fetchPage, put, revision },
+        transport: {
+          fetchPage, put, revision, claim, answer, applyOffer, keepOffer, dismissOffer, stopWaiting,
+        },
         firstPage: canvasPage(v),
         forceWebgl: false,
         onReady: () => {

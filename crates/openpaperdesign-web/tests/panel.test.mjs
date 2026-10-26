@@ -75,6 +75,8 @@ const T = {
   SAVE: 'openpaperdesign_app_canvas_save', READY: 'openpaperdesign_app_ready', RELEASE: 'openpaperdesign_app_page_release',
   // The per-page tools stay on the server for older views; this editor never calls them.
   PAGE: 'openpaperdesign_app_page', PAGE_SAVE: 'openpaperdesign_app_page_save',
+  // Issue #23's Edit here and hand-over (the fake server answers them only through `override`).
+  CLAIM: 'openpaperdesign_app_claim', DRAFT: 'openpaperdesign_app_draft',
 };
 const ok = (v) => ({ result: { content: [{ type: 'text', text: JSON.stringify(v) }] } });
 const no = (status, error, revision = null) => ({ result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error, status, revision }) }] } });
@@ -562,7 +564,13 @@ test('a stale binding or released mount is refused by the server and never appli
   t.env.every(300);
   await flush();
   assert.equal(t.srv.saved, undefined, 'nothing written');
-  assert.equal(t.shown.status.at(-1), 'Save failed; retrying');
+  // R78-01/05: a mount the server no longer knows can't save, claim or hand over; it says so
+  // instead of retrying.
+  assert.equal(t.shown.status.at(-1), 'Read-only: this view is no longer known to the canvas');
+  const tried = t.srv.named(T.SAVE).length;
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, tried, 'not retried');
   t.env.every(1000);
   await flush();
   assert.ok(!t.ed.calls.some((c) => c.startsWith('reload')), 'a refused poll loads nothing');
@@ -1016,4 +1024,426 @@ test('R26: a late real clipboard rejection must not mask a save failure during i
   await t.h.dispose();
   assert.equal(during.className, 'failure', 'the unsaved failure must remain visible until recovery');
   assert.match(during.textContent, /Save failed/);
+});
+
+// ---- issue #23: the same canvas open in several views; the one that opened it last edits.
+
+test('issue #23: a view whose save is refused because another view edits shows read-only with Edit here, keeps its change, retries nothing, and Edit here claims and saves it', async () => {
+  const t = await readyEditor();
+  // As the real editor: a failed save leaves the change unsaved.
+  t.ed.save_failed = function failed() { this.calls.push('save_failed'); this.pending = '{"mine":1}'; };
+  t.srv.override[T.SAVE] = () => no(423, 'This canvas is now being edited in another OpenPaperDesign view');
+  t.ed.pending = '{"mine":1}';
+  t.env.every(300);
+  await flush();
+  assert.equal(t.shown.status.at(-1), 'Read-only: another view is editing this canvas');
+  assert.ok(!t.shown.status.includes('Saved'), 'never shown as saved');
+  assert.ok(t.refs.conflict.classes.has('show'), 'the read-only banner');
+  const said = String(t.refs.conflict.children[0]);
+  assert.match(said, /unsaved change here wasn't saved\. It is still here/);
+  const button = t.refs.conflict.children.find((c) => c && c.tag === 'button');
+  assert.equal(button.textContent, 'Edit here');
+  // Nothing is retried while read-only, and input doesn't reach the editor.
+  const tried = t.srv.named(T.SAVE).length;
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.named(T.SAVE).length, tried);
+  t.refs.canvas.fire('pointerdown', { pointerId: 4, button: 0, clientX: 2, clientY: 2, timeStamp: 9 });
+  assert.ok(!t.ed.calls.includes('down'), 'read-only: no input');
+  // Edit here: the claim tool, pinned to this view's binding and mount; then the change saves.
+  t.srv.override[T.CLAIM] = () => ok({ binding: BINDING, editing: true });
+  delete t.srv.override[T.SAVE];
+  button.fire('click');
+  await flush();
+  assert.deepEqual(t.srv.named(T.CLAIM), [{ binding: BINDING, mount: 1 }]);
+  assert.ok(t.shown.status.includes('Editing here again'));
+  assert.ok(!t.refs.conflict.classes.has('show'), 'the banner goes');
+  t.env.every(300);
+  await flush();
+  assert.equal(t.srv.saved, '{"mine":1}', 'the kept change, saved from this view');
+  assert.equal(t.shown.status.at(-1), 'Saved');
+  await t.h.dispose();
+});
+
+test('issue #23: a clean view told by its poll that another view edits becomes read-only and keeps following what is saved there', async () => {
+  const t = await readyEditor();
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: false });
+  t.env.every(1000);
+  await flush();
+  assert.equal(t.shown.status.at(-1), 'Read-only: another view is editing this canvas');
+  assert.ok(t.refs.conflict.classes.has('show'));
+  assert.match(String(t.refs.conflict.children[0]), /This view is read-only and keeps showing what is saved there/);
+  // A save made in the editing view is loaded here.
+  t.srv.revision = '"theirs"';
+  t.env.every(1000);
+  await flush();
+  assert.ok(t.ed.calls.some((c) => c.startsWith('reload:')), 'reloaded in place');
+  t.refs.canvas.fire('pointerdown', { pointerId: 5, button: 0, clientX: 2, clientY: 2, timeStamp: 9 });
+  assert.ok(!t.ed.calls.includes('down'), 'read-only: no input');
+  // The poll says this view edits again (it opened the canvas again): the banner goes.
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: true });
+  t.env.every(1000);
+  await flush();
+  assert.ok(!t.refs.conflict.classes.has('show'));
+  assert.equal(t.shown.status.at(-1), 'Editing here again');
+  await t.h.dispose();
+});
+
+test('issue #23 (R78-03): a view with an unsaved change and an open field learns from its poll that another view edits, and hands both over through its own mount', async () => {
+  const t = await readyEditor();
+  // The renderer's own handover (state.rs): the whole canvas, the change, and the open field.
+  t.ed.pending = '{"mine":1}';
+  t.ed.handover = () => JSON.stringify({
+    canvas: '{"whole":1}', changed: true, unfinished: [{ kind: 'title', text: 'D' }],
+  });
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: false, handover: null });
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, offer: 'o1' });
+  t.env.every(1000);
+  await flush();
+  assert.equal(t.shown.status.at(-1), 'Read-only: another view is editing this canvas');
+  assert.deepEqual(t.srv.named(T.DRAFT), [{
+    binding: BINDING, mount: 1, action: 'answer', if_match: '"r1"', text: '{"whole":1}', changed: true,
+    unfinished: JSON.stringify([{ kind: 'title', text: 'D' }]),
+  }], 'answered on the revision it was made on, pinned to this mount');
+  assert.equal(t.srv.named(T.SAVE).length, 0, 'never saved from here');
+  assert.equal(t.ed.pending, '{"mine":1}', 'and kept here');
+  // Nothing is answered again on later polls.
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: false,
+    handover: { offers: [{ id: 'o1', from_here: true, changed: true, canvas: true, base: '"r1"', unfinished: [] }], pending: [] } });
+  t.env.every(1000);
+  await flush();
+  assert.equal(t.srv.named(T.DRAFT).length, 1);
+  assert.match(String(t.refs.conflict.children[0]), /It was handed over to that view/);
+  await t.h.dispose();
+});
+
+test('issue #23 (R78-03/04): the editing view is told of a handed-over change and applies it by its id through its own mount', async () => {
+  const t = await readyEditor();
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: true,
+    handover: { offers: [{ id: 'o1', from_here: false, changed: true, canvas: true, base: t.srv.revision, unfinished: [] }], pending: [] } });
+  t.env.every(1000);
+  await flush();
+  assert.ok(t.refs.conflict.classes.has('show'), 'the handover banner');
+  const row = t.refs.conflict.children.find((c) => c && c.tag === 'div');
+  assert.match(String(row.children[0]), /handed it over here/);
+  const buttons = row.children.filter((c) => c && c.tag === 'button');
+  assert.deepEqual(buttons.map((b) => b.textContent), ['Apply', 'Keep as a new canvas', 'Dismiss']);
+  assert.equal(t.srv.named(T.DRAFT).length, 0, 'nothing applied without the person');
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, applied: true, revision: '"applied"', left: null });
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: true, handover: null });
+  buttons[0].fire('click');
+  await flush();
+  assert.deepEqual(t.srv.named(T.DRAFT), [{ binding: BINDING, mount: 1, action: 'apply', id: 'o1' }]);
+  assert.ok(t.shown.status.includes('Applied the change handed over from another view'));
+  assert.ok(!t.refs.conflict.classes.has('show'), 'the banner goes');
+  await t.h.dispose();
+});
+
+// R186 (LEAD185-01): after Continue here the page's focus was on the body (its button gone), so
+// Enter reached nothing. The keyboard goes back to this mount's own canvas.
+function offerRevision(t, offers) {
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: true,
+    handover: { offers, pending: [] } });
+}
+function bannerButton(t, label) {
+  const row = t.refs.conflict.children.find((c) => c && c.tag === 'div');
+  return row && row.children.find((c) => c && c.tag === 'button' && c.textContent === label);
+}
+const TEXT_EDIT = { kind: 'text', page: 'p1', node: 7, text: 'Hel', caret: 3 };
+
+test('R186: Continue here gives the keyboard back to this mount\'s canvas, from a pointer click or the keyboard, and Apply with a continuation does too', async () => {
+  const t = await readyEditor();
+  const taken = [];
+  t.ed.resume_unfinished = (json) => { taken.push(JSON.parse(json)); return ''; };
+  offerRevision(t, [{ id: 'o1', from_here: false, changed: false, canvas: false, base: t.srv.revision, unfinished: [TEXT_EDIT] }]);
+  t.env.every(1000);
+  await flush();
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, dismissed: true });
+  offerRevision(t, []);
+  const focused = t.refs.canvas.focused;
+  // A pointer's click (detail 1).
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  assert.deepEqual(taken, [TEXT_EDIT], 'its text edit is open here');
+  assert.equal(t.refs.canvas.focused, focused + 1, 'the canvas has the keyboard: Enter reaches the editor');
+  assert.ok(t.shown.status.includes('Its unfinished edit is open here: finish it (Enter) or cancel it (Escape)'));
+  assert.equal(t.ed.calls.filter((c) => c === 'saved').length, 0, 'nothing finished or saved');
+  // The keyboard's activation of a focused button (Enter or Space: a click, detail 0).
+  offerRevision(t, [{ id: 'o2', from_here: false, changed: false, canvas: false, base: t.srv.revision, unfinished: [{ kind: 'title', text: 'D' }] }]);
+  t.env.every(1000);
+  await flush();
+  offerRevision(t, []);
+  bannerButton(t, 'Continue here').fire('click', { detail: 0 });
+  await flush();
+  assert.equal(t.refs.canvas.focused, focused + 2);
+  // Apply, then its continuation opened here.
+  offerRevision(t, [{ id: 'o3', from_here: false, changed: true, canvas: true, base: t.srv.revision, unfinished: [TEXT_EDIT] }]);
+  t.env.every(1000);
+  await flush();
+  // As the server does: the Apply's commit is the canvas's revision now (its next read says so).
+  t.srv.override[T.DRAFT] = () => {
+    t.srv.revision = '"applied"';
+    return ok({ binding: BINDING, applied: true, revision: '"applied"', left: null });
+  };
+  offerRevision(t, []);
+  bannerButton(t, 'Apply').fire('click', { detail: 0 });
+  await flush();
+  assert.deepEqual(taken.at(-1), TEXT_EDIT);
+  assert.equal(t.refs.canvas.focused, focused + 3, 'the continuation has the keyboard after Apply too');
+  // Apply with nothing to continue moves no focus.
+  offerRevision(t, [{ id: 'o4', from_here: false, changed: true, canvas: true, base: t.srv.revision, unfinished: [] }]);
+  t.env.every(1000);
+  await flush();
+  offerRevision(t, []);
+  bannerButton(t, 'Apply').fire('click', { detail: 1 });
+  await flush();
+  assert.equal(t.refs.canvas.focused, focused + 3);
+  await t.h.dispose();
+});
+
+test('R186: a Continue here whose mount is disposed meanwhile takes no focus', async () => {
+  const t = await readyEditor();
+  t.ed.resume_unfinished = () => '';
+  offerRevision(t, [{ id: 'o1', from_here: false, changed: false, canvas: false, base: t.srv.revision, unfinished: [TEXT_EDIT] }]);
+  t.env.every(1000);
+  await flush();
+  // Its dismissal (an unfinished-only offer, all taken up) is still on its way when the mount goes.
+  let release;
+  t.srv.holds[T.DRAFT] = new Promise((r) => { release = r; });
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, dismissed: true });
+  const focused = t.refs.canvas.focused;
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  const gone = t.h.dispose();
+  release();
+  await gone;
+  await flush();
+  assert.equal(t.refs.canvas.focused, focused, 'a disposed mount never takes the focus');
+});
+
+test('R190 (R80-02): the mount\'s drain (Home, All projects) never calls a committed Apply\'s kept continuation clean', async () => {
+  const t = await readyEditor();
+  const taken = [];
+  t.ed.resume_unfinished = (json) => { taken.push(JSON.parse(json)); return ''; };
+  // A finished change and a unique unfinished Canvas name, handed over by a view now gone.
+  offerRevision(t, [{ id: 'o1', from_here: false, changed: true, canvas: true, base: t.srv.revision,
+    unfinished: [{ kind: 'title', text: 'Dz-190' }] }]);
+  t.env.every(1000);
+  await flush();
+  // Apply commits (and the server's record drops the offer); the read after it fails.
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, applied: true, revision: '"applied"', left: null });
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: '"applied"', editing: true, handover: null });
+  t.srv.override[T.CANVAS] = () => no(503, 'the canvas could not be read');
+  bannerButton(t, 'Apply').fire('click', { detail: 1 });
+  await flush();
+  assert.deepEqual(taken, [], 'not opened onto a canvas that wasn\'t loaded');
+  assert.ok(bannerButton(t, 'Continue here'), 'kept, to continue');
+  const releases = t.srv.named(T.RELEASE).length;
+  assert.equal(await t.h.drain(), 'pending', 'leaving isn\'t clean while it is the only copy');
+  assert.equal(t.ed.freed, false, 'the editor stays');
+  assert.equal(t.srv.named(T.RELEASE).length, releases, 'its mount stays');
+  assert.equal(t.srv.named(T.DRAFT).filter((a) => a.action === 'apply').length, 1, 'applied once');
+  t.h.resume();
+  await t.h.dispose();
+});
+
+test('R191: the mount\'s drain never calls leaving clean after an Apply whose answer was lost', async () => {
+  const t = await readyEditor();
+  t.ed.resume_unfinished = () => '';
+  const name = { kind: 'title', base: 'Plan', text: 'Dz-190-unknown-æøå' };
+  offerRevision(t, [{ id: 'o1', from_here: false, changed: true, canvas: true, base: t.srv.revision, unfinished: [name] }]);
+  t.env.every(1000);
+  await flush();
+  // The server commits it and drops the offer, but Codex's answer is an error.
+  let applies = 0;
+  t.srv.override[T.DRAFT] = () => {
+    applies += 1;
+    t.srv.revision = '"applied"';
+    return { error: { code: -32603, message: 'the answer was lost' } };
+  };
+  t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: '"applied"', editing: true, handover: null });
+  bannerButton(t, 'Apply').fire('click', { detail: 1 });
+  await flush();
+  assert.ok(t.shown.status.some((s) => /isn't known whether/.test(s)), t.shown.status.join(' | '));
+  t.env.every(1000);
+  await flush();
+  const releases = t.srv.named(T.RELEASE).length;
+  assert.equal(await t.h.drain(), 'uncertain');
+  assert.equal(t.ed.freed, false, 'the editor stays');
+  assert.equal(t.srv.named(T.RELEASE).length, releases, 'its mount stays');
+  assert.equal(applies, 1, 'applied once, never again on its own');
+  t.h.resume();
+  await t.h.dispose();
+});
+
+test('R192 (R81-01): a revision poll answered from before an unanswered Apply never lets the mount leave clean', async () => {
+  const t = await readyEditor();
+  t.ed.resume_unfinished = () => '';
+  const name = { kind: 'title', base: 'Plan', text: 'Dz-192-held-æøå' };
+  const listed = { offers: [{ id: 'o1', from_here: false, changed: true, canvas: true, base: t.srv.revision, unfinished: [name] }], pending: [] };
+  offerRevision(t, listed.offers);
+  t.env.every(1000);
+  await flush();
+  // A poll starts, its answer (the offer, as it was) held in transport.
+  let release;
+  t.srv.holds[T.REVISION] = new Promise((r) => { release = r; });
+  const before = ok({ binding: BINDING, revision: t.srv.revision, editing: true, handover: listed });
+  t.srv.override[T.REVISION] = () => before;
+  t.env.every(1000);
+  await flush();
+  // Apply commits and drops the offer; Codex's answer is an error.
+  let applies = 0;
+  t.srv.override[T.DRAFT] = () => {
+    applies += 1;
+    return { error: { code: -32603, message: 'the answer was lost' } };
+  };
+  bannerButton(t, 'Apply').fire('click', { detail: 1 });
+  await flush();
+  // The held answer arrives, listing the offer.
+  delete t.srv.holds[T.REVISION];
+  release();
+  await flush();
+  assert.equal(await t.h.drain(), 'uncertain');
+  assert.equal(t.ed.freed, false);
+  assert.equal(applies, 1);
+  t.h.resume();
+  await t.h.dispose();
+});
+
+test('R193 (R82-01): the newest view\'s banner shows a kept recovery and continues it on its version; an unknown one is dismiss-only', async () => {
+  const t = await readyEditor();
+  const taken = [];
+  t.ed.resume_unfinished = (json) => { taken.push(JSON.parse(json)); return ''; };
+  // What it took up stays open as typed, as the adapter hands it on (`handover`); Continue
+  // dismisses an offer of names only once its frames have drawn them so (run 196).
+  t.ed.handover = () => JSON.stringify({ canvas: '', changed: false, unfinished: taken });
+  const frames = async () => {
+    for (let i = 1; i <= 6; i += 1) {
+      t.env.frame(i * 16);
+      await new Promise((r) => { setTimeout(r, 20); });
+      await flush();
+    }
+  };
+  const name = { kind: 'title', base: 'Plan', text: 'Dz-193-æøå' };
+  const kept = (id, state, revision) => ({ id, from_here: false, changed: false, canvas: false, base: t.srv.revision,
+    unfinished: [{ kind: 'recovery', v: 1, id: `r-${id}`, state, ...(revision ? { revision } : {}), packets: [name] }] });
+  // An unknown one: listed, its reason said, Dismiss only.
+  offerRevision(t, [kept('o1', 'unknown')]);
+  t.env.every(1000);
+  await flush();
+  const row = () => t.refs.conflict.children.find((c) => c && c.tag === 'div');
+  assert.match(String(row().children[0]), /got no answer/);
+  assert.equal(bannerButton(t, 'Continue here'), undefined, 'never opened');
+  assert.ok(bannerButton(t, 'Dismiss'));
+  // An applied one on this view's version: continued here, the raw packet exactly.
+  offerRevision(t, [kept('o2', 'applied', t.srv.revision)]);
+  t.env.every(1000);
+  await flush();
+  assert.match(String(row().children[0]), /continue only on that version/);
+  t.srv.override[T.DRAFT] = () => ok({ binding: BINDING, dismissed: true });
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  await frames();
+  assert.deepEqual(taken, [name]);
+  assert.ok(t.srv.named(T.DRAFT).some((a) => a.action === 'dismiss' && a.id === 'o2'), 'taken up: it leaves the record');
+  // Saying which kept recovery it resolves (run 194), as a JSON list in text (the panel's way).
+  assert.ok(t.srv.named(T.DRAFT).some((a) => a.action === 'dismiss' && a.id === 'o2' && a.resolved === '["r-o2"]'),
+    JSON.stringify(t.srv.named(T.DRAFT)));
+  // One for another version: refused, its reason said, still listed.
+  offerRevision(t, [kept('o3', 'applied', '"other"')]);
+  t.env.every(1000);
+  await flush();
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  assert.equal(taken.length, 1, 'nothing opened over another version');
+  assert.ok(t.shown.status.some((s) => /newer change was saved/.test(s)), t.shown.status.join(' | '));
+  assert.ok(!t.srv.named(T.DRAFT).some((a) => a.id === 'o3'), 'not dismissed');
+  await t.h.dispose();
+});
+
+test('R186 (R78-03): a field value whose field doesn\'t open here says so and can be continued again; a refused one stays listed with its reason', async () => {
+  const t = await readyEditor();
+  const field = { kind: 'inspector', page: 'p1', ids: [7], label: 'X  ', nth: 0, text: '-' };
+  let answer = '';
+  let outcome = 'its field isn\'t shown here (the layers or the panel aren\'t), so it wasn\'t opened';
+  t.ed.resume_unfinished = () => answer;
+  t.ed.resume_outcome = () => outcome;
+  offerRevision(t, [{ id: 'o1', from_here: false, changed: false, canvas: false, base: t.srv.revision, unfinished: [field] }]);
+  t.env.every(1000);
+  await flush();
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  assert.equal(t.srv.named(T.DRAFT).length, 0, 'a field\'s offer is never dismissed by Continue here');
+  assert.ok(t.shown.status.some((s) => s.startsWith('Its unfinished value wasn\'t opened here: its field isn\'t shown here')),
+    t.shown.status.join(' | '));
+  assert.ok(bannerButton(t, 'Continue here'), 'and it can be continued again');
+  // It opens this time.
+  outcome = '';
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  assert.ok(!bannerButton(t, 'Continue here'), 'continued: not taken up twice');
+  assert.match(String(t.refs.conflict.children.find((c) => c && c.tag === 'div').children[0]), /were opened here; dismiss this/);
+  // A target refused here (locked): nothing taken, its reason said, still listed.
+  offerRevision(t, [{ id: 'o2', from_here: false, changed: false, canvas: false, base: t.srv.revision, unfinished: [field] }]);
+  t.env.every(1000);
+  await flush();
+  answer = 'a layer it edits is locked here';
+  const focused = t.refs.canvas.focused;
+  const row = t.refs.conflict.children.filter((c) => c && c.tag === 'div').at(-1);
+  row.children.find((c) => c && c.tag === 'button' && c.textContent === 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  assert.ok(t.shown.status.includes('Its unfinished edit wasn\'t opened here; it is still listed: a layer it edits is locked here'),
+    t.shown.status.join(' | '));
+  assert.equal(t.refs.canvas.focused, focused, 'nothing opened, no focus moved');
+  assert.equal(t.srv.named(T.DRAFT).length, 0);
+  await t.h.dispose();
+});
+
+test('R197 (R86-01): a partly opened offer keeps Continue here, says what opened and what waits, and continues the rest once the name being typed ends', async () => {
+  const t = await readyEditor();
+  const E = { kind: 'title', base: 'Plan', text: 'E-197 — æøå' };
+  const D = { kind: 'title', base: 'Plan', text: 'D-197 — recovered æøå' };
+  // The adapter's one Canvas name field: a second Canvas name waits (DRAFT_HERE).
+  const open = [];
+  const taken = [];
+  t.ed.resume_unfinished = (json) => {
+    const c = JSON.parse(json);
+    if (open.some((x) => x.kind === c.kind)) {
+      return 'the same kind of edit is being typed here; finish it first (nothing here was replaced)';
+    }
+    open.push(c);
+    taken.push(c);
+    t.ed.canReload = false;
+    return '';
+  };
+  t.ed.handover = () => JSON.stringify({ canvas: '', changed: false, unfinished: open });
+  const frames = async () => {
+    for (let i = 1; i <= 6; i += 1) {
+      t.env.frame(i * 16);
+      await new Promise((r) => { setTimeout(r, 20); });
+      await flush();
+    }
+  };
+  offerRevision(t, [{ id: 'm', from_here: false, changed: false, canvas: false, base: t.srv.revision,
+    unfinished: [E, { kind: 'recovery', v: 1, id: 'r-m', state: 'applied', revision: t.srv.revision, packets: [D] }] }]);
+  t.env.every(1000);
+  await flush();
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  await frames();
+  assert.deepEqual(taken, [E]);
+  assert.equal(t.srv.named(T.DRAFT).length, 0, 'nothing dismissed');
+  const row = () => String(t.refs.conflict.children.find((c) => c && c.tag === 'div').children[0]);
+  assert.match(row(), /Opened here: the Canvas name "E-197 — æøå" still being typed; still to continue here: the Canvas name "D-197 — recovered æøå"/);
+  assert.ok(bannerButton(t, 'Continue here'), 'the rest can be continued here');
+  // The person cancels E (Escape); Continue here again opens D alone, then the offer goes.
+  open.length = 0;
+  t.ed.canReload = true;
+  bannerButton(t, 'Continue here').fire('click', { detail: 1 });
+  await flush();
+  await frames();
+  assert.deepEqual(taken, [E, D], 'D, exactly; E not again');
+  assert.ok(t.srv.named(T.DRAFT).some((a) => a.action === 'dismiss' && a.id === 'm' && a.resolved === '["r-m"]'),
+    JSON.stringify(t.srv.named(T.DRAFT)));
+  await t.h.dispose();
 });

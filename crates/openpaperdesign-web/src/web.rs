@@ -483,4 +483,21 @@ impl WebEditor {
     pub fn save_failed(&mut self) {
         self.state.save_failed();
     }
+
+    /// What this editor hands over to the view that took the canvas's editing (issue #23, see
+    /// [`WebState::handover`]): `{canvas, changed, unfinished}` as JSON.
+    pub fn handover(&mut self) -> String {
+        self.state.handover()
+    }
+
+    /// Take up an edit another view handed over (see [`WebState::resume_unfinished`]): `""`
+    /// taken up, else why not.
+    pub fn resume_unfinished(&mut self, continuation: &str) -> String {
+        self.state.resume_unfinished(continuation)
+    }
+
+    /// What became of the last field value taken up (see [`WebState::resume_outcome`]).
+    pub fn resume_outcome(&self) -> String {
+        self.state.resume_outcome()
+    }
 }

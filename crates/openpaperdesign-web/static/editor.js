@@ -26,11 +26,16 @@ const OPD_LOADING_STATUS = new Set(['Starting renderer…', 'Loading the editor�
 // the change is not saved until a later save is acknowledged.
 const OPD_SAVE_FAILED = new Set(['Save failed; retrying', 'Save failed (server unreachable); retrying']);
 // A save refused because the canvas changed elsewhere (page.js `saveStep`): nothing is retried;
-// only the conflict banner's reload (or a later acknowledged save) resolves it.
-const OPD_CONFLICT = new Set(['Not saved: conflict']);
-// What resolves an outstanding failure or conflict: an acknowledged save, or the explicit
-// reload of the version on disk (page.js `discardStep`).
-const OPD_RESOLVED = new Set(['Saved', 'Reloaded the version on disk']);
+// only the conflict banner's reload (or a later acknowledged save) resolves it. Likewise a view
+// that another, later-opened view took the editing from (issue #23, page.js
+// `OPD_READONLY_STATUS`): it stays shown until this view edits again (`OPD_EDITING_STATUS`).
+// A view the canvas's editor no longer knows (R78-01) stays so until the tab is reloaded.
+const OPD_UNIDENTIFIED_STATUS_TEXT = 'Read-only: this view is no longer known to the canvas';
+const OPD_CONFLICT = new Set(['Not saved: conflict', 'Read-only: another view is editing this canvas',
+  OPD_UNIDENTIFIED_STATUS_TEXT]);
+// What resolves an outstanding failure or conflict: an acknowledged save, the explicit reload of
+// the version on disk (page.js `discardStep`), or this view's Edit here (`claimStep`).
+const OPD_RESOLVED = new Set(['Saved', 'Reloaded the version on disk', 'Editing here again']);
 
 /**
  * How a host shows a status: 'quiet' (live region only), 'loading' (a small temporary
@@ -195,7 +200,9 @@ export function opdIsMac(nav) {
 
 /**
  * Mount one editor. opts: {
- *   lib: { Session, frameStep, saveStep, discardStep },
+ *   lib: { Session, frameStep, saveStep, discardStep, claimStep, offerStep },
+ *                                    `claimStep` (optional) backs the read-only banner's Edit here,
+ *                                    `offerStep` (optional) the handover banner's actions
  *   canvas,                          the canvas element (inside the editor's own root)
  *   status(text, error), renderer(text, error), conflictBox
  *   boot(canvas, page, webgl, systemDark, appearance) -> Promise<editor>
@@ -209,7 +216,13 @@ export function opdIsMac(nav) {
  *                                    default 'none'), given to each editor once it booted
  *   onBackground(background)         the person chose another one (the canvas's menu, Menu ▸
  *                                    Background, View, the palette or the grid shortcut)
- *   transport: { fetchPage(), put(snapshot, revision), revision() }
+ *   transport: { fetchPage(), put(snapshot, revision), revision(), claim(),
+ *                answer(offer, base), applyOffer(id), keepOffer(id), dismissOffer(id),
+ *                stopWaiting(id) }
+ *                                    `claim()` (optional) takes the canvas's editing for this
+ *                                    view; `revision()` may answer { revision, editing,
+ *                                    handover, view }; the others (optional) are issue #23's
+ *                                    handover (see session.js)
  *   firstPage: { text, revision }, forceWebgl, state
  *   onReady(session)                 the renderer is Ready (once per mount)
  *   onHome()                         upstream's Home/New/Open: the host's own way back to its
@@ -273,6 +286,12 @@ export function opdMountEditor(opts) {
     },
     put: transport.put,
     revision: transport.revision,
+    claim: transport.claim,
+    answer: transport.answer,
+    applyOffer: transport.applyOffer,
+    keepOffer: transport.keepOffer,
+    dismissOffer: transport.dismissOffer,
+    stopWaiting: transport.stopWaiting,
     log: opts.log,
   }, opts.state || {});
 
@@ -289,6 +308,12 @@ export function opdMountEditor(opts) {
       if (!disposed) opts.status('The browser didn\'t allow copying here; use Ctrl/⌘+C on the canvas.');
     });
   };
+  // Pointers pressed and keys held while this view could edit: their moves and releases still
+  // reach the editor after it became read-only (`Session.settle`, R78-03), so an interaction
+  // already under way ends as the person ends it; nothing new starts.
+  const pressed = new Set();
+  const held = new Set();
+  const settling = (id, set, fn) => (set.has(id) ? session.settle(fn) : session.edit(fn));
   function wire(c) {
     on(c, 'pointerdown', (e) => {
       e.preventDefault();
@@ -296,17 +321,20 @@ export function opdMountEditor(opts) {
         c.focus();
         c.setPointerCapture(e.pointerId);
         capture = [c, e.pointerId];
+        pressed.add(e.pointerId);
         mods(ed, e);
         ed.pointer_down(...local(c, e), e.button, e.timeStamp);
       });
     });
-    on(c, 'pointermove', (e) => session.edit((ed) => {
+    on(c, 'pointermove', (e) => settling(e.pointerId, pressed, (ed) => {
       mods(ed, e);
       ed.pointer_move(...local(c, e), e.timeStamp);
     }));
     const up = (e) => {
       if (capture && capture[1] === e.pointerId) capture = null;
-      session.edit((ed) => { mods(ed, e); ed.pointer_up(...local(c, e), e.button, e.timeStamp); });
+      const id = e.pointerId;
+      settling(id, pressed, (ed) => { mods(ed, e); ed.pointer_up(...local(c, e), e.button, e.timeStamp); });
+      pressed.delete(id);
     };
     on(c, 'pointerup', up);
     on(c, 'pointercancel', up);
@@ -326,6 +354,7 @@ export function opdMountEditor(opts) {
       e.stopPropagation();
       const taken = session.edit((ed) => {
         mods(ed, e);
+        held.add(e.code);
         const t = ed.key_down(e.key, e.code, e.repeat);
         flushClipboard(ed);
         return t;
@@ -334,7 +363,8 @@ export function opdMountEditor(opts) {
     });
     on(c, 'keyup', (e) => {
       e.stopPropagation();
-      session.edit((ed) => { mods(ed, e); ed.key_up(e.key, e.code); });
+      settling(e.code, held, (ed) => { mods(ed, e); ed.key_up(e.key, e.code); });
+      held.delete(e.code);
     });
     on(c, 'focus', () => session.withEditor((ed) => ed.focus(true)));
     on(c, 'blur', () => session.withEditor((ed) => ed.focus(false)));
@@ -440,6 +470,9 @@ export function opdMountEditor(opts) {
       opts.status('Ready');
       session.canvas.focus();
       if (opts.onReady) opts.onReady(session);
+      // Opened while another view has the editing (it opened the canvas later): say so at once.
+      if (session.state.readonly) ui.readonly();
+      else if (session.state.handover) ui.handover();
     },
     // Terminal: shown once, in red, and the frame loop stops.
     fatal: (msg) => {
@@ -454,24 +487,250 @@ export function opdMountEditor(opts) {
     // the button reloads the server's version in place.
     conflict: () => {
       if (disposed) return;
-      const c = opts.conflictBox;
-      c.replaceChildren();
-      c.append('This canvas was changed elsewhere (a Paper, the list of Papers or the shown Paper, '
-        + 'for example by an agent) since your unsaved change. Nothing was overwritten, and your '
-        + 'change is not saved. ');
-      const b = c.ownerDocument.createElement('button');
-      b.type = 'button';
-      b.textContent = 'Reload (discard my unsaved change)';
-      on(b, 'click', () => lib.discardStep(session, ui));
-      c.append(b);
-      c.classList.add('show');
+      banner('conflict', 'This canvas was changed elsewhere (a Paper, the list of Papers or the '
+        + 'shown Paper, for example by an agent) since your unsaved change. Nothing was '
+        + 'overwritten, and your change is not saved. ',
+      [['Reload (discard my unsaved change)', () => lib.discardStep(session, ui)]]);
     },
     hideConflict: () => {
-      const c = opts.conflictBox;
-      c.classList.remove('show');
-      c.replaceChildren();
+      if (shown !== 'conflict') return;
+      clearBanner();
+      // A change handed over from another view waited behind the conflict.
+      if (!session.state.readonly && session.state.handover) ui.handover();
+    },
+    // Issue #23: another view (opened later) has the canvas's editing. The banner says so, says
+    // what happens to what is unsaved here (kept, not saved; handed over to that view, or why
+    // not), and offers Edit here. Shown again only when what it says changes; the status line
+    // latches the same until this view edits again.
+    readonly: () => {
+      if (disposed) return;
+      const s = session.state;
+      const unsaved = session.withEditor((ed) => !ed.can_reload()) === true;
+      if (s.unidentified) {
+        // R78-01: the server doesn't know this view; nothing from it is admitted.
+        banner('readonly', 'This view can\'t edit this canvas any more: its editor doesn\'t know '
+          + 'it (the tab was closed, the canvas reopened, or OpenPaperDesign restarted). '
+          + (unsaved
+            ? 'What is unsaved here stays on screen but can\'t be saved or handed over from here; '
+              + 'reloading this tab drops it. '
+            : 'Reload this tab to edit here. '), []);
+        opts.status(OPD_UNIDENTIFIED_STATUS_TEXT);
+        return;
+      }
+      const lead = 'Another OpenPaperDesign view (one opened after this one) is editing this canvas '
+        + 'now';
+      const mine = (s.handover && s.handover.offers || []).some((o) => o.from_here);
+      let text;
+      if (!unsaved) {
+        text = `${lead}. This view is read-only and keeps showing what is saved there. `;
+      } else if (s.handed === 'change' && mine) {
+        text = `${lead}, so your unsaved change here wasn't saved. It was handed over to that `
+          + 'view, where it can be applied (only onto the version it was made on, so nothing is '
+          + 'overwritten), kept as a new canvas, or its unfinished edits continued; it is still '
+          + 'here too, not lost. ';
+      } else if (s.handed === 'unfinished' && mine) {
+        text = `${lead}. Your unfinished edit here (not in the canvas yet) was handed over to `
+          + 'that view, which can continue it there; it also stays here as it is. ';
+      } else if (s.handed === 'change' || s.handed === 'unfinished') {
+        text = `${lead}. What you handed over was applied, kept or dismissed there; it is still `
+          + 'here too, unsaved. ';
+      } else {
+        text = `${lead}, so your unsaved change here wasn't saved. It is still here, not lost, and `
+          + 'is handed over to that view as soon as it can be. Edit here to save it from this view '
+          + 'instead; if the canvas was changed there meanwhile, you get a conflict instead of '
+          + 'overwriting it. ';
+      }
+      // What this view keeps of a change applied here, or of an Apply that got no answer, isn't
+      // in its editor: say it, and whether the record holds it now (R82-01, run 193).
+      const kept = session.keptHere ? session.keptHere() : { applied: 0, unknown: 0 };
+      const all = (session.appliedPending ? session.appliedPending().length : 0)
+        + (session.uncertainPending ? session.uncertainPending().length : 0);
+      if (kept.applied || kept.unknown) {
+        text += 'This view also keeps unfinished edits of a change handed over and applied here '
+          + '(or whose Apply got no answer); they go to that view, with what guards them, as soon '
+          + 'as it can take them, and stay here until then. ';
+      } else if (all) {
+        text += 'Unfinished edits this view kept of a change applied here were handed over to that '
+          + 'view, with what guards them; they also stay here until it takes them up. ';
+      }
+      const actions = lib.claimStep ? [['Edit here', () => lib.claimStep(session, ui)]] : [];
+      // The explicit way to drop what is unsaved here and follow the editing view instead.
+      if (unsaved) {
+        actions.push(['Reload (discard my unsaved change)', async () => {
+          await lib.discardStep(session, ui);
+          if (!disposed && session.state.readonly) ui.readonly();
+        }]);
+      }
+      banner('readonly', text, actions);
+      opts.status('Read-only: another view is editing this canvas');
+    },
+    hideReadonly: () => {
+      if (shown === 'readonly') clearBanner();
+    },
+    // In the editing view (R78-03): what other views handed over when they lost the editing,
+    // one row each, with what can be done with it here (Apply: a save on the revision it was
+    // made on, a conflict if the canvas changed since; Continue here: its unfinished edits open
+    // here; Keep as a new canvas; Dismiss), and the views still waited for (Stop waiting).
+    // Behind a conflict banner, it waits for that to be resolved.
+    handover: () => {
+      if (disposed || shown === 'conflict' || session.state.readonly) return;
+      const offers = session.offers();
+      // Applied here already, its unfinished edits not open here yet (R79-04).
+      const kept = session.appliedPending ? session.appliedPending() : [];
+      // Applied with no answer, its unfinished edits kept here (run 191); one the record still
+      // lists shows on its own row instead.
+      const unsure = (session.uncertainPending ? session.uncertainPending() : [])
+        .filter((u) => !offers.some((o) => o.id === u.id));
+      const now = Date.now();
+      // A live view answers within about a second: only one that hasn't by then is shown.
+      const waiting = session.waiting().filter((p) => p.ended || now - p.since > 3000);
+      if (!offers.length && !kept.length && !unsure.length && !waiting.length) {
+        if (shown === 'handover') clearBanner();
+        return;
+      }
+      const step = (action, id) => () => lib.offerStep && lib.offerStep(session, ui, action, id);
+      const rows = [];
+      for (const k of kept) {
+        const continued = session.continued && session.continued.has(k.id);
+        const actions = continued ? [] : [['Continue here', step('resume', k.id)]];
+        actions.push(['Dismiss', step('dismiss', k.id)]);
+        rows.push([`A change handed over from another view was applied here (saved). ${continued
+          ? 'Its unfinished edits were opened here; dismiss this when you are done with them'
+          : `Its unfinished edits (${k.unfinished.map(describe).join(', ')}) aren't open here yet: `
+            + 'continue them here, or dismiss them'}. `, actions]);
+      }
+      for (const u of unsure) {
+        rows.push([`Applying a change handed over from another view got no answer, so it may or may `
+          + `not have been saved. Its unfinished edits (${u.unfinished.map(describe).join(', ')}) are `
+          + 'kept only here; they aren\'t opened, since it isn\'t known which version they belong '
+          + 'to. Dismiss them when you no longer need them. ', [['Dismiss', step('dismiss', u.id)]]]);
+      }
+      for (const o of offers) {
+        if (o.applied) {
+          rows.push(['A change handed over from another view was applied here (saved); it is still '
+            + 'listed only because tidying up after saving it failed. ', [['Dismiss', step('dismiss', o.id)]]]);
+          continue;
+        }
+        const parts = [];
+        if (o.changed) parts.push('an unsaved change');
+        for (const c of o.unfinished || []) parts.push(describe(c));
+        const stale = o.changed && o.base !== session.state.revision;
+        const actions = [];
+        if (o.changed && !stale) actions.push(['Apply', step('apply', o.id)]);
+        const continued = session.continued && session.continued.has(o.id);
+        // Opened here in part (R86-01): what opened, and what still waits to be continued here.
+        const progress = !continued && session.offerProgress ? session.offerProgress(o.id) : null;
+        const partly = progress && progress.opened.length && progress.waiting.length;
+        // Not after an unanswered Apply of it: which version its edits belong to isn't known.
+        if (!continued && !o.uncertain && (o.unfinished || []).some(movableEdit)) {
+          actions.push(['Continue here', step('resume', o.id)]);
+        }
+        if (o.canvas) actions.push(['Keep as a new canvas', step('keep', o.id)]);
+        actions.push(['Dismiss', step('dismiss', o.id)]);
+        rows.push([`Another OpenPaperDesign view lost the editing of this canvas with ${parts.join(', ')
+        } and handed it over here${o.uncertain ? ' (an Apply of it got no answer, so it may already '
+          + 'be saved; applying it again is checked against the canvas, never saved twice)' : ''}${
+          stale ? ' (made on an earlier version of the canvas: applying '
+          + 'it would overwrite what was saved since, so it can only be kept as a new canvas or '
+          + 'dismissed; nothing is merged)' : ''}${continued ? '. Its unfinished edits were '
+          + 'opened here; dismiss this when you are done with them' : ''}${partly ? `. Opened here: ${
+            progress.opened.map(describe).join(', ')}; still to continue here: ${
+            progress.waiting.map(describe).join(', ')} (once what is being typed is finished or `
+          + 'cancelled)' : ''}. `, actions]);
+      }
+      for (const p of waiting) {
+        rows.push(p.ended
+          ? ['The view that was editing before closed without handing anything over; what it had '
+            + 'unsaved, if anything, is gone with it. ', [['OK', step('stop', p.id)]]]
+          : ['Waiting for the view that was editing before to hand over what it has: it hasn\'t '
+            + 'answered yet (it may be hidden, asleep or disconnected, and answers when it runs '
+            + 'again; if its window ended, anything unsaved there is gone). ',
+          [['Stop waiting', step('stop', p.id)]]]);
+      }
+      banner('handover', '', [], rows);
+    },
+    hideHandover: () => {
+      if (shown === 'handover') clearBanner();
+    },
+    // The keyboard back to this editor's canvas (LEAD185-01): after an unfinished edit was taken
+    // up here, its field (or text) is the editor's, and keys only reach the editor through its
+    // canvas. The banner button that asked is gone by then, so the page's focus fell to the body.
+    // Only this mount's own current canvas, never once it was disposed or its editor replaced;
+    // nothing is finished, saved or moved by this (the editor's own field keeps its draft and
+    // caret, and asks for its keyboard focus inside the editor).
+    focusEditor: () => {
+      if (disposed || !session.ed || session.disposed || !session.canvas) return false;
+      const c = session.canvas;
+      if (typeof c.focus !== 'function') return false;
+      c.focus({ preventScroll: true });
+      return true;
     },
   };
+  // What a handed-over unfinished edit is, for the banner.
+  const short = (t) => (String(t).length > 40 ? `${String(t).slice(0, 40)}…` : String(t));
+  function describe(c) {
+    switch (c && c.kind) {
+      case 'title': return `the Canvas name "${short(c.text)}" still being typed`;
+      case 'page': return `a Paper's name "${short(c.text)}" still being typed`;
+      case 'layer': return `a layer's name "${short(c.text)}" still being typed`;
+      case 'text': return `text "${short(c.text)}" still being typed`;
+      case 'inspector': return `"${short(c.text)}" still being typed in the Design panel's ${String(c.label || 'field').trim()} field`;
+      case 'theme-metric': return `"${short(c.text)}" still being typed as a text style's ${{ size: 'size', 'letter-spacing': 'letter spacing' }[c.metric] || 'line height'} in Theme`;
+      case 'gesture': return 'a drag still under way (it is handed over when it ends there)';
+      // R82-01 (run 193): a view's kept edits of a change applied there, or of an Apply that
+      // got no answer, with what guards them.
+      case 'recovery': {
+        const inner = Array.isArray(c.packets) ? c.packets.map(describe).join(', ') : 'unfinished edits';
+        if (c.v !== 1) return `${inner}, kept by a newer editor in a form this one can't open`;
+        return c.state === 'unknown'
+          ? `${inner}, kept after an Apply there that got no answer (it may or may not have been saved; they aren't opened)`
+          : `${inner}, kept after its change was applied there (they continue only on that version of the canvas)`;
+      }
+      default: return 'a value still being typed in a field there (it stays there)';
+    }
+  }
+  const movableEdit = (c) => Boolean(c)
+    && (['title', 'page', 'layer', 'text', 'inspector', 'theme-metric'].includes(c.kind)
+      // A kept recovery of an applied change continues here (on its version: Session checks).
+      || (c.kind === 'recovery' && c.v === 1 && c.state === 'applied'));
+  // Which banner the shared box shows ('conflict', 'readonly', 'handover' or null), and its
+  // text: the same banner with the same text isn't built again (its button keeps the focus).
+  let shown = null;
+  let shownText = null;
+  function banner(kind, text, actions, rows = []) {
+    const key = JSON.stringify([text, actions.map((a) => a[0]), rows.map((r) => [r[0], r[1].map((a) => a[0])])]);
+    if (shown === kind && shownText === key) return;
+    shown = kind;
+    shownText = key;
+    const c = opts.conflictBox;
+    const doc = c.ownerDocument;
+    const buttons = (into, list) => {
+      for (const [label, fn] of list) {
+        const b = doc.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        on(b, 'click', fn);
+        into.append(b);
+      }
+    };
+    c.replaceChildren();
+    if (text) c.append(text);
+    buttons(c, actions);
+    for (const [t, list] of rows) {
+      const row = doc.createElement('div');
+      row.append(t);
+      buttons(row, list);
+      c.append(row);
+    }
+    c.classList.add('show');
+  }
+  function clearBanner() {
+    shown = null;
+    shownText = null;
+    const c = opts.conflictBox;
+    c.classList.remove('show');
+    c.replaceChildren();
+  }
 
   wire(opts.canvas);
   const started = (async () => {
@@ -481,14 +740,25 @@ export function opdMountEditor(opts) {
     opts.status('Starting renderer…');
     // ---- saving: one request at a time, always with the revision last seen.
     timers.push(env.setInterval(() => { if (!disposed) lib.saveStep(session, ui); }, OPD_SAVE_POLL_MS));
-    // ---- changes made elsewhere: reload in place when nothing is unsaved here.
+    // ---- changes made elsewhere: reload in place when nothing is unsaved here. A read-only
+    // view (another view has the editing) follows them too, and learns here when that changes.
     timers.push(env.setInterval(async () => {
       if (disposed) return;
       try {
         const r = await session.poll();
         if (disposed || session.state.error) return; // a terminal error stays on screen
-        if (r === 'reloaded') opts.status('Updated with changes made elsewhere');
+        const st = session.state;
+        if (r === 'unidentified' || r === 'readonly'
+          || ((r === 'handed' || r === 'handover') && st.readonly)) ui.readonly();
+        else if (r === 'editing') {
+          ui.hideReadonly();
+          if (st.conflict) ui.conflict();
+          else if (st.handover) ui.handover();
+          opts.status('Editing here again');
+        } else if (r === 'reloaded') opts.status('Updated with changes made elsewhere');
         else if (r === 'behind') opts.status('Changed elsewhere; saving your edit will report a conflict');
+        // The handover banner follows the record (and a waited-for view's age) on every poll.
+        if (!st.readonly) ui.handover();
       } catch {
         // Unreachable; the save loop reports that.
       }

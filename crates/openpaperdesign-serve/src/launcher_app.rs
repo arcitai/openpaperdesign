@@ -14,7 +14,12 @@
 //! name, a `force` flag, a server-made binding identity or a canvas file's bytes reach it.
 //!
 //! One canvas is bound per process, through the same prepare/install/retire handoff as project
-//! mode; its lease moves with the binding and is released only after the old server drained.
+//! mode; its lease's handle moves with the binding and is dropped only after the old server
+//! drained. Several processes (Codex chats, panels) may bind the same canvas (issue #23): each
+//! open takes its editing, and so does each new view of a binding (an in-panel mount, a browser
+//! tab); every write is admitted by it under the lease, and a view that lost it is read-only
+//! until it takes it back, handing its unsaved change over meanwhile (see `library`,
+//! "Editing").
 //! Creation and import run in an owned task, so a caller that goes away can't strand a
 //! half-made canvas, its cleanup or the handoff. A lost reply doesn't mean nothing happened:
 //! the canvas then shows up in the list. Nothing is retried automatically.
@@ -66,7 +71,12 @@ pub(super) const RELEASE: &str = "openpaperdesign_app_page_release";
 pub(super) const CANVAS: &str = "openpaperdesign_app_canvas";
 pub(super) const CANVAS_REVISION: &str = "openpaperdesign_app_canvas_revision";
 pub(super) const CANVAS_SAVE: &str = "openpaperdesign_app_canvas_save";
-pub(super) const PANEL_TOOLS: [&str; 9] = [
+// The in-panel editor's Edit here (issue #23): take the canvas's editing back for this view.
+pub(super) const CLAIM: &str = "openpaperdesign_app_claim";
+// Issue #23's new-view recovery: a view that lost the editing hands its unsaved change over
+// (`offer`), and the editing view applies or dismisses it.
+pub(super) const DRAFT: &str = "openpaperdesign_app_draft";
+pub(super) const PANEL_TOOLS: [&str; 11] = [
     ASSET,
     PAGE,
     REVISION,
@@ -76,8 +86,10 @@ pub(super) const PANEL_TOOLS: [&str; 9] = [
     CANVAS,
     CANVAS_REVISION,
     CANVAS_SAVE,
+    CLAIM,
+    DRAFT,
 ];
-pub(super) const TOOLS: [&str; 19] = [
+pub(super) const TOOLS: [&str; 21] = [
     LIST,
     CREATE,
     OPEN,
@@ -97,6 +109,8 @@ pub(super) const TOOLS: [&str; 19] = [
     CANVAS,
     CANVAS_REVISION,
     CANVAS_SAVE,
+    CLAIM,
+    DRAFT,
 ];
 
 /// The packaged renderer goes to the in-panel editor in parts of this many bytes (the last one
@@ -151,8 +165,19 @@ const LIBRARY_ONLY: &str = "This OpenPaperDesign server runs the app library: it
     --codex-context` (or `--workspace <dir>`) server.";
 const NO_CANVAS: &str = "No canvas is open in this OpenPaperDesign window. Open one from the \
     library. Nothing was changed.";
-const BUSY: &str = "This canvas is open in another OpenPaperDesign window (another Codex chat \
-    or panel). Close it there first. Nothing was changed here.";
+/// Another view having the canvas open is no refusal any more (issue #23: opening it here takes
+/// its editing). This is only another process's hold of its lease that outlasted the bounded
+/// wait: a long save, a save there that couldn't be undone (that window keeps the canvas closed
+/// to everyone), or an older OpenPaperDesign that keeps a canvas for as long as it is open.
+const BUSY: &str = "This canvas is held right now by another OpenPaperDesign window (another \
+    Codex chat or panel): it is in the middle of a save, a save there couldn't be undone, or it \
+    runs an older OpenPaperDesign that keeps a canvas for as long as it has it open. Nothing was \
+    changed here. Try again in a moment; if it stays like this, update OpenPaperDesign there or \
+    end that chat's OpenPaperDesign.";
+/// A Rename from the list of a canvas another view is editing (see `app_rename`).
+const RENAME_ELSEWHERE: &str = "This canvas is open for editing in another OpenPaperDesign view \
+    (or was, in a window that ended without closing it). Nothing was renamed. Open it here (its \
+    editing then moves here), then rename it.";
 const CLOSE_NEEDS_FORCE: &str = "The editor of this canvas was opened (its browser tab, or the \
     editor in another OpenPaperDesign view). Closing stops the server it saves to, so an edit \
     there that isn't saved yet (the page shows an unsaved change or \"Saving…\") would be lost. \
@@ -235,7 +260,12 @@ pub(super) const INSTRUCTIONS: &str = "openpaperdesign (app library): the OpenPa
     (get_tree_summary with nodeId \"root\" and its pageId); changes to an unread or \
     since-changed page are refused as conflicts. Each successful change is saved at once and \
     shows in the person's editor when it has no unsaved change of its own. A canvas whose editor may hold unsaved changes \
-    can't be switched or closed from here: ask the person. In this server list_resources and \
+    can't be switched or closed from here: ask the person. The same canvas may be open in \
+    several OpenPaperDesign views (chats, panels, browser tabs); the one opened last edits it, \
+    the others are read-only. Your changes are this chat's: admitted while any view of this \
+    chat's canvas edits it. A change refused because another view now edits it changed nothing: \
+    open the canvas again here (openpaperdesign_library_open) only if the person wants editing \
+    to move here, then read the page again. In this server list_resources and \
     open_file only name the open canvas; create_file and export aren't offered; images must be \
     data: URIs. Workspace design projects (design/<name>/ in a repository) need a separately \
     started `openpaperdesign-mcp --codex-context` server; don't claim this one can bind or edit \
@@ -328,7 +358,10 @@ fn tools() -> Vec<Value> {
                 "panel": panel
             }, "required": ["name"], "additionalProperties": false}}),
         json!({"name": OPEN, "_meta": app,
-            "description": "For the home view: open a library canvas in the editor.",
+            "description": "For the home view: open a library canvas in the editor. Another \
+                OpenPaperDesign view (another Codex chat or panel) may have it open too: this \
+                view then takes its editing, and that one shows it read-only and keeps its \
+                unsaved change. Opening the canvas already open here takes its editing back.",
             "inputSchema": {"type": "object", "properties": {"id": id, "force": force, "replace": replace, "panel": panel},
                 "required": ["id"], "additionalProperties": false}}),
         json!({"name": EDITOR, "_meta": app,
@@ -369,13 +402,44 @@ fn tools() -> Vec<Value> {
         json!({"name": CANVAS, "_meta": app,
             "description": "For the home view's own editor: the whole canvas this view shows \
                 (every page in list order as an upstream page file, the active page, and the \
-                canvas revision). Without mount the result names this editor's mount; then \
-                with mount.",
+                canvas revision). Without mount the result names this editor's new mount, the \
+                newest view, which takes the canvas's editing (`editing`); then with mount.",
             "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding"])}),
         json!({"name": CANVAS_REVISION, "_meta": app,
             "description": "For the home view's own editor: the current canvas revision (any \
-                page, the page list or the active page).",
+                page, the page list or the active page), whether this mount has the canvas's \
+                editing (another view opened later, another mount of this editor too, takes \
+                it; this one is then read-only), and the handover record (`handover`: the \
+                offers views handed over and the views still waited for, see \
+                openpaperdesign_app_draft, or null).",
             "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
+        json!({"name": CLAIM, "_meta": app,
+            "description": "For the home view's own editor: Edit here. Take the canvas's \
+                editing back for this view from the view that took it. Nothing is saved by \
+                this; the editor's next save is still checked against the canvas's revision, \
+                so a change saved elsewhere meanwhile is a conflict, never overwritten.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount}), &["binding", "mount"])}),
+        json!({"name": DRAFT, "_meta": app,
+            "description": "For the home view's own editor: the handover between views of one \
+                canvas. `answer` (by a view that lost the editing): what it has unsaved, its \
+                whole canvas as `text` (a canvas save with every page, on revision \
+                `if_match`; `changed` when it differs from it) and its `unfinished` edits (the \
+                editor's continuations, a JSON list as text), or nothing; it then no longer \
+                keeps the editing view waiting. The editing view, by the handed-over change's \
+                `id`: `apply` saves it on that revision (a change saved since is a conflict, \
+                never overwritten), `keep` keeps it as a new library canvas, `dismiss` drops \
+                it; `stop` (a pending view's `id`) stops waiting for that view. Answering \
+                changes no canvas file.",
+            "inputSchema": doc(json!({"binding": binding, "mount": mount,
+                "action": {"type": "string",
+                    "enum": ["answer", "apply", "keep", "dismiss", "stop"]},
+                "id": {"type": "string", "maxLength": 64},
+                "if_match": {"type": "string", "maxLength": 64}, "text": {"type": "string"},
+                "changed": {"type": "boolean"}, "unfinished": {"type": "string"},
+                // The kept recoveries an apply, keep or dismiss resolves (run 194, R83): their
+                // ids, a JSON list as text (as `unfinished`).
+                "resolved": {"type": "string", "maxLength": 2048}}),
+                &["binding", "mount", "action"])}),
         json!({"name": CANVAS_SAVE, "_meta": app,
             "description": "For the home view's own editor: save the canvas (the page list, \
                 the active page and each changed page), only if if_match is the canvas \
@@ -406,8 +470,8 @@ fn tools() -> Vec<Value> {
                 "additionalProperties": false}}),
         json!({"name": RENAME, "_meta": app,
             "description": "For the home view: rename a library canvas (its name only; its \
-                pages, content and identity stay). A canvas another OpenPaperDesign window has \
-                open is refused, with nothing changed.",
+                pages, content and identity stay). A canvas another OpenPaperDesign view is \
+                editing is refused, with nothing changed: open it here first.",
             "inputSchema": {"type": "object", "properties": {
                 "id": id,
                 "name": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_CHARS}
@@ -686,6 +750,10 @@ impl Launcher {
             "library": lib.root(),
             "editor_loaded": loaded,
             "browser_saves": saves,
+            // Issue #23: whether this binding has the canvas's editing ("here") or another,
+            // later-opened view does ("elsewhere": this one is read-only until it takes it back
+            // by opening the canvas again or the editor's Edit here).
+            "editing": if b.server.editing_here(None) { "here" } else { "elsewhere" },
         });
         if panel {
             out["panel"] = json!(true);
@@ -740,7 +808,7 @@ impl Launcher {
             }
             let lease = Arc::new(lease);
             let guard = crate::library::guard(lib.clone(), &lease);
-            let install = Self::prepare_library_install(dir, &id, listening, lease, guard)
+            let install = Self::prepare_library_install(&lib, dir, &id, listening, lease, guard)
                 .map_err(|e| created.fail(&e))?;
             Self::install(state, install, None, Owner::Library).await?;
             Ok::<_, String>(id)
@@ -777,6 +845,19 @@ impl Launcher {
             return Err(STALE.into());
         }
         if state.bound.as_ref().and_then(|b| b.doc.as_deref()) == Some(id) {
+            // Opening it again here is asking to edit it here (issue #23: the newest open
+            // edits): this binding takes the editing back if another view had taken it. The same
+            // binding, URL and lease; a failed claim leaves it read-only, and the result says so.
+            if let Some(b) = state.bound.as_ref()
+                && !b.server.editing_here(None)
+                && let Err(e) = b.server.claim(None, None).await
+            {
+                return Err(format!(
+                    "This canvas is open here, but editing couldn't be taken back from the \
+                     other view ({}). It stays read-only here; nothing was changed.",
+                    e.msg
+                ));
+            }
             return text(Self::library_editor(
                 &mut state,
                 lib,
@@ -795,7 +876,10 @@ impl Launcher {
         let listening = Self::listen(lib.root())
             .await
             .map_err(|e| format!("{e}. Nothing was opened; the open canvas is unchanged."))?;
-        let lease = match Lease::acquire(lib, id) {
+        // Another view may have this canvas open (issue #23): that is no reason to refuse.
+        // Only another process's hold of its lease (a write under way, or one it keeps) is,
+        // after a bounded wait.
+        let lease = match Lease::acquire_within(lib, id).await {
             Ok(l) => l,
             Err(LeaseError::Busy) => return Err(BUSY.into()),
             Err(LeaseError::Failed(e)) => {
@@ -810,7 +894,7 @@ impl Launcher {
         let lease = Arc::new(lease);
         let guard = crate::library::guard(lib.clone(), &lease);
         let install =
-            Self::prepare_library_install(lib.document_dir(id), id, listening, lease, guard)?;
+            Self::prepare_library_install(lib, lib.document_dir(id), id, listening, lease, guard)?;
         Self::install(state, install, None, Owner::Library).await?;
         let mut state = self.state.clone().lock_owned().await;
         if state.bound.as_ref().and_then(|b| b.doc.as_deref()) != Some(id) {
@@ -823,15 +907,20 @@ impl Launcher {
         text(Self::library_editor(&mut state, lib, "opened", panel)?)
     }
 
+    /// A library binding prepared under the lease the open (or creation) holds: its server, and
+    /// its own editing of the canvas (`library::Editing`), claimed once it is installed.
     fn prepare_library_install(
+        lib: &Arc<Library>,
         dir: PathBuf,
         doc: &str,
         (listener, port, token): (Listener, u16, String),
         lease: Arc<Lease>,
         guard: crate::Guard,
     ) -> Result<Install, String> {
-        let prepared = Server::prepare_library(dir, BUNDLE_FILES, port, token.clone(), guard)
-            .map_err(|e| e.to_string())?;
+        let editing = Arc::new(crate::library::Editing::new(lib.clone(), &lease)?);
+        let prepared =
+            Server::prepare_library(dir, BUNDLE_FILES, port, token.clone(), guard, editing)
+                .map_err(|e| e.to_string())?;
         Ok(Install {
             listener,
             port,
@@ -937,7 +1026,8 @@ impl Launcher {
                 // Its files may be inconsistent: not offered as a canvas file.
                 lib.refuse_if_broken(id)
                     .map_err(|e| format!("Not exported: {e}. Nothing was exported."))?;
-                let lease = match Lease::acquire(lib, id) {
+                // A canvas open in other views is read as last saved, as here (issue #23).
+                let lease = match Lease::acquire_within(lib, id).await {
                     Ok(l) => l,
                     Err(LeaseError::Busy) => return Err(BUSY.into()),
                     Err(LeaseError::Failed(e)) => {
@@ -985,13 +1075,20 @@ impl Launcher {
                 // "busy".
                 lib.refuse_if_broken(id)
                     .map_err(|e| format!("Not renamed: {e}. Nothing was changed."))?;
-                let lease = match Lease::acquire(lib, id) {
+                let lease = match Lease::acquire_within(lib, id).await {
                     Ok(l) => l,
                     Err(LeaseError::Busy) => return Err(BUSY.into()),
                     Err(LeaseError::Failed(e)) => {
                         return Err(format!("{e}. Nothing was renamed."));
                     }
                 };
+                // A view editing it (issue #23) would see its next save refused as a conflict:
+                // its editing record is read under the lease, and any editor refuses the rename.
+                match lib.editor_of(id) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => return Err(RENAME_ELSEWHERE.into()),
+                    Err(e) => return Err(format!("{e}. Nothing was renamed.")),
+                }
                 // The lease goes with the rename: released after it, or kept for good if its
                 // write couldn't be undone. Its message is shown as it is.
                 lib.rename_document(lease, name)?;
@@ -1038,13 +1135,15 @@ fn panel_args<'a>(
     args: &'a Value,
     strings: &[&str],
     ints: &[&str],
+    bools: &[&str],
 ) -> Result<&'a serde_json::Map<String, Value>, String> {
     let map = args
         .as_object()
         .ok_or("arguments must be an object; nothing was read or changed")?;
     for (k, v) in map {
         let ok = (strings.contains(&k.as_str()) && v.is_string())
-            || (ints.contains(&k.as_str()) && v.as_u64().is_some_and(|n| n <= MAX_SAFE_INTEGER));
+            || (ints.contains(&k.as_str()) && v.as_u64().is_some_and(|n| n <= MAX_SAFE_INTEGER))
+            || (bools.contains(&k.as_str()) && v.is_boolean());
         if !ok {
             return Err(format!(
                 "unexpected argument `{k}`, or not of its type; nothing was read or changed"
@@ -1114,6 +1213,29 @@ fn api_refusal(e: crate::ApiError) -> String {
     panel_refusal(e.status.as_u16(), &e.msg, e.etag.as_deref())
 }
 
+/// A panel's handover answer (`openpaperdesign_app_draft` `answer`): `if_match` the revision
+/// its canvas (`text`, a whole canvas save) was made on, `changed`, and `unfinished` (a JSON
+/// list of the editor's continuations, as text); none of them when it has nothing to hand
+/// over. Checked as the browser's (`crate::parse_offer`).
+fn panel_offer(
+    map: &serde_json::Map<String, Value>,
+) -> Result<Option<crate::library::NewOffer>, crate::ApiError> {
+    if !map.contains_key("text") && !map.contains_key("unfinished") {
+        return Ok(None);
+    }
+    let unfinished = match map.get("unfinished").and_then(Value::as_str) {
+        Some(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        None => json!([]),
+    };
+    let body = json!({
+        "base": map.get("if_match").cloned().unwrap_or(Value::Null),
+        "canvas": map.get("text").cloned().unwrap_or(json!("")),
+        "changed": map.get("changed").cloned().unwrap_or(json!(false)),
+        "unfinished": unfinished,
+    });
+    crate::parse_offer(&body.to_string())
+}
+
 impl Launcher {
     /// Whether this build serves the in-panel editor (its module and renderer, see
     /// `panel_editor`).
@@ -1150,7 +1272,7 @@ impl Launcher {
     ) -> ToolResult {
         tokio::pin!(cancelled);
         if name == ASSET {
-            let map = panel_args(args, &[], &["part"])?;
+            let map = panel_args(args, &[], &["part"], &[])?;
             let part = map
                 .get("part")
                 .and_then(Value::as_u64)
@@ -1175,7 +1297,20 @@ impl Launcher {
             ),
             READY | RELEASE => (&["binding"], &["mount"], &["binding", "mount"]),
             CANVAS => (&["binding"], &["mount"], &["binding"]),
-            CANVAS_REVISION => (&["binding"], &["mount"], &["binding", "mount"]),
+            CANVAS_REVISION | CLAIM => (&["binding"], &["mount"], &["binding", "mount"]),
+            DRAFT => (
+                &[
+                    "binding",
+                    "action",
+                    "id",
+                    "if_match",
+                    "text",
+                    "unfinished",
+                    "resolved",
+                ],
+                &["mount"],
+                &["binding", "mount", "action"],
+            ),
             CANVAS_SAVE => (
                 &["binding", "if_match", "text"],
                 &["mount"],
@@ -1184,7 +1319,8 @@ impl Launcher {
             _ => return Err(format!("unknown tool {name}")),
         };
         let bad = |status: u16, msg: &str| panel_refusal(status, msg, None);
-        let map = panel_args(args, strings, ints).map_err(|e| bad(400, &e))?;
+        let bools: &[&str] = if name == DRAFT { &["changed"] } else { &[] };
+        let map = panel_args(args, strings, ints, bools).map_err(|e| bad(400, &e))?;
         if let Some(k) = required.iter().find(|k| !map.contains_key(**k)) {
             return Err(bad(
                 400,
@@ -1246,14 +1382,22 @@ impl Launcher {
                 })
             };
             // Without the state lock: a save of this editor that had already started finishes
-            // its commit or rollback before the release is acknowledged. The binding stays.
+            // its commit or rollback before the release is acknowledged. The binding stays. A
+            // handover this mount still owed is marked ended (it left without answering).
             if let Some(server) = &released {
                 server.drain_writer().await;
+                if let Some(m) = mount {
+                    server.release_view(&format!("m{m}")).await;
+                }
             }
             return text(json!({"binding": binding, "released": released.is_some()}));
         }
         const CANCELLED: &str = "the save was cancelled before it started; nothing was written";
-        let admitted = if save {
+        const CANCELLED_CHANGE: &str = "this was cancelled before it started; nothing was changed";
+        // Every call that changes something (a save, a claim, a handover) is admitted the same
+        // way: cancellation first, its mount's lifetime under the writer fence (R78-05).
+        let mutating = save || name == CLAIM || name == DRAFT;
+        let admitted = if mutating {
             // An already cancelled save, or one cancelled while waiting for admission, never
             // starts.
             tokio::select! {
@@ -1265,6 +1409,9 @@ impl Launcher {
             self.panel_server(binding, mount).await
         };
         let (server, live) = admitted.map_err(|e| bad(410, &e))?;
+        // Issue #23: each mount is a view of its own (`m<n>`), so of two mounts of this binding
+        // only the newer one edits (see `Server::claim`).
+        let view = mount.map(|m| format!("m{m}"));
         match name {
             PAGE => {
                 let page = server.page(page_id).map_err(api_refusal)?;
@@ -1298,13 +1445,17 @@ impl Launcher {
                         ),
                     ));
                 }
-                out["mount"] = json!(self.mount_for(binding, mount).await?);
+                let m = self.mount_for(binding, mount, &server).await?;
+                out["mount"] = json!(m);
                 text(out)
             }
             CANVAS => {
                 let canvas = server.canvas().await.map_err(api_refusal)?;
                 let mut out = canvas.to_json().map_err(api_refusal)?;
                 out["binding"] = json!(binding);
+                // Issue #23: whether this view may save it (see `CANVAS_REVISION`); the longer
+                // value for the measurement below, the actual one once the mount is known.
+                out["editing"] = json!(false);
                 // The widest mount number, for the measurement below.
                 out["mount"] = json!(MAX_SAFE_INTEGER);
                 // Measured as it would be sent, as a page read is; refused before a mount is
@@ -1320,12 +1471,103 @@ impl Launcher {
                         ),
                     ));
                 }
-                out["mount"] = json!(self.mount_for(binding, mount).await?);
+                let m = self.mount_for(binding, mount, &server).await?;
+                out["mount"] = json!(m);
+                out["editing"] = json!(server.editing_here(Some(&format!("m{m}"))));
                 text(out)
             }
             CANVAS_REVISION => {
                 let revision = server.canvas_revision().map_err(api_refusal)?;
-                text(json!({"binding": binding, "revision": revision}))
+                // Issue #23: whether this view still has the canvas's editing (another view
+                // opened later takes it; this one then shows the canvas read-only, and keeps
+                // following what is saved there), and the handover record. Hints:
+                // every save checks the editing again.
+                text(json!({
+                    "binding": binding,
+                    "revision": revision,
+                    "editing": server.editing_here(view.as_deref()),
+                    "handover": server.handover_json(view.as_deref()),
+                }))
+            }
+            CLAIM => {
+                // Under the writer fence (a save of this view under way finishes first), with
+                // this mount's lifetime checked again there: a claim of a mount released while
+                // it waited never runs (R78-05). Cancellation first on every poll, as a save's;
+                // once it holds the fence it runs to its end within that poll. A refusal
+                // changes nothing and leaves the view read-only.
+                // Its refusal keeps its condition and status (`Server::claim`); a claim that took
+                // the editing says what of its bookkeeping after didn't happen (`note`).
+                let live = live.ok_or_else(|| bad(410, UNMOUNTED))?;
+                let claimed = tokio::select! {
+                    biased;
+                    () = &mut cancelled => return Err(bad(503, CANCELLED_CHANGE)),
+                    r = server.claim(view.as_deref(), Some(&live)) => r.map_err(api_refusal)?,
+                };
+                text(json!({"binding": binding, "editing": true, "note": claimed.note}))
+            }
+            DRAFT => {
+                // Issue #23's handover, through this mount's own view and lifetime, admitted
+                // as a save is (see `Server::answer`, `Server::apply_offer`).
+                let live = live.ok_or_else(|| bad(410, UNMOUNTED))?;
+                let view = view.as_deref().unwrap_or_default();
+                let id = get("id").unwrap_or_default();
+                let action = get("action").unwrap_or_default();
+                let offer = if action == "answer" {
+                    panel_offer(map).map_err(api_refusal)?
+                } else {
+                    None
+                };
+                // `resolved` comes as a JSON list in text, as `unfinished` does.
+                let listed = match map.get("resolved").and_then(Value::as_str) {
+                    None => None,
+                    Some(t) => Some(serde_json::from_str::<Value>(t).map_err(|_| {
+                        bad(400, "`resolved` is a JSON list of ids; nothing was changed")
+                    })?),
+                };
+                let resolved = crate::resolved_of(listed.as_ref()).map_err(api_refusal)?;
+                let done = async {
+                    match action {
+                        "answer" => server
+                            .answer(view, Some(&live), offer)
+                            .await
+                            .map(|id| json!({"binding": binding, "offer": id})),
+                        "apply" => server
+                            .apply_offer(Some(view), Some(&live), id, &resolved)
+                            .await
+                            .map(|a| {
+                                json!({"binding": binding, "applied": true,
+                                "revision": a.revision, "left": a.left})
+                            }),
+                        "keep" => server
+                            .keep_offer(Some(view), Some(&live), id, &resolved)
+                            .await
+                            .map(|k| {
+                                json!({"binding": binding,
+                                "kept": {"id": k.id, "name": k.name}, "left": k.left})
+                            }),
+                        "dismiss" => server
+                            .dismiss_offer(Some(view), Some(&live), id, &resolved)
+                            .await
+                            .map(|()| json!({"binding": binding, "dismissed": true})),
+                        _ => server
+                            .stop_waiting(Some(view), Some(&live), id)
+                            .await
+                            .map(|()| json!({"binding": binding, "stopped": true})),
+                    }
+                };
+                if !["answer", "apply", "keep", "dismiss", "stop"].contains(&action) {
+                    return Err(bad(
+                        400,
+                        "`action` is answer, apply, keep, dismiss or stop; nothing was read or \
+                         changed",
+                    ));
+                }
+                let out = tokio::select! {
+                    biased;
+                    () = &mut cancelled => return Err(bad(503, CANCELLED_CHANGE)),
+                    r = done => r.map_err(api_refusal)?,
+                };
+                text(out)
             }
             CANVAS_SAVE => {
                 let if_match = get("if_match").unwrap_or_default();
@@ -1336,7 +1578,7 @@ impl Launcher {
                 let revision = tokio::select! {
                     biased;
                     () = &mut cancelled => return Err(bad(503, CANCELLED)),
-                    r = server.save_canvas_while(&live, if_match, body) => {
+                    r = server.save_canvas_while(&live, view.as_deref().unwrap_or_default(), if_match, body) => {
                         r.map_err(api_refusal)?
                     }
                 };
@@ -1359,7 +1601,7 @@ impl Launcher {
                 let revision = tokio::select! {
                     biased;
                     () = &mut cancelled => return Err(bad(503, CANCELLED)),
-                    r = server.save_page_while(&live, page_id, if_match, body) => {
+                    r = server.save_page_while(&live, view.as_deref().unwrap_or_default(), page_id, if_match, body) => {
                         r.map_err(api_refusal)?
                     }
                 };
@@ -1397,20 +1639,35 @@ impl Launcher {
     }
 
     /// The mount of an in-panel read: the one it names, or for a first read (none) a new one,
-    /// registered only while `binding` is still the open one.
-    async fn mount_for(&self, binding: &str, mount: Option<u64>) -> Result<u64, String> {
+    /// registered only while `binding` is still the open one. A new mount is the newest view of
+    /// the canvas, so it takes the editing (issue #23; see `Server::claim`): every earlier mount
+    /// and tab of this binding, and every other process's view, is read-only from then on. If
+    /// it can't be taken now (the canvas busy), the mount opens read-only and says so.
+    async fn mount_for(
+        &self,
+        binding: &str,
+        mount: Option<u64>,
+        server: &Server,
+    ) -> Result<u64, String> {
         if let Some(m) = mount {
             return Ok(m);
         }
-        let mut state = self.state.lock().await;
-        expect_binding(&state, Some(binding)).map_err(|e| panel_refusal(410, &e, None))?;
-        let b = state
-            .bound
-            .as_mut()
-            .ok_or_else(|| panel_refusal(410, NO_CANVAS, None))?;
-        b.next_mount += 1;
-        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        b.mounts.insert(b.next_mount, live);
-        Ok(b.next_mount)
+        let m = {
+            let mut state = self.state.lock().await;
+            expect_binding(&state, Some(binding)).map_err(|e| panel_refusal(410, &e, None))?;
+            let b = state
+                .bound
+                .as_mut()
+                .ok_or_else(|| panel_refusal(410, NO_CANVAS, None))?;
+            b.next_mount += 1;
+            let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            b.mounts.insert(b.next_mount, live.clone());
+            (b.next_mount, live)
+        };
+        let (m, live) = m;
+        // Without the state lock, as every use of the writer fence by a panel call; never for
+        // a mount released meanwhile.
+        let _ = server.claim(Some(&format!("m{m}")), Some(&live)).await;
+        Ok(m)
     }
 }

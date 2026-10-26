@@ -309,8 +309,15 @@ pub fn definitions() -> Vec<Value> {
              elements stack vertically. position:absolute with left/top is supported. No margin, \
              grid or tables.\n\
              - Text: font-size, font-weight (≥600 = bold), font-style, color, line-height, \
-             letter-spacing, text-align, text-decoration; <b>/<i>/<u>/<s>/<span style> make rich \
-             text. Font family is always Inter.\n\
+             letter-spacing, text-align, text-decoration, font-family; <b>/<i>/<u>/<s>/<span \
+             style> make rich text (weight, style, decoration, color and size per range).\n\
+             - font-family: the bundled Inter (default) or Geist Mono, by name (any case, quoted \
+             or not) or generic (monospace, ui-monospace = Geist Mono; sans-serif, system-ui, \
+             ui-sans-serif = Inter); the list's first such entry wins. It is inherited from \
+             containers, and a text element's own list naming neither is drawn in Inter. One \
+             family per text layer: a font-family on inline elements inside text (a <span> in a \
+             <p>) is not applied. No other font can be used. (This fallback is for CSS only: a \
+             saved page naming a family the app doesn't have is refused, not read as Inter.)\n\
              - Boxes: background(-color/-image: colors, linear/radial gradients, url()), border, \
              border-radius, opacity, overflow:hidden, mix-blend-mode, width/height (px, %, \
              fit-content).\n\

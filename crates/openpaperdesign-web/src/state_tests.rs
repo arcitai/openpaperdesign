@@ -10058,3 +10058,1582 @@ fn r180_a_refused_metric_and_family_keep_an_open_text_draft() {
     let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
     assert!(typed.ends_with("øx"), "the draft still types: {typed}");
 }
+
+// ---- issue #23 (R78-03): what a view that lost the editing hands over, and taking it up
+
+/// A handover's parts: the whole canvas it carries, whether it is a change, its continuations.
+fn handover_of(s: &mut WebState) -> (serde_json::Value, bool, Vec<serde_json::Value>) {
+    let h: serde_json::Value = serde_json::from_str(&s.handover()).unwrap();
+    let canvas = serde_json::from_str(h["canvas"].as_str().unwrap()).unwrap();
+    (
+        canvas,
+        h["changed"].as_bool().unwrap(),
+        h["unfinished"].as_array().unwrap().clone(),
+    )
+}
+
+#[test]
+fn r78_a_finished_change_and_an_open_canvas_name_are_handed_over_together() {
+    let mut s = state();
+    // A finished change (a new rectangle, one undo step) and then the Canvas name being typed.
+    s.ed.edit("Add", |tx| {
+        let id = tx.alloc_id();
+        tx.insert(
+            Node::new(
+                id,
+                NodeKind::Rect,
+                crate::geom::Rect::new(5.0, 5.0, 10.0, 10.0),
+            ),
+            None,
+            None,
+        );
+    });
+    s.ui.file_title_draft = Some("D".into());
+    // The real renderer offers a snapshot with the field open (R78's mixed case): a snapshot
+    // alone can't tell an unfinished field.
+    let snap = s
+        .save_snapshot()
+        .expect("a snapshot with the name field open");
+    s.save_failed();
+    assert_eq!(parse_save(&snap).2.len(), 1);
+    let undo = s.ed.history.undo_len();
+    let (canvas, changed, unfinished) = handover_of(&mut s);
+    assert!(changed, "the change is handed over");
+    let pages = canvas["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    let sent = page_from_json(pages[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(sent.doc.nodes.len(), 2, "the whole page, with the change");
+    assert_eq!(canvas["active_page"], "p");
+    assert_eq!(
+        unfinished,
+        vec![serde_json::json!({"kind": "title", "text": "D", "base": "Canvas"})],
+        "and the open name's own text, not a flag"
+    );
+    // Nothing here changed: the field is open as typed, the change unsaved, the history kept.
+    assert_eq!(s.ui.file_title_draft.as_deref(), Some("D"));
+    assert!(s.dirty() && !s.can_reload());
+    assert_eq!(s.ed.history.undo_len(), undo);
+}
+
+#[test]
+fn r78_a_text_being_typed_is_handed_over_as_typed_and_left_out_of_the_canvas() {
+    let mut s = state();
+    let rect = s.ed.doc.root[0];
+    let text = s.ed.edit("Add text", |tx| {
+        let id = tx.alloc_id();
+        tx.insert(
+            Node::new(
+                id,
+                text_kind("Hi", 16.0, true),
+                crate::geom::Rect::new(0.0, 0.0, 20.0, 10.0),
+            ),
+            None,
+            None,
+        );
+        id
+    });
+    let saved = s.save_snapshot().unwrap();
+    s.save_succeeded();
+    drop(saved);
+    s.ed.start_text_edit(text, None);
+    s.ed.insert_text("!");
+    let typed = s.ed.doc.get(text).unwrap().kind.text().cloned().unwrap();
+    assert!(
+        s.save_snapshot().is_none(),
+        "nothing to save while it is typed"
+    );
+    let (canvas, changed, unfinished) = handover_of(&mut s);
+    assert!(!changed, "nothing finished since the save");
+    let sent = page_from_json(canvas["pages"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        sent.doc.get(text).unwrap().kind.text().unwrap(),
+        "Hi",
+        "the canvas is as it was before the edit began"
+    );
+    assert!(sent.doc.get(rect).is_some());
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0]["kind"], "text");
+    assert_eq!(unfinished[0]["text"], typed.as_str());
+    assert_eq!(unfinished[0]["node"], text.0);
+    // The edit is still open here, as typed.
+    assert_eq!(s.ed.text_edit.as_ref().map(|t| t.id), Some(text));
+    assert_eq!(s.ed.doc.get(text).unwrap().kind.text().unwrap(), &typed);
+    // Taken up in another editor of the same canvas: open there as typed, not committed.
+    let mut other = WebState::open(
+        &canvas_named(std::slice::from_ref(&sent), "p", "Canvas"),
+        false,
+        W,
+        H,
+    )
+    .unwrap();
+    settle(&mut other, 0.0);
+    let undo = other.ed.history.undo_len();
+    assert_eq!(other.resume_unfinished(&unfinished[0].to_string()), "");
+    assert_eq!(other.ed.text_edit.as_ref().map(|t| t.id), Some(text));
+    assert_eq!(other.ed.doc.get(text).unwrap().kind.text().unwrap(), &typed);
+    assert_eq!(other.ed.history.undo_len(), undo, "not committed");
+    assert!(
+        other.save_snapshot().is_none(),
+        "nothing saved while it is open"
+    );
+    // Finishing it there is one undo step, as typing it there would have been.
+    other.ed.end_text_edit();
+    assert_eq!(other.ed.history.undo_len(), undo + 1);
+}
+
+#[test]
+fn r78_a_new_text_layer_being_typed_moves_with_its_layer_and_a_rename_moves_as_its_field() {
+    let mut s = state();
+    // Typing a brand-new text: the layer exists only in the open edit.
+    s.ed.begin("Edit text");
+    let id = s.ed.tx().alloc_id();
+    s.ed.tx().insert(
+        Node::new(
+            id,
+            text_kind("Ne", 16.0, true),
+            crate::geom::Rect::new(0.0, 0.0, 20.0, 10.0),
+        ),
+        None,
+        None,
+    );
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id,
+        caret: 2,
+        anchor: None,
+    });
+    let (canvas, _, unfinished) = handover_of(&mut s);
+    let sent = page_from_json(canvas["pages"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(sent.doc.get(id).is_none(), "not in the handed-over canvas");
+    assert!(unfinished[0]["layer"].is_object(), "the layer goes along");
+    let mut other = WebState::open(&canvas_named(&[sent], "p", "Canvas"), false, W, H).unwrap();
+    settle(&mut other, 0.0);
+    assert_eq!(other.resume_unfinished(&unfinished[0].to_string()), "");
+    assert_eq!(other.ed.doc.get(id).unwrap().kind.text().unwrap(), "Ne");
+    assert!(
+        other.save_snapshot().is_none(),
+        "still being typed, not saved"
+    );
+    // A Paper's rename moves as its open field, with its text.
+    let mut two = two_pages();
+    two.ui.pages.renaming = Some((0, "Alphabet".into()));
+    let (_, changed, unfinished) = handover_of(&mut two);
+    assert!(!changed);
+    assert_eq!(
+        unfinished,
+        vec![
+            serde_json::json!({"kind": "page", "page": "alpha1", "text": "Alphabet", "base": "Alpha"})
+        ]
+    );
+    let mut there = two_pages();
+    assert_eq!(there.resume_unfinished(&unfinished[0].to_string()), "");
+    assert_eq!(there.ui.pages.renaming, Some((0, "Alphabet".to_string())));
+    assert!(!there.can_reload(), "an open field there now, not finished");
+    // Another one now isn't taken up over that open rename (R79-04, run 189).
+    let why = there.resume_unfinished(r#"{"kind":"page","page":"alpha1","text":"X"}"#);
+    assert!(why.contains("being typed here"), "{why}");
+    assert_eq!(there.ui.pages.renaming, Some((0, "Alphabet".to_string())));
+    // One that isn't in this canvas isn't taken up, and says why.
+    let why = two_pages().resume_unfinished(r#"{"kind":"page","page":"nope","text":"X"}"#);
+    assert!(why.contains("isn't in this canvas"), "{why}");
+}
+
+/// Types `text` into the Design panel's number field labelled `label` of `s`'s one rectangle
+/// (as `open_number_field`), unfinished.
+fn typed_number_field(s: &mut WebState, label: &str, text: &str) -> crate::model::NodeId {
+    let id = open_number_field(s, label);
+    s.paste(text);
+    step(s);
+    step(s);
+    id
+}
+
+#[test]
+fn r186_an_unfinished_inspector_value_moves_with_its_field_and_raw_text_and_resumes_unfinished() {
+    // The old view: "-" typed into X (not a value yet), and nothing in the document.
+    let mut s = state();
+    let id = typed_number_field(&mut s, "X  ", "-");
+    let (_, changed, unfinished) = handover_of(&mut s);
+    assert!(!changed, "nothing finished");
+    assert_eq!(unfinished.len(), 1, "{unfinished:?}");
+    let c = &unfinished[0];
+    assert_eq!(c["kind"], "inspector");
+    assert_eq!(c["text"], "-", "the raw draft, not a normalised value");
+    assert_eq!(c["label"], "X  ");
+    assert_eq!(c["ids"], serde_json::json!([id.0]));
+    assert!(paints(&mut s, "-"), "and it stays here as it is");
+    // The new view (the same canvas): taken up over its next frames, still unfinished.
+    let mut other = state();
+    assert_eq!(other.resume_unfinished(&c.to_string()), "");
+    assert_eq!(other.ed.selection, vec![id], "its layer selected");
+    for _ in 0..4 {
+        step(&mut other);
+    }
+    assert!(other.field_has_keyboard(), "the field has the keyboard");
+    assert_eq!(other.resume_outcome(), "", "taken up");
+    let shown = painted_text(&mut other);
+    assert!(
+        shown.iter().any(|(t, _)| t == "-"),
+        "with the raw draft: {shown:?}"
+    );
+    assert_eq!(
+        other.ed.doc.get(id).unwrap().rect.x,
+        100.0,
+        "nothing applied or saved"
+    );
+    assert!(!other.dirty() && other.save_snapshot().is_none());
+    // Finishing it there is the person's: typing on, then Enter.
+    other.paste("40");
+    step(&mut other);
+    press(&mut other, "Enter", "Enter");
+    step(&mut other);
+    step(&mut other);
+    assert_eq!(other.ed.doc.get(id).unwrap().rect.x, -40.0);
+    // A target that isn't here, or is locked here: refused with why, nothing changed.
+    let mut third = state();
+    let missing = serde_json::json!({"kind": "inspector", "page": "p", "ids": [999],
+        "label": "X  ", "nth": 0, "text": "-"});
+    let why = third.resume_unfinished(&missing.to_string());
+    assert!(why.contains("aren't in this canvas"), "{why}");
+    third.ed.doc.nodes.get_mut(&id).unwrap().locked = true;
+    let why = third.resume_unfinished(&c.to_string());
+    assert!(why.contains("locked"), "{why}");
+    assert!(third.ed.selection.is_empty(), "nothing selected for it");
+}
+
+#[test]
+fn r186_an_unfinished_theme_metric_moves_with_its_style_and_resumes_unfinished() {
+    // The old view: "15" typed into the 20 Regular style's line height, not entered.
+    let (mut s, ids) = metric_fixture();
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    let p = metric_field_at(&mut s, "Line height");
+    timed_click(&mut s, p);
+    s.modifiers(false, true, false, false);
+    press(&mut s, "a", "KeyA");
+    s.modifiers(false, false, false, false);
+    step(&mut s);
+    s.paste("15");
+    step(&mut s);
+    let (_, changed, unfinished) = handover_of(&mut s);
+    assert!(!changed, "nothing finished");
+    let c = unfinished
+        .iter()
+        .find(|c| c["kind"] == "theme-metric")
+        .unwrap_or_else(|| panic!("{unfinished:?}"))
+        .clone();
+    assert_eq!(c["metric"], "line-height");
+    assert_eq!(c["text"], "15", "the raw draft");
+    assert_eq!(c["style"]["size"], 2000, "20 (its key, in hundredths)");
+    assert_eq!(c["style"]["bold"], false);
+    assert!(paints(&mut s, "15"), "and it stays here as it is");
+    // The new view: the style's editor opens in Theme with that text in its field, unfinished.
+    let (mut other, _) = metric_fixture();
+    let before = page_to_json(&other.ed.page_data(0));
+    assert_eq!(other.resume_unfinished(&c.to_string()), "");
+    for _ in 0..3 {
+        step(&mut other);
+    }
+    assert_eq!(other.ui.left_tab, crate::ui::LeftTab::Theme);
+    assert!(ui::popup_open(&other.ctx), "its style's editor is open");
+    assert!(
+        other.field_has_keyboard(),
+        "the field has the keyboard: {:?}",
+        painted_text(&mut other)
+    );
+    assert!(paints(&mut other, "15"));
+    assert_eq!(
+        page_to_json(&other.ed.page_data(0)),
+        before,
+        "nothing applied"
+    );
+    assert!(!other.dirty());
+    // Finishing it there is the person's: typing on, then Enter, through the same admission.
+    other.paste("0%");
+    step(&mut other);
+    press(&mut other, "Enter", "Enter");
+    timed_frames(&mut other, 3);
+    let lh = |s: &WebState, id| s.ed.doc.get(id).unwrap().text_style.line_height;
+    assert_eq!(lh(&other, ids.first), Some(1.5));
+    assert_eq!(lh(&other, ids.second), Some(1.5));
+    assert_eq!(
+        lh(&other, ids.control),
+        Some(2.0),
+        "another style untouched"
+    );
+    // A style that isn't here, or whose layers are all locked here: refused with why.
+    let (mut third, ids3) = metric_fixture();
+    let mut gone = c.clone();
+    gone["style"]["size"] = serde_json::json!(9900);
+    let why = third.resume_unfinished(&gone.to_string());
+    assert!(why.contains("isn't on the shown Paper"), "{why}");
+    for id in [ids3.first, ids3.second] {
+        third.ed.doc.nodes.get_mut(&id).unwrap().locked = true;
+    }
+    let why = third.resume_unfinished(&c.to_string());
+    assert!(why.contains("locked"), "{why}");
+    assert!(!ui::popup_open(&third.ctx), "no editor opened for it");
+    // A style's size (the same field_drafts path as the Design panel's fields): taken up in its
+    // editor's Size field, as typing it there does. That field updates while it is typed (egui's
+    // DragValue), so a value shows on the style's layers at once, in the use still under way:
+    // not finished, not saved; and handed over again from there as its style's, as it is now.
+    let (mut fourth, ids4) = metric_fixture();
+    let mut size = c.clone();
+    size["metric"] = serde_json::json!("size");
+    size["text"] = serde_json::json!("2");
+    assert_eq!(fourth.resume_unfinished(&size.to_string()), "");
+    for _ in 0..6 {
+        step(&mut fourth);
+    }
+    assert!(
+        fourth.field_has_keyboard(),
+        "the Size field has the keyboard"
+    );
+    assert_eq!(fourth.resume_outcome(), "", "taken up");
+    let font = |s: &WebState, id| s.ed.doc.get(id).unwrap().kind.font_size();
+    assert_eq!(font(&fourth, ids4.first), Some(2.0), "as typing 2 shows it");
+    assert_eq!(
+        font(&fourth, ids4.control),
+        Some(20.0),
+        "another style untouched"
+    );
+    assert!(
+        ui::design_system::editing(&fourth.ctx, &fourth.ed),
+        "a use under way"
+    );
+    assert!(fourth.save_snapshot().is_none(), "held while it is open");
+    let (_, _, again) = handover_of(&mut fourth);
+    let s2 = again
+        .iter()
+        .find(|x| x["kind"] == "theme-metric")
+        .unwrap_or_else(|| panic!("{again:?}"));
+    assert_eq!(
+        (&s2["metric"], &s2["text"]),
+        (&size["metric"], &size["text"])
+    );
+    assert_eq!(s2["style"]["size"], 200, "its style as it is now");
+    // Its label names its style.
+    let style = (2000, false, false, crate::model::FontFamily::ALL[0]);
+    let label = ui::design_system::theme_size_label(style);
+    assert_eq!(super::theme_style_of(&label), Some(style));
+    assert_eq!(super::theme_style_of("X  "), None);
+}
+
+/// The lead's control for a Theme use handed over (R186): `a` (Unicode, a red underlined range,
+/// the whole layer 20 Regular) and `b`'s body (its head "Head" is Bold: a range of `b`) are the
+/// 20 Regular style's; `c` is independently already 2 Regular; `d` is 20 Regular but locked; `e`
+/// is 20 Bold.
+struct UseIds {
+    a: crate::model::NodeId,
+    b: crate::model::NodeId,
+    c: crate::model::NodeId,
+    d: crate::model::NodeId,
+    e: crate::model::NodeId,
+}
+
+fn use_page() -> (PageData, UseIds) {
+    use crate::model::TextSpan;
+    let mut doc = Document::default();
+    let a = theme_layer(
+        &mut doc,
+        text_kind("Æble — øre ✓ ok", 20.0, false),
+        (100.0, 100.0, 220.0, 30.0),
+        |n| {
+            n.text_style.spans = vec![TextSpan {
+                start: 0,
+                end: 4,
+                color: Some(RED),
+                underline: Some(true),
+                ..Default::default()
+            }];
+        },
+    );
+    let b = theme_layer(
+        &mut doc,
+        text_kind("Head body", 20.0, true),
+        (100.0, 200.0, 120.0, 30.0),
+        |n| {
+            n.text_style.spans = vec![TextSpan {
+                start: 0,
+                end: 4,
+                bold: Some(true),
+                ..Default::default()
+            }];
+        },
+    );
+    let c = theme_layer(
+        &mut doc,
+        text_kind("Tiny", 2.0, true),
+        (100.0, 300.0, 40.0, 4.0),
+        |_| {},
+    );
+    let d = theme_layer(
+        &mut doc,
+        text_kind("Locked", 20.0, true),
+        (100.0, 400.0, 80.0, 30.0),
+        |n| n.locked = true,
+    );
+    let e = theme_layer(
+        &mut doc,
+        text_kind("Bold", 20.0, true),
+        (100.0, 500.0, 80.0, 30.0),
+        |n| n.text_style.bold = true,
+    );
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    (page, UseIds { a, b, c, d, e })
+}
+
+/// A view of `page` as the canvas "Canvas", laid out, its left panel open.
+fn use_view(page: &PageData) -> WebState {
+    let text = canvas_named(std::slice::from_ref(page), "p", "Canvas");
+    let mut s = WebState::open(&text, false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    s
+}
+
+/// `s`'s one Theme value continuation in its handover, with the canvas's shown page and
+/// `changed`; anything else it lists may only be the Theme use's own notice.
+fn theme_packet(s: &mut WebState) -> (serde_json::Value, PageData, bool) {
+    let (canvas, changed, unfinished) = handover_of(s);
+    assert_eq!(canvas["active_page"], "p");
+    assert_eq!(canvas["name"], "Canvas");
+    assert_eq!(canvas["pages"].as_array().unwrap().len(), 1);
+    let others: Vec<_> = unfinished
+        .iter()
+        .filter(|c| c["kind"] != "theme-metric")
+        .collect();
+    assert!(
+        others.iter().all(|c| c["kind"] == "theme-use"),
+        "{unfinished:?}"
+    );
+    let packet: Vec<_> = unfinished
+        .iter()
+        .filter(|c| c["kind"] == "theme-metric")
+        .collect();
+    assert_eq!(packet.len(), 1, "{unfinished:?}");
+    let sent = page_from_json(canvas["pages"][0]["text"].as_str().unwrap()).unwrap();
+    (packet[0].clone(), sent, changed)
+}
+
+/// `text` typed into the open style editor's Size as a person types it, its text selected first.
+fn type_theme_size(s: &mut WebState, text: &str) {
+    picker_field(s, "Size ");
+    s.paste(text);
+    step(s);
+}
+
+#[test]
+fn r186_a_handed_over_theme_size_keeps_its_use_s_layers_not_its_new_style_s() {
+    use crate::model::{Color, FontFamily};
+    let (page, ids) = use_page();
+    let regular = |size: i64| (size, false, false, FontFamily::ALL[0]);
+    let font = |s: &WebState, id| s.ed.doc.get(id).unwrap().kind.font_size();
+    let json = |s: &WebState| page_to_json(&s.ed.page_data(0));
+    // The use's own identity: the style it began with and has now, the raw text, and exactly
+    // its characters (A whole, with its Unicode text and red range; B's body only).
+    // Run 192 (R81-02): with its layers exactly as in the canvas handed over with it (`bases`,
+    // here `with`'s A and B).
+    let packet_of = |now: i64, text: &str, with: &PageData| {
+        serde_json::json!({
+            "kind": "theme-metric", "metric": "size", "page": "p", "text": text,
+            "style": super::style_json(regular(now)), "from": super::style_json(regular(2000)),
+            "targets": [
+                {"node": ids.a.0, "whole": true, "ranges": [[0, 15]]},
+                {"node": ids.b.0, "whole": false, "ranges": [[4, 9]]},
+            ],
+            "bases": [with.doc.get(ids.a), with.doc.get(ids.b)],
+        })
+    };
+    // Everything that isn't the use's stays as authored: C (already 2 Regular), D (20 Regular,
+    // locked), E (20 Bold); A's text, range and box rules, B's Bold head.
+    let kept = |s: &WebState, id| {
+        assert_eq!(s.ed.doc.get(id), page.doc.get(id), "{id:?} untouched");
+    };
+    let in_use = |s: &WebState, size: f64| {
+        let mut want = page.doc.get(ids.a).unwrap().clone();
+        if let NodeKind::Text { font_size, .. } = &mut want.kind {
+            *font_size = size;
+        }
+        want.rect = s.ed.doc.get(ids.a).unwrap().rect;
+        assert_eq!(
+            s.ed.doc.get(ids.a),
+            Some(&want),
+            "A: only its size (and laid out)"
+        );
+        let b = s.ed.doc.get(ids.b).unwrap();
+        assert_eq!(b.kind.text().map(String::as_str), Some("Head body"));
+        assert_eq!(
+            b.kind.font_size(),
+            Some(20.0),
+            "B's own size stays (a range changes)"
+        );
+        for i in 0..9 {
+            let c = b.text_style.char_style(i, 20.0, Color::INK);
+            let want = if i < 4 { (true, 20.0) } else { (false, size) };
+            assert_eq!((c.bold, c.size), want, "B's character {i}: never broadened");
+        }
+        for id in [ids.c, ids.d, ids.e] {
+            kept(s, id);
+        }
+    };
+
+    // 1. The old view: 2 typed into 20 Regular's Size, as a person types it. That field updates
+    //    while it is typed (egui's DragValue), so the use shows 2 at once, held unsaved.
+    let mut typed = use_view(&page);
+    open_theme(&mut typed);
+    open_picker(&mut typed, "20 · Regular");
+    type_theme_size(&mut typed, "2");
+    assert_eq!(font(&typed, ids.a), Some(2.0));
+    // Right after the frame that applied it, the field still names the style it began with;
+    // the packet names the use all the same (t187a: it named 20 Regular, refused next door).
+    let (early, early_sent, _) = theme_packet(&mut typed);
+    assert_eq!(early, packet_of(200, "2", &early_sent));
+    // A handover comes on a poll, frames later.
+    timed_frames(&mut typed, 3);
+    in_use(&typed, 2.0);
+    assert!(ui::design_system::editing(&typed.ctx, &typed.ed));
+    assert!(
+        typed.save_snapshot().is_none(),
+        "held while the use is open"
+    );
+    let (packet, sent, changed) = theme_packet(&mut typed);
+    assert!(changed, "its live change is in the canvas it hands over");
+    assert_eq!(
+        page_to_json(&sent),
+        json(&typed),
+        "the whole canvas as it stands"
+    );
+    assert_eq!(packet, packet_of(200, "2", &sent));
+
+    // 2. The next view, with that canvas (as Apply gives it), takes it up: its field has "2",
+    //    exactly as typed there, and nothing more is applied than typing it did.
+    let mut other = use_view(&sent);
+    assert_eq!(other.resume_unfinished(&packet.to_string()), "");
+    for _ in 0..6 {
+        step(&mut other);
+    }
+    assert!(other.field_has_keyboard());
+    assert_eq!(other.resume_outcome(), "");
+    assert!(painted_text(&mut other).iter().any(|(t, _)| t == "2"));
+    assert_eq!(json(&other), json(&typed), "resumed 2 is typed 2");
+    assert!(ui::design_system::editing(&other.ctx, &other.ed));
+    assert!(other.save_snapshot().is_none());
+    // It types on there: 24, still unfinished, still only the use's characters.
+    other.paste("4");
+    step(&mut other);
+    step(&mut other);
+    assert_eq!(font(&other, ids.a), Some(24.0), "its use goes on");
+    assert_eq!(font(&other, ids.c), Some(2.0), "C was never in that use");
+    in_use(&other, 24.0);
+    assert!(other.save_snapshot().is_none());
+    // Handed over again while unfinished: the same use, its text as it is now.
+    timed_frames(&mut other, 3);
+    let (again, sent2, changed) = theme_packet(&mut other);
+    assert!(changed);
+    assert_eq!(page_to_json(&sent2), json(&other));
+    assert_eq!(again, packet_of(2400, "24", &sent2));
+
+    // 3. A third view, with earlier accepted work of its own, takes that up and finishes it.
+    let mut third = use_view(&sent2);
+    third.ed.begin("Rename");
+    third.ed.tx().node_mut(ids.e).unwrap().name = "Kept".into();
+    third.ed.commit();
+    let steps = third.ed.history.undo_len();
+    assert_eq!(third.resume_unfinished(&again.to_string()), "");
+    for _ in 0..6 {
+        step(&mut third);
+    }
+    assert!(third.field_has_keyboard());
+    third.paste("0");
+    step(&mut third);
+    step(&mut third);
+    assert_eq!(font(&third, ids.a), Some(240.0));
+    assert_eq!(font(&third, ids.c), Some(2.0));
+    assert_eq!(third.ed.doc.get(ids.e).unwrap().name, "Kept");
+    assert!(
+        third.save_snapshot().is_none(),
+        "nothing saved before it is finished"
+    );
+    // Finished by the person: Enter, then the editor closed. Then it saves, as one step here.
+    press(&mut third, "Enter", "Enter");
+    timed_frames(&mut third, 3);
+    close_picker(&mut third);
+    timed_frames(&mut third, 3);
+    assert!(!ui::design_system::editing(&third.ctx, &third.ed));
+    assert!(third.save_snapshot().is_some(), "it saves once finished");
+    third.save_failed();
+    assert_eq!(
+        third.ed.history.undo_len(),
+        steps + 1,
+        "this view's part is one step"
+    );
+    // Undo takes back this view's part of the use (back to 24, the canvas it came with: what
+    // the earlier views made is that canvas here, their steps stay theirs), never the rename.
+    third.ed.undo();
+    assert_eq!(font(&third, ids.a), Some(24.0));
+    assert_eq!(font(&third, ids.c), Some(2.0));
+    assert_eq!(
+        third.ed.doc.get(ids.e).unwrap().name,
+        "Kept",
+        "earlier work kept"
+    );
+    third.ed.redo();
+    assert_eq!(font(&third, ids.a), Some(240.0));
+    assert_eq!(font(&third, ids.c), Some(2.0));
+
+    // 4. An entry that isn't a value yet ("-"): nothing applied there or here, exact and
+    //    unfinished in both, the same identity (a use not begun is its style's characters).
+    let untouched = use_view(&page).ed.doc.clone();
+    let mut dash = use_view(&page);
+    open_theme(&mut dash);
+    open_picker(&mut dash, "20 · Regular");
+    type_theme_size(&mut dash, "-");
+    timed_frames(&mut dash, 3);
+    assert_eq!(dash.ed.doc, untouched, "no live change");
+    let (minus, sent3, changed) = theme_packet(&mut dash);
+    assert!(!changed);
+    assert_eq!(page_to_json(&sent3), page_to_json(&page));
+    assert_eq!(minus, packet_of(2000, "-", &sent3));
+    let mut taken = use_view(&page);
+    assert_eq!(taken.resume_unfinished(&minus.to_string()), "");
+    for _ in 0..6 {
+        step(&mut taken);
+    }
+    assert!(taken.field_has_keyboard());
+    assert!(painted_text(&mut taken).iter().any(|(t, _)| t == "-"));
+    assert_eq!(taken.ed.doc, untouched, "nothing applied");
+    assert!(!taken.dirty());
+
+    // 5. Refused, with why, nothing changed and nothing opened: the use's change isn't in this
+    //    canvas (Continue here without Apply: A and B are still 20 here, only C is 2); a layer
+    //    of it locked or missing here; a continuation that doesn't name its layers.
+    let refused = |s: &mut WebState, c: &serde_json::Value, why: &str| {
+        let before = s.ed.doc.clone();
+        let got = s.resume_unfinished(&c.to_string());
+        assert!(got.contains(why), "{got}");
+        step(s);
+        assert!(!ui::popup_open(&s.ctx), "{why}: no editor opened");
+        assert!(!ui::design_system::editing(&s.ctx, &s.ed));
+        assert_eq!(s.ed.doc, before, "{why}: nothing changed");
+    };
+    refused(&mut use_view(&page), &packet, "apply it first");
+    let mut locked = sent.clone();
+    locked.doc.nodes.get_mut(&ids.a).unwrap().locked = true;
+    refused(&mut use_view(&locked), &packet, "locked here");
+    let mut missing = sent.clone();
+    missing.doc.nodes.remove(&ids.b);
+    missing.doc.root.retain(|id| *id != ids.b);
+    refused(
+        &mut use_view(&missing),
+        &packet,
+        "isn't in this canvas here",
+    );
+    let mut bare = packet.clone();
+    bare.as_object_mut().unwrap().remove("targets");
+    refused(&mut use_view(&sent), &bare, "which layers");
+}
+
+// ---- R79 (run 189): a text being typed moves exactly as it is, only onto the text it was
+// typed into, and keeps the receiving editor's layer ids valid.
+
+/// `framed` "abcd" (a red underlined range [1, 3)) inside frame `frame`, and `top` "Hi" at the
+/// root.
+struct TextIds {
+    frame: crate::model::NodeId,
+    framed: crate::model::NodeId,
+    top: crate::model::NodeId,
+}
+
+fn text_page() -> (PageData, TextIds) {
+    use crate::model::TextSpan;
+    let mut doc = Document::default();
+    let frame = theme_layer(
+        &mut doc,
+        NodeKind::Frame { clip: false },
+        (50.0, 50.0, 300.0, 200.0),
+        |_| {},
+    );
+    let framed = doc.alloc_id();
+    let mut n = Node::new(
+        framed,
+        text_kind("abcd", 16.0, true),
+        crate::geom::Rect::new(10.0, 10.0, 60.0, 20.0),
+    );
+    n.parent = Some(frame);
+    n.text_style.spans = vec![TextSpan {
+        start: 1,
+        end: 3,
+        color: Some(RED),
+        underline: Some(true),
+        ..Default::default()
+    }];
+    doc.nodes.insert(framed, n);
+    doc.nodes.get_mut(&frame).unwrap().children.push(framed);
+    let top = theme_layer(
+        &mut doc,
+        text_kind("Hi", 16.0, true),
+        (400.0, 50.0, 30.0, 20.0),
+        |_| {},
+    );
+    let page = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    (page, TextIds { frame, framed, top })
+}
+
+/// `s` typing into `id`: its edit opened, the caret at `caret`, `typed` typed there.
+fn typing(s: &mut WebState, id: crate::model::NodeId, caret: usize, typed: &str) {
+    s.ed.start_text_edit(id, None);
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id,
+        caret,
+        anchor: None,
+    });
+    s.ed.insert_text(typed);
+}
+
+/// `s`'s one text continuation and the canvas's shown page it hands over with.
+fn text_packet(s: &mut WebState) -> (serde_json::Value, PageData) {
+    let (canvas, _, unfinished) = handover_of(s);
+    let texts: Vec<_> = unfinished.iter().filter(|c| c["kind"] == "text").collect();
+    assert_eq!(texts.len(), 1, "{unfinished:?}");
+    let sent = page_from_json(canvas["pages"][0]["text"].as_str().unwrap()).unwrap();
+    (texts[0].clone(), sent)
+}
+
+/// What a refusal must leave as it was: the document, selection, undo history and edit.
+fn kept_state(s: &WebState) -> (Document, Vec<crate::model::NodeId>, usize, bool) {
+    (
+        s.ed.doc.clone(),
+        s.ed.selection.clone(),
+        s.ed.history.undo_len(),
+        s.ed.text_edit.is_some(),
+    )
+}
+
+#[test]
+fn r189_a_new_text_taken_up_keeps_its_id_reserved_through_finish_save_creation_and_undo() {
+    let mut s = state();
+    // Typing a brand-new text: the layer, and its id's allocation, exist only in the open edit.
+    s.ed.begin("Edit text");
+    let id = s.ed.tx().alloc_id();
+    s.ed.tx().insert(
+        Node::new(
+            id,
+            text_kind("Ne", 16.0, true),
+            crate::geom::Rect::new(0.0, 0.0, 20.0, 10.0),
+        ),
+        None,
+        None,
+    );
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id,
+        caret: 2,
+        anchor: None,
+    });
+    let (packet, sent) = text_packet(&mut s);
+    assert_eq!(
+        sent.doc.next_id, id.0,
+        "the canvas handed over is from before the edit: its id isn't allocated there"
+    );
+    let mut other = use_view(&sent);
+    let rect = other.ed.doc.root[0];
+    assert_eq!(other.resume_unfinished(&packet.to_string()), "");
+    assert!(
+        other.ed.doc.next_id > id.0,
+        "its id is reserved here (next_id {}, the text {id:?})",
+        other.ed.doc.next_id
+    );
+    // Typing on, finishing it, then an ordinary new layer: a distinct id, the text kept.
+    other.ed.insert_text("w");
+    other.ed.end_text_edit();
+    let made = other.ed.add_node(
+        Node::new(
+            crate::model::NodeId(0),
+            NodeKind::Rect,
+            crate::geom::Rect::new(300.0, 300.0, 10.0, 10.0),
+        ),
+        None,
+    );
+    assert_ne!(made, id, "a new layer never takes the recovered text's id");
+    assert_eq!(other.ed.doc.get(id).unwrap().kind.text().unwrap(), "New");
+    assert_eq!(other.ed.doc.get(made).unwrap().kind, NodeKind::Rect);
+    assert_eq!(other.ed.doc.root, vec![rect, id, made]);
+    other.ed.doc.validate().unwrap();
+    // Saved and reopened exactly so.
+    let snap = other.save_snapshot().expect("finished: it saves");
+    other.save_succeeded();
+    let saved = parse_save(&snap).2.into_iter().next().unwrap().1;
+    saved.doc.validate().unwrap();
+    assert_eq!(saved.doc.nodes, other.ed.doc.nodes);
+    let reopened = use_view(&saved);
+    assert_eq!(reopened.ed.doc.get(id).unwrap().kind.text().unwrap(), "New");
+    assert_eq!(reopened.ed.doc.root, vec![rect, id, made]);
+    // Undo takes back the new layer, then the text; Redo brings both back, ids as they were.
+    other.ed.undo();
+    other.ed.undo();
+    assert!(other.ed.doc.get(id).is_none() && other.ed.doc.get(made).is_none());
+    other.ed.doc.validate().unwrap();
+    other.ed.redo();
+    other.ed.redo();
+    assert_eq!(other.ed.doc.get(id).unwrap().kind.text().unwrap(), "New");
+    assert_eq!(other.ed.doc.root, vec![rect, id, made]);
+    other.ed.doc.validate().unwrap();
+}
+
+#[test]
+fn r189_a_text_being_typed_moves_with_its_ranges_as_they_are_now() {
+    let (page, ids) = text_page();
+    let mut s = use_view(&page);
+    // "✓" typed before the red range ("✓abcd", the range now [2, 4)), then its "c" deleted.
+    typing(&mut s, ids.framed, 0, "✓");
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id: ids.framed,
+        caret: 4,
+        anchor: Some(3),
+    });
+    s.ed.insert_text("");
+    let live = s.ed.doc.get(ids.framed).unwrap().clone();
+    assert_eq!(live.kind.text().unwrap(), "✓abd");
+    assert_eq!(
+        (live.text_style.spans[0].start, live.text_style.spans[0].end),
+        (2, 3)
+    );
+    let settled = use_view(&page).ed.doc.get(ids.framed).unwrap().clone();
+    let (packet, sent) = text_packet(&mut s);
+    assert_eq!(
+        sent.doc.get(ids.framed),
+        Some(&settled),
+        "the canvas is from before"
+    );
+    let mut other = use_view(&sent);
+    let undo = other.ed.history.undo_len();
+    assert_eq!(other.resume_unfinished(&packet.to_string()), "");
+    assert_eq!(
+        other.ed.doc.get(ids.framed),
+        Some(&live),
+        "the layer exactly as it is being typed there: its text, ranges and box"
+    );
+    let te = other.ed.text_edit.clone().unwrap();
+    assert_eq!((te.id, te.caret, te.anchor), (ids.framed, 3, None));
+    assert!(
+        other.save_snapshot().is_none(),
+        "not saved while it is typed"
+    );
+    // Typing on there is typing on here: the same layer as the same keys give the old view.
+    other.ed.insert_text("x");
+    s.ed.insert_text("x");
+    assert_eq!(other.ed.doc.get(ids.framed), s.ed.doc.get(ids.framed));
+    // Finished: one step there, saved and reopened as it is.
+    other.ed.end_text_edit();
+    assert_eq!(other.ed.history.undo_len(), undo + 1);
+    let done = other.ed.doc.get(ids.framed).unwrap().clone();
+    let snap = other.save_snapshot().unwrap();
+    other.save_succeeded();
+    let saved = parse_save(&snap).2.into_iter().next().unwrap().1;
+    assert_eq!(saved.doc.get(ids.framed), Some(&done));
+    assert_eq!(use_view(&saved).ed.doc.get(ids.framed), Some(&done));
+    // Undo gives the text as it was before the edit began; Redo the finished one.
+    other.ed.undo();
+    assert_eq!(other.ed.doc.get(ids.framed), Some(&settled));
+    other.ed.redo();
+    assert_eq!(other.ed.doc.get(ids.framed), Some(&done));
+    assert_eq!(
+        other.ed.doc.get(ids.top),
+        sent.doc.get(ids.top),
+        "others untouched"
+    );
+}
+
+#[test]
+fn r189_a_text_continuation_is_refused_where_it_would_change_what_it_wasnt_typed_over() {
+    let (page, ids) = text_page();
+    let refused = |page: &PageData, packet: &serde_json::Value, why: &str| {
+        let mut r = use_view(page);
+        let before = kept_state(&r);
+        let got = r.resume_unfinished(&packet.to_string());
+        assert!(got.contains(why), "{why}: {got}");
+        assert_eq!(kept_state(&r), before, "{why}: nothing changed here");
+    };
+    let mut s = use_view(&page);
+    typing(&mut s, ids.top, 2, "!");
+    let (top, sent) = text_packet(&mut s);
+    let mut s = use_view(&page);
+    typing(&mut s, ids.framed, 4, "e");
+    let (framed, _) = text_packet(&mut s);
+    // Locked here: itself, or through its frame.
+    let mut locked = sent.clone();
+    locked.doc.nodes.get_mut(&ids.top).unwrap().locked = true;
+    refused(&locked, &top, "locked");
+    let mut ancestor = sent.clone();
+    ancestor.doc.nodes.get_mut(&ids.frame).unwrap().locked = true;
+    refused(&ancestor, &framed, "locked");
+    // A newer accepted text here (saved after it was handed over): never typed over.
+    let mut newer = sent.clone();
+    if let NodeKind::Text { text, .. } = &mut newer.doc.nodes.get_mut(&ids.top).unwrap().kind {
+        *text = "Hi there".into();
+    }
+    refused(&newer, &top, "changed here since");
+    // An older editor's continuation, which doesn't say what it was typed over: refused.
+    let mut legacy = top.clone();
+    for k in ["base", "live"] {
+        legacy.as_object_mut().unwrap().remove(k);
+    }
+    refused(&sent, &legacy, "doesn't say");
+    // A new text whose id another layer has here: refused, that layer untouched.
+    let mut s = use_view(&page);
+    s.ed.begin("Edit text");
+    let id = s.ed.tx().alloc_id();
+    s.ed.tx().insert(
+        Node::new(
+            id,
+            text_kind("Ne", 16.0, true),
+            crate::geom::Rect::new(0.0, 0.0, 20.0, 10.0),
+        ),
+        None,
+        None,
+    );
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id,
+        caret: 2,
+        anchor: None,
+    });
+    let (fresh, sent2) = text_packet(&mut s);
+    let mut occupied = sent2.clone();
+    let other = Node::new(
+        id,
+        text_kind("Other", 16.0, true),
+        crate::geom::Rect::new(0.0, 300.0, 40.0, 20.0),
+    );
+    occupied.doc.nodes.insert(id, other);
+    occupied.doc.root.push(id);
+    occupied.doc.next_id = id.0 + 1;
+    refused(&occupied, &fresh, "its id is another layer's here");
+    // Its parent missing or locked here.
+    let mut orphan = fresh.clone();
+    orphan["parent"] = serde_json::json!(999);
+    orphan["layer"]["parent"] = serde_json::json!(999);
+    refused(&sent2, &orphan, "isn't in this canvas");
+    let mut inside = fresh.clone();
+    inside["parent"] = serde_json::json!(ids.frame.0);
+    inside["layer"]["parent"] = serde_json::json!(ids.frame.0);
+    refused(&ancestor, &inside, "locked");
+    // And taken up where it is safe: the same packets on the canvas they were typed over.
+    for p in [&top, &framed, &fresh] {
+        let mut ok = use_view(&sent2);
+        assert_eq!(ok.resume_unfinished(&p.to_string()), "", "{p}");
+    }
+}
+
+#[test]
+fn r189_a_continuation_never_replaces_an_unfinished_edit_of_its_own_here() {
+    // A name being typed here: one handed over for the same field is refused, the draft kept.
+    let mut s = two_pages();
+    s.ui.file_title_draft = Some("X".into());
+    let why = s.resume_unfinished(r#"{"kind":"title","text":"D"}"#);
+    assert!(why.contains("being typed here"), "{why}");
+    assert_eq!(s.ui.file_title_draft.as_deref(), Some("X"));
+    s.ui.file_title_draft = None;
+    s.ui.pages.renaming = Some((1, "Bet".into()));
+    let why = s.resume_unfinished(r#"{"kind":"page","page":"alpha1","text":"Alphabet"}"#);
+    assert!(why.contains("being typed here"), "{why}");
+    assert_eq!(s.ui.pages.renaming, Some((1, "Bet".to_string())));
+    s.ui.pages.renaming = None;
+    let rect = s.ed.doc.root[0];
+    s.ui.renaming = Some((rect, "Mine".into()));
+    let c =
+        serde_json::json!({"kind": "layer", "page": "beta22", "node": rect.0, "text": "Theirs"});
+    let why = s.resume_unfinished(&c.to_string());
+    assert!(why.contains("being typed here"), "{why}");
+    assert_eq!(s.ui.renaming, Some((rect, "Mine".to_string())));
+}
+
+// ---- R80 (run 190): a refused continuation changes nothing here, on any Paper, and a name
+// being typed is never taken up over a newer name.
+
+/// [`text_page`] as "Words" (`pa`), `edit`ed, beside "Shapes" (`pb`, one rectangle).
+fn two_papers(edit: impl FnOnce(&mut PageData)) -> Vec<PageData> {
+    let (mut words, _) = text_page();
+    words.id = "pa".into();
+    words.name = "Words".into();
+    edit(&mut words);
+    let shapes = page(
+        "pb",
+        "Shapes",
+        crate::geom::Rect::new(400.0, 300.0, 50.0, 50.0),
+    );
+    vec![words, shapes]
+}
+
+/// `pages` opened on `active`, laid out, the left panel open.
+fn paper_view(pages: &[PageData], active: &str) -> WebState {
+    let mut s = WebState::open(&canvas(pages, active), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    s
+}
+
+/// The open name drafts: the Canvas's, a Paper's, a layer's.
+type Drafts = (
+    Option<String>,
+    Option<(usize, String)>,
+    Option<(crate::model::NodeId, String)>,
+);
+
+/// Everything a refused continuation must leave as it was (R80-03): every Paper with its
+/// content and camera, the shown Paper, selection, undo history, open drafts, the dirty and
+/// list flags, revision and document stamp, and whether it may reload.
+#[derive(Debug, PartialEq)]
+struct Whole {
+    pages: Vec<String>,
+    active: usize,
+    selection: Vec<crate::model::NodeId>,
+    undo: usize,
+    drafts: Drafts,
+    dirty: bool,
+    meta: bool,
+    revision: u64,
+    stamp: u64,
+    can_reload: bool,
+}
+
+fn whole(s: &WebState) -> Whole {
+    Whole {
+        pages: (0..s.ed.pages.len())
+            .map(|i| page_to_json(&s.ed.page_data(i)))
+            .collect(),
+        active: s.ed.active_page,
+        selection: s.ed.selection.clone(),
+        undo: s.ed.history.undo_len(),
+        drafts: (
+            s.ui.file_title_draft.clone(),
+            s.ui.pages.renaming.clone(),
+            s.ui.renaming.clone(),
+        ),
+        dirty: s.dirty(),
+        meta: s.ed.meta_dirty,
+        revision: s.ed.revision,
+        stamp: s.ed.doc_stamp,
+        can_reload: s.can_reload(),
+    }
+}
+
+#[test]
+fn r190_a_refused_continuation_for_another_paper_changes_nothing_here() {
+    let (_, ids) = text_page();
+    let pages = two_papers(|_| {});
+    // Real packets, typed on Words: into `top`, into `framed`, a new text, and Theme's Size.
+    let mut s = paper_view(&pages, "pa");
+    typing(&mut s, ids.top, 2, "!");
+    let (top, _) = text_packet(&mut s);
+    let mut s = paper_view(&pages, "pa");
+    typing(&mut s, ids.framed, 4, "e");
+    let (framed, _) = text_packet(&mut s);
+    let mut s = paper_view(&pages, "pa");
+    s.ed.begin("Edit text");
+    let id = s.ed.tx().alloc_id();
+    s.ed.tx().insert(
+        Node::new(
+            id,
+            text_kind("Ne", 16.0, true),
+            crate::geom::Rect::new(0.0, 0.0, 20.0, 10.0),
+        ),
+        None,
+        None,
+    );
+    s.ed.text_edit = Some(crate::editor::TextEdit {
+        id,
+        caret: 2,
+        anchor: None,
+    });
+    let (fresh, _) = text_packet(&mut s);
+    let mut s = paper_view(&pages, "pa");
+    open_theme(&mut s);
+    open_picker(&mut s, "16 · Regular");
+    type_theme_size(&mut s, "2");
+    timed_frames(&mut s, 3);
+    let (_, _, unfinished) = handover_of(&mut s);
+    let theme = unfinished
+        .iter()
+        .find(|c| c["kind"] == "theme-metric")
+        .unwrap_or_else(|| panic!("{unfinished:?}"))
+        .clone();
+    // A clean receiver showing Shapes refuses each, and nothing at all changes here.
+    let refused = |pages: &[PageData], c: &serde_json::Value, why: &str| {
+        let mut r = paper_view(pages, "pb");
+        assert!(r.can_reload() && !r.dirty(), "{why}: clean before");
+        let before = whole(&r);
+        let got = r.resume_unfinished(&c.to_string());
+        assert!(got.contains(why), "{why}: {got}");
+        assert_eq!(whole(&r), before, "{why}: nothing changed here");
+        assert!(r.save_snapshot().is_none(), "{why}: nothing to save");
+    };
+    let set_text = |p: &mut PageData, t: &str| {
+        if let NodeKind::Text { text, .. } = &mut p.doc.nodes.get_mut(&ids.top).unwrap().kind {
+            *text = t.into();
+        }
+    };
+    refused(
+        &two_papers(|p| p.doc.nodes.get_mut(&ids.top).unwrap().locked = true),
+        &top,
+        "locked",
+    );
+    let frame_locked = two_papers(|p| p.doc.nodes.get_mut(&ids.frame).unwrap().locked = true);
+    refused(&frame_locked, &framed, "locked");
+    refused(
+        &two_papers(|p| set_text(p, "Hi there")),
+        &top,
+        "changed here since",
+    );
+    let occupied = two_papers(|p| {
+        let other = Node::new(
+            id,
+            text_kind("Other", 16.0, true),
+            crate::geom::Rect::new(0.0, 300.0, 40.0, 20.0),
+        );
+        p.doc.nodes.insert(id, other);
+        p.doc.root.push(id);
+        p.doc.next_id = id.0 + 1;
+    });
+    refused(&occupied, &fresh, "another layer's");
+    let mut orphan = fresh.clone();
+    orphan["parent"] = serde_json::json!(999);
+    orphan["layer"]["parent"] = serde_json::json!(999);
+    refused(&pages, &orphan, "isn't in this canvas");
+    let mut inside = fresh.clone();
+    inside["parent"] = serde_json::json!(ids.frame.0);
+    inside["layer"]["parent"] = serde_json::json!(ids.frame.0);
+    refused(&frame_locked, &inside, "locked");
+    // Its change (16 to 2) isn't on Words here, and no other text there is 2 pt.
+    refused(&pages, &theme, "isn't on the shown Paper");
+    // Controls: where it is safe it is taken up, on its own Paper, shown for it.
+    for c in [&top, &framed, &fresh] {
+        let mut ok = paper_view(&pages, "pb");
+        assert_eq!(ok.resume_unfinished(&c.to_string()), "", "{c}");
+        assert_eq!(ok.ed.active_page, 0, "Words is shown for it");
+    }
+}
+
+#[test]
+fn r190_a_name_being_typed_is_never_taken_up_over_a_newer_name() {
+    // Real packets: the Canvas name, a Paper's name and a layer's name being typed.
+    let packet = |s: &mut WebState| {
+        let (_, _, u) = handover_of(s);
+        assert_eq!(u.len(), 1, "{u:?}");
+        u[0].clone()
+    };
+    let mut s = two_pages();
+    s.ui.file_title_draft = Some("D".into());
+    let title = packet(&mut s);
+    let mut s = two_pages();
+    s.ui.pages.renaming = Some((0, "Alphabet".into()));
+    let paper = packet(&mut s);
+    let mut s = two_pages();
+    let rect = s.ed.doc.root[0];
+    let was = s.ed.doc.get(rect).unwrap().name.clone();
+    s.ui.renaming = Some((rect, "Mine".into()));
+    let layer = packet(&mut s);
+    assert_eq!(title["base"], "Canvas", "the name it was typed over");
+    assert_eq!(paper["base"], "Alpha");
+    assert_eq!(layer["base"], was.as_str());
+    // Each renamed here since (an accepted save, an agent's rename): refused, the newer name
+    // and everything else kept.
+    let refused = |text: &str, c: &serde_json::Value| {
+        let mut r = WebState::open(text, false, W, H).unwrap();
+        settle(&mut r, 0.0);
+        let before = whole(&r);
+        let got = r.resume_unfinished(&c.to_string());
+        assert!(got.contains("renamed here since"), "{c}: {got}");
+        assert_eq!(whole(&r), before, "{c}: nothing changed here");
+    };
+    let pages = two_pages_data();
+    refused(&canvas_named(&pages, "beta22", "X"), &title);
+    let mut renamed = two_pages_data();
+    renamed[0].name = "X".into();
+    refused(&canvas(&renamed, "beta22"), &paper);
+    let mut renamed = two_pages_data();
+    renamed[1].doc.nodes.get_mut(&rect).unwrap().name = "X".into();
+    refused(&canvas(&renamed, "beta22"), &layer);
+    // An older editor's, which doesn't say what it was typed over: refused too.
+    let mut legacy = title.clone();
+    legacy.as_object_mut().unwrap().remove("base");
+    let mut r = two_pages();
+    assert!(
+        r.resume_unfinished(&legacy.to_string())
+            .contains("doesn't say")
+    );
+    // Over the names they were typed over: taken up.
+    for c in [&title, &paper, &layer] {
+        assert_eq!(two_pages().resume_unfinished(&c.to_string()), "", "{c}");
+    }
+}
+
+// ---- R81-02 (run 192): a field value is taken up only over the layers it was typed over.
+
+#[test]
+fn r192_a_field_value_is_never_typed_over_a_newer_accepted_change_of_its_layers() {
+    // A real Design-panel X packet: 24 typed (shown on the layer as typed), not finished.
+    let mut s = state();
+    let id = typed_number_field(&mut s, "X  ", "24");
+    let (canvas, _, unfinished) = handover_of(&mut s);
+    let packet = unfinished
+        .iter()
+        .find(|c| c["kind"] == "inspector")
+        .unwrap_or_else(|| panic!("{unfinished:?}"))
+        .clone();
+    assert_eq!(packet["text"], "24");
+    let sent = page_from_json(canvas["pages"][0]["text"].as_str().unwrap()).unwrap();
+    let open = |p: &PageData| {
+        let mut r = WebState::open(
+            &canvas_named(std::slice::from_ref(p), "p", "Canvas"),
+            false,
+            W,
+            H,
+        )
+        .unwrap();
+        settle(&mut r, 0.0);
+        r
+    };
+    // A newer accepted change of that layer here (an agent moved it to X 200, saved): refused,
+    // with why, and nothing here changed.
+    let mut newer = sent.clone();
+    newer.doc.nodes.get_mut(&id).unwrap().rect.x = 200.0;
+    let mut r = open(&newer);
+    let before = whole(&r);
+    let why = r.resume_unfinished(&packet.to_string());
+    assert!(why.contains("changed here since"), "{why}");
+    assert_eq!(whole(&r), before);
+    assert_eq!(r.ed.doc.get(id).unwrap().rect.x, 200.0, "the newer X stays");
+    // An older editor's, which doesn't say what its layers were: refused too.
+    let mut legacy = packet.clone();
+    legacy.as_object_mut().unwrap().remove("bases");
+    assert!(
+        open(&sent)
+            .resume_unfinished(&legacy.to_string())
+            .contains("doesn't say")
+    );
+    // Over the layer as it was there: taken up.
+    assert_eq!(open(&sent).resume_unfinished(&packet.to_string()), "");
+}
+
+#[test]
+fn r192_a_theme_value_is_never_typed_over_a_newer_accepted_change_of_its_layers() {
+    let (page, ids) = use_page();
+    let mut s = use_view(&page);
+    open_theme(&mut s);
+    open_picker(&mut s, "20 · Regular");
+    type_theme_size(&mut s, "2");
+    timed_frames(&mut s, 3);
+    let (packet, sent, _) = theme_packet(&mut s);
+    // A newer accepted change of one of its layers here (A's fill, saved since): refused.
+    let mut newer = sent.clone();
+    newer.doc.nodes.get_mut(&ids.a).unwrap().style.opacity = 0.5;
+    let mut r = use_view(&newer);
+    let before = whole(&r);
+    let why = r.resume_unfinished(&packet.to_string());
+    assert!(why.contains("changed here since"), "{why}");
+    assert_eq!(whole(&r), before);
+    // Over its layers as they were there: taken up.
+    assert_eq!(use_view(&sent).resume_unfinished(&packet.to_string()), "");
+}
+
+// ---- Run 196: the parent's run-195 Linux runtime (BRIEF-196 B). A legacy mixed offer carried an
+// ordinary Paper name E and a kept recovery of the Canvas name D (both unfinished there); one
+// Continue here took both up and, before any key, the Paper name was committed and saved.
+
+const R196_TITLE: &str = "OPD23 protocol195 — disposable æøå";
+const R196_PAGE: &str = "2542e8f2749f19ed";
+
+/// The two packets exactly as the parent's fixture handed them over (`LEGACY-MIXED-INPUT.json`:
+/// the ordinary Paper name, then the recovery's packet), in the order Continue here takes them.
+fn r196_packets() -> [serde_json::Value; 2] {
+    [
+        serde_json::json!({"kind": "page", "page": R196_PAGE, "base": "Paper 1",
+            "text": "E195 — Paper æøå"}),
+        serde_json::json!({"kind": "title", "base": R196_TITLE, "text": "D195 — recovered æøå"}),
+    ]
+}
+
+/// The run's canvas (one empty Paper, "Paper 1"), in a fresh view: its left panel closed, as a
+/// fresh view opens (and as the run's screenshot shows), or opened (`layers`).
+fn r196_view(layers: bool) -> WebState {
+    let paper = PageData {
+        id: R196_PAGE.into(),
+        name: "Paper 1".into(),
+        doc: Document::default(),
+        camera: Some(Default::default()),
+    };
+    let mut s =
+        WebState::open(&canvas_named(&[paper], R196_PAGE, R196_TITLE), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    if layers {
+        open_layers(&mut s);
+    } else {
+        assert!(!s.ui.narrow.shown().is_some_and(|a| a.layers), "closed");
+    }
+    s
+}
+
+/// Which open name field has the keyboard ("title", "page" or none).
+fn r196_focused(s: &WebState) -> Option<&'static str> {
+    let f = s.ctx.memory(|m| m.focused())?;
+    if s.ui.file_title_draft.is_some() && s.ui.file_title_field == Some(f) {
+        Some("title")
+    } else if s.ui.pages.renaming.is_some() && s.ui.pages.rename_field == Some(f) {
+        Some("page")
+    } else {
+        None
+    }
+}
+
+#[test]
+fn r196_two_names_continued_together_stay_unfinished_until_each_is_finished() {
+    let [e, d] = r196_packets();
+    for layers in [false, true] {
+        let mut s = r196_view(layers);
+        let undo = s.ed.history.undo_len();
+        assert_eq!(s.resume_unfinished(&e.to_string()), "", "{layers}");
+        assert_eq!(s.resume_unfinished(&d.to_string()), "", "{layers}");
+        // The frames after Continue here, and more, with no key or click.
+        timed_frames(&mut s, 12);
+        let state = serde_json::json!({
+            "paper": s.ed.pages[0].name,
+            "canvas": s.ui.project_name,
+            "paper_draft": s.ui.pages.renaming.as_ref().map(|(i, t)| (*i, t.clone())),
+            "title_draft": s.ui.file_title_draft,
+            "save": s.save_snapshot(),
+            "reloadable": s.can_reload(),
+        });
+        assert_eq!(
+            state,
+            serde_json::json!({"paper": "Paper 1", "canvas": R196_TITLE,
+                "paper_draft": [0, "E195 — Paper æøå"], "title_draft": "D195 — recovered æøå",
+                "save": null, "reloadable": false}),
+            "{layers}: both still being typed, nothing finished or saved"
+        );
+        assert_eq!(s.ed.history.undo_len(), undo, "{layers}: no step made");
+        assert!(!s.ed.project_dirty(), "{layers}: the Paper list unchanged");
+        // One of them has the keyboard; the other waits, drawn, as typed.
+        let first = r196_focused(&s).expect("one name field has the keyboard");
+        if layers {
+            assert!(s.ui.narrow.shown().is_some_and(|a| a.layers));
+        }
+        // Handed on again exactly (re-export), with what each was typed over.
+        let (_, changed, unfinished) = handover_of(&mut s);
+        assert!(!changed, "{layers}");
+        assert_eq!(unfinished, vec![d.clone(), e.clone()], "{layers}");
+        // Enter finishes only the one being typed; the other then gets the keyboard, unfinished.
+        press(&mut s, "Enter", "Enter");
+        timed_frames(&mut s, 6);
+        let second = r196_focused(&s).expect("the other name field has the keyboard now");
+        assert_ne!(first, second, "{layers}");
+        match first {
+            "title" => {
+                assert_eq!(s.ui.project_name, "D195 — recovered æøå");
+                assert_eq!(s.ed.pages[0].name, "Paper 1", "{layers}: not finished");
+            }
+            _ => {
+                assert_eq!(s.ed.pages[0].name, "E195 — Paper æøå");
+                assert_eq!(s.ui.project_name, R196_TITLE, "{layers}: not finished");
+            }
+        }
+        // Escape drops the second as typed; the first stays finished.
+        press(&mut s, "Escape", "Escape");
+        timed_frames(&mut s, 6);
+        assert!(s.ui.file_title_draft.is_none() && s.ui.pages.renaming.is_none());
+        let save = s.save_snapshot().expect("the finished one is saved");
+        let v: serde_json::Value = serde_json::from_str(&save).unwrap();
+        if first == "title" {
+            assert_eq!(v["name"], "D195 — recovered æøå");
+            assert_eq!(v["pages"][0]["name"], "Paper 1");
+        } else {
+            assert!(v.get("name").is_none());
+            assert_eq!(v["pages"][0]["name"], "E195 — Paper æøå");
+        }
+    }
+}
+
+// ---- R86 (run 197).
+
+/// One Paper ("p") with group G holding layer L ("Plan L"), and group H holding K: a receiving
+/// view's own tree with both groups collapsed (a person's presentation choice), its Layers open.
+fn r197_nested() -> (WebState, [crate::model::NodeId; 4]) {
+    let mut doc = Document::default();
+    let g = theme_layer(
+        &mut doc,
+        NodeKind::Group,
+        (100.0, 100.0, 200.0, 100.0),
+        |n| {
+            n.name = "G".into();
+        },
+    );
+    let l = theme_layer(&mut doc, NodeKind::Rect, (100.0, 100.0, 50.0, 50.0), |n| {
+        n.name = "Plan L".into();
+        n.parent = Some(g);
+    });
+    let h = theme_layer(
+        &mut doc,
+        NodeKind::Group,
+        (400.0, 100.0, 100.0, 100.0),
+        |n| {
+            n.name = "H".into();
+        },
+    );
+    let k = theme_layer(&mut doc, NodeKind::Rect, (400.0, 100.0, 50.0, 50.0), |n| {
+        n.name = "K".into();
+        n.parent = Some(h);
+    });
+    doc.root.retain(|id| *id != l && *id != k);
+    doc.nodes.get_mut(&g).unwrap().children.push(l);
+    doc.nodes.get_mut(&h).unwrap().children.push(k);
+    let paper = PageData {
+        id: "p".into(),
+        name: "Page 1".into(),
+        doc,
+        camera: Some(Default::default()),
+    };
+    let mut s = WebState::open(&canvas(&[paper], "p"), false, W, H).unwrap();
+    settle(&mut s, 0.0);
+    open_layers(&mut s);
+    s.ui.collapsed.insert(g);
+    s.ui.collapsed.insert(h);
+    timed_frames(&mut s, 4);
+    (s, [g, l, h, k])
+}
+
+/// L's unfinished name as the outgoing view handed it over: raw (spaces kept), over "Plan L".
+fn r197_layer_packet(l: crate::model::NodeId) -> serde_json::Value {
+    serde_json::json!({"kind": "layer", "page": "p", "node": l.0, "base": "Plan L",
+        "text": " D-197 — lag æøå "})
+}
+
+/// Takes up L's name in `s` and asserts, over frames with no input, that it stays unfinished,
+/// reachable and exactly as typed; then Enter finishes it, one Undo step.
+fn r197_layer_stays_unfinished(s: &mut WebState, [g, l, h, k]: [crate::model::NodeId; 4]) {
+    let packet = r197_layer_packet(l);
+    let doc = s.ed.doc.clone();
+    let undo = s.ed.history.undo_len();
+    assert_eq!(s.resume_unfinished(&packet.to_string()), "");
+    timed_frames(s, 12);
+    let state = serde_json::json!({
+        "document_unchanged": s.ed.doc == doc,
+        "undo_steps": s.ed.history.undo_len() - undo,
+        "dirty": s.ed.project_dirty() || s.ed.is_dirty(),
+        "save": s.save_snapshot(),
+        "draft": s.ui.renaming.as_ref().map(|(id, t)| (id.0, t.clone())),
+    });
+    assert_eq!(
+        state,
+        serde_json::json!({"document_unchanged": true, "undo_steps": 0, "dirty": false,
+            "save": null, "draft": [l.0, " D-197 — lag æøå "]}),
+        "still being typed, nothing finished or saved"
+    );
+    // Its field is there and has the keyboard: L's row is drawn, G opened for it; H as it was.
+    assert!(
+        s.ui.layer_rows.iter().any(|(r, _, _)| *r == l),
+        "L's row is drawn"
+    );
+    let field = s.ui.rename_field.expect("the rename field is laid out");
+    assert_eq!(s.ctx.memory(|m| m.focused()), Some(field));
+    assert!(!s.ui.collapsed.contains(&g), "only its own group opened");
+    assert!(
+        s.ui.collapsed.contains(&h),
+        "another group stays as the person left it"
+    );
+    assert!(!s.ui.layer_rows.iter().any(|(r, _, _)| *r == k));
+    // Handed on again exactly.
+    let (_, changed, unfinished) = handover_of(s);
+    assert!(!changed);
+    assert_eq!(unfinished, vec![packet]);
+    // Enter finishes it (trimmed, as a rename is): one undoable step, which Undo takes back.
+    press(s, "Enter", "Enter");
+    timed_frames(s, 4);
+    assert_eq!(s.ed.doc.get(l).unwrap().name, "D-197 — lag æøå");
+    assert_eq!(s.ed.history.undo_len(), undo + 1);
+    assert!(s.save_snapshot().is_some(), "now it is saved");
+    s.ed.undo();
+    assert_eq!(s.ed.doc.get(l).unwrap().name, "Plan L");
+}
+
+#[test]
+fn r197_a_nested_layer_name_continued_under_a_collapsed_group_stays_unfinished_until_entered() {
+    let (mut s, ids) = r197_nested();
+    r197_layer_stays_unfinished(&mut s, ids);
+}
+
+/// The route after an Apply (Session `openApplied`): the committed canvas is loaded first, then
+/// the kept name is taken up, the same way and as safely (no second Apply: only the load).
+#[test]
+fn r197_after_an_apply_s_load_a_nested_layer_name_stays_unfinished_too() {
+    let (mut s, ids) = r197_nested();
+    let applied = canvas(&pages_now(&s), "p");
+    s.reload(&applied).unwrap();
+    timed_frames(&mut s, 4);
+    assert!(
+        s.ui.collapsed.contains(&ids[0]),
+        "the receiver's tree as it was"
+    );
+    r197_layer_stays_unfinished(&mut s, ids);
+}
+
+/// R86-01: the adapter's half of Continue here of two Canvas names (an ordinary E and a kept
+/// recovery's D, both typed over "Plan"): E opens; D is refused while E is being typed (one
+/// Canvas name field); Escape drops E with nothing changed, and then D alone opens, exactly. If
+/// E was finished instead, D (typed over "Plan") is refused without effects.
+#[test]
+fn r197_a_second_canvas_name_waits_and_then_continues_alone() {
+    let e = serde_json::json!({"kind": "title", "base": "Plan", "text": "E-197 — æøå"});
+    let d = serde_json::json!({"kind": "title", "base": "Plan", "text": "D-197 — recovered æøå"});
+    for finish in ["Escape", "Enter"] {
+        let paper = PageData {
+            id: "p".into(),
+            name: "Paper 1".into(),
+            doc: Document::default(),
+            camera: Some(Default::default()),
+        };
+        let mut s = WebState::open(&canvas_named(&[paper], "p", "Plan"), false, W, H).unwrap();
+        settle(&mut s, 0.0);
+        let doc = s.ed.doc.clone();
+        assert_eq!(s.resume_unfinished(&e.to_string()), "");
+        let why = s.resume_unfinished(&d.to_string());
+        assert!(why.contains("being typed here"), "{why}");
+        timed_frames(&mut s, 8);
+        assert_eq!(s.ui.file_title_draft.as_deref(), Some("E-197 — æøå"));
+        assert_eq!(s.ui.project_name, "Plan");
+        assert!(s.save_snapshot().is_none());
+        press(&mut s, finish, finish);
+        timed_frames(&mut s, 4);
+        assert!(s.ui.file_title_draft.is_none(), "{finish}");
+        if finish == "Escape" {
+            // Cancelled: nothing changed, and D now opens alone, exactly.
+            assert_eq!(s.ui.project_name, "Plan");
+            assert!(s.save_snapshot().is_none());
+            assert_eq!(s.resume_unfinished(&d.to_string()), "");
+            timed_frames(&mut s, 8);
+            assert_eq!(
+                s.ui.file_title_draft.as_deref(),
+                Some("D-197 — recovered æøå")
+            );
+            assert_eq!(s.ui.project_name, "Plan");
+            assert!(s.save_snapshot().is_none(), "D is being typed, not saved");
+            let (_, _, unfinished) = handover_of(&mut s);
+            assert_eq!(unfinished, vec![d.clone()]);
+        } else {
+            // Finished: E is the name now; D, typed over "Plan", isn't taken up over it.
+            assert_eq!(s.ui.project_name, "E-197 — æøå");
+            let why = s.resume_unfinished(&d.to_string());
+            assert!(!why.is_empty(), "refused");
+            assert!(s.ui.file_title_draft.is_none(), "nothing opened");
+            assert_eq!(s.ui.project_name, "E-197 — æøå");
+        }
+        assert_eq!(s.ed.doc, doc, "{finish}: the Paper untouched");
+    }
+}

@@ -70,7 +70,7 @@ const IDS = ['back', 'title', 'menu-button', 'menu-icon', 'menu-label', 'menu', 
   'create', 'cancel-new', 'folder-help', 'folder-title', 'folder-refresh', 'folder-done', 'result', 'result-title',
   'result-state', 'result-fields', 'result-list', 'result-actions', 'canvas', 'reopen', 'force', 'close', 'export', 'canvas-state',
   'result-details', 'result-meta', 'result-detail', 'app', 'editor', 'ed-title', 'ed-status', 'ed-renderer', 'ed-stage', 'ed-canvas',
-  'ed-conflict', 'ed-alert', 'ed-alert-text', 'ed-leave', 'ed-home', 'about'];
+  'ed-conflict', 'ed-alert', 'ed-alert-text', 'ed-leave', 'ed-too-large', 'ed-home', 'about'];
 // What the editor view had before it filled the view, and no longer has (no Close, Export, Full
 // screen or browser button, no notes line, no Details).
 const GONE = ['ed-close', 'ed-export', 'ed-full', 'ed-browser', 'ed-note', 'ed-details', 'ed-meta', 'edit-here'];
@@ -103,7 +103,7 @@ function mount({ library = false, panel = null, clock = false, media = null } = 
   const els = Object.fromEntries(IDS.map((id) => [id, el('div', document)]));
   for (const id of ['back', 'menu', 'pick', 'new-form', 'rename-form', 'folder-help', 'notices', 'result', 'canvas', 'reopen', 'force', 'close', 'export',
     'm-import', 'import-file', 'result-details', 'result-meta', 'result-detail', 'editor', 'ed-renderer', 'ed-alert', 'ed-leave', 'ed-home',
-    'lib-bar', 'no-match']) {
+    'ed-too-large', 'lib-bar', 'no-match']) {
     els[id].hidden = true;
   }
   const props = {};
@@ -2466,6 +2466,48 @@ test('R25-F2: persistent, unreachable and conflict failures stay shown and disti
   assert.equal(v.els['ed-alert'].hidden, true);
 });
 
+// R190 (R80-02): a drain that holds a committed Apply's continuation not open yet ('pending')
+// keeps the editor, says why and closes nothing; only the explicit discard lets it go.
+test('panel: All projects with a kept continuation keeps the editor, says why, and closes nothing until it is dropped', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.finish();
+  h.o.onStatus('Ready');
+  await flush();
+  h.nextDrain = 'pending';
+  h.o.onHome(); // the workspace's All projects (its menu, or Ctrl/⌘+Alt+Shift+H)
+  await flush();
+  assert.match(v.els['ed-alert-text'].textContent, /aren't open here yet/);
+  assert.match(v.els['ed-alert-text'].textContent, /Edit here first if this view is read-only/);
+  assert.equal(v.els['ed-leave'].hidden, false, 'Leave without saving is offered');
+  assert.equal(libCalls(v, 'openpaperdesign_app_close'), 0, 'nothing closed');
+  assert.ok(!fake.log.includes('dispose'), 'the editor stays');
+  assert.ok(fake.log.includes('resume'), 'and goes on');
+  // The explicit choice drops it: then the editor goes and its binding is closed.
+  v.els['ed-leave'].onclick();
+  await flush();
+  assert.ok(fake.log.includes('dispose'));
+  await closedHome(v);
+});
+
+// R191: a drain that holds an unanswered Apply's unfinished edits ('uncertain') says so.
+test('panel: All projects after an unanswered Apply keeps the editor and says it may or may not be saved', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  h.finish();
+  h.o.onStatus('Ready');
+  await flush();
+  h.nextDrain = 'uncertain';
+  h.o.onHome();
+  await flush();
+  assert.match(v.els['ed-alert-text'].textContent, /may or may not have been saved/);
+  assert.equal(v.els['ed-leave'].hidden, false);
+  assert.equal(libCalls(v, 'openpaperdesign_app_close'), 0);
+  assert.ok(!fake.log.includes('dispose'));
+});
+
 test('panel: New file, Import, Open current file and the menu\'s Open all mount here, asking for the panel', async () => {
   const routes = [
     ['New file', (v) => { v.els['new-file'].onclick(); }, 'openpaperdesign_app_create', { name: 'Untitled', panel: true }, 'created'],
@@ -2698,6 +2740,68 @@ test('panel: the editor adds no chrome of its own and never asks for or opens a 
   assert.ok(editorCalls.length > 0);
   assert.ok(editorCalls.every((m) => m.params.arguments.panel === true), JSON.stringify(editorCalls.map((m) => m.params)));
   panelOnly(v);
+});
+
+// R186 (#6, owner comment 6388936169): the one exception to the above. A canvas this panel
+// refused as too large (413, before anything was mounted) is offered in its browser editor,
+// for exactly its own binding, through the app's editor result and `ui/open-link`; a mounted
+// editor still never shows it.
+test('panel: a canvas too large for the panel offers its own browser editor, for its own binding, and never claims it loaded', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  const h = fake.handles[0];
+  const button = v.els['ed-too-large'];
+  assert.equal(button.hidden, true, 'not offered while the editor starts');
+  // Another start failure isn't a size refusal: no browser offer.
+  h.fail(Object.assign(new Error('the renderer could not be compiled'), { status: undefined }));
+  await flush();
+  assert.equal(button.hidden, true);
+  // The size refusal, on a fresh open.
+  h.o.onHome();
+  await flush();
+  await closedHome(v);
+  await relist(v);
+  await openInPanel(v);
+  const big = fake.handles[1];
+  big.fail(Object.assign(new Error('this canvas is too large for the panel (413). Open it in the browser editor instead'), { status: 413 }));
+  await flush();
+  assert.equal(button.hidden, false, 'offered');
+  assert.equal(v.els['ed-home'].hidden, false, 'and Back to files');
+  assert.equal(v.count('ui/open-link'), 0, 'nothing opened without the person');
+  // A failed request stays shown, with the button to try again.
+  button.onclick();
+  await flush();
+  assert.deepEqual(libAction(v).params, { name: 'openpaperdesign_app_editor', arguments: { binding: B1 } },
+    'exactly this binding, not the panel');
+  assert.equal(button.disabled, true, 'one request at a time');
+  await answer(v, LIB_EDITOR('opened', ID2), libAction(v));
+  assert.match(v.els['ed-alert-text'].textContent, /another canvas than this one, so nothing was opened/);
+  assert.equal(v.count('ui/open-link'), 0);
+  assert.equal(button.disabled, false);
+  button.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened', ID1, { url: 'http://example.com/#token=' + '0'.repeat(64) }), libAction(v));
+  assert.match(v.els['ed-alert-text'].textContent, /no local browser editor link/);
+  assert.equal(v.count('ui/open-link'), 0);
+  // Its own answer: the link goes to the host, and asking is never taken for a load.
+  button.onclick();
+  await flush();
+  await answer(v, LIB_EDITOR('opened'), libAction(v));
+  assert.equal(v.last('ui/open-link').params.url, URL_OK);
+  await ack(v);
+  assert.match(v.els['ed-alert-text'].textContent, /doesn't confirm it loaded/);
+  assert.ok(!/is ready|Ready to edit/i.test(v.els.live.textContent), 'no Ready announced');
+  // A reply after Back belongs to no view: nothing is opened for it.
+  button.onclick();
+  await flush();
+  const late = libAction(v);
+  h.o.onHome(); // the first, failed editor's Home is no longer the view's: nothing
+  big.o.onHome();
+  await flush();
+  const opened = v.count('ui/open-link');
+  v.from({ id: late.id, result: toolText(LIB_EDITOR('opened')) });
+  await flush();
+  assert.equal(v.count('ui/open-link'), opened, 'a late answer opens nothing');
 });
 
 test('panel: an Open answered without the panel, or for another canvas or binding, mounts nothing and opens nothing', async () => {

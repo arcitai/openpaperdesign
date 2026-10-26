@@ -1274,6 +1274,662 @@ impl WebState {
     pub fn save_failed(&mut self) {
         self.inflight = None;
     }
+
+    /// What this editor hands over when another view took the canvas's editing (issue #23,
+    /// R78-03): `{canvas, changed, unfinished}`, as JSON. Nothing in this editor changes
+    /// except that finished pending edits are committed to its own undo history, as a save
+    /// does (`commit_pending`); nothing is finished, dropped or marked saved.
+    /// - `canvas`: the whole canvas as a canvas save (`{active_page, pages: [{id, name,
+    ///   text}], name}`, every page with its content) as it stands without any edit still
+    ///   under way: the open transaction of a gesture or text edit is left out (taken back on a
+    ///   throwaway copy of the shown page, never here).
+    /// - `changed`: whether that canvas differs from what this view last loaded or saved.
+    /// - `unfinished`: each edit still under way, as a continuation another editor can take up
+    ///   (`resume_unfinished`): the Canvas name's, a Paper's or a layer's rename field with its
+    ///   text, and a text layer being typed with its text and caret (and the layer itself when
+    ///   the edit made it). A gesture (a drag) or another field's draft can't move: they are
+    ///   listed (`gesture`, `field`) so the editing view is told, and stay here.
+    pub fn handover(&mut self) -> String {
+        self.ed.commit_pending();
+        let active = self.ed.active_page;
+        let mut pages = Vec::with_capacity(self.ed.pages.len());
+        for i in 0..self.ed.pages.len() {
+            let mut data = self.ed.page_data(i);
+            if i == active {
+                data.doc = Document {
+                    name: data.doc.name.clone(),
+                    ..self.settled_doc()
+                };
+            }
+            pages.push(serde_json::json!({
+                "id": data.id,
+                "name": data.name,
+                "text": page_to_json(&data),
+            }));
+        }
+        let canvas = serde_json::json!({
+            "active_page": self.ed.active_page_id(),
+            "pages": pages,
+            "name": self.ui.project_name,
+        });
+        let changed = self.ed.project_dirty() || self.name_dirty();
+        serde_json::json!({
+            "canvas": canvas.to_string(),
+            "changed": changed,
+            "unfinished": self.unfinished_edits(),
+        })
+        .to_string()
+    }
+
+    /// The shown page's document without the open transaction (a gesture's or a text edit's),
+    /// on a throwaway copy (`Editor::preview`): committed there and undone, so it is exactly
+    /// what it was when that edit began. This editor isn't touched.
+    fn settled_doc(&self) -> Document {
+        if !self.ed.is_busy() && self.ed.text_edit.is_none() {
+            return self.ed.doc.clone();
+        }
+        let mut copy = self.ed.preview();
+        copy.text_edit = None;
+        copy.commit();
+        if copy.history.can_undo() {
+            copy.undo();
+        }
+        copy.doc
+    }
+
+    /// The edits still under way here (see [`WebState::handover`]).
+    fn unfinished_edits(&self) -> Vec<serde_json::Value> {
+        let changed = |text: &str, name: Option<&str>| {
+            let t = text.trim();
+            !t.is_empty() && name.is_some_and(|n| n != t)
+        };
+        // Each name with the name it was typed over (`base`), so it is only taken up over that
+        // name, never over a newer one (R80-01, run 190).
+        let mut out = Vec::new();
+        if let Some(text) = &self.ui.file_title_draft
+            && changed(text, Some(&self.ui.project_name))
+        {
+            out.push(serde_json::json!({
+                "kind": "title", "text": text, "base": self.ui.project_name,
+            }));
+        }
+        if let Some((i, text)) = &self.ui.pages.renaming
+            && let Some(p) = self.ed.pages.get(*i)
+            && changed(text, Some(&p.name))
+        {
+            out.push(serde_json::json!({
+                "kind": "page", "page": p.id, "text": text, "base": p.name,
+            }));
+        }
+        let page = self.ed.active_page_id().to_string();
+        if let Some((id, text)) = &self.ui.renaming
+            && let Some(n) = self.ed.doc.get(*id)
+            && changed(text, Some(n.name.as_str()))
+        {
+            out.push(serde_json::json!({
+                "kind": "layer", "page": page, "node": id.0, "text": text, "base": n.name,
+            }));
+        }
+        if let Some(te) = &self.ed.text_edit
+            && let Some(n) = self.ed.doc.get(te.id)
+        {
+            let settled = self.settled_doc();
+            // The layer exactly as it is being typed (`live`: its text, ranges as typing moved
+            // them, box and overrides) and, for a layer that was there before, that layer as it
+            // was (`base`), so it is only taken up over that same layer (R79-02/03, run 189).
+            let mut c = serde_json::json!({
+                "kind": "text",
+                "page": page,
+                "node": te.id.0,
+                "text": n.kind.edit_text().unwrap_or_default(),
+                "caret": te.caret,
+                "anchor": te.anchor,
+                "live": serde_json::to_value(n).unwrap_or_default(),
+            });
+            if let Some(base) = settled.nodes.get(&te.id) {
+                c["base"] = serde_json::to_value(base).unwrap_or_default();
+            }
+            // A layer the edit itself made (typing a new text): it goes along, with where it
+            // sits.
+            if !settled.nodes.contains_key(&te.id) {
+                let index = self
+                    .ed
+                    .doc
+                    .children(n.parent)
+                    .iter()
+                    .position(|x| *x == te.id);
+                c["layer"] = serde_json::to_value(n).unwrap_or_default();
+                c["parent"] = serde_json::json!(n.parent.map(|p| p.0));
+                c["index"] = serde_json::json!(index);
+            }
+            out.push(c);
+        }
+        if self.ed.is_busy() {
+            out.push(serde_json::json!({"kind": "gesture"}));
+        }
+        // An unfinished literal value (R78-03): the Design panel's number field or a Theme text
+        // style's size that has the keyboard, with the raw text typed into it (also one that
+        // isn't a value yet, such as "-"), and the field it is in; a Theme line height or
+        // letter spacing typed and not entered, with its style. Only what was actually typed: a
+        // field merely focused holds nothing to hand over.
+        let mut carried = false;
+        if let Some(f) = ui::field_drafts::focused(&self.ctx)
+            && let Some(text) = f.text
+        {
+            carried = true;
+            let c = match theme_style_of(&f.target.label) {
+                Some(style) => {
+                    let mut c = serde_json::json!({
+                        "kind": "theme-metric", "metric": "size", "page": f.target.page,
+                        "text": text,
+                    });
+                    let held = ui::design_system::style_use(&self.ctx, &self.ed, style);
+                    put_use(&mut c, &held);
+                    let ids: Vec<_> = held.targets.iter().map(|t| t.id).collect();
+                    self.put_bases(&mut c, &ids);
+                    c
+                }
+                None => {
+                    let mut c = serde_json::json!({
+                        "kind": "inspector", "page": f.target.page,
+                        "ids": f.target.ids.iter().map(|i| i.0).collect::<Vec<_>>(),
+                        "label": f.target.label, "nth": f.target.nth, "text": text,
+                    });
+                    self.put_bases(&mut c, &f.target.ids);
+                    c
+                }
+            };
+            out.push(c);
+        }
+        if let Some((style, metric, text)) = ui::design_system::metric_draft(&self.ctx, &self.ed) {
+            carried = true;
+            let mut c = serde_json::json!({
+                "kind": "theme-metric", "metric": metric, "page": page, "text": text,
+            });
+            let held = ui::design_system::style_use(&self.ctx, &self.ed, style);
+            put_use(&mut c, &held);
+            let ids: Vec<_> = held.targets.iter().map(|t| t.id).collect();
+            self.put_bases(&mut c, &ids);
+            out.push(c);
+        }
+        // What can't move: another field's draft (a library or palette field), a Theme colour or
+        // style change still open (its value is in the canvas above already).
+        if !carried && self.field_editing() {
+            out.push(serde_json::json!({"kind": "field"}));
+        }
+        if self.focused && ui::design_system::editing(&self.ctx, &self.ed) {
+            out.push(serde_json::json!({"kind": "theme-use"}));
+        }
+        out
+    }
+
+    /// Take up an edit another view handed over (one of its `unfinished`, see
+    /// [`WebState::handover`]) as an edit under way here, exactly as it was there: a rename
+    /// field open with its text, or a text layer being typed with its text and caret (its
+    /// open transaction, not committed: Escape or a click elsewhere finishes it, Undo after
+    /// that takes it back as one step), or an unfinished value in the Design panel's number
+    /// field or a Theme text style's field (its layers selected or its style's editor opened,
+    /// the field focused and its raw text put in as typed, over the next frames: R78-03).
+    /// Nothing is saved or finished by this. Returns `""` when it was taken up, else why not
+    /// (its page, layers, Paper or style aren't here, a layer is locked, a Theme change of
+    /// another is under way…); then nothing changed here. Only on an editor with nothing else
+    /// under way.
+    pub fn resume_unfinished(&mut self, json: &str) -> String {
+        match self.resume_one(json) {
+            Ok(()) => {
+                self.redraw = true;
+                String::new()
+            }
+            Err(why) => why.to_string(),
+        }
+    }
+
+    fn resume_one(&mut self, json: &str) -> Result<(), &'static str> {
+        let Ok(c) = serde_json::from_str::<serde_json::Value>(json) else {
+            return Err("it isn't an edit this editor knows");
+        };
+        if self.ed.is_busy() || self.ed.text_edit.is_some() || self.inflight.is_some() {
+            return Err("an edit is still under way here; finish it first");
+        }
+        // Never over an edit of the same kind already under way here (R79-04): that draft is
+        // this view's own, newer, and nothing replaces it.
+        let kind = c.get("kind").and_then(|k| k.as_str()).unwrap_or_default();
+        let own = match kind {
+            "title" => self.ui.file_title_draft.is_some(),
+            "page" => self.ui.pages.renaming.is_some(),
+            "layer" => self.ui.renaming.is_some(),
+            "inspector" | "theme-metric" => self.field_editing(),
+            _ => false,
+        };
+        if own {
+            return Err(DRAFT_HERE);
+        }
+        if let kind @ ("inspector" | "theme-metric") = kind {
+            return self.resume_field(kind, &c);
+        }
+        self.resume_rename_or_text(&c)
+    }
+
+    /// A field value's layers exactly as they are in the canvas handed over with it (`bases`,
+    /// run 192, R81-02): it is only taken up over those layers as they are there, never over a
+    /// newer accepted change of them (a field value carries its raw text, not what it replaces).
+    fn put_bases(&self, c: &mut serde_json::Value, ids: &[crate::model::NodeId]) {
+        let settled = self.settled_doc();
+        c["bases"] = ids
+            .iter()
+            .filter_map(|id| settled.get(*id))
+            .map(|n| serde_json::to_value(n).unwrap_or_default())
+            .collect();
+    }
+
+    /// Whether `c`'s field value is taken up over its layers `ids` on `doc` (`put_bases`): every
+    /// one is there exactly as it was, or why not. Without `bases` (an older editor's), refused.
+    fn check_bases(
+        doc: &Document,
+        c: &serde_json::Value,
+        ids: &[crate::model::NodeId],
+    ) -> Result<(), &'static str> {
+        let bases: Vec<crate::model::Node> = c
+            .get("bases")
+            .and_then(|b| serde_json::from_value(b.clone()).ok())
+            .ok_or(LEGACY_FIELD)?;
+        if ids.is_empty() || ids.iter().any(|id| !bases.iter().any(|b| b.id == *id)) {
+            return Err(LEGACY_FIELD);
+        }
+        if bases.iter().any(|b| doc.get(b.id) != Some(b)) {
+            return Err(NEWER_FIELD);
+        }
+        Ok(())
+    }
+
+    /// Paper `i`'s document as it is now, for checking a continuation for it before it is shown
+    /// (R80-03, run 190): showing a Paper is itself a change here (`Editor::switch_page`: the
+    /// list to save, a new revision and document stamp), so a refusal must not show it first.
+    fn page_doc(&self, i: usize) -> std::borrow::Cow<'_, Document> {
+        if i == self.ed.active_page {
+            std::borrow::Cow::Borrowed(&self.ed.doc)
+        } else {
+            std::borrow::Cow::Owned(self.ed.page_data(i).doc)
+        }
+    }
+
+    /// An unfinished field value taken up (see [`WebState::resume_unfinished`]): its target
+    /// checked as it is here first (the page, every layer, none effectively locked; a style's
+    /// own admission), then shown and handed to the UI's own field (`field_drafts`,
+    /// `design_system::resume_style_field`), unfinished.
+    fn resume_field(&mut self, kind: &str, c: &serde_json::Value) -> Result<(), &'static str> {
+        let text = c
+            .get("text")
+            .and_then(|t| t.as_str())
+            .ok_or("it carries no text")?
+            .to_string();
+        let page = c.get("page").and_then(|p| p.as_str());
+        let Some(i) = page.and_then(|p| self.ed.pages.iter().position(|x| x.id == p)) else {
+            return Err("its Paper isn't in this canvas here");
+        };
+        let tier = self.ui.narrow.tier(self.screen.x);
+        if kind == "theme-metric" {
+            let held = use_from_json(c)?;
+            let field = c.get("metric").and_then(|m| m.as_str()).unwrap_or_default();
+            // Checked first, on its own Paper as it is (another one checked on an editor of its
+            // document alone), and only then shown: a refusal changes nothing here (R80-03).
+            if ui::design_system::editing(&self.ctx, &self.ed) {
+                return Err("another Theme change is under way here; finish it first");
+            }
+            let ids: Vec<_> = held.targets.iter().map(|t| t.id).collect();
+            if i == self.ed.active_page {
+                ui::design_system::check_style_field(&self.ed, &held, field)?;
+                Self::check_bases(&self.ed.doc, c, &ids)?;
+            } else {
+                let probe = crate::editor::Editor::new(self.ed.page_data(i).doc);
+                ui::design_system::check_style_field(&probe, &held, field)?;
+                Self::check_bases(&probe.doc, c, &ids)?;
+            }
+            self.ed.switch_page(i);
+            ui::design_system::resume_style_field(&self.ctx, &self.ed, held, field, text)?;
+            // Theme is the left panel's other view.
+            self.ui.left_tab = ui::LeftTab::Theme;
+            self.ui.panels.open(ui::NarrowPanel::Layers, tier);
+            return Ok(());
+        }
+        let ids: Vec<crate::model::NodeId> = c
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(crate::model::NodeId)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let label = c
+            .get("label")
+            .and_then(|l| l.as_str())
+            .ok_or("it names no field")?;
+        let nth = c.get("nth").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+        // Checked as the canvas is here: every layer it edits must be on its page here.
+        let doc = if i == self.ed.active_page {
+            self.ed.doc.clone()
+        } else {
+            self.ed.page_data(i).doc
+        };
+        if ids.is_empty() || ids.iter().any(|id| doc.get(*id).is_none()) {
+            return Err("the layers it edits aren't in this canvas here");
+        }
+        if ids.iter().any(|id| doc.is_effectively_locked(*id)) {
+            return Err("a layer it edits is locked here");
+        }
+        // Only over those layers exactly as they were there (R81-02): the raw text it carries
+        // would otherwise be typed over a newer accepted value.
+        Self::check_bases(&doc, c, &ids)?;
+        self.ed.switch_page(i);
+        self.ed.selection = ids.clone();
+        self.ui.panels.open(ui::NarrowPanel::Design, tier);
+        ui::field_drafts::resume(
+            &self.ctx,
+            ui::field_drafts::FieldTarget {
+                page: self.ed.active_page_id().to_string(),
+                ids,
+                label: label.to_string(),
+                nth,
+            },
+            text,
+        );
+        Ok(())
+    }
+
+    /// What became of the last field value taken up (`resume_unfinished`): `""` taken up,
+    /// `"still opening"`, or why it wasn't (its field didn't show here).
+    pub fn resume_outcome(&self) -> String {
+        ui::field_drafts::outcome(&self.ctx).unwrap_or_default()
+    }
+
+    fn resume_rename_or_text(&mut self, c: &serde_json::Value) -> Result<(), &'static str> {
+        const MISSING: &str = "its Paper or layer isn't in this canvas here";
+        let c = c.clone();
+        let text = c.get("text").and_then(|t| t.as_str()).map(str::to_string);
+        let page = c.get("page").and_then(|p| p.as_str());
+        let page = page.and_then(|p| self.ed.pages.iter().position(|x| x.id == p));
+        let node = c
+            .get("node")
+            .and_then(|n| n.as_u64())
+            .map(crate::model::NodeId);
+        // A name is taken up only over the name it was typed over (R80-01, run 190): one renamed
+        // here since (an accepted save, an agent's rename) keeps its newer name.
+        let base = c.get("base").and_then(|b| b.as_str());
+        let over = |now: &str| match base {
+            None => Err(LEGACY_NAME),
+            Some(b) if b != now => Err(NEWER_NAME),
+            Some(_) => Ok(()),
+        };
+        // Everything is checked on its own Paper as it is before that Paper is shown, so a
+        // refusal changes nothing here (R80-03).
+        match (c.get("kind").and_then(|k| k.as_str()), text) {
+            (Some("title"), Some(t)) if self.ui.file_rename => {
+                over(&self.ui.project_name)?;
+                self.ui.file_title_draft = Some(t);
+                // Its field is drawn only with the UI.
+                self.ui.hide_ui = false;
+                Ok(())
+            }
+            (Some("page"), Some(t)) => {
+                let i = page.ok_or(MISSING)?;
+                over(&self.ed.pages[i].name)?;
+                self.ui.pages.renaming = Some((i, t));
+                self.show_name_rows(true);
+                Ok(())
+            }
+            (Some("layer"), Some(t)) => {
+                let (Some(i), Some(id)) = (page, node) else {
+                    return Err(MISSING);
+                };
+                {
+                    let doc = self.page_doc(i);
+                    over(&doc.get(id).ok_or(MISSING)?.name)?;
+                }
+                self.ed.switch_page(i);
+                self.ui.renaming = Some((id, t));
+                self.show_name_rows(false);
+                // Its row too, inside groups folded here (R86-02).
+                ui::reveal_layer(&self.ed, &mut self.ui, id);
+                Ok(())
+            }
+            (Some("text"), Some(t)) => {
+                let (Some(i), Some(id)) = (page, node) else {
+                    return Err(MISSING);
+                };
+                self.resume_text(i, id, &t, &c)
+            }
+            _ => Err(MISSING),
+        }
+    }
+
+    /// The rows a rename taken up is typed in (a Paper's, `paper`, or a layer's), shown as Rename
+    /// Paper… and a layer's Rename show them (the left panel open on its Design view, the Papers
+    /// list unfolded, the layer rows rather than the library): a rename whose rows aren't drawn
+    /// is finished as losing focus does, which taken up from another view it never may be (run
+    /// 196: a closed left panel saved the Paper's name before any key).
+    fn show_name_rows(&mut self, paper: bool) {
+        let tier = self.ui.narrow.tier(self.screen.x);
+        self.ui.hide_ui = false;
+        self.ui.left_tab = ui::LeftTab::Design;
+        if paper {
+            self.ui.pages.collapsed = false;
+        } else {
+            self.ui.show_library = false;
+        }
+        self.ui.panels.open(ui::NarrowPanel::Layers, tier);
+    }
+
+    /// A text layer's edit taken up (see [`WebState::resume_unfinished`]): one open
+    /// transaction, as starting the edit makes, with the layer exactly as it is being typed
+    /// there (`live`: its text, its ranges as typing moved them, its box and overrides, R79-03),
+    /// the caret and selection where they were. Only where that is exactly the edit's own
+    /// (R79-01/02, run 189), checked before anything changes: a layer that was there is taken
+    /// up only over that same layer as it was when the edit began (`base`; a newer change here,
+    /// such as a later save of its text, is never typed over) and not while it is locked here,
+    /// itself or through an ancestor; a layer the edit made (`layer`) only where its id is free,
+    /// under a parent that is here, can hold it and isn't locked, and its id is reserved here in
+    /// the same step (the canvas came from before the edit allocated it), so later layers never
+    /// take it, also after Undo and Redo. A continuation that doesn't say this (an older
+    /// editor's) is refused. Nothing is merged. All of it is checked on Paper `i` as it is, and
+    /// that Paper is shown only once it is taken up (R80-03, run 190).
+    fn resume_text(
+        &mut self,
+        i: usize,
+        id: crate::model::NodeId,
+        text: &str,
+        c: &serde_json::Value,
+    ) -> Result<(), &'static str> {
+        const DISAGREE: &str = "its parts don't agree, so it isn't taken up";
+        let node_of = |k: &str| {
+            c.get(k)
+                .and_then(|l| serde_json::from_value::<crate::model::Node>(l.clone()).ok())
+        };
+        let fresh = c.get("layer").is_some();
+        let Some(live) = node_of(if fresh { "layer" } else { "live" }) else {
+            return Err(LEGACY_TEXT);
+        };
+        if live.id != id || live.kind.edit_text() != Some(text) {
+            return Err(DISAGREE);
+        }
+        let paper = self.page_doc(i);
+        let doc: &Document = &paper;
+        let (parent, index) = if fresh {
+            if doc.get(id).is_some() || id.0 == 0 {
+                return Err("its id is another layer's here, so it isn't taken up over that layer");
+            }
+            let parent = c
+                .get("parent")
+                .and_then(|p| p.as_u64())
+                .map(crate::model::NodeId);
+            if live.parent != parent || !live.children.is_empty() {
+                return Err(DISAGREE);
+            }
+            if let Some(p) = parent {
+                let Some(pn) = doc.get(p) else {
+                    return Err("the frame or group it was typed in isn't in this canvas here");
+                };
+                if !(pn.is_frame() || pn.is_group()) {
+                    return Err(DISAGREE);
+                }
+                if doc.is_effectively_locked(p) {
+                    return Err("the frame or group it was typed in is locked here");
+                }
+            }
+            let index = c.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
+            (parent, index)
+        } else {
+            let Some(base) = node_of("base") else {
+                return Err(LEGACY_TEXT);
+            };
+            let Some(now) = doc.get(id) else {
+                return Err("its layer isn't in this canvas here");
+            };
+            if doc.is_effectively_locked(id) {
+                return Err("its layer is locked here");
+            }
+            if *now != base {
+                return Err(NEWER_TEXT);
+            }
+            if live.parent != base.parent || live.children != base.children {
+                return Err(DISAGREE);
+            }
+            (None, None)
+        };
+        drop(paper);
+        self.ed.switch_page(i);
+        let arrow = matches!(live.kind, crate::model::NodeKind::Connector { .. });
+        self.ed
+            .begin(if arrow { "Edit label" } else { "Edit text" });
+        {
+            let mut tx = self.ed.tx();
+            if fresh {
+                tx.insert(live, parent, index);
+                tx.doc.next_id = tx.doc.next_id.max(id.0 + 1);
+            } else if let Some(n) = tx.node_mut(id) {
+                *n = live;
+            }
+        }
+        let len = text.chars().count();
+        let at = |k: &str| {
+            c.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).min(len))
+        };
+        self.ed.selection = vec![id];
+        self.ed.text_edit = Some(crate::editor::TextEdit {
+            id,
+            caret: at("caret").unwrap_or(len),
+            anchor: at("anchor"),
+        });
+        Ok(())
+    }
+}
+
+/// Why a field value isn't taken up over a newer change of its layers here (R81-02).
+const NEWER_FIELD: &str = "its layers changed here since it was handed over (a newer change), \
+                           so that value isn't typed over them";
+
+/// Why an older editor's field value isn't taken up (R81-02).
+const LEGACY_FIELD: &str = "it was handed over by an older editor and doesn't say what its \
+                            layers were, so it isn't taken up (it stays there)";
+
+/// Why a name being typed isn't taken up over a newer name here (R80-01).
+const NEWER_NAME: &str = "it was renamed here since it was handed over (a newer change), so \
+                          that name isn't typed over";
+
+/// Why an older editor's name continuation isn't taken up (R80-01).
+const LEGACY_NAME: &str = "it was handed over by an older editor and doesn't say what the name \
+                           was before it was typed, so it isn't taken up (it stays there)";
+
+/// Why a continuation of the kind of edit already under way here isn't taken up (R79-04).
+const DRAFT_HERE: &str = "the same kind of edit is being typed here; finish it first (nothing \
+                          here was replaced)";
+
+/// Why a text continuation isn't typed over a newer change of its layer here (R79-02).
+const NEWER_TEXT: &str = "its text changed here since it was handed over (a newer change), so \
+                          it isn't typed over";
+
+/// Why an older editor's text continuation isn't taken up (R79-02).
+const LEGACY_TEXT: &str = "it was handed over by an older editor and doesn't say what its text \
+                           was before it was typed, so it isn't taken up (it stays there)";
+
+/// A text style as a handover carries it.
+fn style_json(s: ui::design_system::StyleKey) -> serde_json::Value {
+    serde_json::json!({"size": s.0, "bold": s.1, "italic": s.2, "family": s.3.name()})
+}
+
+/// A Theme value's use (`design_system::style_use`) in its continuation: `style` (the style it
+/// has now), `from` and `targets` (`[{node, whole, ranges: [[a, b]…]}]`, character indices).
+fn put_use(c: &mut serde_json::Value, u: &ui::design_system::StyleUse) {
+    c["style"] = style_json(u.now);
+    c["from"] = style_json(u.from);
+    c["targets"] = u
+        .targets
+        .iter()
+        .map(|t| serde_json::json!({"node": t.id.0, "whole": t.whole, "ranges": t.ranges}))
+        .collect();
+}
+
+fn use_from_json(c: &serde_json::Value) -> Result<ui::design_system::StyleUse, &'static str> {
+    let unknown = "its text style isn't one this editor knows";
+    let now = c.get("style").and_then(style_from_json).ok_or(unknown)?;
+    let from = c.get("from").and_then(style_from_json).ok_or(unknown)?;
+    let bad = "it doesn't say which layers its change is for";
+    let targets = c
+        .get("targets")
+        .and_then(|t| t.as_array())
+        .ok_or(bad)?
+        .iter()
+        .map(|t| {
+            let ranges = t.get("ranges")?.as_array()?;
+            let ranges = ranges
+                .iter()
+                .map(|r| {
+                    let r = r.as_array()?;
+                    match r.as_slice() {
+                        [a, b] => Some((a.as_u64()? as usize, b.as_u64()? as usize)),
+                        _ => None,
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(ui::design_system::StyleTarget {
+                id: crate::model::NodeId(t.get("node")?.as_u64()?),
+                whole: t.get("whole")?.as_bool()?,
+                ranges,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(bad)?;
+    Ok(ui::design_system::StyleUse { from, now, targets })
+}
+
+fn style_from_json(v: &serde_json::Value) -> Option<ui::design_system::StyleKey> {
+    let family = v.get("family")?.as_str()?;
+    let family = crate::model::FontFamily::ALL
+        .into_iter()
+        .find(|f| f.name() == family)?;
+    Some((
+        v.get("size")?.as_i64()?,
+        v.get("bold")?.as_bool()?,
+        v.get("italic")?.as_bool()?,
+        family,
+    ))
+}
+
+/// The text style a Theme size field's label names (`design_system::theme_size_label`).
+fn theme_style_of(label: &str) -> Option<ui::design_system::StyleKey> {
+    let rest = label.strip_prefix("Theme size ")?;
+    let mut parts = rest.splitn(4, '/');
+    let size = parts.next()?.parse().ok()?;
+    let bold = parts.next()?.parse().ok()?;
+    let italic = parts.next()?.parse().ok()?;
+    let name = parts.next()?;
+    let family = crate::model::FontFamily::ALL
+        .into_iter()
+        .find(|f| f.name() == name)?;
+    Some((size, bold, italic, family))
 }
 
 #[cfg(test)]

@@ -294,6 +294,10 @@ pub struct BoundHost {
     held: crate::HeldPages,
     /// The app library's identity check, for a library canvas (see `crate::Guard`).
     guard: Option<crate::Guard>,
+    /// A library canvas's editing (issue #23, see `crate::library`): a call that may change the
+    /// canvas holds its lease from the reload to the commit, and saves only while this binding
+    /// is its editor.
+    editing: Option<Arc<crate::library::Editing>>,
 }
 
 const MANIFEST_KEY: &str = "\0manifest";
@@ -421,7 +425,7 @@ impl BoundHost {
         broken: crate::Broken,
         held: crate::HeldPages,
     ) -> Result<BoundHost, String> {
-        BoundHost::prepare_guarded(dir, broken, held, None)
+        BoundHost::prepare_guarded(dir, broken, held, None, None)
     }
 
     fn prepare_guarded(
@@ -429,6 +433,7 @@ impl BoundHost {
         broken: crate::Broken,
         held: crate::HeldPages,
         guard: Option<crate::Guard>,
+        editing: Option<Arc<crate::library::Editing>>,
     ) -> Result<BoundHost, String> {
         if let Some(g) = &guard {
             g()?;
@@ -450,9 +455,16 @@ impl BoundHost {
             broken,
             held,
             guard,
+            editing,
         };
         h.load()?;
         Ok(h)
+    }
+
+    /// Whether saving now would write anything (pending edits committed first, as the save does).
+    fn would_write(&mut self) -> bool {
+        self.ed.commit_pending();
+        !self.ed.dirty_pages().is_empty() || self.ed.meta_dirty
     }
 
     fn note_held_pages(&self) {
@@ -925,6 +937,16 @@ fn execute_inner(
         g()?;
     }
     check_project_dir(&dir)?;
+    // A library canvas, a call that may change it (issue #23, see `crate::library`): its lease
+    // from the reload below to the commit, so no other OpenPaperDesign process writes between
+    // this call's checks and its save. Kept until this function returns.
+    let editing = host.editing.clone();
+    let _hold = match &editing {
+        Some(e) if !READ_TOOLS.contains(&name) => {
+            Some(e.lock_write(&host.broken).map_err(|e| e.message())?)
+        }
+        _ => None,
+    };
     host.sync()?;
     let mut args = args.clone();
     let session = args
@@ -992,6 +1014,22 @@ fn execute_inner(
              you change (get_tree_summary with nodeId \"root\" and its pageId, or get_node_info \
              on its nodes; get_basic_info for the page list) and redo the change on what is \
              there now."
+            )),
+            None,
+        ));
+    }
+    // Only the canvas's editor saves (issue #23): a view that isn't editing (another one opened
+    // the canvas since) changes nothing, and its session observes nothing.
+    if let Some(e) = &editing
+        && host.would_write()
+        && !matches!(e.owns(None), Ok(true))
+    {
+        undo(host, snap)?;
+        return Ok((
+            Err(format!(
+                "{} To edit from here again, call openpaperdesign_library_open with this \
+                 canvas's id (editing then moves here), then read the page again.",
+                crate::library::NOT_EDITING
             )),
             None,
         ));
@@ -1119,11 +1157,11 @@ pub(crate) fn spawn_host(
     broken: crate::Broken,
     held: crate::HeldPages,
 ) -> Result<Calls, String> {
-    spawn_host_guarded(dir, root_id, lifecycle, broken, held, None)
+    spawn_host_guarded(dir, root_id, lifecycle, broken, held, None, None)
 }
 
 /// [`spawn_host`] with the app library's guard (see `crate::Guard`), checked before the
-/// project is loaded and before every call.
+/// project is loaded and before every call, and its editing (see `BoundHost::editing`).
 pub(crate) fn spawn_host_guarded(
     dir: PathBuf,
     root_id: (u64, u64),
@@ -1131,6 +1169,7 @@ pub(crate) fn spawn_host_guarded(
     broken: crate::Broken,
     held: crate::HeldPages,
     guard: Option<crate::Guard>,
+    editing: Option<Arc<crate::library::Editing>>,
 ) -> Result<Calls, String> {
     let (tx, rx) = std::sync::mpsc::channel::<Option<Job>>();
     let calls = Calls {
@@ -1143,7 +1182,7 @@ pub(crate) fn spawn_host_guarded(
     std::thread::Builder::new()
         .name("opd-mcp-host".into())
         .spawn(move || {
-            let host = BoundHost::prepare_guarded(&dir, broken, held, guard);
+            let host = BoundHost::prepare_guarded(&dir, broken, held, guard, editing);
             let mut host = match host {
                 Ok(h) => {
                     let _ = ready_tx.send(Ok(()));

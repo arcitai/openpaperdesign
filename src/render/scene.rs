@@ -1247,3 +1247,66 @@ pub fn export_frame(
         viewport: Rect::new(0.0, 0.0, size_px.x, size_px.y),
     }
 }
+
+#[cfg(test)]
+pub(crate) mod large_canvas_tests {
+    use super::*;
+    use crate::render::mesh::Vertex;
+
+    /// The lead's #6 fixture (run 188), exactly as its canonical page has it: 30,000 root
+    /// frames, rounded (radius 12), vertical auto layout, 10×10 on a 12 px grid, named
+    /// "Cell 0".."Cell 29999", no camera (it opens zoomed to fit).
+    pub(crate) fn many_frames_page() -> crate::project::format::PageData {
+        let nodes: Vec<serde_json::Value> = (0..30_000u64)
+            .map(|i| {
+                serde_json::json!({"id": i + 1, "name": format!("Cell {i}"), "type": "frame",
+                "clip": false, "rect": {"x": (i % 200) * 12, "y": (i / 200) * 12, "w": 10, "h": 10},
+                "style": {"fills": [{"type": "solid", "color": "#b9d6fc"}], "stroke": null,
+                    "stroke_width": 1, "corner_radius": 12, "opacity": 1},
+                "visible": true, "locked": false,
+                "layout": {"direction": "vertical", "wrap": false, "gap": 0, "gap_auto": false,
+                    "cross_gap": 0, "padding": [0, 0, 0, 0], "align_main": "start",
+                    "align_cross": "start"}})
+            })
+            .collect();
+        let page = serde_json::json!({"format": "paper-rs-page", "version": 3, "id": "p",
+            "name": "Page 1", "next_id": 30_001, "root": (1..=30_000u64).collect::<Vec<_>>(),
+            "nodes": nodes});
+        crate::project::format::page_from_json(&page.to_string()).unwrap()
+    }
+
+    /// Bytes of a frame's screen-space batches (one vertex and one index buffer per frame).
+    fn screen_bytes(f: &CanvasFrame) -> (usize, usize) {
+        let batches = f.under.iter().chain(&f.over);
+        let v: usize = batches.clone().map(|b| b.mesh.vertices.len()).sum();
+        let i: usize = batches.map(|b| b.mesh.indices.len()).sum();
+        (v * std::mem::size_of::<Vertex>(), i * 4)
+    }
+
+    /// [`many_frames_page`] as the browser editor first shows it: zoomed to fit a 1024×700
+    /// canvas.
+    pub(crate) fn many_frames_frame() -> CanvasFrame {
+        let page = many_frames_page();
+        assert_eq!(page.doc.root.len(), 30_000);
+        let mut ed = Editor::new(page.doc);
+        ed.viewport = v2(1024.0, 700.0);
+        ed.zoom_to_fit();
+        assert_eq!(
+            ed.frame_labels().len(),
+            30_000,
+            "every frame's name label is drawn"
+        );
+        canvas(&ed, &mut SceneCache::default(), V2::ZERO, Background::None)
+    }
+
+    /// The measured cause (run 188): this page's frame-name labels are more screen geometry
+    /// than one buffer of wgpu's WebGL2 downlevel `max_buffer_size` (256 MiB, the browser
+    /// editor's device) can hold. It was one buffer, so it was invalid and its upload panicked;
+    /// `gpu::upload` now cuts it into parts that fit (its tests), the geometry unchanged.
+    #[test]
+    fn many_root_frames_draw_more_screen_geometry_than_one_webgl2_buffer() {
+        let (v, i) = screen_bytes(&many_frames_frame());
+        assert_eq!((v, i), (270_000_160, 78_840_024));
+        assert!(v > 256 << 20, "over one buffer");
+    }
+}

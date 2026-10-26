@@ -4,6 +4,7 @@
 //! panel is closed, and the projects home screen.
 
 pub mod design_system;
+pub mod field_drafts;
 pub mod home;
 pub mod inspector;
 pub mod library;
@@ -681,6 +682,7 @@ pub fn draw(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) -> egui::Rect {
     // drawn last frame (Design chosen, panels collapsed, UI hidden): finished as losing focus
     // finishes it, as the renames are (R171 panel finding).
     design_system::begin_frame(ui.ctx(), ed);
+    field_drafts::begin_frame(ui.ctx());
     if let Some(hv) = &mut st.home {
         home::draw(ui, hv, st.native_chrome, st.translucent_sidebar);
         return egui::Rect::NOTHING;
@@ -1693,6 +1695,22 @@ pub fn file_name(draft: &str) -> Option<String> {
     ok.then(|| n.to_string())
 }
 
+/// Whether another open name field than `mine` (the Canvas name's, a Paper's or a layer's
+/// rename) has the keyboard. A name field asks for it only while none does: names taken up
+/// together from another view (run 196) would otherwise take it from each other each frame, and
+/// the one that lost it would be finished as a click elsewhere finishes it, unasked.
+fn other_name_field_focused(ctx: &egui::Context, st: &UiState, mine: egui::Id) -> bool {
+    let Some(f) = ctx.memory(|m| m.focused()).filter(|f| *f != mine) else {
+        return false;
+    };
+    let open = [
+        st.file_title_draft.is_some().then_some(st.file_title_field),
+        st.pages.renaming.is_some().then_some(st.pages.rename_field),
+        st.renaming.is_some().then_some(st.rename_field),
+    ];
+    open.into_iter().flatten().flatten().any(|id| id == f)
+}
+
 /// Finish the Canvas name's draft as losing focus does, where its field isn't drawn.
 fn finish_title_draft(st: &mut UiState) {
     if let Some(n) = st.file_title_draft.take().as_deref().and_then(file_name) {
@@ -1870,7 +1888,7 @@ fn file_title_field(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, rect: egui::
                 )
             }
         }
-    } else if !r.has_focus() {
+    } else if !r.has_focus() && !other_name_field_focused(ui.ctx(), st, r.id) {
         r.request_focus();
     }
 }
@@ -2110,6 +2128,18 @@ fn kind_icon(k: &NodeKind) -> Icon {
     }
 }
 
+/// Unfold, in the Layers tree, exactly the groups and frames that hold layer `id` (its row is
+/// then drawn), and nothing else: other folded groups stay as the person left them. A rename
+/// whose row isn't drawn is finished as losing focus does (`layers`), which a layer's name taken
+/// up from another view never may be (R86-02, run 197).
+pub fn reveal_layer(ed: &Editor, st: &mut UiState, id: NodeId) {
+    let mut parent = ed.doc.get(id).and_then(|n| n.parent);
+    while let Some(p) = parent {
+        st.collapsed.remove(&p);
+        parent = ed.doc.get(p).and_then(|n| n.parent);
+    }
+}
+
 /// Finish the inline layer rename as losing focus does: its trimmed name, if not empty and
 /// changed, as one undoable edit of the shown page's node. The rename names that node by its
 /// id in the shown document, so it is finished before another page is shown (`pages::run`).
@@ -2281,7 +2311,7 @@ fn layer_row(ui: &mut Ui, ed: &mut Editor, st: &mut UiState, id: NodeId, depth: 
         // `lost_focus` would hide Enter or a click elsewhere and the rename would never commit.
         if r.lost_focus() {
             commit_rename(ed, st);
-        } else if !r.has_focus() {
+        } else if !r.has_focus() && !other_name_field_focused(ui.ctx(), st, r.id) {
             r.request_focus();
         }
     } else {

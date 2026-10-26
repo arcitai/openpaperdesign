@@ -7,8 +7,9 @@ metadata:
 
 # openpaperdesign editor
 
-Contract updated 2026-10-17: you can edit the person's library canvases (source candidate;
-until it is qualified in Codex, check the tools are actually listed before relying on them).
+Contract updated 2026-10-24: you can edit the person's library canvases, and the same canvas
+may be open in several views (source candidate; until it is qualified in Codex, check the tools
+are actually listed before relying on them).
 
 An editable design canvas (paper-rs). The packaged plugin starts
 `openpaperdesign-mcp --app-library ${PLUGIN_DATA}`: an app-library server.
@@ -40,7 +41,14 @@ You can work on the same canvas:
 
 - `openpaperdesign_status` reports `mode: app-library`, the library folder and the open canvas.
   This server has no workspace: don't claim it can bind or edit a repository project.
-- A canvas open in another Codex window is busy; it isn't taken over.
+- The same canvas may be open in several Codex chats, panels or browser tabs: the view opened
+  last edits it, the others show it read-only (and keep what they hold, handing it over to the
+  editing view, where the person applies, continues, keeps or dismisses it; you don't).
+  Your changes count for this chat's canvas while any of its views edits. A change of yours
+  refused because another chat's view now edits the canvas changed nothing; check
+  `openpaperdesign_library_current` (`editing`), and open the canvas again here
+  (`openpaperdesign_library_open`) only if the person wants editing to move here, then read
+  the page again. Don't take editing from the person's other view on your own.
 - The person can rename the file from the editor's title. The name is saved with their next
   canvas save, so their editor counts as unsaved until then. The canvas background (none,
   dots or lines) and Home's grid or list are view preferences: never canvas content, and

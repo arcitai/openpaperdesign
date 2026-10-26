@@ -133,8 +133,20 @@ fn blend_state(key: usize) -> wgpu::BlendState {
     wgpu::BlendState { color, alpha }
 }
 
-/// (index range, world clip, blend key, image) of one cached world draw.
-type WorldDraw = (std::ops::Range<u32>, Option<Rect>, usize, Option<String>);
+/// (index range, world clip, blend key, image, buffer part) of one cached world draw.
+type WorldDraw = (
+    std::ops::Range<u32>,
+    Option<Rect>,
+    usize,
+    Option<String>,
+    usize,
+);
+
+/// What [`upload`] made: the buffer pairs, and the (input range, part, index range) pieces.
+type Uploaded = (
+    Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    Vec<(usize, usize, std::ops::Range<u32>)>,
+);
 
 struct Draw {
     range: std::ops::Range<u32>,
@@ -143,15 +155,142 @@ struct Draw {
     blend: usize,
     image: Option<String>,
     world: bool,
+    /// Which vertex/index buffer pair it draws from ([`upload`]).
+    part: usize,
 }
 
 /// Cached world-space geometry: reused while the item list is unchanged (panning, idle).
 struct WorldBuffers {
     signature: Vec<(usize, Option<[u64; 4]>, usize)>,
-    vb: Option<wgpu::Buffer>,
-    ib: Option<wgpu::Buffer>,
-    /// (index range, world clip, blend key, image) per draw.
+    /// Vertex and index buffers, one pair per part ([`upload`]).
+    parts: Vec<(wgpu::Buffer, wgpu::Buffer)>,
     draws: Vec<WorldDraw>,
+}
+
+/// One part of a triangle list cut to fit buffers ([`split_for_buffers`]): its own vertices,
+/// its indices into them, and its index ranges, each with the input range it is (part of).
+#[derive(Debug, Default, PartialEq)]
+struct SplitPart {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    ranges: Vec<(usize, std::ops::Range<u32>)>,
+}
+
+/// Triangle lists (`indices` into `vertices`, drawn as `ranges` in that order, each a whole
+/// number of triangles) cut into parts whose vertex and index data each fit one buffer of at
+/// most `max` bytes (run 188, #6: a page of 30,000 root frames drew 270,000,160 B of frame-name
+/// labels into one screen vertex buffer, over WebGL2's 256 MiB `max_buffer_size`; wgpu made that
+/// buffer invalid and `create_buffer_init` panicked, so the editor never became Ready). Only at
+/// triangle boundaries, in order: every triangle is drawn exactly as before, by the same draws
+/// (a range split across parts becomes one draw per part). A vertex used in two parts is in both.
+fn split_for_buffers(
+    vertices: &[Vertex],
+    indices: &[u32],
+    ranges: &[std::ops::Range<u32>],
+    max: u64,
+) -> Vec<SplitPart> {
+    let vmax = (max / std::mem::size_of::<Vertex>() as u64).max(3) as usize;
+    let imax = ((max / 4) as usize / 3 * 3).max(3);
+    // Where each vertex is in the current part (`seen` is that part's number).
+    let mut seen = vec![usize::MAX; vertices.len()];
+    let mut at = vec![0u32; vertices.len()];
+    let mut parts = Vec::new();
+    let mut cur = SplitPart::default();
+    for (ri, r) in ranges.iter().enumerate() {
+        let mut t = r.start as usize;
+        while t < r.end as usize {
+            let start = cur.indices.len() as u32;
+            while t + 3 <= r.end as usize {
+                let tri = &indices[t..t + 3];
+                let n = parts.len();
+                let new = tri.iter().filter(|&&v| seen[v as usize] != n).count();
+                if cur.indices.len() + 3 > imax || cur.vertices.len() + new > vmax {
+                    break;
+                }
+                for &v in tri {
+                    let v = v as usize;
+                    if seen[v] != n {
+                        seen[v] = n;
+                        at[v] = cur.vertices.len() as u32;
+                        cur.vertices.push(vertices[v]);
+                    }
+                    cur.indices.push(at[v]);
+                }
+                t += 3;
+            }
+            if cur.indices.len() as u32 > start {
+                cur.ranges.push((ri, start..cur.indices.len() as u32));
+            }
+            if t + 3 <= r.end as usize {
+                // This part is full: the rest goes on in the next.
+                parts.push(std::mem::take(&mut cur));
+            } else {
+                t = r.end as usize;
+            }
+        }
+    }
+    if !cur.indices.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// Vertex and index buffers for `vertices`/`indices` drawn as `ranges`: one pair, as before,
+/// when both fit the device's `max_buffer_size`, else one pair per [`split_for_buffers`] part.
+/// Returns the buffers and, for each input range in order, the (part, range) pieces it draws.
+fn upload(
+    device: &wgpu::Device,
+    vertices: &[Vertex],
+    indices: &[u32],
+    ranges: &[std::ops::Range<u32>],
+    labels: (&str, &str),
+) -> Uploaded {
+    let mk = |data: &[u8], usage, label| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage,
+        })
+    };
+    let pair = |v: &[Vertex], i: &[u32]| {
+        (
+            mk(
+                bytemuck::cast_slice(v),
+                wgpu::BufferUsages::VERTEX,
+                labels.0,
+            ),
+            mk(bytemuck::cast_slice(i), wgpu::BufferUsages::INDEX, labels.1),
+        )
+    };
+    if indices.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // `create_buffer_init` pads to the copy alignment: leave room for it.
+    let max = device
+        .limits()
+        .max_buffer_size
+        .saturating_sub(wgpu::COPY_BUFFER_ALIGNMENT);
+    let fits = |bytes: usize| bytes as u64 <= max;
+    if fits(std::mem::size_of_val(vertices)) && fits(std::mem::size_of_val(indices)) {
+        let pieces = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, 0, r.clone()))
+            .collect();
+        return (vec![pair(vertices, indices)], pieces);
+    }
+    let parts = split_for_buffers(vertices, indices, ranges, max);
+    let mut pieces = Vec::new();
+    for (p, part) in parts.iter().enumerate() {
+        pieces.extend(part.ranges.iter().map(|(i, r)| (*i, p, r.clone())));
+    }
+    // In each input range's order: its pieces stay in drawing order.
+    pieces.sort_by_key(|(i, p, _)| (*i, *p));
+    let buffers = parts
+        .iter()
+        .map(|part| pair(&part.vertices, &part.indices))
+        .collect();
+    (buffers, pieces)
 }
 
 pub struct CanvasRenderer {
@@ -486,7 +625,7 @@ impl CanvasRenderer {
         self.uploads += 1;
         let mut vertices: Vec<Vertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-        let mut draws: Vec<WorldDraw> = Vec::new();
+        let mut merged: Vec<WorldDraw> = Vec::new();
         for it in items {
             let bk = blend_key(it.blend);
             for p in it.pieces.iter() {
@@ -495,43 +634,34 @@ impl CanvasRenderer {
                 vertices.extend_from_slice(&p.mesh.vertices);
                 indices.extend(p.mesh.indices.iter().map(|i| i + base));
                 let end = indices.len() as u32;
-                match draws.last_mut() {
+                match merged.last_mut() {
                     Some(d)
                         if d.1 == it.clip && d.2 == bk && d.3 == p.image && d.0.end == start =>
                     {
                         d.0.end = end
                     }
-                    _ => draws.push((start..end, it.clip, bk, p.image.clone())),
+                    _ => merged.push((start..end, it.clip, bk, p.image.clone(), 0)),
                 }
             }
         }
-        let mk = |data: &[u8], usage, label| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: data,
-                usage,
+        let ranges: Vec<_> = merged.iter().map(|d| d.0.clone()).collect();
+        let (parts, pieces) = upload(
+            device,
+            &vertices,
+            &indices,
+            &ranges,
+            ("world vertices", "world indices"),
+        );
+        let draws = pieces
+            .into_iter()
+            .map(|(i, part, range)| {
+                let d = &merged[i];
+                (range, d.1, d.2, d.3.clone(), part)
             })
-        };
-        let (vb, ib) = if indices.is_empty() {
-            (None, None)
-        } else {
-            (
-                Some(mk(
-                    bytemuck::cast_slice(&vertices),
-                    wgpu::BufferUsages::VERTEX,
-                    "world vertices",
-                )),
-                Some(mk(
-                    bytemuck::cast_slice(&indices),
-                    wgpu::BufferUsages::INDEX,
-                    "world indices",
-                )),
-            )
-        };
+            .collect();
         self.world = Some(WorldBuffers {
             signature: sig,
-            vb,
-            ib,
+            parts,
             draws,
         });
     }
@@ -593,23 +723,37 @@ impl CanvasRenderer {
                     blend: 0,
                     image: None,
                     world: false,
+                    part: 0,
                 });
             }
         }
-        let sbuf = (!sidx.is_empty()).then(|| {
-            (
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("screen vertices"),
-                    contents: bytemuck::cast_slice(&sverts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("screen indices"),
-                    contents: bytemuck::cast_slice(&sidx),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-            )
-        });
+        // Usually one pair; more only when the batches outgrow one buffer ([`upload`]).
+        let ranges: Vec<_> = under.iter().chain(&over).map(|d| d.range.clone()).collect();
+        let (sbuf, pieces) = upload(
+            device,
+            &sverts,
+            &sidx,
+            &ranges,
+            ("screen vertices", "screen indices"),
+        );
+        let n_under = under.len();
+        let (mut split_under, mut split_over) = (Vec::new(), Vec::new());
+        for (i, part, range) in pieces {
+            let (src, out) = if i < n_under {
+                (&under[i], &mut split_under)
+            } else {
+                (&over[i - n_under], &mut split_over)
+            };
+            out.push(Draw {
+                range,
+                clip: src.clip,
+                blend: src.blend,
+                image: src.image.clone(),
+                world: false,
+                part,
+            });
+        }
+        let (under, over) = (split_under, split_over);
         let vp = frame.viewport;
         let to_screen = |r: &Rect| {
             Rect::new(
@@ -625,7 +769,7 @@ impl CanvasRenderer {
             .map(|w| {
                 w.draws
                     .iter()
-                    .filter_map(|(range, clip, blend, image)| {
+                    .filter_map(|(range, clip, blend, image, part)| {
                         let sc = match clip {
                             Some(c) => vp.intersection(&to_screen(c))?,
                             None => vp,
@@ -636,6 +780,7 @@ impl CanvasRenderer {
                             blend: *blend,
                             image: image.clone(),
                             world: true,
+                            part: *part,
                         })
                     })
                     .collect()
@@ -667,20 +812,13 @@ impl CanvasRenderer {
         pass.set_bind_group(1, &self.ramp_bg, &[]);
         let mut current_pipeline = usize::MAX;
         for d in under.iter().chain(&world_draws).chain(&over) {
-            let (vb, ib) = if d.world {
-                match self
-                    .world
-                    .as_ref()
-                    .and_then(|w| w.vb.as_ref().zip(w.ib.as_ref()))
-                {
-                    Some(b) => b,
-                    None => continue,
-                }
+            let pair = if d.world {
+                self.world.as_ref().and_then(|w| w.parts.get(d.part))
             } else {
-                match &sbuf {
-                    Some((v, i)) => (v, i),
-                    None => continue,
-                }
+                sbuf.get(d.part)
+            };
+            let Some((vb, ib)) = pair else {
+                continue;
             };
             let (x, y, w, h) = match d.clip {
                 Some(c) => {
@@ -845,5 +983,116 @@ impl Headless {
         );
         self.queue.submit([enc.finish()]);
         self.read(&tex)
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use std::ops::Range;
+
+    /// Every input range draws exactly its triangles, vertex for vertex and in order, from
+    /// `parts` (as `upload` orders the pieces), and every part fits `max` bytes.
+    fn assert_same_triangles(
+        vertices: &[Vertex],
+        indices: &[u32],
+        ranges: &[Range<u32>],
+        parts: &[SplitPart],
+        max: u64,
+    ) {
+        for p in parts {
+            assert!(std::mem::size_of_val(p.vertices.as_slice()) as u64 <= max);
+            assert!(std::mem::size_of_val(p.indices.as_slice()) as u64 <= max);
+            assert!(p.indices.iter().all(|&i| (i as usize) < p.vertices.len()));
+            assert!(
+                p.ranges
+                    .iter()
+                    .all(|(_, r)| r.len() % 3 == 0 && !r.is_empty())
+            );
+        }
+        let mut pieces: Vec<(usize, usize, Range<u32>)> = Vec::new();
+        for (p, part) in parts.iter().enumerate() {
+            pieces.extend(part.ranges.iter().map(|(i, r)| (*i, p, r.clone())));
+        }
+        pieces.sort_by_key(|(i, p, _)| (*i, *p));
+        let mut want = ranges
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| r.clone().map(move |k| (i, k)));
+        for (i, p, r) in pieces {
+            for k in r {
+                let (wi, wk) = want.next().expect("no more than the input");
+                assert_eq!(i, wi, "the same draw");
+                let part = &parts[p];
+                assert_eq!(
+                    part.vertices[part.indices[k as usize] as usize],
+                    vertices[indices[wk as usize] as usize]
+                );
+            }
+        }
+        assert!(want.next().is_none(), "every triangle is drawn");
+    }
+
+    fn vertex(n: u32) -> Vertex {
+        Vertex {
+            pos: [n as f32, -(n as f32)],
+            color: [1.0, 0.5, 0.25, 1.0],
+            uv: [0.0; 2],
+            kind: n,
+            _pad: 0,
+        }
+    }
+
+    #[test]
+    fn a_list_too_big_for_one_buffer_is_cut_at_triangles_and_draws_the_same() {
+        // Three draws over shared vertices (a fan, a strip, two lone triangles).
+        let vertices: Vec<Vertex> = (0..12).map(vertex).collect();
+        let indices: Vec<u32> = vec![
+            0, 1, 2, 0, 2, 3, 0, 3, 4, // fan
+            5, 6, 7, 6, 7, 8, 7, 8, 9, // strip
+            10, 11, 0, 9, 10, 11, // lone ones, reusing an early vertex
+        ];
+        let ranges = vec![0..9, 9..18, 18..24];
+        let size = std::mem::size_of::<Vertex>() as u64;
+        // Room for 5 vertices per part (and 12 indices): several parts, a draw split across two.
+        let max = 5 * size;
+        let parts = split_for_buffers(&vertices, &indices, &ranges, max);
+        assert!(parts.len() > 2, "{}", parts.len());
+        assert_same_triangles(&vertices, &indices, &ranges, &parts, max);
+        // Roomy enough for everything: one part, the draws as given.
+        let one = split_for_buffers(&vertices, &indices, &ranges, 1 << 20);
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            one[0].ranges,
+            vec![(0, 0..9), (1, 9..18), (2, 18..24)],
+            "the same draws"
+        );
+        assert_same_triangles(&vertices, &indices, &ranges, &one, 1 << 20);
+        assert!(split_for_buffers(&vertices, &[], &[], max).is_empty());
+    }
+
+    /// The lead's 30,000-frame page (run 188) as the browser editor first draws it: its screen
+    /// batches, gathered exactly as `CanvasRenderer::render` gathers them, are cut into parts
+    /// that each fit WebGL2's 256 MiB (as `upload` cuts them for that device), every triangle
+    /// drawn as before.
+    #[test]
+    fn many_root_frames_draw_through_buffers_within_the_webgl2_limit() {
+        let f = crate::render::scene::large_canvas_tests::many_frames_frame();
+        let mut vertices: Vec<Vertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut ranges = Vec::new();
+        for b in f.under.iter().chain(&f.over) {
+            let base = vertices.len() as u32;
+            let start = indices.len() as u32;
+            vertices.extend_from_slice(&b.mesh.vertices);
+            indices.extend(b.mesh.indices.iter().map(|i| i + base));
+            ranges.push(start..indices.len() as u32);
+        }
+        let max =
+            wgpu::Limits::downlevel_webgl2_defaults().max_buffer_size - wgpu::COPY_BUFFER_ALIGNMENT;
+        assert!(std::mem::size_of_val(vertices.as_slice()) as u64 > max);
+        let parts = split_for_buffers(&vertices, &indices, &ranges, max);
+        assert_eq!(parts.len(), 2);
+        assert_same_triangles(&vertices, &indices, &ranges, &parts, max);
     }
 }

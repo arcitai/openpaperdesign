@@ -139,9 +139,12 @@ static INVENTORY_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// in-panel WASM editor again, after published `home-21`; HTML and layout unchanged);
 /// `home-23` carries the editor that draws, edits and saves a text layer's bundled font family,
 /// Inter or Geist Mono (DESIGN.md revision 23; a changed in-panel WASM editor, now up to
-/// 18 MiB with the Geist Mono faces, after `home-22`; HTML and layout unchanged). No earlier
-/// URI is served.
-const HOME_URI: &str = "ui://openpaperdesign/home-23.html";
+/// 18 MiB with the Geist Mono faces, after `home-22`; HTML and layout unchanged); `home-24`
+/// carries the local multiple-view editing of issue #23 (the same canvas open in several
+/// views: the newest open edits, an earlier view shows a read-only banner with Edit here and
+/// keeps an unsaved change; a changed in-panel editor module and view HTML, after `home-23`).
+/// No earlier URI is served.
+const HOME_URI: &str = "ui://openpaperdesign/home-24.html";
 const HOME_MIME: &str = "text/html;profile=mcp-app";
 const HOME_HTML: &str = include_str!("home.html");
 /// Geist Pixel Square (SIL OFL 1.1, `assets/geist-OFL.txt`), unmodified, for the home's
@@ -325,9 +328,11 @@ struct Bound {
     editor_opened: bool,
     /// Whose admitted authority installed this binding.
     owner: Owner,
-    /// An app-library canvas: its id, and its lease. The binding owns the lease only to hold it
-    /// (it is never read): the lock is released when this binding is dropped, which every
-    /// switch and close does only after the server was retired.
+    /// An app-library canvas: its id, and its lease. The binding owns the lease's open handle
+    /// for as long as it lives (its server's `library::Editing` holds it weakly and takes its
+    /// lock around each write; see `library`, "Editing"); a lock still held then (a write whose
+    /// rollback failed) goes when this binding is dropped, which every switch and close does
+    /// only after the server was retired.
     doc: Option<String>,
     _lease: Option<Arc<crate::library::Lease>>,
     /// An app-library binding's own identity (`<canvas id>.<n>`, unique in this process), which
@@ -1098,6 +1103,19 @@ impl Launcher {
             {
                 state.workspace = Some(ws);
                 state.pinned_by = owner;
+            }
+            // A library canvas (issue #23): the new binding takes the canvas's editing while the
+            // open still holds its lease (whoever had it: the newest view edits), and the lease's
+            // lock is let go after, so other views (other processes) can open and read it. A
+            // failed claim leaves this binding read-only; its result says so (`editing`).
+            if let Some(l) = &lease {
+                if let Err(e) = server.claim(None, None).await {
+                    eprintln!(
+                        "openpaperdesign-mcp: the opened canvas couldn't take its editing: {}",
+                        e.msg
+                    );
+                }
+                l.unlock();
             }
             state.bound = Some(Bound {
                 server: server.clone(),
