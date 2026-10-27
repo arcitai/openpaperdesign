@@ -1,11 +1,12 @@
-//! ⌘K command palette: fuzzy search over every action, tool, page, layer and library item.
+//! ⌘K command palette: fuzzy search over every action, tool, page (a Paper, as people see
+//! it), layer and library item.
 
 use super::UiState;
 use crate::editor::shortcuts::{self, Action};
 use crate::editor::{Editor, Tool};
 use crate::model::NodeId;
 use crate::theme;
-use egui::{Color32, RichText};
+use egui::RichText;
 
 #[derive(Default)]
 pub struct PaletteUi {
@@ -14,6 +15,9 @@ pub struct PaletteUi {
     pub selected: usize,
     /// Focus the text field on the next frame.
     focus: bool,
+    /// The search field's widget id, as of the last frame the palette was drawn: lets a host
+    /// tell keyboard focus in this (ephemeral) search from focus in a document field.
+    pub search_id: Option<egui::Id>,
 }
 
 impl PaletteUi {
@@ -32,6 +36,8 @@ pub enum Command {
     Layer(NodeId),
     Library(String),
     ToggleLibrary,
+    /// The canvas's background pattern (a view preference, see `UiState::set_background`).
+    Background(crate::render::scene::Background),
 }
 
 pub struct Entry {
@@ -112,6 +118,7 @@ pub fn entries(ed: &Editor, st: &UiState) -> Vec<Entry> {
             Action::Boolean(crate::editor::vector_ops::BoolOp::Union),
         ),
         ("Hand-drawn style on/off", Action::ToggleSketch),
+        ("Collapse / restore panels", Action::TogglePanels),
     ] {
         if seen.insert(label.to_string()) {
             out.push(Entry {
@@ -130,10 +137,21 @@ pub fn entries(ed: &Editor, st: &UiState) -> Vec<Entry> {
         detail: String::new(),
         cmd: Command::ToggleLibrary,
     });
+    for b in crate::render::scene::Background::ALL {
+        out.push(Entry {
+            label: format!("Background: {}", b.label()),
+            detail: if st.background == b {
+                "Shown".into()
+            } else {
+                "View".into()
+            },
+            cmd: Command::Background(b),
+        });
+    }
     for (i, p) in ed.pages.iter().enumerate() {
         out.push(Entry {
-            label: format!("Go to page: {}", p.name),
-            detail: "Page".into(),
+            label: format!("Go to Paper: {}", p.name),
+            detail: "Paper".into(),
             cmd: Command::Page(i),
         });
     }
@@ -190,6 +208,7 @@ pub fn run(ed: &mut Editor, st: &mut UiState, cmd: Command) {
             }
         }
         Command::ToggleLibrary => st.show_library = !st.show_library,
+        Command::Background(b) => st.set_background(b),
     }
 }
 
@@ -238,11 +257,12 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
                     ui.set_width(width);
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.palette.query)
-                            .hint_text("Search actions, tools, pages, layers…")
+                            .hint_text("Search actions, tools, Papers, layers…")
                             .font(egui::FontId::proportional(15.0))
                             .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY),
                     );
+                    st.palette.search_id = Some(r.id);
                     if st.palette.focus {
                         r.request_focus();
                         st.palette.focus = false;
@@ -257,33 +277,31 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
                             for (i, e) in results.iter().enumerate().take(60) {
                                 let sel = i == st.palette.selected;
                                 let (row, resp) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), 26.0),
+                                    egui::vec2(ui.available_width(), 28.0),
                                     egui::Sense::click(),
                                 );
+                                // The chosen row is the selection tint, as a selected layer row
+                                // and the current tool are; its text keeps the text colour.
                                 if sel {
-                                    ui.painter().rect_filled(row, 6.0, theme::accent());
+                                    let fill = theme::selected_fill(ui);
+                                    ui.painter().rect_filled(row, theme::RADIUS, fill);
                                     ui.scroll_to_rect(row, None);
                                 } else if resp.hovered() {
-                                    ui.painter().rect_filled(row, 6.0, p.hover);
+                                    ui.painter().rect_filled(row, theme::RADIUS, p.hover);
                                 }
-                                let fg = if sel { Color32::WHITE } else { p.text };
                                 ui.painter().text(
                                     egui::pos2(row.left() + 10.0, row.center().y),
                                     egui::Align2::LEFT_CENTER,
                                     &e.label,
                                     egui::FontId::proportional(theme::BODY),
-                                    fg,
+                                    p.text,
                                 );
                                 ui.painter().text(
                                     egui::pos2(row.right() - 10.0, row.center().y),
                                     egui::Align2::RIGHT_CENTER,
                                     &e.detail,
-                                    egui::FontId::proportional(theme::SECONDARY),
-                                    if sel {
-                                        Color32::from_white_alpha(200)
-                                    } else {
-                                        p.secondary
-                                    },
+                                    theme::medium(theme::SECONDARY),
+                                    p.secondary,
                                 );
                                 if resp.clicked() {
                                     chosen = Some(e.cmd.clone());
@@ -297,6 +315,9 @@ pub fn draw(ctx: &egui::Context, ed: &mut Editor, st: &mut UiState, canvas: egui
         });
     if let Some(c) = chosen {
         st.palette.open = false;
+        // A command may show another page (Go to page, or an action that does): open fields
+        // are finished first on the page they belong to, as for the pages panel's actions.
+        super::pages::finish_fields(ctx, ed, st);
         run(ed, st, c);
     }
 }

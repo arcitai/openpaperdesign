@@ -352,6 +352,7 @@ fn convert(elements: &[Value], files: Option<&Value>) -> Imported {
                             route,
                             start_head: sh,
                             end_head: eh,
+                            label: None,
                         },
                         b,
                     );

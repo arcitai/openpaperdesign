@@ -81,9 +81,24 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor, st: &mut UiState) {
                 .first()
                 .and_then(|id| ed.doc.get(*id))
                 .map_or("Item".to_string(), |n| n.name.clone());
-            if let Some(item) = LibItem::from_selection(&ed.doc, &ids, &name) {
-                lib.library.items.push(item);
-                lib.dirty = true;
+            match LibItem::from_selection(&ed.doc, &ids, &name) {
+                // Refused before the library changes (see `library::LABELS_REFUSED` and
+                // `FAMILIES_REFUSED`).
+                Some(item) if item.refusal().is_some() => {
+                    ed.status = item.refusal().unwrap_or_default().into();
+                }
+                Some(item) => {
+                    lib.library.items.push(item);
+                    lib.dirty = true;
+                    // This Add succeeded: its own earlier refusal, if still shown, no longer
+                    // holds. Any other or newer note stays.
+                    if ed.status == crate::library::LABELS_REFUSED
+                        || ed.status == crate::library::FAMILIES_REFUSED
+                    {
+                        ed.status.clear();
+                    }
+                }
+                None => {}
             }
         }
     });
