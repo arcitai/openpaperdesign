@@ -1,6 +1,7 @@
 # OpenPaperDesign — product design direction
 
-Revision: 24 · 2026-10-25 · The one canonical visual and interaction direction for the OPD app
+Revision: 24 · 2026-10-25 (its issue #23 leaving/closing text corrected 2026-10-26, runs
+198–206) · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
 rendering, document model), which stays valid and is not repeated here. This file is the
@@ -211,6 +212,20 @@ the one set of files in the library: no copy, no second store, no cloud.
   it has: it hasn't answered yet (it may be hidden, asleep or disconnected, and answers when it
   runs again; if its window ended, anything unsaved there is gone)", with **Stop waiting**. One
   that closed without answering is said to have closed. Whatever it sends later still arrives.
+  A view that closed normally (Home, its tab closed, or its whole window's Close) is recorded
+  as gone, and then never waited for: there is nothing it could still hand over. If another
+  window is holding the canvas just then, the leaving or closing waits for it rather than give
+  up. If recording it fails (a disk error, also one only reading the records, or a record
+  already listing as many waited-for views as it can hold, where nothing is removed to make
+  room), the view says so as it closes,
+  already while the close is still under way, and the library again with the close's answer, as it came (also
+  when the release or close wasn't confirmed, or was refused). That OpenPaperDesign then keeps
+  the canvas until it can record it, also after the canvas was closed there: it tries again
+  whenever it next lists or opens canvases, and as it ends. Meanwhile no other window can take
+  the editing or change the canvas, and a view that was waiting for it says that nothing can be
+  handed over right now, rather than that the view may still answer. A view whose window ended
+  without closing (a crash), or a failure that persists until that OpenPaperDesign ends, can't
+  be told apart from a hidden one, and is waited for until Stop waiting.
 - **Nothing is lost or overwritten.** A change in a read-only view also stays there, on screen,
   unsaved, with its undo history. A save already under way finishes first (the new view waits
   for it, at most about a second, and loads it). Edit here takes the editing back (and takes
@@ -218,7 +233,8 @@ the one set of files in the library: no copy, no second store, no cloud.
   meanwhile, so a change made in the other view is a conflict (its banner comes back), never
   overwritten. Leaving a read-only view with an unsaved change asks first, as for a conflict.
   Applying a handed-over change says what was saved, also if tidying up after it failed. A
-  write that couldn't be undone keeps the canvas locked to that window until it closes.
+  write that couldn't be undone keeps the canvas locked to that OpenPaperDesign until it is
+  restarted, also after the canvas was closed there.
 - **Closing is safe.** Closing a view that isn't editing never takes the editing from the one
   that is. An agent of a chat whose canvas another chat now edits is told its change was
   refused, unwritten, and how to edit there again; it never takes the editing on its own.

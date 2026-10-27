@@ -331,9 +331,12 @@ fn tools() -> Vec<Value> {
     let doc = |props: Value, required: &[&str]| json!({"type": "object", "properties": props, "required": required, "additionalProperties": false});
     vec![
         json!({"name": LIST, "_meta": app, "inputSchema": none,
-            "description": "For the home view: the canvases in OpenPaperDesign's app library \
-                (read-only: nothing is created, opened or locked), and the views' kept \
-                appearance."}),
+            "description": "For the home view: the canvases in OpenPaperDesign's app library, \
+                and the views' kept appearance. It creates, opens or locks no canvas and never \
+                changes a drawing. Before listing, it finishes this window's own bookkeeping of \
+                canvases it closed while their editing and handover records couldn't be \
+                written: it writes those two records then, and lets go of a canvas it kept \
+                locked for that (`cleanup` in the result)."}),
         json!({"name": APPEARANCE, "_meta": app,
             "description": "For the home view: keep the views' appearance (system follows the \
                 OS; light or dark override it). A view preference in the library's own folder: \
@@ -605,7 +608,9 @@ impl Launcher {
                 let state = self.state.lock().await;
                 let open = state.bound.as_ref().and_then(|b| b.doc.clone());
                 drop(state);
-                let mut listed = lib.list(open.as_deref())?;
+                // What a binding that ended here still owes is recorded first (R92-01), and
+                // the result says so (`cleanup`, R93-02).
+                let mut listed = lib.list_settling(open.as_deref())?;
                 // Read-only too: a missing or unknown preference is System, and nothing is made.
                 listed["appearance"] = json!(lib.appearance());
                 // Likewise the other view preferences (their defaults: grid, no background).
@@ -869,7 +874,9 @@ impl Launcher {
         lib.read_document(id)
             .map_err(|e| format!("This canvas can't be opened: {e}. Nothing was changed."))?;
         // A canvas whose earlier write here couldn't be undone is never opened writable again in
-        // this process (its lease is kept, so other processes get "busy").
+        // this process (its lease is kept, so other processes get "busy"); nor one a binding that
+        // ended here still keeps locked, once what it owes is tried again (R92-01).
+        lib.settle_owed();
         lib.refuse_if_broken(id)
             .map_err(|e| format!("This canvas can't be opened: {e}. Nothing was changed."))?;
         library_switch(&state, force, replace)?;
@@ -948,21 +955,31 @@ impl Launcher {
         if editors_in_use(b) && !force {
             return Err(CLOSE_NEEDS_FORCE.into());
         }
-        tokio::spawn(async move {
+        // The binding's end records that its views ended (waiting for another window's lease if
+        // it must: `Server::retire`); what of that didn't happen goes with the answer (`cleanup`,
+        // run 202, R91-01). Closed either way: its admission ended for good.
+        let cleanup = tokio::spawn(async move {
             let mut state = state;
+            let mut cleanup = None;
             if let Some(b) = state.bound.as_ref() {
                 b.server.retire().await;
+                cleanup = b.server.retirement_outcome();
             }
             state.bound = None;
+            cleanup
         })
         .await
         .map_err(|e| format!("closing stopped unexpectedly: {e}"))?;
-        text(json!({
+        let mut out = json!({
             "action": "closed",
             "canvas": {"id": doc},
             "note": "The canvas's editor server was stopped. Everything saved before this is in \
                 the library; an edit still unsaved in a browser tab was not saved by closing.",
-        }))
+        });
+        if let Some(c) = cleanup {
+            out["cleanup"] = c;
+        }
+        text(out)
     }
 
     /// The open canvas as last saved, as a canvas file. The snapshot is taken under its lease
@@ -1023,7 +1040,9 @@ impl Launcher {
                 lib.read_document(id).map_err(|e| {
                     format!("This canvas can't be exported: {e}. Nothing was exported.")
                 })?;
-                // Its files may be inconsistent: not offered as a canvas file.
+                // Its files may be inconsistent: not offered as a canvas file. (What a binding
+                // that ended here still owes is recorded first: R92-01.)
+                lib.settle_owed();
                 lib.refuse_if_broken(id)
                     .map_err(|e| format!("Not exported: {e}. Nothing was exported."))?;
                 // A canvas open in other views is read as last saved, as here (issue #23).
@@ -1072,7 +1091,8 @@ impl Launcher {
                     format!("This canvas can't be renamed: {e}. Nothing was changed.")
                 })?;
                 // A canvas fenced here keeps its lease, so this comes first: its reason, not
-                // "busy".
+                // "busy". (What a binding that ended here still owes is recorded first: R92-01.)
+                lib.settle_owed();
                 lib.refuse_if_broken(id)
                     .map_err(|e| format!("Not renamed: {e}. Nothing was changed."))?;
                 let lease = match Lease::acquire_within(lib, id).await {
@@ -1382,12 +1402,17 @@ impl Launcher {
                 })
             };
             // Without the state lock: a save of this editor that had already started finishes
-            // its commit or rollback before the release is acknowledged. The binding stays. A
-            // handover this mount still owed is marked ended (it left without answering).
+            // its commit or rollback before the release is acknowledged. The binding stays. Its
+            // record cleanup follows (it never edits or is waited for again); what of that
+            // didn't complete is said (`note`, `cleanup_status`: R89-01), never a refusal.
             if let Some(server) = &released {
                 server.drain_writer().await;
-                if let Some(m) = mount {
-                    server.release_view(&format!("m{m}")).await;
+                if let Some(m) = mount
+                    && let Err(e) = server.release_view(&format!("m{m}")).await
+                {
+                    let mut out = crate::release_outcome(&e);
+                    out["binding"] = json!(binding);
+                    return text(out);
                 }
             }
             return text(json!({"binding": binding, "released": released.is_some()}));

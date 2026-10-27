@@ -638,14 +638,23 @@ export function opdMountEditor(opts) {
             progress.waiting.map(describe).join(', ')} (once what is being typed is finished or `
           + 'cancelled)' : ''}. `, actions]);
       }
+      // The canvas held right now (R91-02, run 202: a change under way, or a window keeping it
+      // until it records that a view of it left): nothing can be handed over meanwhile, and
+      // whether that view will still answer can't be told from here.
+      const held = Boolean(session.state.handover && session.state.handover.held);
       for (const p of waiting) {
         rows.push(p.ended
           ? ['The view that was editing before closed without handing anything over; what it had '
             + 'unsaved, if anything, is gone with it. ', [['OK', step('stop', p.id)]]]
-          : ['Waiting for the view that was editing before to hand over what it has: it hasn\'t '
-            + 'answered yet (it may be hidden, asleep or disconnected, and answers when it runs '
-            + 'again; if its window ended, anything unsaved there is gone). ',
-          [['Stop waiting', step('stop', p.id)]]]);
+          : held
+            ? ['Waiting for the view that was editing before: nothing can be handed over right now, '
+              + 'because another OpenPaperDesign window holds this canvas (a change under way, or a '
+              + 'window keeping it until it records that a view of it left), so it can\'t be told '
+              + 'from here whether that view will still answer. ', [['Stop waiting', step('stop', p.id)]]]
+            : ['Waiting for the view that was editing before to hand over what it has: it hasn\'t '
+              + 'answered yet (it may be hidden, asleep or disconnected, and answers when it runs '
+              + 'again; if its window ended, anything unsaved there is gone). ',
+            [['Stop waiting', step('stop', p.id)]]]);
       }
       banner('handover', '', [], rows);
     },

@@ -177,10 +177,37 @@ export function opdCreatePanel(opts) {
     wanting.add(h);
     const live = () => !h.left;
     const say = (text, error) => { if (live() && onStatus) onStatus(text, Boolean(error)); };
+    // What its release came to, for whoever stays to say it (the view's Home: this editor is
+    // gone by then). Null: confirmed, recorded completely. Otherwise `{ kind, note, status }`
+    // (R90-02, R91-03 run 202): 'partial', released but recording that it left didn't complete
+    // (the server's note; `status` that condition's); 'unconfirmed', no answer it can read (no
+    // answer in time, Codex didn't run it, or an answer it can't read: it may still be under
+    // way, e.g. waiting for another window's hold of the canvas); 'refused', the server's own
+    // refusal (its `status`). Asked once: a release isn't sent again.
     const release = async () => {
-      if (h.mount === null || h.released) return;
+      if (h.mount === null || h.released) return null;
       h.released = true;
-      await call(P.RELEASE, { binding, mount: h.mount }, 5000).catch(() => {});
+      let r;
+      try {
+        r = await call(P.RELEASE, { binding, mount: h.mount }, 5000);
+      } catch (e) {
+        r = { fail: 'Codex didn\'t run the request (' + String((e && e.message) || e) + ')', unknown: true };
+      }
+      const v = r && r.ok;
+      if (v) {
+        return typeof v.note === 'string'
+          ? { kind: 'partial', note: v.note, status: Number.isInteger(v.cleanup_status) ? v.cleanup_status : 0 }
+          : null;
+      }
+      if (r && r.refused) {
+        return { kind: 'refused', note: 'Letting this editor go was refused: ' + String(r.refused.error || 'refused'),
+          status: Number.isInteger(r.refused.status) ? r.refused.status : 0 };
+      }
+      return { kind: 'unconfirmed',
+        note: 'Codex didn\'t confirm letting this editor go (' + String((r && r.fail) || 'no answer')
+          + '), so it isn\'t known whether that, and recording that it left, completed; it may still '
+          + 'be under way. Closing the file waits for it.',
+        status: 0 };
     };
     // A canvas answer for this view: its binding, a revision, the active page and at least one
     // page, each with its id, name and page file as text.
@@ -362,12 +389,13 @@ export function opdCreatePanel(opts) {
       if (h.mounted && h.mounted.setBackground) h.mounted.setBackground(b);
     };
     // For good: the mount is undone and the server told this editor is gone. Saves nothing.
+    // Returns what of recording that it left didn't complete (`release`), else null.
     h.dispose = async () => {
-      if (h.left) return;
+      if (h.left) return null;
       h.left = true;
       wanting.delete(h);
       if (h.mounted) h.mounted.dispose();
-      await release();
+      return release();
     };
     return h;
   }

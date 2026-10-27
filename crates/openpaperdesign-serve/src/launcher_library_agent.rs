@@ -86,11 +86,17 @@ pub(super) fn agent_tools() -> Vec<Value> {
     let id = json!({"type": "string", "pattern": "^[0-9a-f]{16}$",
         "description": "A canvas id from openpaperdesign_library_canvases."});
     let mut out = vec![
+        // Not read-only (R93-02, run 204): it may first write this window's own ownership
+        // records of canvases it closed (`Library::list_settling`), never a drawing.
         json!({"name": AGENT_LIST, "inputSchema": none,
-            "annotations": {"readOnlyHint": true},
+            "annotations": {"readOnlyHint": false, "destructiveHint": false},
             "description": "List the canvases in OpenPaperDesign's app library (the ones the \
-                person sees in the OpenPaperDesign home), and which one is open here. \
-                Read-only: nothing is created, opened or locked."}),
+                person sees in the OpenPaperDesign home), and which one is open here. It \
+                creates, opens or locks no canvas and never changes a drawing. Before listing, \
+                it finishes this window's own bookkeeping of canvases it closed while their \
+                editing and handover records couldn't be written: it writes those two records \
+                then, and lets go of a canvas it kept locked for that (`cleanup` in the result \
+                says which, and any it still can't record)."}),
         json!({"name": AGENT_CURRENT, "inputSchema": none,
             "annotations": {"readOnlyHint": true},
             "description": "The canvas open in this OpenPaperDesign window: its id, name, \
@@ -201,7 +207,9 @@ impl Launcher {
                     .bound
                     .as_ref()
                     .and_then(|b| b.doc.clone());
-                text(lib.list(open.as_deref())?)
+                // What a binding that ended here still owes is recorded first (R92-01), and
+                // the result says so (`cleanup`, R93-02).
+                text(lib.list_settling(open.as_deref())?)
             }
             AGENT_CURRENT => {
                 let state = self.state.clone().lock_owned().await;

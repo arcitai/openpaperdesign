@@ -330,9 +330,10 @@ struct Bound {
     owner: Owner,
     /// An app-library canvas: its id, and its lease. The binding owns the lease's open handle
     /// for as long as it lives (its server's `library::Editing` holds it weakly and takes its
-    /// lock around each write; see `library`, "Editing"); a lock still held then (a write whose
-    /// rollback failed) goes when this binding is dropped, which every switch and close does
-    /// only after the server was retired.
+    /// lock around each write; see `library`, "Editing"). Every switch and close drops it only
+    /// after the server was retired; a lock that retirement left held (its records still say a
+    /// view of it may answer, or its writes are fenced) then stays with the library, not this
+    /// binding (`library::Editing::outlive`, R92-01), until recorded or this process ends.
     doc: Option<String>,
     _lease: Option<Arc<crate::library::Lease>>,
     /// An app-library binding's own identity (`<canvas id>.<n>`, unique in this process), which
@@ -963,6 +964,7 @@ impl Launcher {
     /// the state, leaves it running, so the lease is still kept until the drain is done.
     fn begin_shutdown(&self) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
+        let library = self.library.clone();
         tokio::spawn(async move {
             let mut state = state.lock_owned().await;
             state.shut_down = true;
@@ -970,6 +972,13 @@ impl Launcher {
                 b.server.retire().await;
             }
             state.bound = None;
+            // A binding that ended here and still keeps its canvas locked (its records say a view
+            // of it may answer: `library::Library::owed`, R92-01) tries once more to record that
+            // its views left, as this process ends. What still can't be recorded then goes with
+            // the process, as after a crash.
+            if let Some(lib) = library {
+                lib.settle_owed();
+            }
         })
     }
 

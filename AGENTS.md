@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 0.96 · Updated: 2026-10-24
+Revision: 1.01 · Updated: 2026-10-27 (issue #23 release/close/handover outcomes, runs 198–206)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1338,7 +1338,8 @@ per-id lease: `File::try_lock` on a regular single-link lock file, taken before
 count, library folders) by a guard on every browser and MCP access; a failed check fences that
 canvas for good, and the next action retires it. Lock files are never removed, truncated or
 replaced, and never exported. The lease's handle moves into the binding and is dropped only after
-retirement drained it, also at the normal end of the service: when stdio closes or the service
+retirement drained it (or, when that retirement left it locked, kept by the library past the
+binding: `Library::owed`, below), also at the normal end of the service: when stdio closes or the service
 fails, `main` runs `Launcher::shutdown`, which refuses any later create/bind/install and retires
 the final binding (started writer and rollback drained, queued and late writers refused) in an
 owned task spawned before any wait, even for the state lock, before its lease drops (both
@@ -1351,7 +1352,8 @@ an open (until its binding claimed the editing), each write (revision check, com
 reload to its commit), a whole-canvas snapshot read (shared), a rename or export of a canvas not
 open here, and a claim or release; each wait is bounded (one second), and only a longer hold
 (a long save, a kept `Broken` lease, an older OpenPaperDesign holding it for its binding's life)
-is busy. `locks/<id>.editor` names the one view that may write: `<token>:<view>` (a random
+is busy, except a view's release or a binding's end, which then wait for it with no bound (see
+below, runs 201–202). `locks/<id>.editor` names the one view that may write: `<token>:<view>` (a random
 editing identity per binding, since binding ids are per process, and the view: panel mount
 `m<n>`, browser tab `t<n>` from `POST /api/view`, sent back as `X-OPD-View`), or `<token>` alone
 between a binding's open and its first view. An open, create or import claims it for the
@@ -1525,7 +1527,100 @@ its own revision and base: after a newer save it is refused, still listed). A fi
 taken up but never shown can be continued again (`fieldOutcome`),
 and the page gives the keyboard back to its own mount's canvas after a continuation
 (`ui.focusEditor`, never for a disposed mount or replaced editor). Released mounts and tabs mark
-their pending entry ended. Claim outcomes are typed, the same over `POST /api/claim` and the
+their pending entry ended; one that edits when it is released also leaves the editing record
+naming only its binding (`<token>`, as before any view opened: its agent still acts; no view
+edits until one takes it), so the next claim waits for nobody (`Editing::release_view`, run 198:
+the parent's actual197 Home then same-canvas reopen otherwise waited, with no end, for the
+released m2). A record naming another view or binding is left as it is; the write is the
+checked record change (put back on failure, `Broken` if that fails too). The release says
+what of this cleanup didn't happen (R89-01, run 199): the view is released for good, so the
+panel's `_app_page_release` answers `released: true` with `note` and `cleanup_status` (`500` a
+write put back, `503` the lease busy or `Broken` with the record named, `403` a record or the
+canvas unreadable) and `POST /api/view/release` answers `200` with the same JSON instead of
+`204`; never a plain success, never a refusal. Home says that note on the library once the
+editor is gone (panel.js `dispose` returns it; home.html `closeAndGoHome`, with the close's own
+answer: R90-02, run 200); a browser tab's page is gone by then (its pagehide release can't
+show anything), and what it leaves is what the next views read below. The cleanup is owed from
+the release on (`Editing::depart`, before any check) and kept with the binding
+(`Editing::departed`) until done (R90, run 200): if the editing record can't be rewritten (put
+back), the handover record notes that the view left (an ended pending entry for it), which
+every claim of every binding reads, so none waits for it while this window stays idle. If a
+record write that would say it left is put back (the editing record and its note, or ending a
+wait already there: run 202, R91-02), this window keeps the canvas locked (`Lease::kept`,
+recoverable: nothing is either version, so not `Broken`), so no other window can take the
+editing or change the canvas while the record still says that view may answer, and every view
+of the canvas is told it is held (`Editing::handover` `held`, read on a handle of its own; the
+waiting banner then says nothing can be handed over right now and that whether the view will
+still answer can't be told from here, editor.js); it tries again at this binding's next change,
+check or close, and lets the lease go once it is recorded. A binding's end does the same for
+every view of it (R92-01, run 203; `Editing::release`): if the editing record can't be cleared
+(put back), the same handover write that ends its waits adds an ended entry for the view that
+record still names, so no claim waits for it; if that handover write is put back too, the lease
+stays kept, and the library, not the ended binding, holds it (`Editing::outlive`,
+`Library::owed`; Close, a canvas switch and the end of the service alike), so the other windows
+are still told the canvas is held and none takes the editing or changes it. That end is tried
+again, without waiting (this process holds the lock), whenever this process next lists, opens,
+renames or exports a canvas (`Library::settle_owed`, from the launcher) and once more as it ends
+(`Launcher::shutdown`), never by a timer, and the lease goes once it is recorded; this process
+doesn't open that canvas again meanwhile (the open says why). A note that is needed where the
+handover record already lists its most views (16, `MAX_PENDING`) is no exception (R93-01, run
+204; `no_room`, for a view's release and a binding's end alike): it isn't written, nothing is
+removed to make room, and it is handled as a write put back (`500`, the lease kept, retried as
+above), never said to be safe, since a claim that first removes its own entry would then have
+room to wait for the view; the retry succeeds once the editing record can be cleared, which needs
+no note. Nor is an editing record that couldn't be read (R94-01, run 205; an I/O error other than
+NotFound, at a view's release or a binding's end): whether it still names a view of the binding
+isn't known, so the lease is kept and retried the same way, the cause said as it is (`Failed`,
+`403`, not a put-back `500` or a fence `503`); nothing is inferred from it, nor written over it
+unread. The same holds for a handover record that couldn't be read (LEAD205-01, run 206): only
+one that was seen and isn't usable (not a plain file, too large, a form this version doesn't
+read: `ReadError::Unusable`, which every claim leaves as it is and waits on nothing in) is left
+as it is and done with; one whose read failed with an I/O error (`ReadError::Unread`, from the
+error kinds of `plain_seen` and the read, never from a message) may well read later, entries and
+all, so the lease is kept and retried, `Failed` (`403`). The public lists (the home's `_app_canvases` and the model's
+`openpaperdesign_library_canvases`) run that retry first (`Library::list_settling`): they write
+those ownership records and may let go of a kept canvas, never a drawing, and say so in their
+tool descriptions (the model's is not marked read-only), their `note` and their `cleanup`, one
+entry per such canvas (`canvas`, `done`, `note`: recorded and let go, or still kept, with why;
+R93-02). A record that may be either version
+(a put-back that failed) still fences the server (`Broken`, named) and keeps the lease, past the
+binding too (until this process ends; no further write). What
+is owed is done first under the binding's next hold of the lease: `lock_write` refuses the
+operation that would rely on the editing record (with that failure's own status) until the
+departure is at least noted, a fence established there stops everything after it, and the
+first failure stops the rest (no later fence hides behind it); a poll of the binding's views
+records an unnoted one too if the writer fence and the lease are free without waiting
+(`settle_departures`). A release or a binding's end (Close, a canvas switch, shutdown) whose
+lease another window holds past the bounded wait is never answered as busy (runs 201–202, R90-01,
+R91-01): it stays under way, waiting once on the lease itself off the executor (a release with
+its binding's writer fence moved along: `Server::release_view` → `spawn_blocking` →
+`Editing::release_view_waiting`; an end after its admission closed: `Server::retire` →
+`Editing::release_waiting`; `Lease::lock_wait`, no retry, timer or task beyond it), and records
+that its views left once it has the lease. Meanwhile no other window can take the editing (it
+needs the same lease) and this window's own writes and close wait behind it. When that window
+lets the lease go, whichever takes it first goes first (no fairness is promised): a claim that
+gets there before this cleanup can create a wait for the view, which this cleanup then ends,
+before it answers; until then that view's banner may show it as waited for. If that window holds
+the lease for its whole life (a fenced one, or an older OpenPaperDesign; neither can add a wait
+to this version's record), the release or end stays under way until it lets the canvas go (the
+panel's release call doesn't wait that long: Home says it wasn't confirmed). What an end didn't
+record is kept typed (`Editing::retirement`, a later fence over an earlier record put back)
+and goes with the Close's answer (`cleanup`, the note and its status; Home says it); a release
+after it is told that, never that cleanup completed. The panel's release returns what it came
+to (`dispose`: `partial`, `unconfirmed` for no answer or an error, `refused` with the server's
+own refusal; R91-03). Home shows it as soon as that departure's one Close is sent, while the
+Close is still unanswered (R92-02, run 203: the editor view is still what is shown, so on its
+own alert and status, `edReason`; nothing there sends a second release or close), then on the
+library with the Close's own answer, its `cleanup` or the unconfirmed-close message after
+Home's 60 s wait; a newer view meanwhile is left alone (`owns`, and a newer editor clears the
+alert). A late answer to a release that timed out isn't delivered (Home's request has gone),
+so that state stays unconfirmed. Limits: a write that keeps failing until this process ends
+can't be recorded by it: the kept lease then goes with the process, and the records are as
+after a crash (said in `cleanup` meanwhile); while it is kept, the other windows can't edit
+that canvas at all. A view that ended without its release (a crashed or killed host) still
+leaves its record, which the next claim waits for until Stop waiting: nothing tells it apart
+from a hidden or disconnected view.
+Claim outcomes are typed, the same over `POST /api/claim` and the
 panel's `_app_claim` (`Server::claim_within`, `edit_refusal`, `api_refusal`): `200` taken (with
 `note` when its handover bookkeeping failed after the editor record was committed: it is taken;
 a `Broken` fence then is in the note too; the note never promises that a handover still
@@ -1543,8 +1638,9 @@ format-2 record is its `403`. Record changes are checked transactions (R78-06,
 (`Broken`, naming the record). A `Broken` write's hold poisons the lease (R78-02,
 `Lease::poison`): its exclusive lock stays for the handle's life; later shared reads read under
 it and no unlock, claim or record change frees it. Retirement clears the record only if it names
-that binding (a non-editor's close takes nothing). An abnormal process end leaves a record naming
-nobody live; nothing waits for it. Rename from the list refuses a canvas whose record names any
+that binding (a non-editor's close takes nothing). An abnormal process end (no release, no
+end) leaves its record as it was, naming a binding or view nobody can tell is gone, which the
+next claim waits for until Stop waiting. Rename from the list refuses a canvas whose record names any
 editor (open it here first); export by id reads it under its lease as last saved.
 Create/import write through the checked commit with every new folder's parent synced, finish
 preparation before the old binding retires, run in an owned task, remove only what is still

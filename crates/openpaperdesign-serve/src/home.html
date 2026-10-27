@@ -1703,6 +1703,8 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   // editor is still let go (released) before any Close, as before.
   const departure = () => Object.freeze({ g: gen, h: panelHandle, binding: panelBinding });
   const owns = (d) => d.g === gen;
+  // What its editor's release said didn't complete (`disposePanel`), by departure.
+  const releasedBy = new WeakMap();
 
   // The editor is let go only when nothing in it is left unsaved (Session.drain): input and
   // polling stop, a save under way finishes and what is left is saved. Otherwise it stays, says
@@ -1744,18 +1746,21 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
       announce(why);
       return false;
     }
-    await disposePanel(h);
+    releasedBy.set(d, await disposePanel(h));
     return owns(d);
   }
 
   // For good: editor `h` is undone (nothing more is saved from it) and the server told so (its
-  // mount released). Only `h`: a newer editor mounted meanwhile stays as it is.
+  // mount released). Only `h`: a newer editor mounted meanwhile stays as it is. Returns what of
+  // recording that it left didn't complete (`{ note, status }`, R90-02), for the library to say
+  // once it shows (the editor is gone by then), else null.
   async function disposePanel(h) {
-    if (!h) return;
+    if (!h) return null;
     if (panelHandle === h) panelHandle = null;
     // A departure still waiting for this editor's drain no longer holds the view.
     if (leavingFrom === h) leavingFrom = null;
-    await h.dispose();
+    const left = await h.dispose();
+    return left && typeof left.note === 'string' ? left : null;
   }
 
   // Home: once the editor was saved and let go, exactly the binding it edited is closed (not
@@ -1770,7 +1775,7 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   $('ed-leave').onclick = async () => {
     if (!panelHandle || leavingFrom === panelHandle) return;
     const d = departure();
-    await disposePanel(d.h);
+    releasedBy.set(d, await disposePanel(d.h));
     if (owns(d)) closeAndGoHome(d);
   };
   $('ed-home').onclick = editorBack;
@@ -1781,16 +1786,42 @@ const opdCreatePanel = null; // __OPD_PANEL_MODULE__
   async function closeAndGoHome(d) {
     if (!owns(d)) return;
     if (panelBinding === d.binding) panelBinding = null;
-    if (!d.binding) return goHome();
-    const r = await act('openpaperdesign_app_close', { binding: d.binding }, 'Closing the file');
+    // What the editor's release came to when it wasn't simply done (R90-02, R91-03: recording
+    // that it left didn't complete, it wasn't confirmed, or it was refused), as it came (its
+    // reason, the records named, what follows): shown while the close is under way, then said
+    // first on the library with the close's answer.
+    const released = releasedBy.get(d);
+    const left = released && released.note ? String(released.note).slice(0, 900) : '';
+    const say = (text) => { notice(text); announce(text); };
+    if (!d.binding) {
+      goHome();
+      if (left) say(left);
+      return;
+    }
+    const closing = act('openpaperdesign_app_close', { binding: d.binding }, 'Closing the file');
+    // Said already while that close is under way (R92-02): the editor view is what is shown
+    // until it answers (the library's notice isn't), so on the editor's own alert and status.
+    // This departure's only: a newer editor clears it (`openPanel`), and nothing there sends
+    // anything more (the editor is gone; Leave and Back do nothing without it).
+    if (left && owns(d) && view === 'editor' && !panelHandle) {
+      hideAlert();
+      edReason(left);
+    }
+    const r = await closing;
     if (!r || !owns(d)) return;
     goHome();
-    if (r.ok && r.ok.action === 'closed') return;
+    if (r.ok && r.ok.action === 'closed') {
+      // Closed; what its end didn't record goes with it (R91-01: `cleanup`).
+      const c = r.ok.cleanup && typeof r.ok.cleanup.note === 'string'
+        ? String(r.ok.cleanup.note).slice(0, 900) : '';
+      const all = [left, c].filter(Boolean).join(' ');
+      if (all) say(all);
+      return;
+    }
     const said = r.refused
       ? 'The file stays open in this window: ' + String(r.refused).split('\n')[0].slice(0, 300)
       : 'Codex didn\'t confirm closing the file, so it may still be open in this window.';
-    notice(said);
-    announce(said);
+    say(left ? left + ' ' + said : said);
   }
 
   // The host is about to remove this view: the same leaving path, for as long as the host

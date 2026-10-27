@@ -1795,7 +1795,9 @@ function fakePanel() {
           started: new Promise((resolve, reject) => { settle = { resolve, reject }; }),
           drain: async () => { log.push('drain'); if (h.drainGate) await h.drainGate; return h.nextDrain; },
           resume: () => { log.push('resume'); },
-          dispose: async () => { log.push('dispose'); },
+          // What its release said didn't complete (panel.js `dispose`), if a test sets it.
+          released: null,
+          dispose: async () => { log.push('dispose'); return h.released; },
           // A kept preference the view learned late (panel.js `setAppearance`), recorded.
           kept: [],
           setAppearance: (a) => { h.kept.push(a); },
@@ -1817,9 +1819,9 @@ function fakePanel() {
   return factory;
 }
 
-async function panelView(context = {}) {
+async function panelView(context = {}, clock = false) {
   const fake = fakePanel();
-  const v = mount({ library: true, panel: fake });
+  const v = mount({ library: true, panel: fake, clock });
   v.from({ id: v.sent[0].id, result: { protocolVersion: '2026-01-26', hostCapabilities: {}, hostContext: context } });
   await flush();
   v.from({ id: v.last('tools/call').id, result: toolText(LIBRARY_LIST) });
@@ -2608,6 +2610,163 @@ test('panel: a refused, failed or unanswered close is said on the library; nothi
   await flush();
   assert.equal(v.els.home.hidden, false);
   assert.match(v.els.notice.textContent, /didn't confirm closing/);
+});
+
+test('panel: what the editor\'s release said didn\'t complete is said on the library, with the close\'s own answer (R90-02)', async () => {
+  const note = 'This view was released (it can\'t change anything any more), but recording that it left didn\'t complete: '
+    + 'this canvas\'s editing record couldn\'t be written (locks/c1.editor: injected; it was put back as it was); and this '
+    + 'canvas\'s handover record couldn\'t be written; so this window\'s writes to the canvas are disabled, and it keeps the '
+    + 'canvas locked so no other window waits for that view, until locks/c1.editor and locks/c1.handover are checked and '
+    + 'OpenPaperDesign is restarted.';
+  for (const [reply, closed] of [
+    [undefined, true],
+    [{ refused: 'The editor of this canvas was opened (its browser tab, or the editor in another OpenPaperDesign view).' }, false],
+  ]) {
+    const { v, fake } = await panelView();
+    await openInPanel(v);
+    fake.handles[0].released = { note, status: 503 };
+    fake.handles[0].o.onHome();
+    await flush();
+    await closedHome(v, reply);
+    assert.equal(v.els.home.hidden, false);
+    const shown = v.els.notice.textContent;
+    assert.ok(shown.startsWith(note), shown);
+    assert.match(shown, /locks\/c1\.editor and locks\/c1\.handover are checked/);
+    if (closed) assert.equal(shown, note, 'closed: only the release\'s note');
+    else assert.match(shown, /The file stays open in this window: The editor of this canvas was opened/);
+    assert.match(v.els.live.textContent, /recording that it left didn't complete/);
+  }
+  // (A release that completed says nothing: 'a confirmed close needs no note', above.)
+});
+
+test('panel: a release that wasn\'t confirmed done, or was refused, is said on the library as it came, with the close\'s answer (R91-03)', async () => {
+  const unconfirmed = 'Codex didn\'t confirm letting this editor go (Codex didn\'t answer), so it isn\'t known whether that, '
+    + 'and recording that it left, completed; it may still be under way. Closing the file waits for it.';
+  const refusedNote = 'Letting this editor go was refused: this editor was released already; nothing was changed';
+  for (const [released, reply, want] of [
+    [{ kind: 'unconfirmed', note: unconfirmed, status: 0 }, undefined, unconfirmed],
+    [{ kind: 'unconfirmed', note: unconfirmed, status: 0 }, { error: { code: -32001, message: 'lost' } },
+      unconfirmed + ' Codex didn\'t confirm closing the file, so it may still be open in this window.'],
+    [{ kind: 'refused', note: refusedNote, status: 410 }, { refused: 'The editor of this canvas was opened (its browser tab, or the editor in another OpenPaperDesign view).' },
+      refusedNote + ' The file stays open in this window: The editor of this canvas was opened (its browser tab, or the editor in another OpenPaperDesign view).'],
+  ]) {
+    const { v, fake } = await panelView();
+    await openInPanel(v);
+    fake.handles[0].released = released;
+    fake.handles[0].o.onHome();
+    await flush();
+    await closedHome(v, reply);
+    assert.equal(v.els.home.hidden, false);
+    assert.equal(v.els.notice.textContent, want);
+    assert.equal(v.els.live.textContent, want);
+    assert.equal(libCalls(v, 'openpaperdesign_app_close'), 1);
+  }
+});
+
+test('panel: what a confirmed Close didn\'t record is said on the library (R91-01 `cleanup`)', async () => {
+  const cleanup = 'The canvas was closed here, but recording that its views left didn\'t complete: this canvas\'s '
+    + 'handover record couldn\'t be written (locks/c1.handover: injected; it was put back as it was).';
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  fake.handles[0].o.onHome();
+  await flush();
+  await closedHome(v, { ...CLOSED, cleanup: { note: cleanup, cleanup_status: 500 } });
+  assert.equal(v.els.home.hidden, false);
+  assert.equal(v.els.notice.textContent, cleanup);
+  assert.match(v.els.live.textContent, /recording that its views left didn't complete/);
+});
+
+test('panel: a release note never reaches a newer view: a close answer after a newer result says nothing (R91-03)', async () => {
+  const { v, fake } = await panelView();
+  await openInPanel(v);
+  fake.handles[0].released = { kind: 'unconfirmed', note: 'Codex didn\'t confirm letting this editor go (Codex didn\'t answer).', status: 0 };
+  fake.handles[0].o.onHome();
+  await flush();
+  const close = libAction(v);
+  // A newer result takes the view before the close answers (as the existing stale-close case).
+  v.from(result(LIB_EDITOR('opened', ID2)));
+  assert.equal(v.els.result.hidden, false);
+  const shown = v.els.notice.textContent;
+  await answer(v, CLOSED, close);
+  assert.equal(v.els.result.hidden, false, 'the newer result stays');
+  assert.equal(v.els.home.hidden, true);
+  assert.equal(v.els.notice.textContent, shown, 'the later answer and its release note change nothing here');
+  assert.doesNotMatch(v.els.notice.textContent + v.els.live.textContent, /letting this editor go/);
+});
+
+test('panel: what the editor\'s release came to is shown while its Close is still unanswered, then that Close\'s own outcome (R92-02)', async () => {
+  const partial = 'This view was released (it can\'t change anything any more), but recording that it left didn\'t complete: '
+    + 'this canvas\'s handover record couldn\'t be written (locks/c1.handover: injected; it was put back as it was); so this '
+    + 'window keeps the canvas locked until it records that the view left.';
+  const unconfirmed = 'Codex didn\'t confirm letting this editor go (Codex didn\'t answer), so it isn\'t known whether that, '
+    + 'and recording that it left, completed; it may still be under way. Closing the file waits for it.';
+  const refusedNote = 'Letting this editor go was refused: this editor was released already; nothing was changed';
+  const NOT_CONFIRMED = 'Codex didn\'t confirm closing the file, so it may still be open in this window.';
+  for (const released of [
+    { kind: 'partial', note: partial, status: 500 },
+    { kind: 'unconfirmed', note: unconfirmed, status: 0 },
+    { kind: 'refused', note: refusedNote, status: 410 },
+  ]) {
+    for (const outcome of ['closed', 'timeout', 'newer']) {
+      const what = `${released.kind} / ${outcome}`;
+      const { v, fake } = await panelView({}, true);
+      await openInPanel(v);
+      const h = fake.handles[0];
+      h.released = released;
+      h.o.onHome();
+      await flush();
+      // The Close is sent, once, and nothing has answered it or timed out yet.
+      const close = libAction(v);
+      assert.equal(close.params.name, 'openpaperdesign_app_close', what);
+      assert.equal(libCalls(v, 'openpaperdesign_app_close'), 1, what);
+      assert.equal(fake.log.filter((x) => x === 'dispose').length, 1, `${what}: one release`);
+      // Said now: the editor view is still what is shown (its library notice is hidden), so on
+      // its own alert and live status, as the release came. Nothing there sends anything more.
+      assert.equal(v.els.editor.hidden, false, what);
+      assert.equal(v.els['ed-alert'].hidden, false, what);
+      assert.equal(v.els['ed-alert-text'].textContent, released.note, what);
+      assert.equal(v.els['ed-status'].textContent, released.note, what);
+      assert.equal(v.els['ed-leave'].hidden, true, what);
+      assert.equal(v.els['ed-home'].hidden, true, what);
+      // The view's own live region says what is under way.
+      assert.match(v.els.live.textContent, /Closing the file/, what);
+      if (outcome === 'closed') {
+        await answer(v, CLOSED, close);
+        assert.equal(v.els.home.hidden, false, what);
+        assert.equal(v.els.notice.textContent, released.note, what);
+        assert.equal(v.els.live.textContent, released.note, what);
+      } else if (outcome === 'timeout') {
+        v.tick(60000);
+        await flush();
+        assert.equal(v.els.home.hidden, false, what);
+        assert.equal(v.els.notice.textContent, released.note + ' ' + NOT_CONFIRMED, what);
+      } else {
+        // A newer result takes the view before the close answers: nothing of this departure
+        // reaches it, then or at the close's answer.
+        v.from(result(LIB_EDITOR('opened', ID2)));
+        assert.equal(v.els.result.hidden, false, what);
+        const shown = v.els.notice.textContent;
+        await answer(v, CLOSED, close);
+        assert.equal(v.els.result.hidden, false, `${what}: the newer result stays`);
+        assert.equal(v.els.home.hidden, true, what);
+        assert.equal(v.els.notice.textContent, shown, what);
+        assert.ok(!(v.els.notice.textContent + v.els.live.textContent).includes(released.note), what);
+      }
+      assert.equal(libCalls(v, 'openpaperdesign_app_close'), 1, `${what}: no second close`);
+      assert.equal(fake.log.filter((x) => x === 'dispose').length, 1, `${what}: no second release`);
+    }
+  }
+});
+
+test('panel: a Close with nothing left unrecorded by the release shows no release note while it waits (R92-02)', async () => {
+  const { v, fake } = await panelView({}, true);
+  await openInPanel(v);
+  fake.handles[0].o.onHome();
+  await flush();
+  assert.equal(libCalls(v, 'openpaperdesign_app_close'), 1);
+  assert.equal(v.els['ed-alert'].hidden, true);
+  await closedHome(v);
+  assert.equal(v.els.notice.textContent, '');
 });
 
 test('panel: a close answer that arrives after a newer result belongs to nothing', async () => {

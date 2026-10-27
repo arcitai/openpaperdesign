@@ -437,6 +437,57 @@ test('R61-F2: the editor reports its Canvas\'s current name (a rename, a reload)
   assert.deepEqual(names, ['Plan', renamed, 'Renamed elsewhere'], 'nothing after leaving');
 });
 
+test('R90-02: leaving returns what the release said didn\'t complete (for the view\'s Home to say), and nothing when it completed', async () => {
+  const t = await readyEditor();
+  const note = 'This view was released (it can\'t change anything any more), but recording that it left didn\'t complete: '
+    + 'this canvas\'s editing record couldn\'t be written (injected; it was put back as it was); the handover record notes '
+    + 'that the view left, so no view waits for it.';
+  t.srv.override[T.RELEASE] = () => ok({ binding: BINDING, released: true, note, cleanup_status: 500 });
+  assert.deepEqual(await t.h.dispose(), { kind: 'partial', note, status: 500 });
+  assert.deepEqual(t.srv.named(T.RELEASE), [{ binding: BINDING, mount: 1 }], 'released once');
+  assert.equal(await t.h.dispose(), null, 'once');
+  const u = await readyEditor();
+  assert.equal(await u.h.dispose(), null, 'completed: nothing to say');
+});
+
+test('R91-03: leaving says what its release came to when it wasn\'t confirmed done (no answer, a bridge error, a thrown bridge, a refusal); the release is asked once', async () => {
+  for (const [reply, kind, re] of [
+    [() => ({ timeout: true }), 'unconfirmed', /^Codex didn't confirm letting this editor go \(Codex didn't answer\), so it isn't known whether that, and recording that it left, completed; it may still be under way\. Closing the file waits for it\.$/],
+    [() => ({ error: { code: -32603, message: 'gone' } }), 'unconfirmed', /\(Codex didn't run the request \(code -32603\)\)/],
+    [() => { throw new Error('bridge closed'); }, 'unconfirmed', /\(Codex didn't run the request \(bridge closed\)\)/],
+    [() => no(410, 'this editor was released already; nothing was changed'), 'refused', /^Letting this editor go was refused: this editor was released already; nothing was changed$/],
+  ]) {
+    const t = await readyEditor();
+    t.srv.override[T.RELEASE] = reply;
+    const out = await t.h.dispose();
+    assert.equal(out && out.kind, kind, JSON.stringify(out));
+    assert.match(out.note, re);
+    if (kind === 'refused') assert.equal(out.status, 410);
+    assert.equal(await t.h.dispose(), null, 'once');
+    assert.equal(t.srv.named(T.RELEASE).length, 1, 'released once, never sent again');
+    assert.equal(t.ed.freed, true, 'the editor is gone either way');
+  }
+});
+
+test('R91-02: a view still waited for while the canvas is held is never promised an answer', async () => {
+  for (const held of [false, true]) {
+    const t = await readyEditor();
+    t.srv.override[T.REVISION] = () => ok({ binding: BINDING, revision: t.srv.revision, editing: true,
+      handover: { held, offers: [], pending: [{ id: 'p1', from_here: false, since: 0, ended: false }], resolved: [] } });
+    t.env.every(1000);
+    await flush();
+    const row = t.refs.conflict.children.find((c) => c && c.tag === 'div');
+    const text = String(row.children[0]);
+    if (held) {
+      assert.match(text, /nothing can be handed over right now, because another OpenPaperDesign window holds this canvas/);
+      assert.doesNotMatch(text, /answers when it runs again/);
+    } else {
+      assert.match(text, /answers when it runs again/);
+    }
+    await t.h.dispose();
+  }
+});
+
 test('leaving waits for the save under way and saves what is left; then everything is undone once', async () => {
   const t = await readyEditor();
   let answer;

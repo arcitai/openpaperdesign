@@ -280,6 +280,26 @@ pub(crate) enum Kind {
 /// exist, and an error for a symlink, the wrong kind, or a file with more than one hard link
 /// (which could alias a file outside the project).
 pub(crate) fn plain(path: &Path, want: Kind) -> Result<bool, String> {
+    plain_seen(path, want).map_err(NotPlain::message)
+}
+
+/// Why [`plain_seen`] refused a path: it couldn't be looked at (an I/O error other than
+/// NotFound: what is there isn't known), or it was, and isn't what was wanted.
+pub(crate) enum NotPlain {
+    Unseen(String),
+    Seen(String),
+}
+
+impl NotPlain {
+    pub(crate) fn message(self) -> String {
+        match self {
+            NotPlain::Unseen(m) | NotPlain::Seen(m) => m,
+        }
+    }
+}
+
+/// [`plain`], saying which kind of refusal it is (run 206, LEAD205-01).
+pub(crate) fn plain_seen(path: &Path, want: Kind) -> Result<bool, NotPlain> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -287,16 +307,18 @@ pub(crate) fn plain(path: &Path, want: Kind) -> Result<bool, String> {
     let m = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(format!("{name}: {e}")),
+        Err(e) => return Err(NotPlain::Unseen(format!("{name}: {e}"))),
     };
     let t = m.file_type();
     if t.is_symlink() {
-        return Err(format!("{name} is a symbolic link"));
+        return Err(NotPlain::Seen(format!("{name} is a symbolic link")));
     }
     match want {
-        Kind::Dir if !t.is_dir() => Err(format!("{name} is not a directory")),
-        Kind::File if !t.is_file() => Err(format!("{name} is not a regular file")),
-        Kind::File if links(&m) > 1 => Err(format!("{name} has more than one hard link")),
+        Kind::Dir if !t.is_dir() => Err(NotPlain::Seen(format!("{name} is not a directory"))),
+        Kind::File if !t.is_file() => Err(NotPlain::Seen(format!("{name} is not a regular file"))),
+        Kind::File if links(&m) > 1 => Err(NotPlain::Seen(format!(
+            "{name} has more than one hard link"
+        ))),
         _ => Ok(true),
     }
 }
@@ -668,13 +690,42 @@ impl Server {
     /// browser saves check the same fence. Retained handles stay retired; this is idempotent.
     /// A library canvas's editing record is cleared after that, only if it still names this
     /// binding (`library::Editing::release`): closing a view that isn't editing never takes the
-    /// editing from the view that is.
+    /// editing from the view that is. If that end couldn't record that every view of this
+    /// binding left (a write put back) or this server is fenced, the canvas's lease outlives the
+    /// binding, still locked (`library::Editing::outlive`, R92-01): no other window is promised
+    /// an answer from a view that ended here.
     pub async fn retire(&self) {
         self.lifecycle.retire(&self.held).await;
         self.calls.stop();
         if let Some(e) = &self.editing {
-            e.release(&self.broken);
+            if let Err(library::EditError::Busy) = e.release(&self.broken) {
+                // Another window holds the lease past the ordinary wait: this end stays under
+                // way until it lets it go, then records that every view of this binding ended
+                // (run 202, R91-01), off the executor. Its admission is closed already; nothing
+                // of this binding runs meanwhile.
+                let (e, broken) = (e.clone(), self.broken.clone());
+                let _ = tokio::task::spawn_blocking(move || e.release_waiting(&broken)).await;
+            }
+            e.outlive(&self.broken);
         }
+    }
+
+    /// What this binding's end (`retire`) didn't record, as a release says it (`note`, the
+    /// condition's `cleanup_status`): `None` when it recorded everything or hasn't ended.
+    pub(crate) fn retirement_outcome(&self) -> Option<serde_json::Value> {
+        let e = self.editing.as_ref()?;
+        let Some(Err(err)) = e.retirement() else {
+            return None;
+        };
+        let a = edit_refusal(err);
+        Some(serde_json::json!({
+            "note": format!(
+                "The canvas was closed here, but recording that its views left didn't \
+                 complete: {}.",
+                a.msg.trim_end_matches('.')
+            ),
+            "cleanup_status": a.status.as_u16(),
+        }))
     }
 
     /// Take a library canvas's editing for this binding (an open, or a view's Edit here; see
@@ -762,23 +813,127 @@ impl Server {
 
     /// A browser tab left (`POST /api/view/release`, as the page goes away): its view changes
     /// nothing any more (every later request naming it is refused as released), and a save of
-    /// it already under way finishes first. If it was still to hand over, it is marked ended.
-    pub(crate) async fn release_tab(&self, view: &str) {
+    /// it already under way finishes first. Then its record cleanup, as [`Server::release_view`].
+    pub(crate) async fn release_tab(&self, view: &str) -> Result<(), ApiError> {
         if let Some(l) = self.views.issued.lock().unwrap().get(view) {
             l.store(false, std::sync::atomic::Ordering::Release);
         }
-        self.release_view(view).await;
+        self.release_view(view).await
     }
 
-    /// A view of this binding left (a tab's release, a panel mount's): after any write of it
-    /// under way (the writer fence), a pending handover of it is marked ended.
-    pub(crate) async fn release_view(&self, view: &str) {
+    /// A view of this binding left (a tab's release, a panel mount's; its caller revoked it
+    /// already, for good): after any write of it under way (the writer fence), its record
+    /// cleanup (`library::Editing::release_view`: it never edits or is waited for again). `Err`
+    /// is what of that cleanup didn't happen, with its condition's status (R89-01, run 199):
+    /// `503` busy or fenced (`Broken`, naming the record that may be either version), `500` a
+    /// record write put back, `403` the canvas or a record no longer checks out. The view stays
+    /// released either way; unless fenced, its cleanup is done at this binding's next hold of
+    /// the lease. A binding already retired did its own cleanup (`Editing::release`). The lease
+    /// held by another window past the ordinary wait is never answered as busy (run 201,
+    /// R90-01): the release stays under way, this binding's writer fence held, until that window
+    /// lets it go, then records that the view left (`Editing::release_view_waiting`).
+    pub(crate) async fn release_view(&self, view: &str) -> Result<(), ApiError> {
+        let Some(e) = &self.editing else {
+            return Ok(());
+        };
+        // Owed from now on, whatever happens below (R90-03).
+        e.depart(view);
+        let write = self.lifecycle.write.clone().lock_owned().await;
+        if self.lifecycle.check_active().is_err() {
+            // Closed here: that close did (or didn't do) every view's cleanup; said as it was.
+            return match e.retirement() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(why)) => {
+                    // Its own condition (status, named files), as that close found it (and,
+                    // when it keeps the canvas locked, what records it later: R92-01).
+                    let kept = why.message().contains("keeps the canvas locked");
+                    let mut a = edit_refusal(why);
+                    a.msg = format!(
+                        "this canvas was closed here, and recording at that close that its \
+                         views left didn't complete ({}){}",
+                        a.msg,
+                        if kept {
+                            ""
+                        } else {
+                            "; nothing more is recorded from this window"
+                        }
+                    );
+                    Err(a)
+                }
+                None => Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "this canvas is being closed here; that close records that its views left",
+                )),
+            };
+        }
+        if let Err(c) = self.check() {
+            return Err(ApiError::new(
+                c.status,
+                format!(
+                    "{}; so nothing more is recorded from this window (a view of another \
+                     window that takes the editing may be told to wait for it: Stop waiting there)",
+                    c.msg
+                ),
+            ));
+        }
+        let done = match e.release_view(&self.broken, view) {
+            Err(library::EditError::Busy) => {
+                // Another window holds the lease: wait for it, off the executor, with this
+                // binding's writer fence moved along (it stays held until the cleanup is done,
+                // even if this request goes away), then do the cleanup.
+                let (e, broken) = (e.clone(), self.broken.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _write = write;
+                    e.release_view_waiting(&broken)
+                })
+                .await
+                .unwrap_or_else(|j| {
+                    Err(library::EditError::Failed(format!(
+                        "recording that it left stopped unexpectedly ({j})"
+                    )))
+                })
+            }
+            other => other,
+        };
+        done.map_err(|err| {
+            let retry = match &err {
+                // Fenced: its message says what follows. Noted: its message says it is safe.
+                library::EditError::Fenced(_) => false,
+                library::EditError::Record(m) | library::EditError::Failed(m) => {
+                    !m.contains("no view waits")
+                        && !m.contains("no view can wait")
+                        && !m.contains("keeps the canvas locked")
+                }
+                _ => true,
+            };
+            let mut a = edit_refusal(err);
+            if retry {
+                a.msg = format!(
+                    "{}; it is done at this window's next change or check of the canvas, or its \
+                     close (until then a view of another window that takes the editing may be \
+                     told to wait for it: Stop waiting there)",
+                    a.msg
+                );
+            }
+            a
+        })
+    }
+
+    /// At a poll of this binding's views: a released view's departure not yet noted is recorded
+    /// now if nothing else is under way (the writer fence free, the lease free at once; no wait,
+    /// no retry beyond the views' own polls: R90-01).
+    fn settle_departures(&self) {
         let Some(e) = &self.editing else {
             return;
         };
-        let _write = self.lifecycle.write.lock().await;
+        if !e.departure_unsafe() {
+            return;
+        }
+        let Ok(_write) = self.lifecycle.write.try_lock() else {
+            return;
+        };
         if self.lifecycle.check_active().is_ok() && self.check().is_ok() {
-            e.release_view(&self.broken, view);
+            e.settle_now(&self.broken);
         }
     }
 
@@ -843,8 +998,10 @@ impl Server {
     }
 
     /// The handover record (issue #23's new-view recovery, see `library::Editing::answer`) as
-    /// `view` sees it, for a revision poll: `null` when nothing waits.
+    /// `view` sees it, for a revision poll: `null` when nothing waits. A released view's
+    /// departure still owed is recorded first, if it can be at once (`settle_departures`).
     pub(crate) fn handover_json(&self, view: Option<&str>) -> serde_json::Value {
+        self.settle_departures();
         self.editing
             .as_ref()
             .and_then(|e| e.handover(view))
@@ -2480,13 +2637,36 @@ async fn post_view(State(s): State<Arc<Server>>) -> Response {
 /// The tab is going away (`POST /api/view/release`): its view changes nothing any more.
 async fn post_view_release(State(s): State<Arc<Server>>, headers: HeaderMap) -> Response {
     match s.tab_of(&headers) {
-        Ok(Some((view, _))) => {
-            s.release_tab(&view).await;
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(Some((view, _))) => match s.release_tab(&view).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            // Released all the same (never a refusal: it can't be undone), with what of its
+            // cleanup didn't happen (R89-01).
+            Err(e) => (
+                [(header::CONTENT_TYPE, "application/json")],
+                release_outcome(&e).to_string(),
+            )
+                .into_response(),
+        },
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// A release whose record cleanup didn't complete (see [`Server::release_view`]), as both
+/// transports say it: released (for good), a `note` saying what didn't happen and what follows,
+/// and that condition's status (`cleanup_status`).
+pub(crate) fn release_outcome(e: &ApiError) -> serde_json::Value {
+    // The condition's message says what follows (`Server::release_view`): noted (no view waits
+    // for it), owed to this window's next change, check or close, or fenced.
+    serde_json::json!({
+        "released": true,
+        "note": format!(
+            "This view was released (it can't change anything any more), but recording that it \
+             left didn't complete: {}.",
+            e.msg.trim_end_matches('.')
+        ),
+        "cleanup_status": e.status.as_u16(),
+    })
 }
 
 /// A tab that lost the editing answers the handover (`POST /api/draft`, see

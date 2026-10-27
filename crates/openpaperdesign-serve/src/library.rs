@@ -31,9 +31,13 @@
 //! is in a long
 //! write, keeps it after a write it couldn't undo (as this one does, see `Broken`), or runs an
 //! older OpenPaperDesign that holds it for as long as it has the canvas open; that is refused
-//! as busy, with nothing changed. The lock is advisory: it coordinates OpenPaperDesign
-//! processes and nothing else (not a native paper-rs app, not other programs). Lease files stay
-//! forever, so every process locks the same file.
+//! as busy, with nothing changed. Except a view's release and a binding's end (runs 201–202):
+//! after that ordinary wait, those wait for it with no bound (`Lease::lock_wait`: another
+//! process that keeps it for its whole life keeps them under way), then record that the views
+//! left; and a window that couldn't record that keeps it (`Lease::kept`) until it can, past the
+//! binding's own end too (`Library::owed`, run 203). The lock is advisory: it coordinates
+//! OpenPaperDesign processes and nothing else (not a native paper-rs app, not other programs).
+//! Lease files stay forever, so every process locks the same file.
 //!
 //! Editing (#23, the owner's "the newest view edits"): exactly one view at a time may write a
 //! canvas, the one named in its `<id>.editor` record: `<token>:<view>`, a binding's random
@@ -60,17 +64,38 @@
 //! view that made them goes away. Every record change (`replace_record`) is a checked
 //! transaction: a failure puts the record back, and one that can't be put back fences the
 //! server (`Broken`), which keeps the lease's exclusive lock with the lease for good
-//! (`Lease::poison`: no later read, claim or cleanup lets it go). A view can also take the
+//! (`Lease::poison`: no later read, claim or cleanup lets it go; past the binding's end, until
+//! this process ends: `Library::owed`). A view can also take the
 //! editing back explicitly ("Edit here", or opening the canvas again); its next save is then
 //! revision-checked against whatever was saved meanwhile, so nothing is overwritten. Reads never
 //! need the editing: every open view keeps showing what is saved. A binding's close or end clears
 //! the record only if it still names that binding (a view that isn't editing never takes the
-//! editing from the one that is), and marks its views still waited for as ended. A process that
-//! ends without closing leaves its record, which names no live binding: the canvas then has no
-//! editor until a view takes it, and nothing waits for that process (its pending entry says it
-//! hasn't answered; the editing view may stop waiting). What only lived in an ended process's
-//! memory and was never handed over (an unsaved edit in a view whose host went away first) is
-//! not on disk and can't be recovered from here.
+//! editing from the one that is), and marks its views still waited for as ended; a view's own
+//! release (a mount's, a tab's) marks it ended if it was waited for, and if it edits, leaves the
+//! record naming only its binding, so no later view waits for it to hand over. A cleanup that
+//! fails is said, and for a view's release kept to be done again; if the editing record can't
+//! be rewritten (put back), the handover record notes that the view it names left (an ended
+//! entry), so no claim waits for it; if the handover record can't be written either (put back),
+//! the window keeps the canvas locked (`Lease::kept`), past the binding's end too
+//! (`Library::owed`), so no other window takes the editing or changes the canvas while the
+//! records say a view of it may answer (they are told it is held), until that is recorded
+//! (`Editing::release_view`, `Editing::release`); a record that can't be put back fences the
+//! server instead (`Broken`, the file named). A departure that needs noting where the
+//! handover record already lists the most views it can (`MAX_PENDING`) is not recorded either,
+//! and is handled the same way (`no_room`, run 204): no entry is removed to make room. Nor is a
+//! cleanup whose editing record couldn't be read (run 205): whether it still names the view
+//! isn't known, so the lease is kept the same way, the cause said (`Failed`). Nor one whose
+//! handover record couldn't be read (run 206: an I/O error, `ReadError::Unread`): its entries
+//! may well read later; only one seen and unusable (not a plain file, too large, a form this
+//! version doesn't read) is left as it is, since no claim can wait on anything in it. A process
+//! that ends without closing (a crash, or a write failing until it ends) leaves its records as
+//! they were: the editing record may still name one of its views, and nothing tells that view
+//! apart from a hidden, asleep or disconnected one. It is waited for like one: the next view to
+//! take the editing gets a pending entry for it (unless one is already there), shown as not
+//! answered until the editing view stops waiting (see DESIGN.md). Nothing here detects that a
+//! process ended. What only lived in an ended process's memory and was never handed over (an
+//! unsaved edit in a view whose host went away first) is not on disk and can't be recovered
+//! from here.
 //!
 //! Identity: the root, the `library/v1/{canvases,locks}` folders and the held lease file are
 //! pinned (device, inode) when first seen and checked again on every library action and, through
@@ -78,7 +103,7 @@
 //! fences that canvas for good: every later read and write through it is refused. The check and
 //! the file operation after it can still race, as for project roots (see `lib.rs`).
 
-use crate::{Kind, dev_ino, plain};
+use crate::{Kind, NotPlain, dev_ino, plain, plain_seen};
 use paper_rs::project::{ASSETS_DIR, MANIFEST, Manifest, PAGES_DIR, PageData};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -116,8 +141,9 @@ const MAX_EDITOR_BYTES: u64 = 256;
 const MAX_DRAFT_BYTES: u64 = 16 << 20;
 /// The largest offer's canvas (a canvas save, as a save is bounded).
 const MAX_OFFER_BYTES: u64 = crate::MAX_PAGE_BYTES as u64;
-/// How long an open, a write, a claim or a release waits for another process's hold of a
-/// canvas's lease (see the module docs): `LEASE_TRIES` × `LEASE_PAUSE`, one second.
+/// How long an open, a write or a claim waits for another process's hold of a canvas's lease
+/// (see the module docs): `LEASE_TRIES` × `LEASE_PAUSE`, one second. A view's release and a
+/// binding's end wait this long first, then for as long as it is held (`Lease::lock_wait`).
 const LEASE_TRIES: u32 = 100;
 const LEASE_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
 /// The views' kept appearance preference (`<root>/library/v1/appearance`, see
@@ -219,6 +245,36 @@ pub struct Library {
     /// The leases of those canvases, kept until this process ends, so no other OpenPaperDesign
     /// process (or a later binding here) opens and writes them meanwhile.
     kept: Mutex<Vec<Lease>>,
+    /// Bindings of this process that ended (Close, Switch, the end of its service) while their
+    /// canvas's records still said that a view of theirs might answer (R92-01, run 203): their
+    /// lease, still locked, outlives them here (`Editing::outlive`), so no other window takes
+    /// the editing or changes the canvas while those records say so (they are told it is held).
+    /// One whose writes were put back is recorded again (`settle_owed`) at this process's next
+    /// use of the library (its list, an open, rename or export of a canvas) and at its end, and
+    /// let go once recorded; one fenced (`Broken`) is kept until this process ends.
+    owed: Mutex<Vec<Owed>>,
+}
+
+/// A binding's lease kept past its end (see `Library::owed`), with the end's record cleanup to
+/// do again (`None`: fenced; nothing more is written from it).
+struct Owed {
+    lease: Arc<Lease>,
+    cleanup: Option<(Arc<Editing>, crate::Broken)>,
+    /// What its end said it didn't record, as it ended.
+    why: String,
+}
+
+impl Owed {
+    /// Why it is still kept: its latest attempt's outcome, else what its end said.
+    fn reason(&self) -> String {
+        match &self.cleanup {
+            Some((e, _)) => e
+                .retirement()
+                .and_then(Result::err)
+                .map_or_else(|| self.why.clone(), |e| e.message()),
+            None => self.why.clone(),
+        }
+    }
 }
 
 impl Library {
@@ -298,6 +354,7 @@ impl Library {
             seen: Mutex::default(),
             broken: Mutex::default(),
             kept: Mutex::default(),
+            owed: Mutex::default(),
         })
     }
 
@@ -336,6 +393,28 @@ impl Library {
         self.locks().join(format!("{id}.lock"))
     }
 
+    /// Whether canvas `id`'s lease is held exclusively right now, by any handle (another
+    /// window's, or this process's own during a change): asked on a handle of its own, opened
+    /// for this and closed again (never a binding's, whose own lock a shared take would
+    /// convert). A hint only; nothing relies on it. False when it can't be asked.
+    fn lease_held_now(&self, id: &str) -> bool {
+        let path = self.lock_path(id);
+        if !matches!(plain(&path, Kind::File), Ok(true)) {
+            return false;
+        }
+        let Ok(f) = File::open(&path) else {
+            return false;
+        };
+        match f.try_lock_shared() {
+            Ok(()) => {
+                let _ = f.unlock();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+
     /// A canvas's editing record (see the module docs, "Editing").
     fn editor_path(&self, id: &str) -> PathBuf {
         self.locks().join(format!("{id}.editor"))
@@ -351,6 +430,12 @@ impl Library {
             return Ok(None);
         }
         let mut text = String::new();
+        // (Tests: `editor_read` fails the next read of an existing record once, as an I/O error
+        // that isn't NotFound would; the record is left as it is. Run 205, R94-01.)
+        #[cfg(test)]
+        if crate::test_support::fault(&self.locks(), "editor_read") {
+            return Err("this canvas's editing record: injected read failure".into());
+        }
         let read = File::open(&path).and_then(|f| {
             use std::io::Read;
             f.take(MAX_EDITOR_BYTES).read_to_string(&mut text)
@@ -379,14 +464,36 @@ impl Library {
     /// half-written): empty when there is none. One that isn't a plain file or doesn't parse
     /// is an error, so it is never overwritten unread.
     fn handover_of(&self, id: &str) -> Result<Handover, String> {
+        self.handover_read(id).map_err(ReadError::message)
+    }
+
+    /// [`Library::handover_of`], saying which kind of failure it is (run 206, LEAD205-01): a
+    /// record seen and not one this version reads (`Unusable`: not a plain file, too large, a
+    /// form it doesn't know or that doesn't parse), which every claim leaves as it is and can
+    /// wait on nothing in; or one that couldn't be read (`Unread`: an I/O error other than
+    /// NotFound), whose content isn't known, so a claim may well read and wait on it later.
+    fn handover_read(&self, id: &str) -> Result<Handover, ReadError> {
         let path = self.handover_path(id);
-        match self.record_bytes(&path) {
-            Ok(None) => Ok(Handover::default()),
-            Ok(Some(b)) => std::str::from_utf8(&b)
+        let named = |e: String| format!("this canvas's handover record: {e}");
+        let bytes = match self.record_read(&path) {
+            Ok(b) => b,
+            Err(ReadError::Unusable(e)) => return Err(ReadError::Unusable(named(e))),
+            Err(ReadError::Unread(e)) => return Err(ReadError::Unread(named(e))),
+        };
+        // (Tests: `handover_read` fails the next read of an existing regular record once, as an
+        // I/O error that isn't NotFound would; the record is left as it is. Run 206, LEAD205-01.)
+        #[cfg(test)]
+        if bytes.is_some() && crate::test_support::fault(&self.locks(), "handover_read") {
+            return Err(ReadError::Unread(named("injected read failure".into())));
+        }
+        match bytes {
+            None => Ok(Handover::default()),
+            Some(b) => std::str::from_utf8(&b)
                 .ok()
                 .and_then(Handover::from_json)
-                .ok_or_else(|| "this canvas's handover record is unreadable".to_string()),
-            Err(e) => Err(format!("this canvas's handover record: {e}")),
+                .ok_or_else(|| {
+                    ReadError::Unusable("this canvas's handover record is unreadable".into())
+                }),
         }
     }
 
@@ -477,9 +584,15 @@ impl Library {
         if before.as_deref() == bytes {
             return Ok(());
         }
+        // (Tests: `record_sync`/`record_restore` fail the next record's write/put-back,
+        // `handover_sync`/`handover_restore` only a handover record's, run 203.)
+        #[cfg(test)]
+        let handover = path.extension().is_some_and(|e| e == "handover");
         let done = self.put_record(path, bytes).and_then(|()| {
             #[cfg(test)]
-            if crate::test_support::fault(&self.locks(), "record_sync") {
+            if crate::test_support::fault(&self.locks(), "record_sync")
+                || (handover && crate::test_support::fault(&self.locks(), "handover_sync"))
+            {
                 return Err(format!("{}: injected sync failure", self.locks().display()));
             }
             sync_dir(&self.locks())
@@ -490,7 +603,9 @@ impl Library {
         // Put the record back as it was.
         let restored = (|| {
             #[cfg(test)]
-            if crate::test_support::fault(&self.locks(), "record_restore") {
+            if crate::test_support::fault(&self.locks(), "record_restore")
+                || (handover && crate::test_support::fault(&self.locks(), "handover_restore"))
+            {
                 return Err("injected restore failure".to_string());
             }
             self.put_record(path, before.as_deref())?;
@@ -509,8 +624,16 @@ impl Library {
 
     /// A record's bytes now (`None`: no record), bounded, never through a link.
     fn record_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
-        if !plain(path, Kind::File)? {
-            return Ok(None);
+        self.record_read(path).map_err(ReadError::message)
+    }
+
+    /// [`Library::record_bytes`], saying which kind of failure it is (see `ReadError`).
+    fn record_read(&self, path: &Path) -> Result<Option<Vec<u8>>, ReadError> {
+        match plain_seen(path, Kind::File) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(NotPlain::Seen(e)) => return Err(ReadError::Unusable(e)),
+            Err(NotPlain::Unseen(e)) => return Err(ReadError::Unread(e)),
         }
         let mut bytes = Vec::new();
         let read = File::open(path).and_then(|f| {
@@ -518,13 +641,13 @@ impl Library {
             f.take(MAX_DRAFT_BYTES + 1).read_to_end(&mut bytes)
         });
         match read {
-            Ok(_) if bytes.len() as u64 > MAX_DRAFT_BYTES => Err(format!(
+            Ok(_) if bytes.len() as u64 > MAX_DRAFT_BYTES => Err(ReadError::Unusable(format!(
                 "{} is larger than a record can be",
                 self.label(path)
-            )),
+            ))),
             Ok(_) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(ReadError::Unread(e.to_string())),
         }
     }
 
@@ -647,8 +770,63 @@ impl Library {
         self.check()
     }
 
+    /// Record again, without waiting, what each binding of this process that ended still owes
+    /// (see `owed`): its lease is still locked by this process, so nothing else can have
+    /// changed the records meanwhile. One recorded lets its lease go; one fenced, or failing
+    /// again, stays. Called at this process's next use of the library (the launcher: before a
+    /// list, an open, rename or export) and at its end; never by a timer. Returns, for each
+    /// such canvas, what came of it (`canvas`, `done`, `note`): what a list says (`cleanup`).
+    /// Only the editing and handover records are written; no canvas's drawing is.
+    pub(crate) fn settle_owed(&self) -> Vec<Value> {
+        let mut said = Vec::new();
+        self.owed.lock().unwrap().retain(|o| {
+            let kept = match &o.cleanup {
+                None => true,
+                Some((editing, broken)) => {
+                    let _ = editing.release(broken);
+                    o.lease.is_kept() || o.lease.is_poisoned()
+                }
+            };
+            said.push(if kept {
+                json!({"canvas": o.lease.doc, "done": false, "note": format!(
+                    "This window still keeps this canvas locked: when it was closed here, \
+                     recording that its views left didn't complete ({}).",
+                    o.reason().trim_end_matches('.')
+                )})
+            } else {
+                json!({"canvas": o.lease.doc, "done": true, "note": "This window recorded that \
+                    the views it closed of this canvas left (its editing and handover records), \
+                    and let the canvas go."})
+            });
+            kept
+        });
+        said
+    }
+
+    /// The public list (the home's and the model's: R93-02, run 204): first what this process
+    /// still owes for canvases it closed is recorded where it can be (`settle_owed`: their
+    /// editing and handover records written, a canvas this window kept locked for that let
+    /// go), then the canvases are listed (`list`, which writes nothing). No canvas is created,
+    /// opened or locked by it, and no drawing is changed. What the first step came to is the
+    /// result's `cleanup`.
+    pub(crate) fn list_settling(&self, open: Option<&str>) -> Result<Value, String> {
+        let cleanup = self.settle_owed();
+        let mut listed = self.list(open)?;
+        listed["cleanup"] = json!(cleanup);
+        listed["note"] = json!(
+            "Listing creates, opens or locks no canvas and never changes a drawing. First it \
+             finishes this window's own bookkeeping of canvases it closed while their editing \
+             and handover records couldn't be written: it writes those two records then, and \
+             lets go of a canvas it kept locked for that; one it can't record yet stays locked \
+             (each is in `cleanup`, with what came of it). These canvases belong to \
+             OpenPaperDesign's own library, not to a project folder."
+        );
+        Ok(listed)
+    }
+
     /// The canvases in the library, read-only and bounded: nothing is created, opened, locked
-    /// or written. `open` is the canvas open in this process, if any.
+    /// or written. `open` is the canvas open in this process, if any. (The public lists go
+    /// through `list_settling`, which may write ownership records first.)
     pub fn list(&self, open: Option<&str>) -> Result<Value, String> {
         self.check()?;
         let canvases = self.canvases();
@@ -1111,8 +1289,16 @@ impl Library {
     }
 
     /// Refused once a write of canvas `id` that isn't open in a binding couldn't be undone:
-    /// names the files that may be inconsistent. Every other canvas is unaffected.
+    /// names the files that may be inconsistent. Every other canvas is unaffected. Refused too
+    /// while a binding of it that ended here still keeps its lease (`owed`): says why.
     pub(crate) fn refuse_if_broken(&self, id: &str) -> Result<(), String> {
+        if let Some(o) = self.owed.lock().unwrap().iter().find(|o| o.lease.doc == id) {
+            return Err(format!(
+                "when it was closed here, recording that its views left didn't complete ({}), \
+                 and this window keeps it locked until then",
+                o.reason().trim_end_matches('.')
+            ));
+        }
         match self.broken.lock().unwrap().get(id) {
             Some(b) => crate::refuse_if_broken(b)
                 .map_err(|e| format!("{e} (this window keeps the canvas locked until then)")),
@@ -1307,6 +1493,14 @@ pub struct Lease {
     /// convert the lock) reads under the exclusive lock it already holds, `unlock` does nothing
     /// and every exclusive take is refused (R78-02).
     poisoned: Mutex<Option<String>>,
+    /// Set while a view released here couldn't be recorded as gone (its write was put back:
+    /// `Editing::forget_view`, run 202; or at the binding's end, `Editing::release`, run 203):
+    /// the exclusive lock this handle holds is kept (no unlock, no conversion by a shared read)
+    /// so no other window can take the editing or change the canvas while the record still says
+    /// that view may answer; this binding's own calls go on under it (each first tries to record
+    /// that view again), and past its end the library keeps the handle (`Library::owed`).
+    /// Cleared once it is recorded.
+    kept: Mutex<bool>,
 }
 
 pub(crate) enum LeaseError {
@@ -1357,9 +1551,31 @@ impl Lease {
             id,
             doc: doc.to_string(),
             poisoned: Mutex::new(None),
+            kept: Mutex::new(false),
         };
         lease.check(lib).map_err(LeaseError::Failed)?;
         Ok(lease)
+    }
+
+    /// Whether this handle keeps its exclusive lock for a departure (see `kept`).
+    fn is_kept(&self) -> bool {
+        *self.kept.lock().unwrap()
+    }
+
+    /// Keep the exclusive lock this handle holds now until `unkeep` (see `kept`). Only called
+    /// under a hold of it.
+    fn keep(&self) {
+        *self.kept.lock().unwrap() = true;
+    }
+
+    /// Stop keeping it: the next hold's end lets it go as usual.
+    fn unkeep(&self) {
+        *self.kept.lock().unwrap() = false;
+    }
+
+    /// Whether this handle keeps its exclusive lock for good (see `poisoned`).
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.lock().unwrap().is_some()
     }
 
     /// [`Lease::acquire`], waiting (boundedly, without blocking the executor) while another
@@ -1389,6 +1605,11 @@ impl Lease {
                 Err(LeaseError::Failed(why.clone()))
             };
         }
+        // Kept for a departure (see `kept`): this handle holds it exclusively already; a read or
+        // a write of this binding goes on under it, never converting or letting it go.
+        if self.is_kept() {
+            return Ok(());
+        }
         for i in 0..LEASE_TRIES {
             let r = if shared {
                 self.file.try_lock_shared()
@@ -1411,10 +1632,45 @@ impl Lease {
         Err(LeaseError::Busy)
     }
 
+    /// The exclusive lock, waiting (blocking this thread) for as long as another process holds
+    /// it: one wait on the lock itself, no retries or timer. Only for a released view's record
+    /// cleanup (`Editing::release_view_waiting`), off the async executor and under its
+    /// binding's writer fence. A poisoned handle admits no change (as `lock`).
+    fn lock_wait(&self) -> Result<(), LeaseError> {
+        if let Some(why) = self.poisoned.lock().unwrap().as_ref() {
+            return Err(LeaseError::Failed(why.clone()));
+        }
+        if self.is_kept() {
+            return Ok(());
+        }
+        self.file
+            .lock()
+            .map_err(|e| LeaseError::Failed(format!("this canvas's lease couldn't be taken: {e}")))
+    }
+
+    /// The exclusive lock if it can be had right now, without waiting (`false`: another process
+    /// holds it, or this handle is poisoned and admits no change). For a poll's best effort only
+    /// (`Editing::settle_now`).
+    fn try_lock_now(&self) -> Result<bool, LeaseError> {
+        if self.poisoned.lock().unwrap().is_some() {
+            return Ok(false);
+        }
+        if self.is_kept() {
+            return Ok(true);
+        }
+        match self.file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => Err(LeaseError::Failed(format!(
+                "this canvas's lease couldn't be taken: {e}"
+            ))),
+        }
+    }
+
     /// Let go of this lease's lock, keeping the open handle (and so the lease's identity). Other
     /// processes can then open and write the canvas between this binding's own writes.
     pub(crate) fn unlock(&self) {
-        if self.poisoned.lock().unwrap().is_none() {
+        if self.poisoned.lock().unwrap().is_none() && !self.is_kept() {
             let _ = self.file.unlock();
         }
     }
@@ -1425,8 +1681,8 @@ impl Lease {
         let mut p = self.poisoned.lock().unwrap();
         if p.is_none() {
             *p = Some(format!(
-                "{why} (this window keeps the canvas locked until it is closed, so no other \
-                 OpenPaperDesign window writes over those files)"
+                "{why} (this window keeps the canvas locked until OpenPaperDesign is \
+                 restarted, so no other OpenPaperDesign window writes over those files)"
             ));
         }
     }
@@ -1512,6 +1768,7 @@ pub(crate) const LEASE_BUSY: &str = "Another OpenPaperDesign window is holding t
     again in a moment.";
 
 /// What `Editing::admit` refuses with.
+#[derive(Clone)]
 pub(crate) enum EditError {
     /// Another binding has the editing (`NOT_EDITING`).
     NotEditing,
@@ -1555,6 +1812,24 @@ pub(crate) struct Editing {
     lease: std::sync::Weak<Lease>,
     /// Never shown, never a credential: 64 hex digits, unique across processes.
     token: String,
+    /// Views of this binding that were released (they can never act again) and whose record
+    /// cleanup (`forget_view`) isn't done yet (R89-01/R90, runs 199–200): it is done under this
+    /// binding's next hold of the lease (`lock_write`), which refuses what would rely on the
+    /// editing record until it is (or until the view's departure is at least noted where every
+    /// claim reads it: `Departed::safe`), and tried at a poll of its views (`settle_now`).
+    departed: Mutex<Vec<Departed>>,
+    /// What this binding's own end (`release`) did: `None` until it ran.
+    retired: Mutex<Option<Result<(), EditError>>>,
+}
+
+/// A released view whose record cleanup isn't done (see `Editing::departed`). `safe`, once the
+/// handover record says that it left (or no claim could wait for it anyway: an unreadable
+/// handover record), with why its cleanup is still incomplete: no claim, of this binding or any
+/// other, then waits for it.
+#[derive(Clone)]
+struct Departed {
+    view: String,
+    safe: bool,
 }
 
 /// A held lease lock (`Editing::admit`, `Editing::read`): released when dropped, after the
@@ -1588,6 +1863,8 @@ impl Editing {
             lib,
             lease: Arc::downgrade(lease),
             token: crate::new_token().map_err(|e| format!("no editing identity: {e}"))?,
+            departed: Mutex::default(),
+            retired: Mutex::default(),
         })
     }
 
@@ -1634,6 +1911,18 @@ impl Editing {
     /// its reload, checks and any commit then see no other process's write. Whether it may
     /// write is [`Editing::owns`], asked under this hold once the call has something to save.
     pub(crate) fn lock_write(&self, broken: &crate::Broken) -> Result<Hold, EditError> {
+        let hold = self.lock_raw(broken)?;
+        // A released view's record cleanup is a prerequisite of anything that relies on the
+        // editing record (R90-03): done first, under this hold, or at least its departure noted
+        // where every claim reads it; else this call is refused with why, and nothing of it
+        // runs. A fence established by it stops everything after it.
+        self.settle_departed(broken, &hold.lease.doc)?;
+        crate::refuse_if_broken(broken).map_err(EditError::Fenced)?;
+        Ok(hold)
+    }
+
+    /// The lease's exclusive lock, checked (see [`Editing::lock_write`]), nothing more.
+    fn lock_raw(&self, broken: &crate::Broken) -> Result<Hold, EditError> {
         let lease = self.lease()?;
         lease.lock(false)?;
         let hold = Hold {
@@ -1769,57 +2058,503 @@ impl Editing {
     /// At this binding's end (after its server was retired): clear the record if it still names
     /// this binding (any view of it), never another's, and mark every view of it still pending
     /// a handover as ended (it can't answer any more; what it didn't hand over is gone with it).
-    /// Nothing while `Broken` (the lock is kept with the lease), and nothing if the lease can't
-    /// be had in time (the record then names no live binding).
-    pub(crate) fn release(&self, broken: &crate::Broken) {
-        if crate::refuse_if_broken(broken).is_err() {
-            return;
+    /// If the record's write is put back, the handover record also gets an ended entry for the
+    /// view it still names, in the same write, so no claim waits for it (R92-01, run 203). If
+    /// that handover write is put back too, or the record has no room for that entry (it lists
+    /// `MAX_PENDING` already: `no_room`, run 204), or the editing record couldn't be read
+    /// (`Failed`, run 205), the lease is kept locked (`Lease::kept`), and past the binding's
+    /// end the library keeps it (`outlive`) until this is recorded. Nothing while
+    /// `Broken` (the lock is kept with the lease, then by the library until this process ends).
+    /// What it did is kept (`retirement`): a view released after it is told, never that its
+    /// cleanup completed when this didn't (R90-03). Every view of this binding is covered,
+    /// released ones included. `Busy` (another window holds the lease past the ordinary wait)
+    /// is not its end: its caller waits for the lease then (`release_waiting`, run 202: R91-01),
+    /// as a view's release does; nothing is kept as done meanwhile. A later fence (a record that
+    /// may be either version) is what is said over an earlier record put back.
+    pub(crate) fn release(&self, broken: &crate::Broken) -> Result<(), EditError> {
+        let done = self.release_now(broken, false);
+        if !matches!(done, Err(EditError::Busy)) {
+            self.retired_as(done.clone());
         }
-        let Ok(hold) = self.lock_write(broken) else {
-            return;
+        done
+    }
+
+    /// [`Editing::release`] whose lease was busy: waits for it (this thread blocked on the lease
+    /// itself), then the same cleanup. Its caller holds nothing else of this binding.
+    pub(crate) fn release_waiting(&self, broken: &crate::Broken) -> Result<(), EditError> {
+        let done = self.release_now(broken, true);
+        self.retired_as(done.clone());
+        done
+    }
+
+    fn retired_as(&self, done: Result<(), EditError>) {
+        if done.is_ok() {
+            self.departed.lock().unwrap().clear();
+        }
+        *self.retired.lock().unwrap() = Some(done);
+    }
+
+    fn release_now(&self, broken: &crate::Broken, wait: bool) -> Result<(), EditError> {
+        crate::refuse_if_broken(broken).map_err(EditError::Fenced)?;
+        let hold = if wait {
+            self.lock_waiting(broken)?
+        } else {
+            self.lock_raw(broken)?
         };
         let doc = hold.lease.doc.clone();
-        if self
-            .lib
-            .editor_of(&doc)
-            .ok()
-            .flatten()
-            .is_some_and(|e| self.names(&e, None))
-        {
-            let r = self.lib.set_editor(&doc, None);
-            let _ = self.recorded(broken, r);
+        let mut first = None;
+        // The view of this binding the editing record still names when its write was put back
+        // (R92-01, run 203): the handover record then says that it left (an ended entry, as a
+        // released view's `forget_view` notes it), so no claim waits for it.
+        let mut stays = None;
+        // The editing record couldn't be read (R94-01, run 205): whether it still names a view
+        // of this binding isn't known, so neither is that no claim will wait for one.
+        let mut unread = false;
+        match self.lib.editor_of(&doc) {
+            Ok(Some(e)) if self.names(&e, None) => {
+                let r = self.lib.set_editor(&doc, None);
+                if let Err(err) = self.recorded(broken, r) {
+                    if matches!(err, EditError::Record(_)) && e.contains(':') {
+                        stays = Some(e);
+                    }
+                    first = Some(err);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                unread = true;
+                first = Some(EditError::Failed(e));
+            }
         }
-        self.end_pending(broken, &doc, |from| self.names(from, None));
+        // Nothing more after a fence; a fence is what is said.
+        crate::refuse_if_broken(broken).map_err(|f| match &first {
+            Some(EditError::Fenced(e)) => EditError::Fenced(e.clone()),
+            _ => EditError::Fenced(f),
+        })?;
+        match self.end_pending(
+            broken,
+            &doc,
+            |from| self.names(from, None),
+            stays.as_deref(),
+        ) {
+            Ok(None) => {
+                if stays.is_some() {
+                    first = first.map(|e| {
+                        EditError::Record(format!(
+                            "{}; the handover record notes that its views left, so no view \
+                             waits for them",
+                            e.message()
+                        ))
+                    });
+                }
+            }
+            // Unreadable: no claim can wait on anything in it (said, as it is).
+            Ok(Some(why)) => {
+                first.get_or_insert(EditError::Failed(why));
+            }
+            Err(e @ EditError::Fenced(_)) => return Err(e),
+            // The handover record couldn't be written (put back): it still says that a view of
+            // this binding may answer (an existing wait, or no note of the view the editing
+            // record names). The lease is kept locked (R92-01, run 203): no other window takes
+            // the editing or changes the canvas meanwhile, and they are told it is held. Past
+            // this binding's end the library keeps it (`outlive`) until this is recorded.
+            // Or it couldn't be read (run 206, LEAD205-01: `Failed`, its own cause and kind kept,
+            // never a put-back): the same, since it may well read later with those entries.
+            Err(e) => {
+                hold.lease.keep();
+                let what = match &first {
+                    Some(f) => format!("{}; and {}", f.message(), e.message()),
+                    None => e.message(),
+                };
+                let said = format!(
+                    "{what}; so this window keeps the canvas locked until it records that its \
+                     views left (no other window can take the editing or change the canvas \
+                     meanwhile, and they are told it is held): it tries again whenever it next \
+                     lists, opens, renames or exports a canvas, and when it ends"
+                );
+                return Err(match e {
+                    EditError::Record(_) => EditError::Record(said),
+                    _ => EditError::Failed(said),
+                });
+            }
+        }
+        // Unread (R94-01): kept as a put-back is (the same `outlive` past this binding's end, the
+        // same retry), its own cause said (`Failed`): nothing is inferred from a record that
+        // wasn't read, and it isn't rewritten unread. Done once the record reads.
+        if unread {
+            hold.lease.keep();
+            return Err(EditError::Failed(format!(
+                "{}; so this window keeps the canvas locked until it can read it and record \
+                 that its views left (no other window can take the editing or change the canvas \
+                 meanwhile, and they are told it is held): it tries again whenever it next \
+                 lists, opens, renames or exports a canvas, and when it ends",
+                first.map_or_else(String::new, |e| e.message())
+            )));
+        }
+        hold.lease.unkeep();
+        first.map_or(Ok(()), Err)
+    }
+
+    /// After this binding's end (`release`, `release_waiting`): its lease, if that end left it
+    /// kept (the records still say that a view of it may answer: their writes were put back)
+    /// or poisoned (`Broken`), outlives it in the library (`Library::owed`, R92-01, run 203).
+    /// The canvas stays locked, and every view is told it is held, until the end's cleanup is
+    /// recorded (tried again at this process's next use of the library and at its end), or,
+    /// fenced, until this process ends. Nothing of this binding's admission comes back.
+    pub(crate) fn outlive(self: &Arc<Self>, broken: &crate::Broken) {
+        let Ok(lease) = self.lease() else {
+            return;
+        };
+        if !lease.is_kept() && !lease.is_poisoned() {
+            return;
+        }
+        let mut owed = self.lib.owed.lock().unwrap();
+        if owed.iter().any(|o| Arc::ptr_eq(&o.lease, &lease)) {
+            return;
+        }
+        let why = self
+            .retirement()
+            .and_then(Result::err)
+            .map_or_else(String::new, |e| e.message());
+        // A fenced one writes nothing more: only its lease is kept.
+        let cleanup = (!lease.is_poisoned()).then(|| (self.clone(), broken.clone()));
+        owed.push(Owed {
+            lease,
+            cleanup,
+            why,
+        });
+    }
+
+    /// The lease's exclusive lock, waiting for as long as another process holds it (see
+    /// `Lease::lock_wait`), checked.
+    fn lock_waiting(&self, broken: &crate::Broken) -> Result<Hold, EditError> {
+        let lease = self.lease()?;
+        lease.lock_wait()?;
+        let hold = Hold {
+            lease: lease.clone(),
+            broken: Some(broken.clone()),
+        };
+        lease.check(&self.lib).map_err(EditError::Failed)?;
+        Ok(hold)
+    }
+
+    /// What this binding's end did (`release`, `release_waiting`): `None` until it was done
+    /// (also while it waits for the lease).
+    pub(crate) fn retirement(&self) -> Option<Result<(), EditError>> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// Owe view `view`'s record cleanup (see [`Editing::release_view`]) from now on, whatever
+    /// happens next: registered before anything is checked or locked (R90-03).
+    pub(crate) fn depart(&self, view: &str) {
+        let mut d = self.departed.lock().unwrap();
+        if !d.iter().any(|x| x.view == view) {
+            d.push(Departed {
+                view: view.to_string(),
+                safe: false,
+            });
+        }
+    }
+
+    /// Whether a released view's departure isn't even noted yet (see `Departed::safe`).
+    pub(crate) fn departure_unsafe(&self) -> bool {
+        self.departed.lock().unwrap().iter().any(|d| !d.safe)
+    }
+
+    /// At a poll of this binding's views (no wait for anything; R90-01): a released view's
+    /// departure not yet noted is recorded now if the lease can be had at once. What fails stays
+    /// owed (and fences this server if it must: `forget_view`).
+    pub(crate) fn settle_now(&self, broken: &crate::Broken) {
+        // Ended: its own end did that cleanup, and what it still owes is the library's to
+        // record again (`outlive`), never a late poll's.
+        if !self.departure_unsafe()
+            || crate::refuse_if_broken(broken).is_err()
+            || self.retirement().is_some()
+        {
+            return;
+        }
+        let Ok(lease) = self.lease() else {
+            return;
+        };
+        if !matches!(lease.try_lock_now(), Ok(true)) {
+            return;
+        }
+        let hold = Hold {
+            lease: lease.clone(),
+            broken: Some(broken.clone()),
+        };
+        if lease.check(&self.lib).is_ok() {
+            let _ = self.settle_departed(broken, &hold.lease.doc);
+        }
     }
 
     /// A view of this binding left (a browser tab's release, a panel mount's): if it was still
-    /// to hand over, it is marked ended. Its record entry, if it edits, stays (nobody edits
-    /// until a view takes it). Under the writer fence, as every lease use.
-    pub(crate) fn release_view(&self, broken: &crate::Broken, view: &str) {
-        if crate::refuse_if_broken(broken).is_err() {
-            return;
+    /// to hand over, it is marked ended. If it edits, the record then names only this binding,
+    /// as before any of its views opened (its agent still acts for it; no view of it edits until
+    /// one takes the editing), never the view that left: the next view to take the editing would
+    /// otherwise wait for that view to hand over, which it never can (run 198: the parent's
+    /// actual197 Home then reopen waited, with no end, for the released mount). A record naming
+    /// another view or binding is left as it is. Under the writer fence, as every lease use; a
+    /// record write that fails is put back (or fences this server: `Broken`), as every one.
+    ///
+    /// The view is released already (its caller revoked it, and registered it: `depart`;
+    /// nothing undoes that). `Err` says what of its cleanup isn't done, as it happened (R89-01,
+    /// R90): the lease busy, a record unreadable, a write put back (`Record`), or a fence
+    /// (`Fenced`, naming the records). A cleanup not done stays owed: done under this binding's
+    /// next hold of the lease (which refuses what relies on the editing record until it is) or
+    /// at a poll of its views. If the editing record couldn't be rewritten, the handover record
+    /// says that the view left (an ended pending entry for it), which every claim of any
+    /// binding reads: none waits for it. If neither can be written (both put back), or an
+    /// existing wait for the view can't be ended, this window keeps the canvas locked
+    /// (`Lease::kept`, not `Broken`: both records are as they were), so no other window claims
+    /// meanwhile and each is told the canvas is held; past this binding's end, until recorded
+    /// (`Editing::release`, `outlive`). A record that can't be put back fences it (`Broken`).
+    pub(crate) fn release_view(&self, broken: &crate::Broken, view: &str) -> Result<(), EditError> {
+        self.depart(view);
+        crate::refuse_if_broken(broken).map_err(EditError::Fenced)?;
+        let hold = self.lock_raw(broken)?;
+        match self.settle_departed(broken, &hold.lease.doc)? {
+            None => Ok(()),
+            Some(partial) => Err(partial),
         }
-        let Ok(hold) = self.lock_write(broken) else {
-            return;
-        };
-        let doc = hold.lease.doc.clone();
-        let record = self.record(Some(view));
-        self.end_pending(broken, &doc, |from| *from == record);
     }
 
-    fn end_pending(&self, broken: &crate::Broken, doc: &str, mine: impl Fn(&String) -> bool) {
-        let Ok(mut h) = self.lib.handover_of(doc) else {
-            return;
+    /// [`Editing::release_view`] whose lease was busy (another window holds it, past the
+    /// ordinary wait: run 201, R90-01): the release stays under way and waits for that window to
+    /// let the lease go (its operation ends, or that window does), then does the same cleanup.
+    /// Never returns busy: until it can record that the view left, nothing else of this binding
+    /// writes (its caller holds the writer fence), and no other window can take the editing
+    /// either (it would need the same lease); a claim that wins the lease first is answered by
+    /// this cleanup right after it (its wait for the view is ended). Blocks this thread.
+    pub(crate) fn release_view_waiting(&self, broken: &crate::Broken) -> Result<(), EditError> {
+        crate::refuse_if_broken(broken).map_err(EditError::Fenced)?;
+        let hold = self.lock_waiting(broken)?;
+        match self.settle_departed(broken, &hold.lease.doc)? {
+            None => Ok(()),
+            Some(partial) => Err(partial),
+        }
+    }
+
+    /// Do the record cleanup of every departed view (see `departed`) under the caller's hold of
+    /// the lease. Each one done leaves the list; one whose departure is only noted stays
+    /// (`safe`) and is said (`Ok(Some)`, the first); the first that can't even be noted stops
+    /// this (nothing after it is tried, so no later fence can hide behind it) and is returned.
+    fn settle_departed(
+        &self,
+        broken: &crate::Broken,
+        doc: &str,
+    ) -> Result<Option<EditError>, EditError> {
+        let list = self.departed.lock().unwrap().clone();
+        let mut partial = None;
+        for d in list {
+            match self.forget_view(broken, doc, &d.view)? {
+                None => self.departed.lock().unwrap().retain(|x| x.view != d.view),
+                Some(why) => {
+                    for x in self.departed.lock().unwrap().iter_mut() {
+                        if x.view == d.view {
+                            x.safe = true;
+                        }
+                    }
+                    partial.get_or_insert(why);
+                }
+            }
+        }
+        // Every departure recorded (or noted): the lease kept for one goes as usual again.
+        if !self.departure_unsafe()
+            && let Ok(lease) = self.lease()
+        {
+            lease.unkeep();
+        }
+        Ok(partial)
+    }
+
+    /// Departed view `view`'s record cleanup (see [`Editing::release_view`]): the editing record
+    /// names only this binding if it named that view, and its pending entry, if any, is ended;
+    /// if the editing record couldn't be rewritten (put back), the handover record notes that
+    /// the view left (`Ok(Some)`, why it isn't done); if that fails too, fenced.
+    fn forget_view(
+        &self,
+        broken: &crate::Broken,
+        doc: &str,
+        view: &str,
+    ) -> Result<Option<EditError>, EditError> {
+        crate::refuse_if_broken(broken).map_err(EditError::Fenced)?;
+        let record = self.record(Some(view));
+        let named = match self.lib.editor_of(doc) {
+            Ok(named) => named,
+            // Unread (R94-01, run 205): whether it still names the view isn't known, so neither
+            // is that no claim will wait for it. Kept as a put-back is, its own cause said
+            // (`Failed`); nothing is written from a record that wasn't read. Done once it reads.
+            Err(e) => {
+                self.lease()?.keep();
+                return Err(EditError::Failed(format!(
+                    "{e}; so this window keeps the canvas locked until it can read it and record \
+                     that the view left (no other window can take the editing or change the \
+                     canvas meanwhile, and they are told it is held): it tries again at this \
+                     window's next change or check of the canvas, or its close"
+                )));
+            }
+        };
+        let mut kept = None;
+        if named.as_deref() == Some(record.as_str()) {
+            let r = self.lib.set_editor(doc, Some(&self.record(None)));
+            match self.recorded(broken, r) {
+                Ok(()) => {}
+                Err(EditError::Record(e)) => kept = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        match self.end_departed(broken, doc, &record, kept.is_some()) {
+            Ok(None) => Ok(kept.map(|e| {
+                EditError::Record(format!(
+                    "{e}; the handover record notes that the view left, so no view waits for it, \
+                     and the editing record is rewritten at this window's next change or check \
+                     of the canvas, or its close"
+                ))
+            })),
+            Ok(Some(why)) => Ok(Some(EditError::Failed(why))),
+            // The handover record couldn't be written either (put back, so it is as it was), or
+            // had no room for the note (`no_room`, R93-01): it still says the view may answer
+            // (its existing wait, or no note of it while the editing record names it, which a
+            // claim could wait for). This window keeps the canvas locked until it records
+            // that (run 202, R91-02): no other window can take the editing or change the canvas
+            // meanwhile, and every view is told the canvas is held (`Editing::handover`).
+            // Or it couldn't be read (run 206, LEAD205-01: `Failed`, its kind kept): the same,
+            // since it may well read later with the view's entry in it.
+            Err(e2 @ (EditError::Record(_) | EditError::Failed(_))) => {
+                self.lease()?.keep();
+                let what = match kept {
+                    Some(e1) => format!("{e1}; and {}", e2.message()),
+                    None => e2.message(),
+                };
+                let said = format!(
+                    "{what}; so this window keeps the canvas locked until it records that the \
+                     view left (no other window can take the editing or change the canvas \
+                     meanwhile, and they are told it is held): it tries again at this window's \
+                     next change or check of the canvas, or its close"
+                );
+                Err(match e2 {
+                    EditError::Record(_) => EditError::Record(said),
+                    _ => EditError::Failed(said),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The pending entries from `record` ended; with `note`, one ended entry for it added if it
+    /// has none, so no claim waits for it (claims add no entry for a record that has one). A
+    /// handover record seen and unusable (not a plain file, too large, a form this version
+    /// doesn't read) is left as it is: no claim can wait on anything in it (`Ok(Some)`, said).
+    /// One that couldn't be read (an I/O error) is an error, `Failed` (run 206): it may well read
+    /// later, entries and all. A full list has no room for the note: that is not recorded, and is
+    /// an error (`no_room`), never said to be safe, since a claim that first removes its own
+    /// entry would then have room to wait for the view (R93-01, run 204).
+    fn end_departed(
+        &self,
+        broken: &crate::Broken,
+        doc: &str,
+        record: &str,
+        note: bool,
+    ) -> Result<Option<String>, EditError> {
+        let mut h = match self.lib.handover_read(doc) {
+            Ok(h) => h,
+            Err(ReadError::Unusable(e)) => {
+                return Ok(Some(format!(
+                    "{e}, so it was left as it is (no view can wait for anything in it)"
+                )));
+            }
+            // Not read (run 206, LEAD205-01): what it holds isn't known, so neither is that no
+            // claim will wait on an entry in it once it reads. Not recorded, and an error.
+            Err(ReadError::Unread(e)) => return Err(EditError::Failed(e)),
+        };
+        let mut changed = false;
+        let mut found = false;
+        for p in h.pending.iter_mut().filter(|p| p.from == record) {
+            found = true;
+            if !p.ended {
+                p.ended = true;
+                changed = true;
+            }
+        }
+        let full = note && !found && h.pending.len() >= MAX_PENDING;
+        if note && !found && !full {
+            h.pending.push(Pending {
+                id: new_id().map_err(EditError::Failed)?,
+                from: record.to_string(),
+                since: now_ms(),
+                ended: true,
+            });
+            changed = true;
+        }
+        if changed {
+            #[cfg(test)]
+            if note && crate::test_support::fault(&self.lib.locks(), "departure_note") {
+                return Err(EditError::Record(
+                    "this canvas's handover record couldn't be written (injected failure; it \
+                     was put back as it was)"
+                        .into(),
+                ));
+            }
+            let r = self.lib.set_handover(doc, &h);
+            self.recorded(broken, r)?;
+        }
+        if full {
+            return Err(no_room());
+        }
+        Ok(None)
+    }
+
+    /// Mark the pending entries `mine` names ended, and with `note` (a view the editing record
+    /// still names) add an ended entry for it if it has none, so no claim waits for it (as
+    /// `end_departed` notes one): one checked record change. A handover record that can't be
+    /// read is left as it is (`Ok(Some)`, said): no claim can wait on anything in it. A full
+    /// list has no room for the note: the rest is written, and the missing note is an error
+    /// (`no_room`), never success (R93-01, run 204).
+    fn end_pending(
+        &self,
+        broken: &crate::Broken,
+        doc: &str,
+        mine: impl Fn(&String) -> bool,
+        note: Option<&str>,
+    ) -> Result<Option<String>, EditError> {
+        let mut h = match self.lib.handover_read(doc) {
+            Ok(h) => h,
+            Err(ReadError::Unusable(e)) => {
+                return Ok(Some(format!(
+                    "{e}, so it was left as it is (no view can wait for anything in it)"
+                )));
+            }
+            // Not read (run 206, LEAD205-01): what it holds isn't known, so neither is that no
+            // claim will wait on an entry in it once it reads. Not recorded, and an error.
+            Err(ReadError::Unread(e)) => return Err(EditError::Failed(e)),
         };
         let mut changed = false;
         for p in h.pending.iter_mut().filter(|p| !p.ended && mine(&p.from)) {
             p.ended = true;
             changed = true;
         }
+        let needed = note.filter(|view| !h.pending.iter().any(|p| p.from == *view));
+        let full = needed.is_some() && h.pending.len() >= MAX_PENDING;
+        if let Some(view) = needed
+            && !full
+        {
+            h.pending.push(Pending {
+                id: new_id().map_err(EditError::Failed)?,
+                from: view.to_string(),
+                since: now_ms(),
+                ended: true,
+            });
+            changed = true;
+        }
         if changed {
             let r = self.lib.set_handover(doc, &h);
-            let _ = self.recorded(broken, r);
+            self.recorded(broken, r)?;
         }
+        if full {
+            return Err(no_room());
+        }
+        Ok(None)
     }
 
     /// Whether this binding (with `view`, that view of it) has the editing now (the record,
@@ -1907,7 +2642,13 @@ impl Editing {
             return None;
         }
         let mine = |from: &str| view.is_some_and(|v| from == self.record(Some(v)));
+        // A view still waited for while the canvas's lease is held exclusively right now (a
+        // change under way, or a window keeping it until it records that a view left, R91-02):
+        // nothing can be handed over while it is, so the views say so rather than promise an
+        // answer (`held`). Read on a handle of its own, never this binding's.
+        let held = h.pending.iter().any(|p| !p.ended) && self.lib.lease_held_now(&lease.doc);
         Some(json!({
+            "held": held,
             "offers": h.offers.iter().map(|o| json!({
                 "id": o.id,
                 "from_here": mine(&o.from),
@@ -2217,6 +2958,36 @@ impl Handover {
 
 fn now_ms() -> u64 {
     paper_rs::project::now_ms() as u64
+}
+
+/// A departure that needed noting where the handover record has no room for it (it already
+/// lists `MAX_PENDING` views): that note was not written (no entry is removed to make room),
+/// so the departure isn't recorded; handled as a write that was put back (R93-01, run 204).
+fn no_room() -> EditError {
+    EditError::Record(format!(
+        "this canvas's handover record can't wait for more views (it already lists \
+         {MAX_PENDING}), so it couldn't note that the view left"
+    ))
+}
+
+/// Why a record in the locks folder couldn't be had (`Library::record_read`, run 206,
+/// LEAD205-01), from the I/O error kinds themselves, never from a message.
+enum ReadError {
+    /// What is there was seen, and isn't a record this version uses: not a plain file (a link,
+    /// a folder, more than one hard link), larger than a record can be, or (a handover record)
+    /// a form it doesn't know or that doesn't parse. It stays so until something replaces it.
+    Unusable(String),
+    /// It couldn't be looked at or read (an I/O error other than NotFound): what it holds isn't
+    /// known, and a later read may well succeed.
+    Unread(String),
+}
+
+impl ReadError {
+    fn message(self) -> String {
+        match self {
+            ReadError::Unusable(m) | ReadError::Unread(m) => m,
+        }
+    }
 }
 
 /// What a failed record change left (see [`Library::replace_record`]).
