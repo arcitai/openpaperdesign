@@ -33,12 +33,14 @@ Do not create a second root direction or a separate competing set of editor toke
 
 Home uses the OpenPaperDesign name, a single shared mark, neutral primary action, medium-weight
 file names, soft fields, 12-point card gaps, quiet metadata, hairline edges and accent only
-for selection/focus. Native window titles and menus use the product name. The owner rejected the boxed
-canvas/plus mark on 28 October: the open-sheet/fold/canvas studies under
-`design/product/identity/` are exploratory, not accepted identity. The owner also rejected all three first-round marks (document-like A/B and unclear C).
-A second visual exploration (forms, freehand gesture, O with an anchor point) is now
-under `design/product/identity/`, with Opus 5.5 High sparring. No choice is assumed. No icon in the present source is an accepted final mark. Apply a selected mark
-consistently across the website, native Home, plugin Home, app icon and plugin manifest. Keep paper-rs
+for selection/focus. Native window titles and menus use the product name. The owner selected overlapping canvas forms (round 2, option 1), with Arc’IT blue
+`#4265a0` and black/white according to theme. The canonical light/dark SVGs are
+`assets/brand/openpaperdesign*.svg`. Native Home uses their committed PNG derivatives;
+plugin Home uses the same path geometry. Website, repository/plugin assets and the app
+icon derive from this one mark through `scripts/render-brand-assets.cjs` in the release
+integration. The app icon uses the inverse mark on an opaque dark tile; the working UI and
+website use theme-specific variants. The blue is a brand colour, not a change to editor
+selection/field tokens. Keep paper-rs
 attribution, file compatibility, licences and history intact.
 
 Native and MCP Home share this hierarchy and finish. They retain their real storage roles:
