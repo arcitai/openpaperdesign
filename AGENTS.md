@@ -27,6 +27,10 @@ engine architecture is `analysis/DESIGN.md`.
     three-line List glyph only; existing shared palette/type values stay unchanged. `src/app.rs` and `src/macos.rs`
     change user-facing window/menu identity only; file formats and upstream attribution stay.
     The shared HTML Home receives the same mark/card spacing without changing its actions.
+  - `src/app.rs` (2026-10-28): selectively port upstream Sketch commit
+    `66893186714a0bb5f16f1e5b9d93e69b5b37a86d`: poll autosave from every event-loop turn,
+    not rendered frames. Keep this fork's `Session::autosave_due_ui` guard and all
+    save/error/ownership behavior. No upstream rename, updater or UI hunks imported.
   - `src/render/gpu.rs`: the image texture is sampled in uniform control flow (B1, WebGPU
     validation in browsers).
   - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`

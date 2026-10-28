@@ -214,15 +214,18 @@ impl App {
         true
     }
 
-    /// Autosave when due. Called after every frame and on timer wake-ups. A Theme change still
-    /// under way waits (`Session::autosave_due_ui`), so its one undo step isn't split.
-    fn tick_autosave(&mut self) {
-        if self
-            .session
-            .autosave_due_ui(&self.ed, &self.ctx, Instant::now())
-        {
+    /// Poll on every event-loop turn, including MCP edits while the window is covered.
+    /// Preserve the fork's Theme draft guard: one in-progress edit remains one undo step.
+    fn tick_autosave(&mut self) -> bool {
+        self.tick_autosave_at(Instant::now())
+    }
+
+    fn tick_autosave_at(&mut self, now: Instant) -> bool {
+        if self.session.autosave_due_ui(&self.ed, &self.ctx, now) {
             self.save_project(false);
+            return true;
         }
+        false
     }
 
     fn show_home(&mut self) {
@@ -702,7 +705,6 @@ impl App {
             || self.st.home.as_ref().is_some_and(|h| !h.actions.is_empty());
         self.handle_requests();
         self.handle_home_actions();
-        self.tick_autosave();
         if self.st.library.dirty {
             self.st.library.dirty = false;
             if let Err(e) = self.st.library.library.save() {
@@ -1214,16 +1216,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Autosave runs off a timer so it also fires while the window sits idle.
-        if self
-            .session
-            .next_deadline()
-            .is_some_and(|d| Instant::now() >= d)
+        // This poll must run even before a deadline exists: an MCP edit can arrive
+        // without any rendered frame to start the debounce clock (upstream 6689318).
+        if self.tick_autosave()
+            && let Some(g) = &self.gfx
         {
-            self.tick_autosave();
-            if let Some(g) = &self.gfx {
-                g.window.request_redraw();
-            }
+            g.window.request_redraw();
         }
         let wake = match (self.next_repaint, self.session.next_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1506,6 +1504,45 @@ mod tests {
             menu: None,
             mcp: None,
         }
+    }
+
+    #[test]
+    fn autosave_starts_without_a_rendered_frame_and_survives_reopen() {
+        let mut a = app();
+        let root = std::env::temp_dir().join(format!(
+            "opd-occluded-autosave-{}",
+            crate::project::new_id()
+        ));
+        a.session = Session::new(Store::open(root.clone()).unwrap());
+        a.session.create(&mut a.ed, "Covered window").unwrap();
+        let project = a.session.project.as_ref().unwrap().dir.clone();
+        a.ed.add_node(
+            crate::model::Node::new(
+                crate::model::NodeId(0),
+                crate::model::NodeKind::Rect,
+                crate::geom::Rect::new(10.0, 20.0, 40.0, 30.0),
+            ),
+            None,
+        );
+        assert!(a.session.next_deadline().is_none());
+        let now = Instant::now();
+        assert!(!a.tick_autosave_at(now));
+        assert_eq!(
+            a.session.next_deadline(),
+            Some(now + crate::session::AUTOSAVE_DELAY)
+        );
+        assert!(!a.tick_autosave_at(
+            now + crate::session::AUTOSAVE_DELAY - std::time::Duration::from_millis(1)
+        ));
+        assert!(a.tick_autosave_at(now + crate::session::AUTOSAVE_DELAY));
+        assert!(!a.ed.project_dirty());
+        let mut reopened = Editor::default();
+        Session::new(Store::open(root.clone()).unwrap())
+            .open(&mut reopened, &project)
+            .unwrap();
+        assert_eq!(reopened.doc.nodes.len(), 1);
+        drop(a);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// One layout of the real UI on a 1280 × 800 surface with these egui events.
