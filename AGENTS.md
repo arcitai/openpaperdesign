@@ -17,6 +17,10 @@ It is not affiliated with or endorsed by Paper (paper.design). Do not suggest th
   `crates/`, which reuse upstream modules via `#[path]`. If an upstream file has to change,
   give the reason in the commit.
 - Upstream source changes so far (keep this list current):
+  - `src/mcp/exec.rs` (2026-10-28): selectively port upstream PR17, commit
+    `e9046867d6ad393a6c8826249989a764aeb14a77`, restoring SVG root attribute case
+    after HTML parsing. A 48-unit viewBox icon requested at 18px now scales to 18px.
+    Raw child markup, import guards, transactions and the existing UI remain unchanged.
   - `src/render/gpu.rs`: the image texture is sampled in uniform control flow (B1, WebGPU
     validation in browsers).
   - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`
