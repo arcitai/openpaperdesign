@@ -5,12 +5,14 @@
     {
       "path": "assets/brand/openpaperdesign.svg",
       "output": "assets/logo.svg",
-      "sha256": "9747eb3c8bb1792c3f76f1d3e3e5bc769da969bdba11d98f19de22ab48e768b1"
+      "sha256": "0a2f7f605557aabc7826cbd9111f81a75f471cec4b4b567b258b0cbe134aa454",
+      "source": "Owner-selected overlapping canvas forms, 2026-10-28. Arc\u2019IT blue #4265a0 with theme-aware black/white. Original vector mark developed with Opus 5.5 High sparring."
     },
     {
       "path": "assets/brand/openpaperdesign-dark.svg",
       "output": "assets/logo-dark.svg",
-      "sha256": "ec4808ede16cfac9eabbad397aec116fe82d9367d9ddabb372a08ce914c853cc"
+      "sha256": "bfa7117c9c23ec3e06647a9233186236fd36efd1ff6ba78da75189d26a58cf6f",
+      "source": "Owner-selected overlapping canvas forms, 2026-10-28. Arc\u2019IT blue #4265a0 with theme-aware black/white. Original vector mark developed with Opus 5.5 High sparring."
     },
     {
       "path": "site/assets/product-architecture.png",
@@ -129,6 +131,18 @@
       "path": "site/assets/NOTICE.md",
       "output": "assets/NOTICE.md",
       "sha256": "759d33b17e4811929dc399d8d2fe9a28438f9d3735a63d73f60b44cbe003e445"
+    },
+    {
+      "path": "assets/brand/home-logo-light.png",
+      "output": "assets/brand/home-logo-light.png",
+      "sha256": "555ec6275fe6562395cfeb62bde8bf2303360c0f1325206938c2e800a23fe81f",
+      "source": "Rendered from the canonical SVG for the shared native Home. Same mark, not a separate identity."
+    },
+    {
+      "path": "assets/brand/home-logo-dark.png",
+      "output": "assets/brand/home-logo-dark.png",
+      "sha256": "a24e82288d732edd92571aa94bba8ec45bcc8176fb6ce23a5d7b1ad7ccd53b20",
+      "source": "Rendered from the canonical SVG for the shared native Home. Same mark, not a separate identity."
     }
   ]
 }

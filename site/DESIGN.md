@@ -22,12 +22,14 @@ Above800px use the quiet product header; at intermediate widths suppress the opt
 ## Acceptance
 Inspect narrow/intermediate/wide layouts, both themes, relevant keyboard/menu states, actual files and all gallery choices. Check no accidental horizontal page overflow, adequate contrast and readable captions. The preview is not hardware certification. Preserve the source/upstream licences and individual brand ownership. Keep local ignored downloads out of deployment by exporting committed files with scripts/export-product-site.py. Domain/indexing/public downloads stay held until the exact latest-UI app and deployed destination are qualified.
 
-## Identity exploration · owner feedback, 2026-10-28
+## Selected identity · owner, 2026-10-28
 
-The boxed canvas/plus mark and the first document-like SVG proposals are rejected. The
-second round explores overlapping shapes, a freehand gesture and an O with a vector anchor,
-with Opus 5.5 High sparring. See `design/product/identity/` at the repository root. These
-are alternatives, not different logos to use on different surfaces. A selected mark must
-be applied to the native app, compact plugin Home, repository and website together.
-The current product assets are development placeholders, not an accepted final identity.
+The owner selected overlapping canvas forms (round 2, option 1) with Arc’IT blue #4265a0
+and theme-aware black/white. Preserve the overlap and separation at small sizes. The
+canonical light/dark SVGs are `assets/brand/openpaperdesign*.svg`; native Home PNGs,
+plugin assets and the app icon derive from them through `scripts/render-brand-assets.cjs`.
+The blue is the existing Arc’IT family accent; keep the page's neutral typography and
+buttons. The app icon uses the inverse mark on a dark tile, while Home and the website
+use the version suited to their theme. One selected mark across surfaces, never a different
+logo for each host. Previous rejected explorations remain under `design/product/identity/`.
 The root DESIGN.md remains canonical for the app and the relationship between surfaces.
