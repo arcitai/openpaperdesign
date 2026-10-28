@@ -2,7 +2,7 @@
 
 A free, open-source canvas for ideas, diagrams, interfaces and visual work. Work on your own, or connect an AI agent over MCP.
 
-![The actual native editor with an editable system diagram](site/assets/product-architecture.png)
+![New UI/UX development snapshot rendered by paper-rs --screenshot](site/assets/product-architecture.png)
 
 Built on **paper-rs by [Michael Shimeles (Rasmic)](https://github.com/michaelshimeles)**, now developed as [Sketch](https://github.com/michaelshimeles/sketch). The core editor is his work. OpenPaperDesign adds agent-host integration, design methods and desktop packaging. This is an independent fork, not affiliated with Paper (paper.design).
 

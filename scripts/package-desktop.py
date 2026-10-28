@@ -75,6 +75,10 @@ def package(platform, arch, binaries, output):
         for license_file in ("LICENSE-MIT", "LICENSE-APACHE", "THIRD_PARTY.md"):
             shutil.copy2(ROOT / license_file, resources / license_file)
         shutil.copy2(ROOT / "assets/fonts/OFL.txt", resources / "Inter-OFL.txt")
+        # The newer workspace also embeds Geist Mono. Carry every additional
+        # bundled font notice when packaging that source, not only Inter's.
+        for notice in sorted((ROOT / "assets/fonts").glob("OFL-*.txt")):
+            shutil.copy2(notice, resources / notice.name)
         (resources / "BUILD.json").write_text(json.dumps({**config, "platform": platform, "architecture": arch,
             "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
             "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)),

@@ -29,3 +29,5 @@ Verify compact/intermediate/wide views, both themes, mobile overlay/focus/scroll
 Export deployments with `python3 scripts/export-product-site.py --output /new/output/path`. This exports committed files from Git, refuses preview entries, and never uploads ignored local binaries. Do not upload the working `site/` directory directly.
 
 The download counter contacts `api.github.com` in the visitor’s browser; it sends no canvas data. Brand marks and owner artwork are credited separately and are not relicensed by the product’s MIT/Apache code licences.
+
+The review page links to the immutable source revision `61d94cc` so guides work before merge and after branch deletion. When publishing a qualified release, update these guide URLs to that release tag.

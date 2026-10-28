@@ -5,7 +5,7 @@ const system=matchMedia('(prefers-color-scheme: dark)');
 let preference;
 try {preference=localStorage.getItem('openpaperdesign-site-theme');}catch{}
 if(!['dark','light'].includes(preference))preference=null;
-function applyTheme(theme){root.dataset.theme=theme;themeButton.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);document.querySelector('#theme-label').textContent=theme==='dark'?'Dark':'Light';document.querySelectorAll('img[src$="logo.svg"],img[src$="logo-dark.svg"]').forEach(img=>img.src=theme==='dark'?'/assets/logo-dark.svg':'/assets/logo.svg');}
+function applyTheme(theme){root.dataset.theme=theme;themeButton.setAttribute('aria-label',`Appearance: switch to ${theme==='dark'?'light':'dark'} theme`);document.querySelector('#theme-label').textContent=theme==='dark'?'Dark':'Light';document.querySelectorAll('img[src$="logo.svg"],img[src$="logo-dark.svg"]').forEach(img=>img.src=theme==='dark'?'/assets/logo-dark.svg':'/assets/logo.svg');}
 applyTheme(preference||(system.matches?'dark':'light'));
 themeButton.addEventListener('click',()=>{preference=root.dataset.theme==='dark'?'light':'dark';applyTheme(preference);try{localStorage.setItem('openpaperdesign-site-theme',preference);}catch{}});
 system.addEventListener('change',()=>{if(!preference)applyTheme(system.matches?'dark':'light');});
@@ -21,7 +21,7 @@ matchMedia('(min-width:800.02px)').addEventListener('change',e=>{if(e.matches)cl
 const offers=document.querySelector('.offers');
 document.addEventListener('click',e=>{if(!offers.contains(e.target))offers.open=false;});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&offers.open){offers.open=false;offers.querySelector('summary').focus();}});
-const previews={'own-site':['This website, designed in OpenPaperDesign. New UI/UX development preview.','OpenPaperDesign’s own website, with desktop and mobile layout studies, inside the new workspace.'],architecture:['New UI/UX preview · development build. Real canvas, editable objects.','The new OpenPaperDesign workspace with an editable system diagram.'],design:['Interface studies in the new workspace. Development preview.','Public website and tile studies in the new OpenPaperDesign UI.'],whiteboard:['Six colours of sticky notes and hand-drawn shapes. New UI/UX development preview.','Coloured sticky notes and hand-drawn shapes in the new workspace.'],banner:['The selected LinkedIn banner as an image layer, beside editable text. New UI/UX preview.','The selected gustavonline tile banner in the new OpenPaperDesign workspace.']};
+const previews={'own-site':['A design study of this website, in OpenPaperDesign. New UI/UX preview.','OpenPaperDesign’s own website, with desktop and mobile layout studies, inside the new workspace.'],architecture:['New UI/UX preview · development build. Real canvas, editable objects.','The new OpenPaperDesign workspace with an editable system diagram.'],design:['Interface studies in the new workspace. Development preview.','Public website and tile studies in the new OpenPaperDesign UI.'],whiteboard:['Six colours of sticky notes and hand-drawn shapes. New UI/UX development preview.','Coloured sticky notes and hand-drawn shapes in the new workspace.'],banner:['A tile banner as an image layer, beside editable vector layers. New UI/UX preview.','The selected gustavonline tile banner in the new OpenPaperDesign workspace.']};
 document.querySelectorAll('[data-preview]').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.preview;if(!previews[key])return;document.querySelectorAll('[data-preview]').forEach(x=>x.setAttribute('aria-pressed',String(x===button)));const image=document.querySelector('#product-screenshot');image.src=`/assets/product-${key}.png`;document.querySelector('#preview-open').href=image.src;image.alt=previews[key][1];document.querySelector('#preview-caption').textContent=previews[key][0];}));
 const platform=detectPlatform(navigator.userAgentData?.platform||navigator.platform,navigator.userAgent,navigator.maxTouchPoints);
 const local=['127.0.0.1','localhost'].includes(location.hostname);
@@ -38,13 +38,14 @@ async function loadDownloads(){
     const asset=selectAsset(manifest,key,local);const article=document.createElement('article');article.dataset.detected=String(key===platform);
     const title=document.createElement('h3');title.textContent=name;const detail=document.createElement('p');detail.textContent=asset?.architecture||arch;
     const state=document.createElement('small');state.textContent=asset?.status||'No packaged release yet';
-    const action=document.createElement('a');action.className=asset?'button':'text-link';action.textContent=asset?'Download preview ↓':'Build from source ↗';action.setAttribute('aria-label',asset?`Download ${name} preview for ${asset.architecture}`:`Build ${name} from source`);action.href=asset?asset.url:'https://github.com/arcitai/openpaperdesign#build-from-source';article.append(title,detail,state,action);if(key===platform){const detected=document.createElement('small');detected.textContent='Your operating system · check architecture';article.append(detected);}list.append(article);
+    const action=document.createElement('a');action.className=asset?'button':'text-link';action.textContent=asset?'Download preview ↓':'Build from source ↗';action.setAttribute('aria-label',asset?`Download ${name} preview for ${asset.architecture}`:`Build ${name} from source`);action.href=asset?asset.url:'https://github.com/arcitai/openpaperdesign/tree/61d94cc11abe0a10e17b71db28f0d56e113e519b#build-from-source';article.append(title,detail,state,action);if(key===platform){const detected=document.createElement('small');detected.textContent='Your operating system · check architecture';article.append(detected);}list.append(article);
   }
   const chosen=selectAsset(manifest,platform,local);const primary=document.querySelector('#primary-download');
   // User agents do not reliably distinguish Intel and Apple Silicon. Let the person
   // choose the explicitly labelled architecture instead of guessing an installer.
-  if(platformLabels[platform]){primary.textContent=`Download free for ${platformLabels[platform][0]} ↓`;primary.href='#download';}
+  if(chosen&&platformLabels[platform]){primary.textContent=`Download free for ${platformLabels[platform][0]} ↓`;primary.href='#download';}
   else if(platform==='mobile'){primary.textContent='Available for desktop ↓';document.querySelector('#release-note').textContent='A desktop app for macOS, Windows and Linux. Choose a platform below.';}
+  else if(!chosen){primary.textContent='Get OpenPaperDesign ↓';primary.href='#download';}
   if(typeof manifest.notice==='string')document.querySelector('#download-help').textContent=manifest.notice;
 }
 loadDownloads().catch(()=>{document.querySelector('#download-help').textContent='Release information could not be loaded. Check GitHub releases for the latest downloads.';});
