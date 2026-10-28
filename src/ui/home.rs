@@ -102,28 +102,40 @@ fn plural(n: u64, unit: &str) -> String {
     }
 }
 
-// The active open-sheet candidate in assets/brand/openpaperdesign.svg.
+// SVG is the identity source; these committed derivatives share its exact geometry/colour.
 fn brand(ui: &mut Ui) {
-    let p = theme::pal(ui);
-    let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-    let point = |x, y| r.min + egui::vec2(x, y) * (20.0 / 32.0);
-    for path in [
-        vec![
-            (7.0, 10.0),
-            (19.0, 10.0),
-            (25.0, 16.0),
-            (25.0, 28.0),
-            (7.0, 28.0),
-            (7.0, 10.0),
-        ],
-        vec![(19.0, 10.0), (19.0, 16.0), (25.0, 16.0)],
-        vec![(11.0, 5.0), (25.0, 5.0), (29.0, 9.0), (29.0, 23.0)],
-    ] {
-        ui.painter().add(egui::Shape::line(
-            path.into_iter().map(|(x, y)| point(x, y)).collect(),
-            egui::Stroke::new(1.45, p.text),
-        ));
-    }
+    let dark = ui.visuals().dark_mode;
+    let id = egui::Id::new(("opd-brand", dark));
+    let cached = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::TextureHandle>(id));
+    let texture = cached.unwrap_or_else(|| {
+        let png: &[u8] = if dark {
+            include_bytes!("../../assets/brand/home-logo-dark.png")
+        } else {
+            include_bytes!("../../assets/brand/home-logo-light.png")
+        };
+        let image = image::load_from_memory(png)
+            .expect("validated bundled brand PNG")
+            .to_rgba8();
+        let pixels = egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        );
+        let texture = ui.ctx().load_texture(
+            if dark {
+                "opd-brand-dark"
+            } else {
+                "opd-brand-light"
+            },
+            pixels,
+            egui::TextureOptions::LINEAR,
+        );
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id, texture.clone()));
+        texture
+    });
+    ui.add(egui::Image::new((texture.id(), egui::vec2(24.0, 24.0))));
 }
 
 fn primary(ui: &mut Ui, text: &str) -> egui::Response {
