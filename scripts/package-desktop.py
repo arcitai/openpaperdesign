@@ -5,10 +5,13 @@ Usage: package-desktop.py --platform macos|windows|linux --arch arm64|x64
                          --bin-dir PATH --output PATH
 macOS packaging runs on a Mac and uses ad-hoc signing only. Release signing/notarization
 is deliberately separate; a successful archive does not prove end-user installation.
+An existing archive or checksum is never replaced: move earlier packages aside first.
+The output directory must support hard links (APFS, ext4, NTFS and similar).
 """
 import argparse
 import hashlib
 import json
+import os
 import plistlib
 import platform as host
 import shutil
@@ -19,6 +22,23 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def publish(files, output):
+    """Hard-link each finished file into output. A link never replaces an existing name, so of
+    two runs packaging the same target exactly one publishes. On failure, withdraw only the
+    names this run linked."""
+    published = []
+    try:
+        for path in files:
+            target = output / path.name
+            os.link(path, target)
+            published.append((target, path))
+    except BaseException:
+        for target, path in reversed(published):
+            if os.path.samefile(target, path):
+                target.unlink()
+        raise
 
 
 def package(platform, arch, binaries, output, require_clean=False):
@@ -45,8 +65,19 @@ def package(platform, arch, binaries, output, require_clean=False):
             subprocess.run(["lipo", str(required), "-verify_arch", *architectures], check=True)
     output.mkdir(parents=True, exist_ok=True)
     name = f"OpenPaperDesign-{config['version']}-{platform}-{arch}"
-    with tempfile.TemporaryDirectory(prefix="opd-package-") as temporary:
-        stage = Path(temporary)
+    archive = output / (name + (".tar.gz" if platform == "linux" else ".zip"))
+    checksum = archive.with_name(archive.name + ".sha256")
+    for existing in (archive, checksum):
+        if os.path.lexists(existing):
+            raise FileExistsError(f"Refusing to replace {existing}; move earlier packages aside first")
+    # The product is built and signed in the system temporary directory: a synced output folder
+    # (Documents) can attach Finder/file-provider metadata that fails strict signature checks.
+    # Only the finished archive and checksum are staged privately beside the output, on its
+    # volume, so publish() can link them into place. A failed or overlapping run then leaves
+    # the output as it was.
+    with tempfile.TemporaryDirectory(prefix="opd-package-") as temporary, \
+         tempfile.TemporaryDirectory(prefix=f".{name}.", suffix=".partial", dir=output) as finished:
+        stage, ready = Path(temporary), Path(finished)
         if platform == "macos":
             product = stage / "OpenPaperDesign.app"
             executable_dir = product / "Contents/MacOS"
@@ -94,24 +125,23 @@ def package(platform, arch, binaries, output, require_clean=False):
             "inputBinaries": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (source, bridge)},
             "components": json.loads((ROOT / "packaging/components.json").read_text()) if (ROOT / "packaging/components.json").is_file() else {},
             "automaticUpdates": False}, indent=2) + "\n")
+        built = ready / archive.name
         if platform == "macos":
             subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / bridge.name)], check=True)
             subprocess.run(["codesign", "--force", "--sign", "-", str(product)], check=True)
             subprocess.run(["codesign", "--verify", "--deep", "--strict", str(product)], check=True)
-            archive = output / (name + ".zip")
-            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(product), str(archive)], check=True)
+            subprocess.run(["ditto", "-c", "-k", "--keepParent", str(product), str(built)], check=True)
         elif platform == "windows":
-            archive = output / (name + ".zip")
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+            with zipfile.ZipFile(built, "w", zipfile.ZIP_DEFLATED) as z:
                 for path in sorted(product.rglob("*")):
                     if path.is_file():
                         z.write(path, path.relative_to(stage))
         else:
-            archive = output / (name + ".tar.gz")
-            with tarfile.open(archive, "w:gz") as t:
+            with tarfile.open(built, "w:gz") as t:
                 t.add(product, arcname=product.name)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n")
+        digest = hashlib.sha256(built.read_bytes()).hexdigest()
+        (ready / checksum.name).write_text(f"{digest}  {archive.name}\n")
+        publish([built, ready / checksum.name], output)
         print(archive)
         return archive
 
