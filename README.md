@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/openpaperdesign-dark.svg">
+  <img src="assets/brand/openpaperdesign.svg" width="56" height="56" alt="">
+</picture>
+
 # OpenPaperDesign
 
 A free, open-source canvas for ideas, diagrams, interfaces and visual work. Work on your own, or connect an AI agent over MCP.
