@@ -1,10 +1,10 @@
 {
   "factoryUi": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
-  "homeConsistency": "0016f65edc0debde06e47381801929317f928108",
-  "productPackaging": "b372b70449e266cc325927415f377eb48daa2267",
+  "homeConsistency": "441e9779dbbd8c01af3e50130618a967f669855a",
+  "productPackaging": "ca76b9970d03a6fc3bff9b64e168ae3a5197847f",
   "upstreamAutosavePort": "d357e6fc2d5cabdae13fb59d8cb150601b4eb726",
   "upstreamOriginal": "66893186714a0bb5f16f1e5b9d93e69b5b37a86d",
   "installedPluginReplaced": false,
-  "identity": "Owner rejected round1; round2 under review. Development placeholder only.",
+  "identity": "Owner-selected round-2 option 1: overlapping forms, ArcIT #4265a0, theme-aware black/white.",
   "nativeQuit": "Menu Quit/window Close flush project state and retain a failed save"
 }
