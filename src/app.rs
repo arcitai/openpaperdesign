@@ -148,7 +148,7 @@ impl App {
         self.ed.status = msg.clone();
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("paper-rs")
+            .set_title("OpenPaperDesign")
             .set_description(msg)
             .show();
     }
@@ -680,16 +680,16 @@ impl App {
         g.queue.present(frame);
 
         let title = if self.st.home.is_some() {
-            "paper-rs".to_string()
+            "OpenPaperDesign".to_string()
         } else if self.session.project.is_some() {
             format!(
-                "{} — {} — paper-rs",
+                "{} — {} — OpenPaperDesign",
                 self.st.project_name,
                 self.ed.page_name()
             )
         } else {
             format!(
-                "{}{} — paper-rs",
+                "{}{} — OpenPaperDesign",
                 self.ed.doc.name,
                 if self.ed.is_dirty() { " •" } else { "" }
             )
@@ -834,7 +834,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("paper-rs")
+            .with_title("OpenPaperDesign")
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(720.0, 480.0));
         // PAPER_RS_OPAQUE=1 turns off vibrancy (and window transparency) on macOS.

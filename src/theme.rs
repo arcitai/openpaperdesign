@@ -395,6 +395,7 @@ pub enum Icon {
     SidebarRight,
     Export,
     Grid,
+    List,
     Trash,
     More,
     Page,
@@ -822,6 +823,11 @@ pub fn paint_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             a.insert(0, pt(m(13.0), 13.0));
             line(&a);
             line(&[pt(m(1.0), 7.0), pt(m(3.0), 9.8), pt(m(5.6), 7.4)]);
+        }
+        Icon::List => {
+            for y in [4.5, 8.0, 11.5] {
+                line(&[pt(3.0, y), pt(13.0, y)]);
+            }
         }
         Icon::Grid => {
             for (x, y) in [(2.5, 2.5), (9.0, 2.5), (2.5, 9.0), (9.0, 9.0)] {

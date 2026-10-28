@@ -240,7 +240,7 @@ pub fn install_menu() -> NativeMenu {
         idx
     }
 
-    let quit = MenuItem::new("Quit paper-rs", true, acc(cmd, Code::KeyQ));
+    let quit = MenuItem::new("Quit OpenPaperDesign", true, acc(cmd, Code::KeyQ));
     cmds.insert(quit.id().clone(), MenuCmd::Quit);
     let _ = (A::Undo, Run(A::Undo));
     let snapping = CheckMenuItem::new("Snapping", true, true, acc(cmd, Code::Quote));
@@ -253,10 +253,10 @@ pub fn install_menu() -> NativeMenu {
 
     let sep = PredefinedMenuItem::separator;
     let app_menu = Submenu::with_items(
-        "paper-rs",
+        "OpenPaperDesign",
         true,
         &[
-            &PredefinedMenuItem::about(Some("About paper-rs"), None),
+            &PredefinedMenuItem::about(Some("About OpenPaperDesign"), None),
             &sep(),
             &PredefinedMenuItem::services(None),
             &sep(),
