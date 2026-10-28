@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {detectPlatform,selectAsset,allowedDownload,appDownloadCount} from '../../site/downloads.js';
+import {detectPlatform,selectAsset,allowedDownload,appDownloadCount,publishedManifest} from '../../site/downloads.js';
 test('mobile never receives a desktop installer, including iPad desktop mode',()=>{
   assert.equal(detectPlatform('MacIntel','iPhone',1),'mobile');
   assert.equal(detectPlatform('MacIntel','Mozilla Safari',5),'mobile');
@@ -26,4 +26,19 @@ test('only reviewed release or local-preview assets become download actions',()=
   assert.equal(selectAsset({},'linux'),null);
   assert.equal(allowedDownload('/downloads/app.zip'),false);
   assert.equal(allowedDownload('/downloads/app.zip',true),true);
+});
+
+test('only a complete published three-platform release with checksum assets supplies downloads',()=>{
+ const tag='v0.1.0-desktop.1';const base=`https://github.com/arcitai/openpaperdesign/releases/download/${tag}/`;
+ const assets=['macos-universal.zip','windows-x64.zip','linux-x64.tar.gz'].flatMap(target=>{
+  const name=`OpenPaperDesign-0.1.0-${target}`;
+  return [{name,size:500,browser_download_url:base+name},{name:name+'.sha256',size:100,browser_download_url:base+name+'.sha256'}];
+ });
+ const release={tag_name:tag,assets};
+ assert.equal(publishedManifest([release]).platforms.macos.architecture,'Intel + Apple Silicon');
+ assert.equal(publishedManifest([{...release,draft:true}]),null);
+ assert.equal(publishedManifest([{...release,tag_name:'candidate-abc'}]),null);
+ assert.equal(publishedManifest([{...release,assets:assets.slice(0,-1)}]),null);
+ assert.equal(publishedManifest([{...release,assets:assets.map((a,i)=>i===0?{...a,browser_download_url:'https://evil.test/app.zip'}:a)}]),null);
+ assert.equal(appDownloadCount([{assets:[{name:'OpenPaperDesign-0.1.0-macos-universal.zip',download_count:4}]}]),4);
 });

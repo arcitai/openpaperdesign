@@ -21,13 +21,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def package(platform, arch, binaries, output):
+def package(platform, arch, binaries, output, require_clean=False):
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True))
+    if require_clean and dirty:
+        raise ValueError("Refusing a distribution package from an uncommitted source tree")
     expected = {"macos": "Darwin", "windows": "Windows", "linux": "Linux"}[platform]
     if host.system() != expected:
         raise ValueError(f"Package {platform} on its matching build host, not {host.system()}")
     machine = host.machine().lower()
     actual_arch = "arm64" if machine in ("arm64", "aarch64") else "x64" if machine in ("x86_64", "amd64") else machine
-    if actual_arch != arch:
+    if actual_arch != arch and not (platform == "macos" and arch == "universal"):
         raise ValueError(f"Requested {arch} but the build host is {actual_arch}")
     config = json.loads((ROOT / "packaging/desktop.json").read_text(encoding="utf-8"))
     suffix = ".exe" if platform == "windows" else ""
@@ -36,6 +40,9 @@ def package(platform, arch, binaries, output):
     for required in (source, bridge):
         if not required.is_file():
             raise FileNotFoundError(f"Missing built executable: {required}")
+        if platform == "macos":
+            architectures = ["arm64", "x86_64"] if arch == "universal" else ["arm64" if arch == "arm64" else "x86_64"]
+            subprocess.run(["lipo", str(required), "-verify_arch", *architectures], check=True)
     output.mkdir(parents=True, exist_ok=True)
     name = f"OpenPaperDesign-{config['version']}-{platform}-{arch}"
     with tempfile.TemporaryDirectory(prefix="opd-package-") as temporary:
@@ -52,7 +59,8 @@ def package(platform, arch, binaries, output):
                      "CFBundleVersion": config["version"], "LSMinimumSystemVersion": config["minimumMacOS"],
                      "NSHighResolutionCapable": True, "LSApplicationCategoryType": "public.app-category.graphics-design",
                      "NSHumanReadableCopyright": "OpenPaperDesign / Arc’IT AI. Built on paper-rs by Michael Shimeles.",
-                     "CFBundleIconFile": "AppIcon"}
+                     "CFBundleIconFile": "AppIcon",
+                     "NSDocumentsFolderUsageDescription": "OpenPaperDesign opens and saves the projects you choose in your Documents folder."}
             (product / "Contents/Info.plist").write_bytes(plistlib.dumps(plist))
             iconset = stage / "AppIcon.iconset"
             iconset.mkdir()
@@ -77,11 +85,14 @@ def package(platform, arch, binaries, output):
         shutil.copy2(ROOT / "assets/fonts/OFL.txt", resources / "Inter-OFL.txt")
         # The newer workspace also embeds Geist Mono. Carry every additional
         # bundled font notice when packaging that source, not only Inter's.
+        if list((ROOT / "assets/fonts").glob("*GeistMono*")) and not (ROOT / "assets/fonts/OFL-GeistMono.txt").is_file():
+            raise FileNotFoundError("The bundled Geist Mono font requires OFL-GeistMono.txt")
         for notice in sorted((ROOT / "assets/fonts").glob("OFL-*.txt")):
             shutil.copy2(notice, resources / notice.name)
         (resources / "BUILD.json").write_text(json.dumps({**config, "platform": platform, "architecture": arch,
-            "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-            "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)),
+            "revision": revision, "dirty": dirty,
+            "inputBinaries": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (source, bridge)},
+            "components": json.loads((ROOT / "packaging/components.json").read_text()) if (ROOT / "packaging/components.json").is_file() else {},
             "automaticUpdates": False}, indent=2) + "\n")
         if platform == "macos":
             subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / bridge.name)], check=True)
@@ -108,8 +119,9 @@ def package(platform, arch, binaries, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", choices=("macos", "windows", "linux"), required=True)
-    parser.add_argument("--arch", choices=("arm64", "x64"), required=True)
+    parser.add_argument("--arch", choices=("arm64", "x64", "universal"), required=True)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-clean", action="store_true")
     args = parser.parse_args()
-    package(args.platform, args.arch, args.bin_dir.resolve(), args.output.resolve())
+    package(args.platform, args.arch, args.bin_dir.resolve(), args.output.resolve(), args.require_clean)

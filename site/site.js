@@ -1,4 +1,4 @@
-import { detectPlatform, selectAsset, appDownloadCount } from './downloads.js';
+import { detectPlatform, selectAsset, appDownloadCount, publishedManifest } from './downloads.js';
 const root=document.documentElement;
 const themeButton=document.querySelector('#theme-toggle');
 const system=matchMedia('(prefers-color-scheme: dark)');
@@ -25,10 +25,11 @@ const previews={'own-site':['A design study of this website, in OpenPaperDesign.
 document.querySelectorAll('[data-preview]').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.preview;if(!previews[key])return;document.querySelectorAll('[data-preview]').forEach(x=>x.setAttribute('aria-pressed',String(x===button)));const image=document.querySelector('#product-screenshot');image.src=`/assets/product-${key}.png`;document.querySelector('#preview-open').href=image.src;image.alt=previews[key][1];document.querySelector('#preview-caption').textContent=previews[key][0];}));
 const platform=detectPlatform(navigator.userAgentData?.platform||navigator.platform,navigator.userAgent,navigator.maxTouchPoints);
 const local=['127.0.0.1','localhost'].includes(location.hostname);
-const platformLabels={macos:['macOS','Apple Silicon'],windows:['Windows','x64'],linux:['Linux','x64']};
+const platformLabels={macos:['macOS','Intel + Apple Silicon'],windows:['Windows','x64'],linux:['Linux','x64']};
 async function loadDownloads(){
   const response=await fetch('/releases.json');if(!response.ok)throw new Error('release manifest unavailable');
   let manifest=await response.json();
+  if(!local){manifest=publishedManifest(await releasesLookup)||manifest;}
   if(local){
     const preview=await fetch('/releases.preview.json');
     if(preview.ok)manifest=await preview.json();
@@ -48,20 +49,21 @@ async function loadDownloads(){
   else if(!chosen){primary.textContent='Get OpenPaperDesign ↓';primary.href='#download';}
   if(typeof manifest.notice==='string')document.querySelector('#download-help').textContent=manifest.notice;
 }
-loadDownloads().catch(()=>{document.querySelector('#download-help').textContent='Release information could not be loaded. Check GitHub releases for the latest downloads.';});
-async function showObservedDownloads(){
+async function publishedReleases(){
   const releases=[];
   for(let page=1;page<=5;page++){
-    const response=await fetch(`https://api.github.com/repos/arcitai/openpaperdesign/releases?per_page=100&page=${page}`,{headers:{Accept:'application/vnd.github+json'}});
-    if(!response.ok)throw new Error('GitHub download totals unavailable');
-    const batch=await response.json();if(!Array.isArray(batch))throw new Error('Invalid GitHub release list');
-    releases.push(...batch);
-    if(batch.length<100){
-      const total=appDownloadCount(releases);if(total===null)return;
-      const count=document.querySelector('#download-count');count.textContent=`${total.toLocaleString()} downloads from GitHub releases · includes repeat downloads`;
-      count.hidden=false;return;
-    }
+    const response=await fetch(`https://api.github.com/repos/arcitai/openpaperdesign/releases?per_page=100&page=${page}`,{headers:{Accept:'application/vnd.github+json'},signal:AbortSignal.timeout(6000)});
+    if(!response.ok)throw new Error('GitHub release metadata unavailable');
+    const batch=await response.json();if(!Array.isArray(batch))throw new Error('Invalid release list');
+    releases.push(...batch);if(batch.length<100)return releases;
   }
-  throw new Error('Release list exceeds the bounded count lookup');
+  throw new Error('Release list exceeds the bounded lookup');
+}
+const releasesLookup=publishedReleases().catch(()=>null);
+async function showObservedDownloads(){
+  const releases=await releasesLookup;if(!releases)return;
+  const total=appDownloadCount(releases);if(total===null)return;
+  const count=document.querySelector('#download-count');count.textContent=`${total.toLocaleString()} downloads from GitHub releases · includes repeat downloads`;count.hidden=false;
 }
 showObservedDownloads().catch(()=>{/* An unavailable number stays hidden, never estimated. */});
+loadDownloads().catch(()=>{document.querySelector('#download-help').textContent='Release information could not be loaded. Check GitHub releases for the latest downloads.';});
