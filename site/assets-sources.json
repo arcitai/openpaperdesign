@@ -143,6 +143,18 @@
       "output": "assets/brand/home-logo-dark.png",
       "sha256": "a24e82288d732edd92571aa94bba8ec45bcc8176fb6ce23a5d7b1ad7ccd53b20",
       "source": "Rendered from the canonical SVG for the shared native Home. Same mark, not a separate identity."
+    },
+    {
+      "path": "site/assets/onlinesourdough.svg",
+      "output": "assets/onlinesourdough.svg",
+      "sha256": "9d6fc30b46611e4eb91bcdb1573f8192ee5652ec860979cf4ead605d28532f34",
+      "source": "Approved owner large-pixel bread mark, reused unchanged from gustavonline/public/assets/brand-marks/onlinesourdough.svg (production snapshot 2026-10-25). Rendered as a theme-aware mask; geometry unchanged."
+    },
+    {
+      "path": "site/assets/gustavonline.jpg",
+      "output": "assets/gustavonline.jpg",
+      "sha256": "85f1ef31fd1243277ffee1e4ad78db187be1275d242f399b4dfad20bd7f847dd",
+      "source": "Approved owner portrait used by FamilyMark in the onlinesourdough family footer, production snapshot 2026-10-25. Reused unchanged from onlinesourdough/public/assets/gustav-linkedin-portrait.jpg."
     }
   ]
 }

@@ -6,7 +6,7 @@ on:
     branches: ['candidate/**']
     tags: ['v*']
   pull_request:
-    paths: ['packaging/**', 'scripts/package-desktop.py', 'scripts/release-manifest.py', '.github/workflows/desktop-preview.yml', '.cargo/**', 'crates/**', 'src/**', 'assets/**', 'build.rs', 'LICENSE-*', 'THIRD_PARTY.md', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*']
+    paths: ['packaging/**', 'scripts/package-desktop.py', 'scripts/tests/**', 'scripts/release-manifest.py', '.github/workflows/desktop-preview.yml', '.cargo/**', 'crates/**', 'src/**', 'assets/**', 'build.rs', 'LICENSE-*', 'THIRD_PARTY.md', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain*']
 
 permissions:
   contents: read
@@ -44,6 +44,8 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Test package publication and release manifests on this OS
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py'
       - name: Toolchain
         shell: bash
         run: |

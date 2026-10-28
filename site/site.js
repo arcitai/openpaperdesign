@@ -1,14 +1,14 @@
-import { detectPlatform, selectAsset, appDownloadCount, publishedManifest } from './downloads.js';
+import { detectPlatform, selectAsset, downloadChoice, appDownloadCount, publishedManifest } from './downloads.js?v=351db479d439';
 const root=document.documentElement;
 const themeButton=document.querySelector('#theme-toggle');
 const system=matchMedia('(prefers-color-scheme: dark)');
 let preference;
 try {preference=localStorage.getItem('openpaperdesign-site-theme');}catch{}
 if(!['dark','light'].includes(preference))preference=null;
-function applyTheme(theme){root.dataset.theme=theme;themeButton.setAttribute('aria-label',`Appearance: switch to ${theme==='dark'?'light':'dark'} theme`);document.querySelector('#theme-label').textContent=theme==='dark'?'Dark':'Light';document.querySelectorAll('img[src$="logo.svg"],img[src$="logo-dark.svg"]').forEach(img=>img.src=theme==='dark'?'/assets/logo-dark.svg':'/assets/logo.svg');}
-applyTheme(preference||(system.matches?'dark':'light'));
-themeButton.addEventListener('click',()=>{preference=root.dataset.theme==='dark'?'light':'dark';applyTheme(preference);try{localStorage.setItem('openpaperdesign-site-theme',preference);}catch{}});
-system.addEventListener('change',()=>{if(!preference)applyTheme(system.matches?'dark':'light');});
+function applyTheme(){root.dataset.theme=preference||(system.matches?'dark':'light');const next=root.dataset.theme==='dark'?'light':'dark';themeButton.setAttribute('aria-label',`Switch to ${next} mode`);themeButton.title=`Switch to ${next} theme`;}
+applyTheme();
+themeButton.addEventListener('click',()=>{preference=root.dataset.theme==='dark'?'light':'dark';applyTheme();try{localStorage.setItem('openpaperdesign-site-theme',preference);}catch{}});
+system.addEventListener('change',()=>{if(!preference)applyTheme();});
 const dialog=document.querySelector('#mobile-navigation');
 const menuButton=document.querySelector('#menu-toggle');
 let previousOverflow='',navigationTarget=null;
@@ -21,33 +21,45 @@ matchMedia('(min-width:800.02px)').addEventListener('change',e=>{if(e.matches)cl
 const offers=document.querySelector('.offers');
 document.addEventListener('click',e=>{if(!offers.contains(e.target))offers.open=false;});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&offers.open){offers.open=false;offers.querySelector('summary').focus();}});
+offers.addEventListener('focusout',e=>{if(!offers.contains(e.relatedTarget))offers.open=false;});
 const previews={'own-site':['A design study of this website, in OpenPaperDesign. New UI/UX preview.','OpenPaperDesign’s own website, with desktop and mobile layout studies, inside the new workspace.'],architecture:['New UI/UX preview · development build. Real canvas, editable objects.','The new OpenPaperDesign workspace with an editable system diagram.'],design:['Interface studies in the new workspace. Development preview.','Public website and tile studies in the new OpenPaperDesign UI.'],whiteboard:['Six colours of sticky notes and hand-drawn shapes. New UI/UX development preview.','Coloured sticky notes and hand-drawn shapes in the new workspace.'],banner:['A tile banner as an image layer, beside editable vector layers. New UI/UX preview.','The selected gustavonline tile banner in the new OpenPaperDesign workspace.']};
 document.querySelectorAll('[data-preview]').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.preview;if(!previews[key])return;document.querySelectorAll('[data-preview]').forEach(x=>x.setAttribute('aria-pressed',String(x===button)));const image=document.querySelector('#product-screenshot');image.src=`/assets/product-${key}.png`;document.querySelector('#preview-open').href=image.src;image.alt=previews[key][1];document.querySelector('#preview-caption').textContent=previews[key][0];}));
 const platform=detectPlatform(navigator.userAgentData?.platform||navigator.platform,navigator.userAgent,navigator.maxTouchPoints);
 const local=['127.0.0.1','localhost'].includes(location.hostname);
-const platformLabels={macos:['macOS','Intel + Apple Silicon'],windows:['Windows','x64'],linux:['Linux','x64']};
-async function loadDownloads(){
-  const response=await fetch('/releases.json');if(!response.ok)throw new Error('release manifest unavailable');
-  let manifest=await response.json();
-  if(!local){manifest=publishedManifest(await releasesLookup)||manifest;}
-  if(local){
-    const preview=await fetch('/releases.preview.json');
-    if(preview.ok)manifest=await preview.json();
-  }
+const platformLabels={macos:['Mac','Intel + Apple Silicon'],windows:['Windows','x64'],linux:['Linux','x64']};
+const buildGuide='https://github.com/arcitai/openpaperdesign/blob/328623852a062023348275ecb3c51dea11abf5ad/docs/openpaperdesign/desktop.md#build-from-source';
+function choiceForCurrentPlatform(key,manifest){return key===platform&&selectAsset(manifest,platform,local);}
+function renderDownloads(manifest){
   const list=document.querySelector('#platform-downloads');list.replaceChildren();
   for(const [key,[name,arch]] of Object.entries(platformLabels)){
-    const asset=selectAsset(manifest,key,local);const article=document.createElement('article');article.dataset.detected=String(key===platform);
-    const title=document.createElement('h3');title.textContent=name;const detail=document.createElement('p');detail.textContent=asset?.architecture||arch;
-    const state=document.createElement('small');state.textContent=asset?.status||'No packaged release yet';
-    const action=document.createElement('a');action.className=asset?'button':'text-link';action.textContent=asset?'Download preview ↓':'Build from source ↗';action.setAttribute('aria-label',asset?`Download ${name} preview for ${asset.architecture}`:`Build ${name} from source`);action.href=asset?asset.url:'https://github.com/arcitai/openpaperdesign/blob/328623852a062023348275ecb3c51dea11abf5ad/docs/openpaperdesign/desktop.md#build-from-source';article.append(title,detail,state,action);if(key===platform){const detected=document.createElement('small');detected.textContent='Your operating system · check architecture';article.append(detected);}list.append(article);
+    const asset=selectAsset(manifest,key,local);
+    const action=document.createElement('a');action.href=asset?asset.url:buildGuide;action.hidden=Boolean(choiceForCurrentPlatform(key,manifest));action.append(document.createTextNode(name));
+    const detail=document.createElement('span');detail.textContent=asset?`${asset.architecture} ↓`:`Build from source · ${arch} ↗`;action.append(detail);
+    action.setAttribute('aria-label',asset?`Download ${name} preview for ${asset.architecture}`:`Build ${name} from source`);action.title=asset?.status||'No packaged release yet';list.append(action);
   }
-  const chosen=selectAsset(manifest,platform,local);const primary=document.querySelector('#primary-download');
-  // User agents do not reliably distinguish Intel and Apple Silicon. Let the person
-  // choose the explicitly labelled architecture instead of guessing an installer.
-  if(chosen&&platformLabels[platform]){primary.textContent=`Download free for ${platformLabels[platform][0]} ↓`;primary.href='#download';}
-  else if(platform==='mobile'){primary.textContent='Available for desktop ↓';document.querySelector('#release-note').textContent='A desktop app for macOS, Windows and Linux. Choose a platform below.';}
-  else if(!chosen){primary.textContent='Get OpenPaperDesign ↓';primary.href='#download';}
+  const choice=downloadChoice(manifest,platform,local),primary=document.querySelector('#primary-download');
+  primary.textContent=choice.label;primary.href=choice.href;
+  const selected=document.querySelector('#download-primary');selected.hidden=!choice.asset;
+  if(choice.asset){
+    const action=document.querySelector('#desktop-download');action.textContent=choice.label;action.href=choice.href;
+    document.querySelector('#download-meta').textContent=choice.meta;
+    document.querySelector('#release-note').textContent=choice.meta;
+  }else document.querySelector('#release-note').textContent=platform==='mobile'?'For Mac, Windows and Linux. Choose your desktop version below.':'Free and open source. No subscription or account needed.';
   if(typeof manifest.notice==='string')document.querySelector('#download-help').textContent=manifest.notice;
+}
+async function loadDownloads(){
+  let manifest={platforms:{}};
+  try{
+    const response=await fetch('/releases.json');if(!response.ok)throw new Error('Release manifest unavailable');
+    manifest=await response.json();
+  }catch{manifest.notice='Release information could not be loaded. Check GitHub releases for the latest downloads.';}
+  if(local){
+    try{const preview=await fetch('/releases.preview.json');if(preview.ok)manifest=await preview.json();}catch{/* The committed manifest remains the safe fallback. */}
+  }
+  // Show the same-origin manifest first. A slow/rate-limited GitHub lookup must not
+  // delay a known download. Reconcile published assets independently afterwards.
+  renderDownloads(manifest);
+  if(!local){const published=publishedManifest(await releasesLookup);if(published)renderDownloads(published);}
 }
 async function publishedReleases(){
   const releases=[];
@@ -61,9 +73,13 @@ async function publishedReleases(){
 }
 const releasesLookup=publishedReleases().catch(()=>null);
 async function showObservedDownloads(){
-  const releases=await releasesLookup;if(!releases)return;
-  const total=appDownloadCount(releases);if(total===null)return;
-  const count=document.querySelector('#download-count');count.textContent=`${total.toLocaleString()} downloads from GitHub releases · includes repeat downloads`;count.hidden=false;
+  const count=document.querySelector('#download-count');
+  const releases=await releasesLookup;
+  if(!releases){count.textContent='Download count unavailable';return;}
+  const total=appDownloadCount(releases)??0;
+  count.textContent=`${total.toLocaleString()} ${total===1?'download':'downloads'}`;
+  count.title='App archives downloaded from GitHub releases, including repeat downloads. Source code and local previews are excluded.';
+  count.setAttribute('aria-label',`${count.textContent} from GitHub app releases, including repeat downloads`);
 }
-showObservedDownloads().catch(()=>{/* An unavailable number stays hidden, never estimated. */});
+showObservedDownloads().catch(()=>{document.querySelector('#download-count').textContent='Download count unavailable';});
 loadDownloads().catch(()=>{document.querySelector('#download-help').textContent='Release information could not be loaded. Check GitHub releases for the latest downloads.';});
