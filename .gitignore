@@ -3,3 +3,7 @@ target/
 *.asar
 app.asar.unpacked/
 .toolchain/
+dist/
+site/downloads/
+site/releases.preview.json
+__pycache__/

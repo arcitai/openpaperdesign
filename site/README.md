@@ -1,56 +1,27 @@
-# OpenPaperDesign product page
+# Product page
 
-A standalone static marketing page for OpenPaperDesign. This directory does
-not build, start or expose the canvas editor, MCP server or Codex plugin.
-It has no package install or build step, forms, analytics or backend.
-
-## Preview
-
-From the repository root, using Python 3.9 or newer:
+Static HTML/CSS/modules, locally served Geist, no framework, analytics or build step. Matches the Arc’IT / gustavonline / onlinesourdough family with its own blue canvas mark.
 
 ```sh
-python3 -m http.server 4184 --bind 127.0.0.1 --directory site
+python3 -m http.server 4388 --bind 127.0.0.1 --directory site
+node --test scripts/tests/downloads.test.mjs
+python3 scripts/sync-site-assets.py --check
 ```
 
-Open http://127.0.0.1:4184/. Only `site/` is served. In this local preview,
-the Arc’IT footer link points to the companion preview on port 4183; on other
-hosts it keeps its normal https://arcitai.com/ destination. Root-absolute URLs
-require serving this folder at a domain root, not under a path prefix or via
-`file://`.
+Serve `site/` at a domain root. The intended public address remains **openpaperdesign.arcitai.com**, tracked by issue #20. Production currently remains noindex until a real release/domain is reviewed. This folder never serves the owner's editor or project library.
 
-## Files and assets
+## Downloads
 
-- `index.html`, `styles.css`, `site.js`: page, responsive themes and theme toggle.
-- `DESIGN.md`: typography, visual direction and content boundaries.
-- `assets-sources.json`: exact source revisions and SHA256 values for the two
-  repository-owned logos and the existing release screenshot.
-- `assets/fonts/`: local fonts, source notes and SIL OFL licences.
-- `assets/licenses/`: unchanged project licences and third-party notices.
+`releases.json` contains only reviewed actual release assets, with explicit platform/architecture and qualification. No executable means a source-build link, not a fake download. Mobile/iPad detection never hands out an inappropriate desktop installer. An optional ignored `releases.preview.json` is fetched **only on localhost** for actual files copied into ignored `site/downloads/`. It must never be deployed. The local preview can therefore demonstrate a built package without advertising it as a public release.
 
-Refresh the pinned repository assets from the root with:
+A null download count is hidden. Only measured GitHub executable-asset download totals belong in the manifest; checksums and source archives are not app downloads. A network failure keeps an explicit GitHub release fallback. Publication is separate from preparing artifacts.
 
-```sh
-python3 scripts/sync-site-assets.py
-```
+## Product images
 
-The updater verifies each asset hash and keeps output inside `site/assets/`.
-Choose a new revision and hash deliberately when replacing an asset. The logos
-are pinned to the branding work in PR #9; the screenshot still shows v0.1.0.
-The source download and setup link also target that existing release. No
-standalone app installer is implied.
+Actual native editor captures from `design/product/fixtures/*.excalidraw`. `scripts/make-product-fixtures.py` generates the editable public examples. Import them with `PAPER_RS_HOME` pointed at a disposable library, then render with the build's `--screenshot` command. See `assets-sources.json` for source revision, hashes and exact limitations. Do not replace these with generated mock UI or present Factory's unreleased plugin UI as desktop.
 
-## Publication is a separate follow-up
+The shared SVG identity lives in `assets/brand/`. Site and plugin assets match the canonical source. Font and upstream licences are retained. The original product-page screenshot remains in Git history.
 
-The intended address is `openpaperdesign.arcitai.com`. This change adds the
-source only: no hosting configuration, deployment workflow, DNS or release.
-The page intentionally keeps `noindex, nofollow` and has no production canonical.
-Before public launch, complete the appropriate application/release work,
-review the real screenshot and download destinations, and verify the page in
-both themes at desktop and mobile sizes. Publish only this static directory,
-with production metadata and a rollback route.
+## Review and publication
 
-- [Standalone app and downloadable release — #18](https://github.com/arcitai/openpaperdesign/issues/18)
-- [Current-app screenshot — #19](https://github.com/arcitai/openpaperdesign/issues/19)
-- [Domain and deployment — #20](https://github.com/arcitai/openpaperdesign/issues/20)
-
-All three follow-ups remain open; adding this page does not complete them.
+Verify compact/intermediate/wide views, both themes, mobile overlay/focus/scroll-lock, Offers, preview tabs and real file downloads. Validate release and source destinations, current screenshot provenance, canonical/social metadata, HTTPS and indexing when publishing. Do not deploy the ignored local package directory or preview manifest. No hosting credentials or installed plugins are changed by this page.

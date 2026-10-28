@@ -1,23 +1,52 @@
 {
   "repository": "arcitai/openpaperdesign",
+  "source": "repository-owned files; verified by SHA256",
   "assets": [
     {
-      "path": "plugin/openpaperdesign/assets/logo.svg",
-      "revision": "b1ca4ac17d0fe861a282a07265e9f13eb3aa2c80",
+      "path": "assets/brand/openpaperdesign.svg",
       "output": "assets/logo.svg",
-      "sha256": "d4b31d3573a0d8ddee2a28b2e90888fe2f3931487621193c479c23f2d610c7c3"
+      "sha256": "8a5fc6c1116a9b709807b859dd2122dd4612147538a96dff7ad9d912654d19ef"
     },
     {
-      "path": "plugin/openpaperdesign/assets/logo-dark.svg",
-      "revision": "b1ca4ac17d0fe861a282a07265e9f13eb3aa2c80",
+      "path": "assets/brand/openpaperdesign-dark.svg",
       "output": "assets/logo-dark.svg",
-      "sha256": "97f2c928b9a884db8b010f64b1a39dbc4b4f893379c3987d321f1d9299c0258c"
+      "sha256": "8a5fc6c1116a9b709807b859dd2122dd4612147538a96dff7ad9d912654d19ef"
     },
     {
-      "path": "docs/openpaperdesign/screenshots/codex-reopen-0078487.jpg",
-      "revision": "v0.1.0",
-      "output": "assets/canvas-v0.1.0.jpg",
-      "sha256": "10801355b25018dd12aa9cb63354163cc4ee1034dcf906abe955180c453c7931"
+      "path": "site/assets/product-architecture.png",
+      "output": "assets/product-architecture.png",
+      "sha256": "ddb3bfa61c413b080bccf7d09fa306b748bdf3ce57b99876d79c790de3f9416a",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "a21558ee9112f73a0e6da7700bdaa8c4c2ff92bb",
+        "fixture": "design/product/fixtures/architecture.excalidraw",
+        "command": "openpaperdesign --screenshot site/assets/product-architecture.png PROJECT --size 1600x1000 --scale 1",
+        "limitations": "Headless native renderer; not a screenshot of Factory PR9 or a completed manual app session."
+      }
+    },
+    {
+      "path": "site/assets/product-design.png",
+      "output": "assets/product-design.png",
+      "sha256": "f5e4f6bfe1a2b5a47c498fec2c63ce899306da3c0f48e916470be3f0c8701acf",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "a21558ee9112f73a0e6da7700bdaa8c4c2ff92bb",
+        "fixture": "design/product/fixtures/design.excalidraw",
+        "command": "openpaperdesign --screenshot site/assets/product-design.png PROJECT --size 1600x1000 --scale 1",
+        "limitations": "Headless native renderer; not a screenshot of Factory PR9 or a completed manual app session."
+      }
+    },
+    {
+      "path": "site/assets/product-whiteboard.png",
+      "output": "assets/product-whiteboard.png",
+      "sha256": "21a885e2b96e397645c612843e141c340d1312e0a99a9ba3efa038dda0fa8a7d",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "a21558ee9112f73a0e6da7700bdaa8c4c2ff92bb",
+        "fixture": "design/product/fixtures/whiteboard.excalidraw",
+        "command": "openpaperdesign --screenshot site/assets/product-whiteboard.png PROJECT --size 1600x1000 --scale 1",
+        "limitations": "Headless native renderer; not a screenshot of Factory PR9 or a completed manual app session."
+      }
     }
   ]
 }

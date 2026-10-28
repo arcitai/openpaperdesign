@@ -1,50 +1,19 @@
-# Product page design
+# OpenPaperDesign product page
 
-The page belongs to the Arc’IT family: neutral surfaces, restrained steel blue,
-short copy and a clear view of the editable canvas. Keep the layout minimal:
-header, purpose, source/setup actions, screenshot, upstream credit and footer.
-Avoid a feature wall or installation sales panel.
+## Direction
+A clear view of the real tool before the sales explanation. Arc’IT family: restrained steel blue, matte neutral surfaces, Geist type, compact header, centred Offers and quiet family footer. Sketch's product narrative is a reference, not copied page code or graphics. The core editor is credited to Michael Shimeles near the product image, in the origin and in the repository.
 
-## Typography and identity
+## Hierarchy and content
+Purpose → OS-appropriate download → three actual editable examples → three feature pairs → optional agents → file ownership and personal origin → platform downloads → upstream credit. Do not invent a demo video or depict Codex PR9 as the standalone app. Keep preview limitations accurate and source downloads distinct from executables. Do not fabricate download totals.
 
-Inter 400 is for the OpenPaperDesign and Arc’IT names. Geist Sans is for all
-other headings, body text, navigation and controls. Supporting words such as
-“An” and “project” in the footer use the reading face. Fonts and their licences
-are served locally.
+## Composition
+Light #fafafa/#202020; dark #171717/#f3f3f3; Arc’IT blue #4265a0/#93b4e9. Reading column up to 1040px, header up to1120px, relaxed vertical rhythm. The app image is flat and unmodified in a modest border, without a fake device, glossy frame or rotated screenshot. Alternating feature rows have their own readable text and image hierarchy.
 
-Use the repository-owned light/dark logo pair unchanged. `assets-sources.json`
-records their exact revision and hashes. These assets come from the branding
-work in PR #9; their presence does not claim its unreleased app features exist.
+## Responsive behavior
+Above760px: compact family header, centred Offers, product links on the right. At intermediate widths suppress the optional Features shortcut before crowding the brand/Offers/theme. At760px and below: icon-only three-line menu, full viewport native dialog, Offers first and product navigation after it; trap modal focus, close on Escape/link, restore focus and lock background scroll. Feature pairs, agents and story become one column with images before their explanatory text. Download cards become clear platform rows; the smallest screens stack their actions. No hover-only essential actions. Long or touch/unknown platform cases must remain usable. iPhone/iPad/Android receive a desktop explanation, not an inappropriate installer.
 
-## Colour, composition and motion
+## Motion and imagery
+Theme changes follow explicit preference with system fallback. No gratuitous loops. Real native captures come from public repository-owned Excalidraw fixtures rendered through this exact editor; filename/source/revision/hash are recorded in assets-sources.json. The drawings are editable illustrative studies of public brand work, not screenshots of the actual websites. A later video must be recorded from the real app.
 
-Light: paper #fafafa, ink #202020, accent #4265a0.
-Dark: paper #171717, ink #f5f5f5, accent #93b4e9.
-
-The second headline line and primary source action use the accent. The current
-release screenshot sits within a rounded grid frame with a subtle halo and
-shadow. Desktop hover straightens its slight tilt. Mobile and reduced-motion
-preferences disable the tilt; reduced motion also removes transitions.
-There is no looping animation. Focus indicators and theme controls remain
-visible, and actions wrap on narrow screens.
-
-## Content and attribution
-
-Keep the distinction between source code and a packaged app. The current
-button downloads v0.1.0 source, and the setup guide is pinned to that release.
-A future installer must be verified before changing this wording. The image
-is the existing v0.1.0 screenshot until issue #19 supplies a current one.
-
-Keep “Built on Paper RS by Rasmic (Michael Shimeles)” with the upstream links,
-and the MIT/Apache links. Repository notices remain unchanged. No affiliation
-with another Paper product is claimed.
-
-Harp and paper.rasmic.xyz informed the initial exploration; no reference assets
-or page code are copied. The composition and type follow Arc’IT's identity.
-
-## Delivery boundary
-
-See [README.md](README.md) for local serving, asset refresh and the open app,
-screenshot and deployment follow-ups. Adding this source does not publish the
-site or close those issues. The accepted local direction still needs final
-browser verification at publication, including themes, mobile layout and links.
+## Verification before delivery
+Inspect compact, intermediate and wide layouts, both themes, widths around the navigation transition, the modal's keyboard/close/scroll-lock and the preview tabs. Exercise actual download links, unavailable/failure and mobile-platform behavior. Validate the product image's legibility and no unintended horizontal overflow. Keep hardware/UI evidence separate from headless renderer or CI evidence. Public indexing/canonical domain and release links change only when the real deployed destinations exist.
