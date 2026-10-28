@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 24 · 2026-10-25 (its issue #23 leaving/closing text corrected 2026-10-26, runs
+Revision: 25 · 2026-10-28 (its issue #23 leaving/closing text corrected 2026-10-26, runs
 198–206) · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
@@ -24,7 +24,50 @@ The owner's explicit priority governs every choice below, and wins where a refer
 - The same restraint applies to Home, the editor, the tools, the inspector, type and spacing,
   in light, dark and narrow layouts. Airiness never shrinks the drawing room below usable.
 
-## Where things stand (revision 24, 2026-10-24)
+## One product across Home, editor and website (owner, 2026-10-28)
+
+The OpenPaperDesign Design skill applies to this product itself. This root file remains
+canonical; implementation tokens remain in `src/theme.rs` and Home's host-variable mapping.
+The product-page companion is `site/DESIGN.md` when integrated with the release branch.
+Do not create a second root direction or a separate competing set of editor tokens.
+
+Home uses the OpenPaperDesign name, a single shared mark, neutral primary action, medium-weight
+file names, soft fields, 12-point card gaps, quiet metadata, hairline edges and accent only
+for selection/focus. Native window titles and menus use the product name. The owner rejected the boxed
+canvas/plus mark on 28 October: the open-sheet/fold/canvas studies under
+`design/product/identity/` are exploratory, not accepted identity. The owner also rejected all three first-round marks (document-like A/B and unclear C).
+A second visual exploration (forms, freehand gesture, O with an anchor point) is now
+under `design/product/identity/`, with Opus 5.5 High sparring. No choice is assumed. No icon in the present source is an accepted final mark. Apply a selected mark
+consistently across the website, native Home, plugin Home, app icon and plugin manifest. Keep paper-rs
+attribution, file compatibility, licences and history intact.
+
+Native and MCP Home share this hierarchy and finish. They retain their real storage roles:
+native project folders versus plugin library files. Do not pretend these are one synced
+library. Search filters the current inventory without more filesystem discovery. Native
+Home keeps grid/list in memory, uses fluid cards and places Recents/Trash in a menu below
+760 points rather than squeezing a permanent sidebar into a small window. A deliberate
+native double-click opens a project; its file menu remains reachable. Plugin Home is the compact version (content width capped at 760 CSS pixels), with the same
+field, button, grid/list and file-menu language. It keeps its existing host API, focus,
+conflict and admission behavior. Desktop has space for Trash and more project management;
+do not duplicate those destinations in the plugin simply for symmetry. An Open desktop app
+control must use a real supported launch route and state its file handoff; never imply the
+independent libraries are automatically synced or add a decorative button that cannot open it.
+
+Use existing palette values. Native chrome remains 12/11 point body/metadata; the HTML
+Home uses 13/12 CSS pixels. Do not enlarge the whole editor to erase that host difference.
+The product page can be more spacious and expressive; the app remains a quiet working tool.
+
+Qualification so far: the native Home opens a project, retains an edit through save and
+quit/reopen, and supports search, Escape and grid/list. Shared UI renders were inspected in
+Light/Dark at 360/640/900/1280 points; the narrow view keeps navigation available as a menu.
+Native test groups and the Home DOM suite passed. A separate Mac-native browser-adapter
+keyboard test limitation is being compared with the unchanged PR9 baseline; do not claim an
+installed Codex or Claude Code Home has been refreshed merely from these source changes.
+This revision is an integration candidate, not evidence that all PR9
+criteria or the installed plugin are complete. Record actual native, narrow, light/dark,
+search, menu, reopen and save checks with the candidate revision before distribution.
+
+## Previously recorded qualification (revision 24, 2026-10-24)
 
 One place to find the current brief and what is left. The full criteria stay in the issues
 themselves and the owner comments they link (#10's seven groups, comment 6314311252; #14's

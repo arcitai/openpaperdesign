@@ -19,6 +19,11 @@ engine architecture is `analysis/DESIGN.md`.
   `crates/`, which reuse upstream modules via `#[path]`. If an upstream file has to change,
   give the reason in the commit.
 - Upstream source changes so far (keep this list current):
+  - 2026-10-28 Home consistency: `src/ui/home.rs` reuses the workspace palette for neutral
+    actions, local search, grid/list and narrow navigation. `src/theme.rs` adds the
+    three-line List glyph only; existing shared palette/type values stay unchanged. `src/app.rs` and `src/macos.rs`
+    change user-facing window/menu identity only; file formats and upstream attribution stay.
+    The shared HTML Home receives the same mark/card spacing without changing its actions.
   - `src/render/gpu.rs`: the image texture is sampled in uniform control flow (B1, WebGPU
     validation in browsers).
   - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`

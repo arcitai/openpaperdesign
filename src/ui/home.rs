@@ -31,11 +31,14 @@ pub struct HomeView {
     /// "Now" for relative timestamps (unix ms); fixed in screenshots.
     pub now_ms: u64,
     pub root: PathBuf,
+    pub query: String,
+    pub list_view: bool,
+    trash_thumbs: HashMap<PathBuf, PathBuf>,
     thumbs: HashMap<PathBuf, (Option<SystemTime>, egui::TextureHandle)>,
 }
 
-const CARD_W: f32 = 232.0;
-const THUMB_H: f32 = 148.0;
+const GAP: f32 = 12.0;
+const CARD_MIN_W: f32 = 208.0;
 
 impl HomeView {
     /// Re-read the project list and trash from the store (keeps cached thumbnails).
@@ -44,6 +47,19 @@ impl HomeView {
         self.entries = store.list();
         self.trash = store.list_trash();
         self.now_ms = now_ms;
+        // Refresh performs the filesystem checks once. Drawing/filtering the library does
+        // not repeatedly stat every thumbnail while the pointer moves around Home.
+        self.thumbs.retain(|path, (time, _)| {
+            std::fs::metadata(path).and_then(|m| m.modified()).ok() == *time
+        });
+        self.trash_thumbs = self
+            .trash
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.dir.join(crate::project::THUMBNAIL);
+                path.is_file().then(|| (entry.dir.clone(), path))
+            })
+            .collect();
     }
 
     pub fn load(store: &crate::project::Store, now_ms: u64) -> HomeView {
@@ -53,12 +69,10 @@ impl HomeView {
     }
 
     fn thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-        if let Some((t, h)) = self.thumbs.get(path)
-            && *t == mtime
-        {
-            return Some(h.clone());
+        if let Some((_, handle)) = self.thumbs.get(path) {
+            return Some(handle.clone());
         }
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         let img = image::open(path).ok()?.to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         let ci = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
@@ -88,56 +102,101 @@ fn plural(n: u64, unit: &str) -> String {
     }
 }
 
+// The active open-sheet candidate in assets/brand/openpaperdesign.svg.
+fn brand(ui: &mut Ui) {
+    let p = theme::pal(ui);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    let point = |x, y| r.min + egui::vec2(x, y) * (20.0 / 32.0);
+    for path in [
+        vec![
+            (7.0, 10.0),
+            (19.0, 10.0),
+            (25.0, 16.0),
+            (25.0, 28.0),
+            (7.0, 28.0),
+            (7.0, 10.0),
+        ],
+        vec![(19.0, 10.0), (19.0, 16.0), (25.0, 16.0)],
+        vec![(11.0, 5.0), (25.0, 5.0), (29.0, 9.0), (29.0, 23.0)],
+    ] {
+        ui.painter().add(egui::Shape::line(
+            path.into_iter().map(|(x, y)| point(x, y)).collect(),
+            egui::Stroke::new(1.45, p.text),
+        ));
+    }
+}
+
+fn primary(ui: &mut Ui, text: &str) -> egui::Response {
+    let p = theme::pal(ui);
+    ui.scope(|ui| {
+        let w = &mut ui.style_mut().visuals.widgets;
+        for v in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            v.bg_fill = p.text;
+            v.weak_bg_fill = p.text;
+            v.fg_stroke = egui::Stroke::new(1.0, p.window);
+        }
+        w.hovered.bg_fill = theme::blend(p.window, p.text.gamma_multiply(0.88));
+        w.hovered.weak_bg_fill = w.hovered.bg_fill;
+        ui.add_sized([100.0, 30.0], egui::Button::new(text))
+    })
+    .inner
+}
+
 pub fn draw(ui: &mut Ui, hv: &mut HomeView, native_chrome: bool, translucent: bool) {
     let p = theme::pal(ui);
-    egui::Panel::left("home-sidebar")
-        .resizable(false)
-        .exact_size(200.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(if translucent {
-                    Color32::TRANSPARENT
-                } else {
-                    p.sidebar
-                })
-                .inner_margin(egui::Margin::symmetric(10, 8)),
-        )
-        .show(ui, |ui| {
-            if native_chrome {
-                ui.add_space(theme::TOOLBAR_H - 8.0);
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("paper-rs")
-                    .font(theme::semibold(theme::SECONDARY))
-                    .color(p.secondary),
-            );
-            ui.add_space(4.0);
-            if sidebar_item(ui, Icon::Grid, "Recents", None, !hv.show_trash) {
-                hv.show_trash = false;
-            }
-            let n = hv.trash.len();
-            if sidebar_item(
-                ui,
-                Icon::Trash,
-                "Trash",
-                (n > 0).then(|| n.to_string()),
-                hv.show_trash,
-            ) {
-                hv.show_trash = true;
-            }
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(hv.root.display().to_string())
-                        .size(theme::SECONDARY - 1.0)
-                        .color(p.secondary),
-                )
-                .on_hover_text("Projects folder");
+    let wide = ui.available_width() >= 760.0;
+    if wide {
+        egui::Panel::left("home-sidebar")
+            .resizable(false)
+            .exact_size(200.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(if translucent {
+                        Color32::TRANSPARENT
+                    } else {
+                        p.sidebar
+                    })
+                    .inner_margin(egui::Margin::symmetric(12, 12)),
+            )
+            .show(ui, |ui| {
+                if native_chrome {
+                    ui.add_space(theme::TOOLBAR_H - 12.0);
+                }
+                ui.horizontal(|ui| {
+                    brand(ui);
+                    ui.label(RichText::new("OpenPaperDesign").font(theme::semibold(theme::TITLE)));
+                });
+                ui.add_space(20.0);
+                if sidebar_item(ui, Icon::Grid, "Recents", None, !hv.show_trash) {
+                    hv.show_trash = false;
+                }
+                if sidebar_item(
+                    ui,
+                    Icon::Trash,
+                    "Trash",
+                    (!hv.trash.is_empty()).then(|| hv.trash.len().to_string()),
+                    hv.show_trash,
+                ) {
+                    hv.show_trash = true;
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.label(
+                        RichText::new("Saved on this device")
+                            .size(theme::SECONDARY)
+                            .color(p.secondary),
+                    )
+                    .on_hover_text(hv.root.display().to_string());
+                });
+                let r = ui.max_rect();
+                ui.painter().vline(
+                    r.right() + 12.0,
+                    r.y_range(),
+                    egui::Stroke::new(1.0, p.separator),
+                );
             });
-        });
+    }
     egui::Panel::top("home-toolbar")
-        .exact_size(theme::TOOLBAR_H + 8.0)
+        .exact_size(theme::TOOLBAR_H)
         .frame(
             egui::Frame::NONE
                 .fill(p.window)
@@ -145,10 +204,38 @@ pub fn draw(ui: &mut Ui, hv: &mut HomeView, native_chrome: bool, translucent: bo
         )
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.label(
-                    RichText::new(if hv.show_trash { "Trash" } else { "Recents" })
-                        .font(theme::semibold(17.0)),
-                );
+                if !wide && native_chrome {
+                    ui.add_space(theme::TRAFFIC_LIGHTS_W);
+                }
+                if wide {
+                    ui.label(
+                        RichText::new(if hv.show_trash { "Trash" } else { "Recents" })
+                            .font(theme::semibold(17.0)),
+                    );
+                } else {
+                    ui.menu_button(
+                        if hv.show_trash {
+                            "Trash ▾"
+                        } else {
+                            "Recents ▾"
+                        },
+                        |ui| {
+                            ui.label(
+                                RichText::new("OpenPaperDesign")
+                                    .font(theme::semibold(theme::TITLE)),
+                            );
+                            ui.separator();
+                            if ui.selectable_label(!hv.show_trash, "Recents").clicked() {
+                                hv.show_trash = false;
+                                ui.close();
+                            }
+                            if ui.selectable_label(hv.show_trash, "Trash").clicked() {
+                                hv.show_trash = true;
+                                ui.close();
+                            }
+                        },
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if hv.show_trash {
                         if ui
@@ -157,34 +244,61 @@ pub fn draw(ui: &mut Ui, hv: &mut HomeView, native_chrome: bool, translucent: bo
                         {
                             hv.actions.push(HomeAction::EmptyTrash);
                         }
-                    } else {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("New Project").color(Color32::WHITE),
-                                )
-                                .fill(theme::accent()),
-                            )
-                            .clicked()
-                        {
-                            hv.actions.push(HomeAction::New);
-                        }
-                        if ui.button("Import…").clicked() {
-                            hv.actions.push(HomeAction::Import);
-                        }
+                    } else if primary(ui, "New project").clicked() {
+                        hv.actions.push(HomeAction::New);
                     }
                 });
             });
-            let r = ui.max_rect();
-            ui.painter().hline(
-                r.x_range(),
-                r.bottom() - 0.5,
-                egui::Stroke::new(1.0, p.separator),
-            );
         });
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(p.window).inner_margin(20))
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
+            ui.label(
+                RichText::new(if hv.show_trash {
+                    "Restore a project or remove it permanently."
+                } else {
+                    "Your projects, saved as you work."
+                })
+                .size(theme::SECONDARY)
+                .color(p.secondary),
+            );
+            ui.horizontal(|ui| {
+                let width =
+                    (ui.available_width() - if hv.show_trash { 0.0 } else { 164.0 }).max(40.0);
+                let response = ui.add_sized(
+                    [width, 30.0],
+                    egui::TextEdit::singleline(&mut hv.query)
+                        .hint_text("Search projects")
+                        .id_salt("home-search"),
+                );
+                if (response.has_focus() || response.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    hv.query.clear();
+                }
+                if !hv.show_trash {
+                    if theme::icon_button(ui, Icon::List, 30.0, hv.list_view)
+                        .on_hover_text("List")
+                        .clicked()
+                    {
+                        hv.list_view = true;
+                    }
+                    if theme::icon_button(ui, Icon::Grid, 30.0, !hv.list_view)
+                        .on_hover_text("Grid")
+                        .clicked()
+                    {
+                        hv.list_view = false;
+                    }
+                    if ui
+                        .add_sized([68.0, 30.0], egui::Button::new("Import…"))
+                        .clicked()
+                    {
+                        hv.actions.push(HomeAction::Import);
+                    }
+                }
+            });
+            ui.add_space(4.0);
             egui::ScrollArea::vertical()
                 .auto_shrink(false)
                 .show(ui, |ui| {
@@ -208,15 +322,20 @@ fn sidebar_item(
     let (row, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
     if selected {
-        ui.painter().rect_filled(row, 6.0, p.pressed);
+        ui.painter().rect_filled(row, theme::RADIUS, p.pressed);
     } else if resp.hovered() {
-        ui.painter().rect_filled(row, 6.0, p.hover);
+        ui.painter().rect_filled(row, theme::RADIUS, p.hover);
     }
     let ir = egui::Rect::from_center_size(
         egui::pos2(row.left() + 16.0, row.center().y),
         egui::vec2(15.0, 15.0),
     );
-    theme::paint_icon(ui.painter(), ir, icon, theme::accent());
+    theme::paint_icon(
+        ui.painter(),
+        ir,
+        icon,
+        if selected { p.text } else { p.secondary },
+    );
     ui.painter().text(
         egui::pos2(row.left() + 32.0, row.center().y),
         egui::Align2::LEFT_CENTER,
@@ -233,13 +352,21 @@ fn sidebar_item(
             p.secondary,
         );
     }
+    theme::focus_ring(ui, row, &resp, false);
     resp.clicked()
 }
 
-fn columns(ui: &Ui) -> usize {
-    ((ui.available_width() + 20.0) / (CARD_W + 20.0))
-        .floor()
-        .max(1.0) as usize
+fn grid_metrics(width: f32) -> (usize, f32) {
+    let cols = ((width + GAP) / (CARD_MIN_W + GAP)).floor().max(1.0) as usize;
+    (
+        cols,
+        ((width - GAP * (cols - 1) as f32) / cols as f32)
+            .floor()
+            .max(1.0),
+    )
+}
+fn matches(name: &str, query: &str) -> bool {
+    name.to_lowercase().contains(&query.trim().to_lowercase())
 }
 
 fn recents_grid(ui: &mut Ui, hv: &mut HomeView) {
@@ -250,32 +377,40 @@ fn recents_grid(ui: &mut Ui, hv: &mut HomeView) {
             ui.label(RichText::new("No projects yet").font(theme::semibold(17.0)));
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Projects are folders in your Documents, saved as you work.")
+                RichText::new("Create a project or import a canvas to get started.")
                     .color(p.secondary),
             );
             ui.add_space(12.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("New Project").color(Color32::WHITE))
-                        .fill(theme::accent()),
-                )
-                .clicked()
-            {
+            if primary(ui, "New project").clicked() {
                 hv.actions.push(HomeAction::New);
             }
         });
         return;
     }
-    let cols = columns(ui);
-    let entries = hv.entries.clone();
+    let (cols, width) = grid_metrics(ui.available_width());
+    let entries: Vec<_> = hv
+        .entries
+        .iter()
+        .filter(|e| matches(&e.manifest.name, &hv.query))
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        ui.label(RichText::new("No projects match your search.").color(p.secondary));
+    }
+    if hv.list_view {
+        for entry in &entries {
+            project_row(ui, hv, entry);
+        }
+        return;
+    }
     for row in entries.chunks(cols) {
         ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 20.0;
+            ui.spacing_mut().item_spacing.x = GAP;
             for e in row {
-                project_card(ui, hv, e);
+                project_card(ui, hv, e, width);
             }
         });
-        ui.add_space(16.0);
+        ui.add_space(GAP);
     }
 }
 
@@ -284,26 +419,23 @@ fn card_frame(
     hv: &mut HomeView,
     thumb: Option<&Path>,
     id: egui::Id,
+    width: f32,
 ) -> egui::Response {
     let p = theme::pal(ui);
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(CARD_W, THUMB_H), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, (width * 0.625).floor()),
+        egui::Sense::hover(),
+    );
+    let resp = ui.interact(rect, id, egui::Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        8.0,
-        if ui.visuals().dark_mode {
-            Color32::from_rgb(0x1f, 0x1f, 0x21)
-        } else {
-            Color32::from_rgb(0xee, 0xee, 0xf0)
-        },
-    );
+    painter.rect_filled(rect, 8.0, p.field);
     if let Some(t) = thumb.and_then(|t| hv.thumb(ui.ctx(), t)) {
         // Fit the thumbnail inside the card, centered.
         let [tw, th] = t.size();
         let s = ((rect.width() - 16.0) / tw as f32)
             .min((rect.height() - 16.0) / th as f32)
-            .min(1.0);
+            .min(1.0 / ui.ctx().pixels_per_point());
         let r =
             egui::Rect::from_center_size(rect.center(), egui::vec2(tw as f32 * s, th as f32 * s));
         ui.painter().image(
@@ -317,34 +449,43 @@ fn card_frame(
             ui.painter(),
             egui::Rect::from_center_size(rect.center(), egui::vec2(28.0, 28.0)),
             Icon::Page,
-            p.tertiary,
+            p.secondary,
         );
     }
     ui.painter().rect_stroke(
         rect,
         8.0,
         egui::Stroke::new(
-            if hovered { 2.0 } else { 1.0 },
+            1.0,
             if hovered {
-                theme::accent()
+                if ui.visuals().dark_mode {
+                    Color32::from_rgb(0x48, 0x48, 0x4c)
+                } else {
+                    Color32::from_rgb(0xd6, 0xd6, 0xd9)
+                }
             } else {
                 p.separator
             },
         ),
         egui::StrokeKind::Inside,
     );
-    let _ = id;
+    theme::focus_ring(ui, rect, &resp, false);
     resp
 }
 
-fn project_card(ui: &mut Ui, hv: &mut HomeView, e: &Entry) {
+fn project_card(ui: &mut Ui, hv: &mut HomeView, e: &Entry, width: f32) {
     let p = theme::pal(ui);
     ui.vertical(|ui| {
-        ui.set_width(CARD_W);
+        ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 2.0;
         let id = egui::Id::new(("card", &e.dir));
-        let resp = card_frame(ui, hv, e.thumbnail.as_deref(), id);
-        if resp.double_clicked() {
+        let resp = card_frame(ui, hv, e.thumbnail.as_deref(), id, width);
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &e.manifest.name)
+        });
+        if resp.double_clicked()
+            || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
             hv.actions.push(HomeAction::Open(e.dir.clone()));
         }
         resp.context_menu(|ui| card_menu(ui, hv, e));
@@ -352,20 +493,21 @@ fn project_card(ui: &mut Ui, hv: &mut HomeView, e: &Entry) {
         let renaming = hv.renaming.as_ref().is_some_and(|(d, _)| *d == e.dir);
         if renaming {
             let (_, name) = hv.renaming.as_mut().unwrap();
-            let r = ui.add(egui::TextEdit::singleline(name).desired_width(CARD_W));
-            r.request_focus();
+            let r = ui.add(egui::TextEdit::singleline(name).desired_width(width));
             if r.lost_focus() {
                 let (dir, name) = hv.renaming.take().unwrap();
                 if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && name.trim() != e.manifest.name
                 {
                     hv.actions.push(HomeAction::Rename(dir, name));
                 }
+            } else if !r.has_focus() {
+                r.request_focus();
             }
         } else {
             ui.horizontal(|ui| {
                 let name = ui.add(
                     egui::Label::new(
-                        RichText::new(&e.manifest.name).font(theme::semibold(theme::BODY)),
+                        RichText::new(&e.manifest.name).font(theme::medium(theme::BODY)),
                     )
                     .truncate()
                     .sense(egui::Sense::click()),
@@ -391,6 +533,94 @@ fn project_card(ui: &mut Ui, hv: &mut HomeView, e: &Entry) {
             .size(theme::SECONDARY)
             .color(p.secondary),
         );
+    });
+}
+
+fn project_row(ui: &mut Ui, hv: &mut HomeView, entry: &Entry) {
+    let p = theme::pal(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("project-row", &entry.dir)),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &entry.manifest.name)
+    });
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 8.0, p.hover);
+    }
+    theme::focus_ring(ui, rect, &response, false);
+    if response.double_clicked()
+        || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+    {
+        hv.actions.push(HomeAction::Open(entry.dir.clone()));
+    }
+    response.context_menu(|ui| card_menu(ui, hv, entry));
+    theme::paint_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 16.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        ),
+        Icon::Page,
+        p.secondary,
+    );
+    let text_rect = egui::Rect::from_min_max(
+        rect.min + egui::vec2(36.0, 5.0),
+        rect.max - egui::vec2(44.0, 5.0),
+    );
+    if hv
+        .renaming
+        .as_ref()
+        .is_some_and(|(dir, _)| *dir == entry.dir)
+    {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+            let (_, name) = hv.renaming.as_mut().unwrap();
+            let response =
+                ui.add_sized([text_rect.width(), 28.0], egui::TextEdit::singleline(name));
+            if response.lost_focus() {
+                let (dir, name) = hv.renaming.take().unwrap();
+                if !ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    && name.trim() != entry.manifest.name
+                {
+                    hv.actions.push(HomeAction::Rename(dir, name));
+                }
+            } else if !response.has_focus() {
+                response.request_focus();
+            }
+        });
+    } else {
+        let mut job = egui::text::LayoutJob::simple(
+            entry.manifest.name.clone(),
+            theme::medium(theme::BODY),
+            p.text,
+            text_rect.width(),
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.painter().layout_job(job);
+        ui.painter().galley(text_rect.min, galley, p.text);
+        ui.painter().text(
+            text_rect.min + egui::vec2(0.0, 17.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "Edited {}",
+                relative_time(entry.manifest.modified, hv.now_ms)
+            ),
+            egui::FontId::proportional(theme::SECONDARY),
+            p.secondary,
+        );
+        response.clone().on_hover_text(&entry.manifest.name);
+    }
+    let more_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 36.0, rect.center().y - 14.0),
+        egui::vec2(28.0, 28.0),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(more_rect), |ui| {
+        let more = theme::icon_button(ui, Icon::More, 28.0, false).on_hover_text("More");
+        egui::Popup::menu(&more).show(|ui| card_menu(ui, hv, entry));
     });
 }
 
@@ -427,23 +657,30 @@ fn trash_grid(ui: &mut Ui, hv: &mut HomeView) {
         });
         return;
     }
-    let cols = columns(ui);
-    let entries = hv.trash.clone();
+    let (cols, width) = grid_metrics(ui.available_width());
+    let entries: Vec<_> = hv
+        .trash
+        .iter()
+        .filter(|e| matches(&e.manifest.name, &hv.query))
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        ui.label(RichText::new("No projects match your search.").color(p.secondary));
+    }
     for row in entries.chunks(cols) {
         ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 20.0;
+            ui.spacing_mut().item_spacing.x = GAP;
             for e in row {
                 ui.vertical(|ui| {
-                    ui.set_width(CARD_W);
-                    let thumb = e.dir.join(crate::project::THUMBNAIL);
-                    let thumb = thumb.is_file().then_some(thumb);
-                    let resp = card_frame(ui, hv, thumb.as_deref(), egui::Id::new(&e.dir));
+                    ui.set_width(width);
+                    let thumb = hv.trash_thumbs.get(&e.dir).cloned();
+                    let resp = card_frame(ui, hv, thumb.as_deref(), egui::Id::new(&e.dir), width);
                     resp.context_menu(|ui| {
                         if ui.button("Restore").clicked() {
                             hv.actions.push(HomeAction::Restore(e.dir.clone()));
                             ui.close();
                         }
-                        if ui.button("Delete Permanently").clicked() {
+                        if ui.button("Delete permanently").clicked() {
                             hv.actions.push(HomeAction::DeleteForever(e.dir.clone()));
                             ui.close();
                         }
@@ -452,7 +689,7 @@ fn trash_grid(ui: &mut Ui, hv: &mut HomeView) {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&e.manifest.name).font(theme::semibold(theme::BODY)),
+                                RichText::new(&e.manifest.name).font(theme::medium(theme::BODY)),
                             )
                             .truncate(),
                         );
@@ -473,13 +710,25 @@ fn trash_grid(ui: &mut Ui, hv: &mut HomeView) {
                 });
             }
         });
-        ui.add_space(16.0);
+        ui.add_space(GAP);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filters_names_and_keeps_cards_inside_narrow_widths() {
+        assert!(matches("Kundens Ønsker", "øNS"));
+        assert!(matches("Board", "  "));
+        assert!(!matches("Board", "notes"));
+        for width in [160.0, 248.0, 424.0, 640.0, 1232.0, 2000.0] {
+            let (cols, card) = grid_metrics(width);
+            assert!(cols >= 1 && card > 0.0);
+            assert!(cols as f32 * card + (cols - 1) as f32 * GAP <= width);
+        }
+    }
 
     #[test]
     fn relative_times() {
