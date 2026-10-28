@@ -21,3 +21,13 @@ Above800px use the quiet product header; at intermediate widths suppress the opt
 
 ## Acceptance
 Inspect narrow/intermediate/wide layouts, both themes, relevant keyboard/menu states, actual files and all gallery choices. Check no accidental horizontal page overflow, adequate contrast and readable captions. The preview is not hardware certification. Preserve the source/upstream licences and individual brand ownership. Keep local ignored downloads out of deployment by exporting committed files with scripts/export-product-site.py. Domain/indexing/public downloads stay held until the exact latest-UI app and deployed destination are qualified.
+
+## Identity exploration · owner feedback, 2026-10-28
+
+The boxed canvas/plus mark and the first document-like SVG proposals are rejected. The
+second round explores overlapping shapes, a freehand gesture and an O with a vector anchor,
+with Opus 5.5 High sparring. See `design/product/identity/` at the repository root. These
+are alternatives, not different logos to use on different surfaces. A selected mark must
+be applied to the native app, compact plugin Home, repository and website together.
+The current product assets are development placeholders, not an accepted final identity.
+The root DESIGN.md remains canonical for the app and the relationship between surfaces.
