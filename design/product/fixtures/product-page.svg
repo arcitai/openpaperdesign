@@ -2,7 +2,7 @@
 <rect width="1810" height="1080" fill="#eeedea"/>
 <rect x="32" y="32" width="1220" height="990" rx="3" fill="#fbfaf8"/>
 <rect x="1300" y="32" width="470" height="990" rx="3" fill="#fbfaf8"/>
-<svg x="76" y="63" width="25" height="25" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><title>OpenPaperDesign</title><rect width="32" height="32" rx="6" fill="#232321"/><path d="M8 9h16v14H8z" fill="none" stroke="#fafafa" stroke-width="1.5"/><path d="M12 18h8M16 14v8" fill="none" stroke="#fafafa" stroke-width="1.4"/><path d="M7 8h3v3H7zM22 21h3v3h-3z" fill="#fafafa"/></svg>
+<svg x="76" y="63" width="25" height="25" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" color="#17181c"><title>OpenPaperDesign</title><path fill="currentColor" d="M25 21H11a4 4 0 0 0-4 4v28a4 4 0 0 0 4 4h28a4 4 0 0 0 4-4V39A18 18 0 0 1 25 21Z"/><circle cx="43" cy="21" r="14" fill="#4265a0"/></svg>
 <text x="111" y="83" font-family="Inter" font-size="22" fill="#232321">OpenPaperDesign</text>
 <text x="735" y="82" font-family="Inter" font-size="17" fill="#232321">Canvas</text><text x="830" y="82" font-family="Inter" font-size="17" fill="#232321">Features</text><text x="938" y="82" font-family="Inter" font-size="17" fill="#232321">GitHub ↗</text>
 <line x1="32" y1="114" x2="1252" y2="114" stroke="#deded8"/>
