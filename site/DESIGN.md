@@ -1,19 +1,23 @@
 # OpenPaperDesign product page
 
-## Direction
-A clear view of the real tool before the sales explanation. Arc’IT family: restrained steel blue, matte neutral surfaces, Geist type, compact header, centred Offers and quiet family footer. Sketch's product narrative is a reference, not copied page code or graphics. The core editor is credited to Michael Shimeles near the product image, in the origin and in the repository.
+Revision 2 · 2026-10-28 · Owner’s latest direction supersedes the first Arc’IT-heavy page.
 
-## Hierarchy and content
-Purpose → OS-appropriate download → three actual editable examples → three feature pairs → optional agents → file ownership and personal origin → platform downloads → upstream credit. Do not invent a demo video or depict Codex PR9 as the standalone app. Keep preview limitations accurate and source downloads distinct from executables. Do not fabricate download totals.
+## Job and direction
+A canvas for everything. A free, open-source visual workspace for ideas, diagrams, interfaces, whiteboards and banners, usable alone or with a coding agent. Primary action: a clearly labelled desktop download. The page has its own neutral product identity; family relationships remain in Offers and the footer.
 
-## Composition
-Light #fafafa/#202020; dark #171717/#f3f3f3; Arc’IT blue #4265a0/#93b4e9. Reading column up to 1040px, header up to1120px, relaxed vertical rhythm. The app image is flat and unmodified in a modest border, without a fake device, glossy frame or rotated screenshot. Alternating feature rows have their own readable text and image hierarchy.
+## References, preserve and change
+Sketch (https://sketch.rasmic.xyz/) supplies the product-first sequence: real editor demonstration, readable feature pairs, source and clear download status. Paper (https://paper.design/, inspected 28 October) supplies the confidence of large readable typography, generous media, coding-tool marks and visible product outcomes. Neither reference supplies code, screenshots, testimonials, branding, HTML/code export or two-way sync claims.
 
-## Responsive behavior
-Above760px: compact family header, centred Offers, product links on the right. At intermediate widths suppress the optional Features shortcut before crowding the brand/Offers/theme. At760px and below: icon-only three-line menu, full viewport native dialog, Offers first and product navigation after it; trap modal focus, close on Escape/link, restore focus and lock background scroll. Feature pairs, agents and story become one column with images before their explanatory text. Download cards become clear platform rows; the smallest screens stack their actions. No hover-only essential actions. Long or touch/unknown platform cases must remain usable. iPhone/iPad/Android receive a desktop explanation, not an inappropriate installer.
+Preserve the family’s calm navbar/footer, real Offers destinations, full mobile overlay and light/dark capability. Change the blue headline and blue primary mark to neutral ink, move appearance to a text control in the footer, remove tiny metadata from the hero, and use actual new UI/UX captures. No moon in the navbar.
 
-## Motion and imagery
-Theme changes follow explicit preference with system fallback. No gratuitous loops. Real native captures come from public repository-owned Excalidraw fixtures rendered through this exact editor; filename/source/revision/hash are recorded in assets-sources.json. The drawings are editable illustrative studies of public brand work, not screenshots of the actual websites. A later video must be recorded from the real app.
+## Sequence and hierarchy
+Quiet header → broad headline and concrete uses → download and source → Codex/Claude Code compatibility → five real canvas examples (this website, system, interface, whiteboard, banner) → three feature pairs → actual local MCP explanation → files and origin → honest platform download status → upstream credit and family footer. Product media up to 1280px; reading column 1120px. Desktop H1 up to78px, body18–21px, captions14–16px. No gratuitous labels or fake customer proof.
 
-## Verification before delivery
-Inspect compact, intermediate and wide layouts, both themes, widths around the navigation transition, the modal's keyboard/close/scroll-lock and the preview tabs. Exercise actual download links, unavailable/failure and mobile-platform behavior. Validate the product image's legibility and no unintended horizontal overflow. Keep hardware/UI evidence separate from headless renderer or CI evidence. Public indexing/canonical domain and release links change only when the real deployed destinations exist.
+## Real content and limits
+All five captures use the new shared native workspace from frozen PR9 source1b04c31, rendered on Apple M4/Metal. They are development previews; current main-branch packaging prototypes do not contain that UI yet. The site itself is an SVG design study imported into the real canvas with desktop/mobile compositions, editable vector layers and cropped native screenshot image layers, not a running HTML page. The banner is the owner-selected real LinkedIn artwork as an image layer, surrounded by editable vectors. Remaining samples are editable public illustrative diagrams, notes and layout studies. Exact source/fixture/binary hashes are in assets-sources.json. Never present these as a publicly released app before qualification.
+
+## Responsive and interaction choices
+Above800px use the quiet product header; at intermediate widths suppress the optional Features shortcut before crowding the brand. At800px and below show an icon-only three-line menu and a full-viewport modal, Offers first. Escape/close restores focus; in-page navigation moves focus to the destination; lock background scroll while open. Stack feature/media/story pairs and platform actions. Gallery buttons wrap on narrow views; image opens at full size. No hover-only essential actions. Touch/mobile devices see a desktop explanation. OS detection leads to labelled architecture choices, never an assumed Apple Silicon installer.
+
+## Acceptance
+Inspect narrow/intermediate/wide layouts, both themes, relevant keyboard/menu states, actual files and all gallery choices. Check no accidental horizontal page overflow, adequate contrast and readable captions. The preview is not hardware certification. Preserve the source/upstream licences and individual brand ownership. Keep local ignored downloads out of deployment by exporting committed files with scripts/export-product-site.py. Domain/indexing/public downloads stay held until the exact latest-UI app and deployed destination are qualified.

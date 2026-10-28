@@ -1,18 +1,18 @@
 # OpenPaperDesign desktop preview
 
-The desktop package runs the existing native Rust editor, without Codex or a plugin. It is separate from the newer Codex Home/workspace UI in PR #9. Both reuse the editor and project format; their host interfaces and access contracts differ.
+The desktop package runs the existing native Rust editor, without Codex or a plugin. The main-branch packaging prototypes do not yet include the new UI/UX shown on the product page. Those images were rendered with the frozen PR #9 source at `1b04c31`, where the shared native workspace also has the new UI. Public desktop release is held until packages include that qualified UI and pass the normal app journey. Both hosts reuse the editor and project format; their access contracts differ.
 
 ## Current status
 
-- **macOS / Apple Silicon:** local release binaries and an ad-hoc-signed `.app`/ZIP built on an Apple M4. The bundle launches to Home. Headless Metal rendering of the three public fixtures succeeds. A native Import interaction was interrupted by a computer-use timeout; new/edit/save/reopen, export and a browser-downloaded/quarantined first launch remain unqualified. Not Apple notarized.
-- **Windows / x64:** The x64 build, CLI smoke check and ZIP packaging passed on the GitHub Windows runner. First launch and editing on a real Windows desktop remain unqualified.
-- **Linux / x64:** CI build/package job prepared. No Linux build or physical-machine pass is claimed yet.
+- **macOS / Apple Silicon:** local release binaries and an ad-hoc-signed `.app`/ZIP built on an Apple M4. The bundle launches to Home. Headless Metal rendering of all five public fixtures succeeds with the frozen new-UI source; this is separate from the main-branch package. A native Import interaction was interrupted by a computer-use timeout; new/edit/save/reopen, export and a browser-downloaded/quarantined first launch remain unqualified. Not Apple notarized.
+- **Windows / x64:** The corrected x64 build and ZIP packaging passed on the GitHub Windows runner at `04c738e` using Bash to gate both CLI commands. The GUI-subsystem app has no console output when opened from Explorer. First launch and editing on a real Windows desktop remain unqualified.
+- **Linux / x64:** The corrected x64 build, CLI smoke checks and tarball packaging passed on the GitHub Ubuntu runner at `04c738e`. No physical-machine pass is claimed.
 
 Use the release's own status and checksums. A workflow archive is not a claim that an installer was accepted by Windows/macOS security checks. The source-only v0.1.0 release is still labelled source. No automatic updater, signing credential or security setting is installed by this work.
 
 ## Library and existing files
 
-The `openpaperdesign` entrypoint uses `~/Documents/OpenPaperDesign`. An explicit `PAPER_RS_HOME` selects another library. No upstream or Codex library is silently moved or adopted. Native projects retain the upstream folder/JSON/assets format and the existing `.paper-rs` compatibility.
+The `openpaperdesign` entrypoint uses `OpenPaperDesign` in your Documents folder, falling back to `Documents` in your home folder when a Linux desktop has not registered one. An explicit `PAPER_RS_HOME` selects another library. No upstream or Codex library is silently moved or adopted. Native projects retain the upstream folder/JSON/assets format and the existing `.paper-rs` compatibility.
 
 Do not edit the same project in the native app and the Codex browser plugin at the same time. The plugin's checked save/binding path does not protect against an independent native writer.
 
@@ -25,7 +25,7 @@ cargo build --release --locked --bin openpaperdesign --bin paper-rs-mcp
 ./target/release/openpaperdesign
 ```
 
-On Windows, use `target/release/openpaperdesign.exe`. On Linux, provide the normal GTK3, X11/Wayland, libxkbcommon and Vulkan/GL runtime libraries. The Ubuntu 24.04 package targets glibc 2.39 or newer. The upstream [build guide](../upstream-README.md#build-and-run) describes those dependencies. A source build does not require an account or an AI agent.
+On Windows, use `target/release/openpaperdesign.exe`. The workflow statically links the MSVC C runtime. A manual build without that flag may require the Microsoft Visual C++ runtime; the GUI executable does not print CLI output in an Explorer-launched console. On Linux, provide the normal GTK3, X11/Wayland, libxkbcommon and Vulkan/GL runtime libraries. The Ubuntu 24.04 package targets glibc 2.39 or newer. The upstream [build guide](../upstream-README.md#build-and-run) describes those dependencies. A source build does not require an account or an AI agent.
 
 The old `paper-rs` binary remains available for upstream-compatible commands. The thin distribution entrypoint reuses that CLI rather than adding a second editor.
 

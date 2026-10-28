@@ -5,7 +5,7 @@ const system=matchMedia('(prefers-color-scheme: dark)');
 let preference;
 try {preference=localStorage.getItem('openpaperdesign-site-theme');}catch{}
 if(!['dark','light'].includes(preference))preference=null;
-function applyTheme(theme){root.dataset.theme=theme;themeButton.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);}
+function applyTheme(theme){root.dataset.theme=theme;themeButton.setAttribute('aria-label',`Switch to ${theme==='dark'?'light':'dark'} theme`);document.querySelector('#theme-label').textContent=theme==='dark'?'Dark':'Light';document.querySelectorAll('img[src$="logo.svg"],img[src$="logo-dark.svg"]').forEach(img=>img.src=theme==='dark'?'/assets/logo-dark.svg':'/assets/logo.svg');}
 applyTheme(preference||(system.matches?'dark':'light'));
 themeButton.addEventListener('click',()=>{preference=root.dataset.theme==='dark'?'light':'dark';applyTheme(preference);try{localStorage.setItem('openpaperdesign-site-theme',preference);}catch{}});
 system.addEventListener('change',()=>{if(!preference)applyTheme(system.matches?'dark':'light');});
@@ -16,13 +16,13 @@ menuButton.addEventListener('click',()=>{previousOverflow=document.body.style.ov
 function closeMenu(){if(dialog.open)dialog.close();}
 document.querySelector('#menu-close').addEventListener('click',closeMenu);
 dialog.addEventListener('close',()=>{document.body.style.overflow=previousOverflow;menuButton.setAttribute('aria-expanded','false');if(navigationTarget){navigationTarget.setAttribute('tabindex','-1');navigationTarget.focus({preventScroll:true});navigationTarget=null;}else if(menuButton.getClientRects().length){menuButton.focus();}});
-dialog.querySelectorAll('a').forEach(a=>a.addEventListener('click',()=>{navigationTarget=a.hash?document.querySelector(a.hash):null;closeMenu();}));
-matchMedia('(width > 760px)').addEventListener('change',e=>{if(e.matches)closeMenu();});
+dialog.querySelectorAll('a').forEach(a=>a.addEventListener('click',()=>{navigationTarget=a.origin===location.origin&&a.pathname===location.pathname&&a.hash?document.getElementById(decodeURIComponent(a.hash.slice(1))):null;closeMenu();}));
+matchMedia('(min-width:800.02px)').addEventListener('change',e=>{if(e.matches)closeMenu();});
 const offers=document.querySelector('.offers');
 document.addEventListener('click',e=>{if(!offers.contains(e.target))offers.open=false;});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&offers.open){offers.open=false;offers.querySelector('summary').focus();}});
-const previews={architecture:['An editable system diagram in the native desktop app.','The real native editor with an editable architecture diagram.'],design:['Interface and brand studies using public work from gustavonline and Arc’IT AI.','Public website and tile-banner studies in the real native editor.'],whiteboard:['Six colours of sticky notes and hand-drawn shapes.','Coloured sticky notes and hand-drawn shapes in the real native editor.']};
-document.querySelectorAll('[data-preview]').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.preview;if(!previews[key])return;document.querySelectorAll('[data-preview]').forEach(x=>x.setAttribute('aria-pressed',String(x===button)));const image=document.querySelector('#product-screenshot');image.src=`/assets/product-${key}.png`;image.alt=previews[key][1];document.querySelector('#preview-caption').textContent=previews[key][0];}));
+const previews={'own-site':['This website, designed in OpenPaperDesign. New UI/UX development preview.','OpenPaperDesign’s own website, with desktop and mobile layout studies, inside the new workspace.'],architecture:['New UI/UX preview · development build. Real canvas, editable objects.','The new OpenPaperDesign workspace with an editable system diagram.'],design:['Interface studies in the new workspace. Development preview.','Public website and tile studies in the new OpenPaperDesign UI.'],whiteboard:['Six colours of sticky notes and hand-drawn shapes. New UI/UX development preview.','Coloured sticky notes and hand-drawn shapes in the new workspace.'],banner:['The selected LinkedIn banner as an image layer, beside editable text. New UI/UX preview.','The selected gustavonline tile banner in the new OpenPaperDesign workspace.']};
+document.querySelectorAll('[data-preview]').forEach(button=>button.addEventListener('click',()=>{const key=button.dataset.preview;if(!previews[key])return;document.querySelectorAll('[data-preview]').forEach(x=>x.setAttribute('aria-pressed',String(x===button)));const image=document.querySelector('#product-screenshot');image.src=`/assets/product-${key}.png`;document.querySelector('#preview-open').href=image.src;image.alt=previews[key][1];document.querySelector('#preview-caption').textContent=previews[key][0];}));
 const platform=detectPlatform(navigator.userAgentData?.platform||navigator.platform,navigator.userAgent,navigator.maxTouchPoints);
 const local=['127.0.0.1','localhost'].includes(location.hostname);
 const platformLabels={macos:['macOS','Apple Silicon'],windows:['Windows','x64'],linux:['Linux','x64']};
@@ -43,8 +43,7 @@ async function loadDownloads(){
   const chosen=selectAsset(manifest,platform,local);const primary=document.querySelector('#primary-download');
   // User agents do not reliably distinguish Intel and Apple Silicon. Let the person
   // choose the explicitly labelled architecture instead of guessing an installer.
-  if(platformLabels[platform]){primary.textContent=`Choose ${platformLabels[platform][0]} download ↓`;primary.href='#download';}
-  if(chosen){document.querySelector('#release-note').textContent=`Free · ${manifest.version} preview · ${chosen.architecture} · ${chosen.status}`;}
+  if(platformLabels[platform]){primary.textContent=`Download free for ${platformLabels[platform][0]} ↓`;primary.href='#download';}
   else if(platform==='mobile'){primary.textContent='Available for desktop ↓';document.querySelector('#release-note').textContent='A desktop app for macOS, Windows and Linux. Choose a platform below.';}
   if(typeof manifest.notice==='string')document.querySelector('#download-help').textContent=manifest.notice;
 }

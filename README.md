@@ -1,10 +1,12 @@
 # OpenPaperDesign
 
-A free, open-source canvas for architecture diagrams, whiteboards and interface design. Work on your own, or connect an AI agent over MCP.
+A free, open-source canvas for ideas, diagrams, interfaces and visual work. Work on your own, or connect an AI agent over MCP.
 
 ![The actual native editor with an editable system diagram](site/assets/product-architecture.png)
 
 Built on **paper-rs by [Michael Shimeles (Rasmic)](https://github.com/michaelshimeles)**, now developed as [Sketch](https://github.com/michaelshimeles/sketch). The core editor is his work. OpenPaperDesign adds agent-host integration, design methods and desktop packaging. This is an independent fork, not affiliated with Paper (paper.design).
+
+The product images use the new UI/UX source snapshot from PR #9. They are development previews; they are not screenshots of an already released desktop package.
 
 ## Desktop preview
 
@@ -15,8 +17,8 @@ The existing **v0.1.0 release is source code**, not an installer. Desktop packag
 | Platform | Current evidence |
 | --- | --- |
 | macOS, Apple Silicon | Local native app and ZIP built; ad-hoc signed, not notarized. Full native qualification pending. |
-| Windows, x64 | Release build and ZIP workflow prepared; build result pending. |
-| Linux, x64 | Release build and tarball workflow prepared; build result pending. |
+| Windows, x64 | Release build and ZIP packaging passed in CI; native desktop journey pending. |
+| Linux, x64 | Release build, CLI smoke and tarball packaging passed in CI; native desktop journey pending. |
 
 ## What you can do
 

@@ -18,7 +18,7 @@ A null download count is hidden. The counter reads measured GitHub release-asset
 
 ## Product images
 
-New UI/UX development-preview captures from `design/product/fixtures/*.excalidraw`. `scripts/make-product-fixtures.py` generates the editable public examples. Import them with `PAPER_RS_HOME` pointed at a disposable library, then render with the build's `--screenshot` command. See `assets-sources.json` for source revision, hashes and exact limitations. Use the new UI/UX source snapshot requested by the owner, with its revision and unreleased status explicit. Never present it as a publicly available desktop release.
+New UI/UX development-preview captures from `design/product/fixtures/` (`.excalidraw` and `.svg`). `scripts/make-product-fixtures.py` generates the editable public examples. Import them with `PAPER_RS_HOME` pointed at a disposable library, then render with the build's `--screenshot` command. See `assets-sources.json` for source revision, hashes and exact limitations. Use the new UI/UX source snapshot requested by the owner, with its revision and unreleased status explicit. Never present it as a publicly available desktop release.
 
 The shared SVG identity lives in `assets/brand/`. Site and plugin assets match the canonical source. Font and upstream licences are retained. The original product-page screenshot remains in Git history.
 
@@ -27,3 +27,5 @@ The shared SVG identity lives in `assets/brand/`. Site and plugin assets match t
 Verify compact/intermediate/wide views, both themes, mobile overlay/focus/scroll-lock, Offers, preview tabs and real file downloads. Validate release and source destinations, current screenshot provenance, canonical/social metadata, HTTPS and indexing when publishing. Do not deploy the ignored local package directory or preview manifest. No hosting credentials or installed plugins are changed by this page.
 
 Export deployments with `python3 scripts/export-product-site.py --output /new/output/path`. This exports committed files from Git, refuses preview entries, and never uploads ignored local binaries. Do not upload the working `site/` directory directly.
+
+The download counter contacts `api.github.com` in the visitor’s browser; it sends no canvas data. Brand marks and owner artwork are credited separately and are not relicensed by the product’s MIT/Apache code licences.
