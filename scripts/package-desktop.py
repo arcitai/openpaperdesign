@@ -29,7 +29,7 @@ def package(platform, arch, binaries, output):
     actual_arch = "arm64" if machine in ("arm64", "aarch64") else "x64" if machine in ("x86_64", "amd64") else machine
     if actual_arch != arch:
         raise ValueError(f"Requested {arch} but the build host is {actual_arch}")
-    config = json.loads((ROOT / "packaging/desktop.json").read_text())
+    config = json.loads((ROOT / "packaging/desktop.json").read_text(encoding="utf-8"))
     suffix = ".exe" if platform == "windows" else ""
     source = binaries / ("openpaperdesign" + suffix)
     bridge = binaries / ("paper-rs-mcp" + suffix)

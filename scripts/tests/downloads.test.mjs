@@ -12,6 +12,8 @@ test('download totals count app archives across releases, not sources, checksums
   assert.equal(appDownloadCount([{assets:[asset('OpenPaperDesign-0.1.0-macos-arm64.zip',3),asset('OpenPaperDesign-0.1.0-macos-arm64.zip.sha256',90),asset('source.tar.gz',88)]},{assets:[asset('OpenPaperDesign-0.1.1-linux-x64.tar.gz',5)]},{draft:true,assets:[asset('OpenPaperDesign-0.1.0-windows-x64.zip',50)]}]),8);
   assert.throws(()=>appDownloadCount([{assets:[asset('OpenPaperDesign-0.1.0-macos-arm64.zip',-1)]}]));
   assert.throws(()=>appDownloadCount({error:'rate limit'}));
+  assert.equal(appDownloadCount([{assets:[asset('source.tar.gz',88)]}]),null);
+  assert.equal(appDownloadCount([{assets:[asset('OpenPaperDesign-0.1.0-windows-x64.zip',0)]}]),0);
 });
 test('desktop OS detection has an honest unknown fallback',()=>{
   assert.equal(detectPlatform('MacIntel','Safari',0),'macos');
@@ -22,4 +24,6 @@ test('only reviewed release or local-preview assets become download actions',()=
   for(const u of ['javascript:alert(1)','https://github.com/other/repo/releases/download/v1/a','https://github.com.evil.test/arcitai/openpaperdesign/releases/download/v1/a','/downloads/../secret','https://evil.test/app.zip'])assert.equal(allowedDownload(u),false);
   assert.equal(selectAsset({platforms:{windows:{url:'https://evil.test/app.zip',architecture:'x64',status:'built'}}},'windows'),null);
   assert.equal(selectAsset({},'linux'),null);
+  assert.equal(allowedDownload('/downloads/app.zip'),false);
+  assert.equal(allowedDownload('/downloads/app.zip',true),true);
 });

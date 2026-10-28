@@ -12,16 +12,18 @@ Serve `site/` at a domain root. The intended public address remains **openpaperd
 
 ## Downloads
 
-`releases.json` contains only reviewed actual release assets, with explicit platform/architecture and qualification. No executable means a source-build link, not a fake download. Mobile/iPad detection never hands out an inappropriate desktop installer. An optional ignored `releases.preview.json` is fetched **only on localhost** for actual files copied into ignored `site/downloads/`. It must never be deployed. The local preview can therefore demonstrate a built package without advertising it as a public release.
+`releases.json` contains only reviewed actual release assets, with explicit platform/architecture and qualification. No executable means a source-build link, not a fake download. The primary action detects the OS and leads to explicitly labelled architecture choices. Mobile/iPad visitors see the desktop availability message. An optional ignored `releases.preview.json` is fetched **only on localhost** for actual files copied into ignored `site/downloads/`. It must never be deployed. The local preview can therefore demonstrate a built package without advertising it as a public release.
 
-A null download count is hidden. Only measured GitHub executable-asset download totals belong in the manifest; checksums and source archives are not app downloads. A network failure keeps an explicit GitHub release fallback. Publication is separate from preparing artifacts.
+A null download count is hidden. The counter reads measured GitHub release-asset totals and stays hidden until an app asset exists; checksums and source archives are not app downloads. A network failure keeps an explicit GitHub release fallback. Publication is separate from preparing artifacts.
 
 ## Product images
 
-Actual native editor captures from `design/product/fixtures/*.excalidraw`. `scripts/make-product-fixtures.py` generates the editable public examples. Import them with `PAPER_RS_HOME` pointed at a disposable library, then render with the build's `--screenshot` command. See `assets-sources.json` for source revision, hashes and exact limitations. Do not replace these with generated mock UI or present Factory's unreleased plugin UI as desktop.
+New UI/UX development-preview captures from `design/product/fixtures/*.excalidraw`. `scripts/make-product-fixtures.py` generates the editable public examples. Import them with `PAPER_RS_HOME` pointed at a disposable library, then render with the build's `--screenshot` command. See `assets-sources.json` for source revision, hashes and exact limitations. Use the new UI/UX source snapshot requested by the owner, with its revision and unreleased status explicit. Never present it as a publicly available desktop release.
 
 The shared SVG identity lives in `assets/brand/`. Site and plugin assets match the canonical source. Font and upstream licences are retained. The original product-page screenshot remains in Git history.
 
 ## Review and publication
 
 Verify compact/intermediate/wide views, both themes, mobile overlay/focus/scroll-lock, Offers, preview tabs and real file downloads. Validate release and source destinations, current screenshot provenance, canonical/social metadata, HTTPS and indexing when publishing. Do not deploy the ignored local package directory or preview manifest. No hosting credentials or installed plugins are changed by this page.
+
+Export deployments with `python3 scripts/export-product-site.py --output /new/output/path`. This exports committed files from Git, refuses preview entries, and never uploads ignored local binaries. Do not upload the working `site/` directory directly.

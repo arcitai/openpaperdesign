@@ -10,7 +10,7 @@ Built on **paper-rs by [Michael Shimeles (Rasmic)](https://github.com/michaelshi
 
 [Downloads and releases](https://github.com/arcitai/openpaperdesign/releases) · [Installation and platform status](docs/openpaperdesign/desktop.md)
 
-The existing **v0.1.0 release is source code**, not an installer. Desktop packaging is being verified in the current product-page/distribution PR. Do not substitute an upstream Sketch download for an OpenPaperDesign app.
+The existing **v0.1.0 release is source code**, not an installer. Desktop packaging is being verified in the desktop packaging work. Do not substitute an upstream Sketch download for an OpenPaperDesign app.
 
 | Platform | Current evidence |
 | --- | --- |
