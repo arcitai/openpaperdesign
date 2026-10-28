@@ -16,7 +16,7 @@ The existing **v0.1.0 release is source code**, not an installer. Desktop packag
 
 | Platform | Current evidence |
 | --- | --- |
-| macOS, Apple Silicon | Local native app and ZIP built; ad-hoc signed, not notarized. Full native qualification pending. |
+| macOS, Apple Silicon | Integrated new-UI preview opens, edits, saves and reopens on Apple M4; ad-hoc signed, not notarized. Downloaded first launch remains unqualified. |
 | Windows, x64 | Release build and ZIP packaging passed in CI; native desktop journey pending. |
 | Linux, x64 | Release build, CLI smoke and tarball packaging passed in CI; native desktop journey pending. |
 
@@ -43,7 +43,7 @@ cargo build --release --locked --bin openpaperdesign --bin paper-rs-mcp
 ./target/release/openpaperdesign
 ```
 
-The distribution entrypoint uses `~/Documents/OpenPaperDesign` by default. Set `PAPER_RS_HOME` to choose another library. Existing upstream libraries are not moved. The original `paper-rs` command, editor, file formats and environment variables remain available. Platform details and the optional MCP bridge are in the [desktop guide](docs/openpaperdesign/desktop.md). The original [upstream README](docs/upstream-README.md) is retained for its detailed feature and command documentation.
+The distribution entrypoint uses the platform’s local application-data folder (`~/Library/Application Support/OpenPaperDesign/projects` on macOS). Set `PAPER_RS_HOME` to choose another library. Existing upstream libraries are not moved. The original `paper-rs` command, editor, file formats and environment variables remain available. Platform details and the optional MCP bridge are in the [desktop guide](docs/openpaperdesign/desktop.md). The original [upstream README](docs/upstream-README.md) is retained for its detailed feature and command documentation.
 
 ## Agent integration
 

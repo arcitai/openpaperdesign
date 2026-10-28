@@ -30,4 +30,4 @@ Export deployments with `python3 scripts/export-product-site.py --output /new/ou
 
 The download counter contacts `api.github.com` in the visitor’s browser; it sends no canvas data. Brand marks and owner artwork are credited separately and are not relicensed by the product’s MIT/Apache code licences.
 
-The review page links to the immutable source revision `61d94cc` so guides work before merge and after branch deletion. When publishing a qualified release, update these guide URLs to that release tag.
+The review page links to the immutable integrated source revision `3286238`, which contains the actual new Home/workspace and native packaging, so guides work before merge and after branch deletion. When publishing a qualified release, update these guide URLs to that release tag.
