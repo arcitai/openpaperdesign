@@ -143,6 +143,16 @@ impl App {
         }
     }
 
+    /// Menu Quit and window Close use the same save boundary. A project's debounce
+    /// may not have elapsed yet; a failed save must keep the app open.
+    fn prepare_exit(&mut self) -> bool {
+        if self.session.project.is_some() {
+            self.save_project(true)
+        } else {
+            self.confirm_discard()
+        }
+    }
+
     fn error(&mut self, msg: String) {
         log::error!("{msg}");
         self.ed.status = msg.clone();
@@ -757,7 +767,7 @@ impl App {
         use crate::macos::MenuCmd;
         match cmd {
             MenuCmd::Quit => {
-                if self.confirm_discard() {
+                if self.prepare_exit() {
                     event_loop.exit();
                 }
             }
@@ -936,10 +946,7 @@ impl ApplicationHandler<UserEvent> for App {
         let now = self.now();
         match event {
             WindowEvent::CloseRequested => {
-                if self.session.project.is_some() {
-                    self.save_project(true);
-                }
-                if self.confirm_discard() {
+                if self.prepare_exit() {
                     event_loop.exit();
                 }
             }
@@ -1541,6 +1548,25 @@ mod tests {
             .open(&mut reopened, &project)
             .unwrap();
         assert_eq!(reopened.doc.nodes.len(), 1);
+        a.ed.add_node(
+            crate::model::Node::new(
+                crate::model::NodeId(0),
+                crate::model::NodeKind::Rect,
+                crate::geom::Rect::new(60.0, 20.0, 40.0, 30.0),
+            ),
+            None,
+        );
+        assert!(a.ed.project_dirty());
+        assert!(
+            a.prepare_exit(),
+            "Quit saves immediately, before another autosave deadline"
+        );
+        let mut after_quit = Editor::default();
+        Session::new(Store::open(root.clone()).unwrap())
+            .open(&mut after_quit, &project)
+            .unwrap();
+        assert_eq!(after_quit.doc.nodes.len(), 2);
+
         drop(a);
         std::fs::remove_dir_all(root).unwrap();
     }

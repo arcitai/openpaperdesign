@@ -23,6 +23,8 @@ engine architecture is `analysis/DESIGN.md`.
     `66893186714a0bb5f16f1e5b9d93e69b5b37a86d`: poll autosave from every event-loop turn,
     not rendered frames. Keep this fork's `Session::autosave_due_ui` guard and all
     save/error/ownership behavior. No upstream rename, updater or UI hunks imported.
+    Native exit follow-up: Menu Quit and window Close both save a project immediately and
+    stay open when that save fails; project autosave alone cannot cover an immediate Quit.
   - `src/render/gpu.rs`: the image texture is sampled in uniform control flow (B1, WebGPU
     validation in browsers).
   - `src/history.rs`, `src/editor/pages.rs`: `#[derive(Clone)]` on `History`, `PageStash`
