@@ -13,6 +13,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  product-site:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check product assets, cache versions and download selection
+        run: |
+          python3 scripts/sync-site-assets.py --check
+          python3 scripts/refresh-site-versions.py --check
+          node --check site/site.js
+          node --test scripts/tests/downloads.test.mjs
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
   native:
     runs-on: ubuntu-24.04
     steps:
