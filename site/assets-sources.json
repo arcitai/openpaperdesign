@@ -100,16 +100,16 @@
     {
       "path": "site/assets/product-own-site.png",
       "output": "assets/product-own-site.png",
-      "sha256": "bc687ceed97c169c9aba6cc7884c1dc890fece89a6ec28f6f3bb04890b65d6c8",
+      "sha256": "1c05ed15c07646d6d4b861545bf04518b5230ece0a7e6b659b0b00c53cebda32",
       "capture": {
         "renderer": "native paper-rs / Apple M4 / Metal",
-        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "sourceRevision": "328623852a062023348275ecb3c51dea11abf5ad",
         "fixture": "design/product/fixtures/product-page.svg",
-        "fixtureSha256": "7017fd1d31fc9eb70c7f00673958ec36a6a86de14374e5ce35004f4bba764f5e",
-        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
-        "limitations": "New UI/UX development build. Desktop and mobile website design study imported as SVG: editable vector layers and cropped native canvas images. Not a running HTML site, not a publicly released app.",
+        "fixtureSha256": "c6b8c683a0d3bfdabeb15299087a5a4660a4f09b07cfee38eee50255cdf50396",
+        "binarySha256": "87aaa0e109d3865083948ea2f5663cf5d0a9457d228336e51f48c8ba32670d2d",
+        "limitations": "Native Metal capture of the imported editable SVG study at the integrated new-UI revision, including the selected brand mark. Source project and capture are development previews; the native product UI surrounds the study.",
         "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/product-page.svg",
-        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1920x1200 --scale 1"
+        "command": "openpaperdesign --screenshot OUTPUT PROJECT --size 1920x1200 --scale 1"
       }
     },
     {
