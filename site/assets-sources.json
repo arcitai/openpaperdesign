@@ -1,0 +1,134 @@
+{
+  "repository": "arcitai/openpaperdesign",
+  "source": "Pinned local captures, owner artwork and credited open-source assets; verified by SHA256.",
+  "assets": [
+    {
+      "path": "assets/brand/openpaperdesign.svg",
+      "output": "assets/logo.svg",
+      "sha256": "9747eb3c8bb1792c3f76f1d3e3e5bc769da969bdba11d98f19de22ab48e768b1"
+    },
+    {
+      "path": "assets/brand/openpaperdesign-dark.svg",
+      "output": "assets/logo-dark.svg",
+      "sha256": "ec4808ede16cfac9eabbad397aec116fe82d9367d9ddabb372a08ce914c853cc"
+    },
+    {
+      "path": "site/assets/product-architecture.png",
+      "output": "assets/product-architecture.png",
+      "sha256": "0e537d41cd1a36572da530f23649128d55857e24d36c904b3f94d6eb3623ade3",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "fixture": "design/product/fixtures/architecture.excalidraw",
+        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1600x1000 --scale 1",
+        "limitations": "New UI/UX at the frozen PR9 source revision, rendered by the native Metal renderer. Development preview, not a released desktop app or proof of a full manual app journey.",
+        "fixtureSha256": "4b405225f8867be96a8f95954945f73f23063ef22c2ce1e1cdf8b62f7d37cd93",
+        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
+        "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/architecture.excalidraw"
+      }
+    },
+    {
+      "path": "site/assets/product-design.png",
+      "output": "assets/product-design.png",
+      "sha256": "7973025656efd91957751092c990b54504dbb6a012197b8d2650492de15885c0",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "fixture": "design/product/fixtures/design.excalidraw",
+        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1600x1000 --scale 1",
+        "limitations": "New UI/UX at the frozen PR9 source revision, rendered by the native Metal renderer. Development preview, not a released desktop app or proof of a full manual app journey.",
+        "fixtureSha256": "e9ddd63c7d11d2c775e99e98d60f4981144fa1684bfd330a7950a5bbfd694c13",
+        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
+        "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/design.excalidraw"
+      }
+    },
+    {
+      "path": "site/assets/product-whiteboard.png",
+      "output": "assets/product-whiteboard.png",
+      "sha256": "d3346f053db63324628b68e1cba820003e27a926df04b1c5ba686a405fd2d3eb",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "fixture": "design/product/fixtures/whiteboard.excalidraw",
+        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1600x1000 --scale 1",
+        "limitations": "New UI/UX at the frozen PR9 source revision, rendered by the native Metal renderer. Development preview, not a released desktop app or proof of a full manual app journey.",
+        "fixtureSha256": "b18b8fbf454335d65c8551626bfea636ff871544560401efb2fa43739e3d3ecf",
+        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
+        "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/whiteboard.excalidraw"
+      }
+    },
+    {
+      "path": "site/assets/product-banner.png",
+      "output": "assets/product-banner.png",
+      "sha256": "42f02c84ef8bec80ea5dbcecef3a054924e08dadeac6428bf489a5bec2a0e55c",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "fixture": "design/product/fixtures/banner-study.svg",
+        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1600x1000 --scale 1",
+        "limitations": "New UI/UX development snapshot. Banner artwork is a raster image layer; surrounding text is imported as vectors. Not a released desktop build.",
+        "artwork": "Owner-selected banner-B-matte, publicly used on LinkedIn; original owner artwork, no third-party UI copied.",
+        "fixtureSha256": "1d5d61b414bedeb2fd53930cd80c3dd7e98d106605c465ea5eea46b2f4e40bcf",
+        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
+        "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/banner-study.svg"
+      }
+    },
+    {
+      "path": "site/assets/arcitai.svg",
+      "output": "assets/arcitai.svg",
+      "sha256": "e2e7db4b96105e5b2f7a87d4295adbe788a9af6577faa03aac980c239306cd93",
+      "source": "Canonical owner mark from arcitai-website/public/assets/arcitai-mark-final.svg"
+    },
+    {
+      "path": "site/assets/codex.svg",
+      "output": "assets/codex.svg",
+      "sha256": "4a2f43ce46b5b6e3722c95088f88d26ef91e6a8c2e598e70642a1c54367386e4",
+      "source": "Lobe Icons static SVG collection, MIT; brand marks remain with their respective owners; used for compatibility, not endorsement.",
+      "sourceUrl": "https://github.com/lobehub/lobe-icons/blob/8b7bbc433d38437fa2b0cca58ae896917162b812/packages/static-svg/icons/codex-color.svg",
+      "sourceRevision": "8b7bbc433d38437fa2b0cca58ae896917162b812"
+    },
+    {
+      "path": "site/assets/claude-code.svg",
+      "output": "assets/claude-code.svg",
+      "sha256": "670b3d8d749d0815ad8f7e62a59d51cb5e2053cb19403f3541a8aed7036a877f",
+      "source": "Lobe Icons static SVG collection, MIT; brand marks remain with their respective owners; used for compatibility, not endorsement.",
+      "sourceUrl": "https://github.com/lobehub/lobe-icons/blob/8b7bbc433d38437fa2b0cca58ae896917162b812/packages/static-svg/icons/claudecode-color.svg",
+      "sourceRevision": "8b7bbc433d38437fa2b0cca58ae896917162b812"
+    },
+    {
+      "path": "site/assets/product-own-site.png",
+      "output": "assets/product-own-site.png",
+      "sha256": "bc687ceed97c169c9aba6cc7884c1dc890fece89a6ec28f6f3bb04890b65d6c8",
+      "capture": {
+        "renderer": "native paper-rs / Apple M4 / Metal",
+        "sourceRevision": "1b04c312f90526a0daaf83e5ad6a8dfe47fde795",
+        "fixture": "design/product/fixtures/product-page.svg",
+        "fixtureSha256": "7017fd1d31fc9eb70c7f00673958ec36a6a86de14374e5ce35004f4bba764f5e",
+        "binarySha256": "384cccce85561625d2c6c55daf695f2949fbf6890f33d8a0a9ec50af11341060",
+        "limitations": "New UI/UX development build. Desktop and mobile website design study imported as SVG: editable vector layers and cropped native canvas images. Not a running HTML site, not a publicly released app.",
+        "importCommand": "PAPER_RS_HOME=DISPOSABLE_LIBRARY paper-rs --import design/product/fixtures/product-page.svg",
+        "command": "paper-rs --screenshot OUTPUT PROJECT --size 1920x1200 --scale 1"
+      }
+    },
+    {
+      "path": "site/assets/licenses/Lobe-Icons-LICENSE",
+      "output": "assets/licenses/Lobe-Icons-LICENSE",
+      "sha256": "add9d7531d1b21646317a8958e38fc727506fa39d24bdecb44154d943c82753a"
+    },
+    {
+      "path": "site/assets/fonts/Geist-LICENSE.txt",
+      "output": "assets/fonts/Geist-LICENSE.txt",
+      "sha256": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137"
+    },
+    {
+      "path": "site/assets/fonts/Inter-LICENSE.txt",
+      "output": "assets/fonts/Inter-LICENSE.txt",
+      "sha256": "3b0a5fca3d17942cde889069889dedbbbd075e9b599968c82a95f4d944e9b345"
+    },
+    {
+      "path": "site/assets/NOTICE.md",
+      "output": "assets/NOTICE.md",
+      "sha256": "759d33b17e4811929dc399d8d2fe9a28438f9d3735a63d73f60b44cbe003e445"
+    }
+  ]
+}
