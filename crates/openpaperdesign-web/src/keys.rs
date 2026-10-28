@@ -9,20 +9,20 @@
 use crate::editor::{Key, Modifiers};
 
 pub fn modifiers(mac: bool, shift: bool, ctrl: bool, alt: bool, meta: bool) -> Modifiers {
-    if mac {
-        Modifiers {
-            shift,
-            ctrl: meta,
-            alt,
-            logo: ctrl,
-        }
+    let (command, secondary) = if mac { (meta, ctrl) } else { (ctrl, meta) };
+    // The browser adapter is also exercised by native-host tests. Normalize for the
+    // Editor's compiled host here, rather than assuming every caller is already wasm.
+    // On wasm (target_os != macos) this is byte-for-byte the previous mapping.
+    let (ctrl, logo) = if cfg!(target_os = "macos") {
+        (secondary, command)
     } else {
-        Modifiers {
-            shift,
-            ctrl,
-            alt,
-            logo: meta,
-        }
+        (command, secondary)
+    };
+    Modifiers {
+        shift,
+        ctrl,
+        alt,
+        logo,
     }
 }
 

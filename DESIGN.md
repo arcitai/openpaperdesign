@@ -60,8 +60,10 @@ The product page can be more spacious and expressive; the app remains a quiet wo
 Qualification so far: the native Home opens a project, retains an edit through save and
 quit/reopen, and supports search, Escape and grid/list. Shared UI renders were inspected in
 Light/Dark at 360/640/900/1280 points; the narrow view keeps navigation available as a menu.
-Native test groups and the Home DOM suite passed. A separate Mac-native browser-adapter
-keyboard test limitation is being compared with the unchanged PR9 baseline; do not claim an
+Native test groups and the Home DOM suite passed. The original Mac-host browser-adapter
+keyboard failures were reproduced on the pre-Home baseline, then corrected by normalizing
+the browser modifiers for the compiled Editor host (the WASM mapping is unchanged). All 334
+browser-adapter unit tests now pass on Mac; do not claim an
 installed Codex or Claude Code Home has been refreshed merely from these source changes.
 This revision is an integration candidate, not evidence that all PR9
 criteria or the installed plugin are complete. Record actual native, narrow, light/dark,

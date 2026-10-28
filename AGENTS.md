@@ -19,6 +19,9 @@ engine architecture is `analysis/DESIGN.md`.
   `crates/`, which reuse upstream modules via `#[path]`. If an upstream file has to change,
   give the reason in the commit.
 - Upstream source changes so far (keep this list current):
+  - `crates/openpaperdesign-web/src/keys.rs` (2026-10-28): normalize the browser command
+    modifier against the compiled Editor host as well as the browser OS. WASM mapping is
+    unchanged; native-host Mac adapter tests can exercise both Mac and non-Mac input correctly.
   - 2026-10-28 Home consistency: `src/ui/home.rs` reuses the workspace palette for neutral
     actions, local search, grid/list and narrow navigation. `src/theme.rs` adds the
     three-line List glyph only; existing shared palette/type values stay unchanged. `src/app.rs` and `src/macos.rs`
