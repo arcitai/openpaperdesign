@@ -1,6 +1,6 @@
 # OpenPaperDesign — product design direction
 
-Revision: 25 · 2026-10-28 (its issue #23 leaving/closing text corrected 2026-10-26, runs
+Revision: 26 · 2026-10-28 (its issue #23 leaving/closing text corrected 2026-10-26, runs
 198–206) · The one canonical visual and interaction direction for the OPD app
 (Home and the workspace). The engine and architecture are described in
 [analysis/DESIGN.md](analysis/DESIGN.md) (paper-rs's historical design: stack, crate layout,
@@ -58,6 +58,15 @@ independent libraries are automatically synced or add a decorative button that c
 Use existing palette values. Native chrome remains 12/11 point body/metadata; the HTML
 Home uses 13/12 CSS pixels. Do not enlarge the whole editor to erase that host difference.
 The product page can be more spacious and expressive; the app remains a quiet working tool.
+The landing-page companion keeps one direct action for a validated detected-OS build,
+visible text-link alternatives and honest preview/signing status. The universal Mac archive needs
+no CPU guess; mobile and unsupported platforms get choices. A small counter reports
+actual GitHub app-archive downloads, not source or local preview downloads. Gallery controls
+sit below the real media. The family footer uses the owner's existing marks and separate
+product, navigation and credit rows. Its Offers chevron, a single theme-aware mark per placement and
+the owner-selected family moon/sun toggle in the navbar remain quiet. Download
+alternatives stay visible without dropdowns; the website has no footer theme selector. These website decisions do not add
+controls or change typography in the working editor.
 
 Qualification so far: the native Home opens a project, retains an edit through save and
 quit/reopen, and supports search, Escape and grid/list. Shared UI renders were inspected in
