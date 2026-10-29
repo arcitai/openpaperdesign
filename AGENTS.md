@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 1.01 · Updated: 2026-10-27 (issue #23 release/close/handover outcomes, runs 198–206)
+Revision: 1.02 · Updated: 2026-10-29 (V1 model profile; earlier: issue #23 release/close/handover outcomes, runs 198–206)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1880,8 +1880,11 @@ follows the remembered active page, and its own saves keep the manifest's active
 
 ## Model profile
 
-- Implementation: `claudeAgent` `claude-opus-5-5`, effort `high`, fastMode `false`.
-- AgentOps, research and independent review: `codex` `gpt-6.1-sol`, reasoningEffort `max`, serviceTier `default`.
+- Lead/AgentOps, architecture and independent review: `claudeAgent` `claude-opus-5-5`, effort `xhigh`, fastMode `false`.
+- Implementation: `claudeAgent` `claude-sonnet-5-5`, effort `xhigh` (Sonnet 5.5 has no Fast option).
+- Owner choice 2026-10-29 for the V1 completion work; it replaces the earlier profile (implementation
+  `claudeAgent` `claude-opus-5-5`, effort `high`, fastMode `false`; AgentOps, research and review
+  `codex` `gpt-6.1-sol`, reasoningEffort `max`, serviceTier `default`).
 - Owner-selected defaults and native project/AgentOps readback verified 2026-10-13.
   Native project configuration owns the
   implementation default; thread selections own AgentOps and review. Preserve the actual
