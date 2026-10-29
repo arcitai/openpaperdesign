@@ -315,3 +315,49 @@ fn m2_pages_panel_screenshot() {
         )) > 500
     );
 }
+
+/// Actual shared-UI renders for the native library's responsive and appearance states.
+/// Output is review evidence under target/, not tracked baseline images.
+#[test]
+fn home_library_surfaces_keep_the_same_inventory_in_both_appearances() {
+    let store = temp_store("home-parity");
+    populate(&store);
+    let Some(g) = gpu() else { return };
+    let output = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/home-review");
+    std::fs::create_dir_all(&output).unwrap();
+    for (theme, label) in [
+        (egui::ThemePreference::Light, "light"),
+        (egui::ThemePreference::Dark, "dark"),
+    ] {
+        for width in [360.0, 640.0, 900.0, 1280.0] {
+            let mut st = UiState {
+                appearance: theme,
+                native_chrome: true,
+                home: Some(HomeView::load(&store, 1_760_000_600_000)),
+                ..Default::default()
+            };
+            let mut ed = Editor::default();
+            for state in ["grid", "list", "search", "trash"] {
+                let hv = st.home.as_mut().unwrap();
+                hv.query = if state == "search" {
+                    "not a matching project".into()
+                } else {
+                    String::new()
+                };
+                hv.list_view = state == "list";
+                hv.show_trash = state == "trash";
+                let img = frame::capture(g, &mut ed, &mut st, [width, 600.0], 2.0, |_| {});
+                img.save(output.join(format!("home-{}-{label}-{state}.png", width as u32)))
+                    .unwrap();
+                let hv = st.home.as_ref().unwrap();
+                assert_eq!(hv.entries.len(), 4);
+                assert!(
+                    hv.actions.is_empty(),
+                    "Layout/search must not write or open files"
+                );
+            }
+        }
+    }
+    assert_eq!(store.list().len(), 4);
+    std::fs::remove_dir_all(&store.root).unwrap();
+}
