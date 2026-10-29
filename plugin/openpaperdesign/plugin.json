@@ -3,11 +3,20 @@
   "name": "openpaperdesign",
   "version": "0.1.0",
   "description": "Create, open and edit design canvases from the Codex sidebar in an editable canvas in the in-app browser, kept in the app's own local library (paper-rs, local only).",
-  "author": { "name": "Arc’IT AI", "url": "https://github.com/arcitai" },
+  "author": {
+    "name": "Arc’IT AI",
+    "url": "https://github.com/arcitai"
+  },
   "license": "MIT OR Apache-2.0",
   "repository": "https://github.com/arcitai/openpaperdesign",
   "homepage": "https://github.com/arcitai/openpaperdesign",
-  "keywords": ["design", "canvas", "whiteboard", "mcp", "paper-rs"],
+  "keywords": [
+    "design",
+    "canvas",
+    "whiteboard",
+    "mcp",
+    "paper-rs"
+  ],
   "extensions": {
     "com.openai": {
       "interface": {
@@ -18,8 +27,8 @@
         "category": "Design",
         "logo": "./assets/logo.svg",
         "logoDark": "./assets/logo-dark.svg",
-        "composerIcon": "./assets/icon.svg",
-        "composerIconDark": "./assets/icon-dark.svg"
+        "composerIcon": "./assets/composer-icon.svg",
+        "composerIconDark": "./assets/composer-icon-dark.svg"
       },
       "onboardingSkill": "./skills/setup"
     }

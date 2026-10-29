@@ -1,0 +1,9 @@
+{
+  "name": "OpenPaperDesign",
+  "identifier": "com.arcitai.openpaperdesign",
+  "version": "0.1.0",
+  "release": "v0.1.0-desktop.1",
+  "minimumMacOS": "11.0",
+  "signing": "ad-hoc preview; not Apple notarized",
+  "upstream": "paper-rs by Michael Shimeles (Rasmic)"
+}
