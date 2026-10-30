@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 1.04 · Updated: 2026-10-29 (launcher icons use the selected mark; earlier: plugin icon contract)
+Revision: 1.05 · Updated: 2026-10-29 (owner model and quota policy; earlier: launcher icons use the selected mark)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1887,13 +1887,27 @@ follows the remembered active page, and its own saves keep the manifest's active
 
 ## Model profile
 
-- Lead/AgentOps, architecture and independent review: `claudeAgent` `claude-opus-5-5`, effort `xhigh`, fastMode `false`.
-- Implementation: `claudeAgent` `claude-sonnet-5-5`, effort `xhigh` (Sonnet 5.5 has no Fast option).
-- Owner choice 2026-10-29 for the V1 completion work; it replaces the earlier profile (implementation
-  `claudeAgent` `claude-opus-5-5`, effort `high`, fastMode `false`; AgentOps, research and review
-  `codex` `gpt-6.1-sol`, reasoningEffort `max`, serviceTier `default`).
-- Thread readback of this profile (lead, implementation, review) verified 2026-10-29; the
-  earlier owner-selected defaults and native project/AgentOps readback verified 2026-10-13.
+- Implementation default: `claudeAgent` `claude-sonnet-5-5`, effort `xhigh` (Sonnet 5.5 has no Fast option).
+- Complex implementation, only with a recorded complexity or quota reason: `claudeAgent`
+  `claude-opus-5-5`, effort `xhigh`, fastMode `false`.
+- Lead/AgentOps, architecture, planning, analysis and independent review: `claudeAgent`
+  `claude-opus-5-5` (effort `xhigh`, fastMode `false`) or `codex` `gpt-6.1-sol` (reasoningEffort
+  `xhigh`, serviceTier `default`).
+- `gpt-6.1-sol` never implements product code, fixes, tests or implementation scripts. As a
+  reviewer it may read, run agreed checks and write review artifacts; it doesn't apply fixes.
+  There is no Sol implementation fallback when Claude limits are hit: wait, or reassign between
+  the two Claude models. All three run at ExtraHigh; effort isn't lowered to save quota.
+- Before a substantial job, read the native usage status if the host exposes it (time, remaining
+  pools, reset times, billing mode). Cost or token totals aren't remaining quota; an unexposed
+  limit stays unknown.
+- Owner policy 2026-10-29, applied at the next safe dispatch or ownership boundary. It replaces
+  the same day's V1 profile (lead and review Opus 5.5 `xhigh`, implementation Sonnet 5.5 `xhigh`)
+  and the earlier profile (implementation `claudeAgent` `claude-opus-5-5`, effort `high`,
+  fastMode `false`; AgentOps, research and review `codex` `gpt-6.1-sol`, reasoningEffort `max`,
+  serviceTier `default`).
+- Thread readback 2026-10-29: lead and review `claude-opus-5-5` `xhigh` fastMode `false`,
+  implementation `claude-sonnet-5-5` `xhigh`; the earlier owner-selected defaults and native
+  project/AgentOps readback verified 2026-10-13.
   Native project configuration owns the
   implementation default; thread selections own AgentOps and review. Preserve the actual
   settings of an in-flight turn and apply changes at its next safe continuation.
