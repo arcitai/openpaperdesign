@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 1.03 · Updated: 2026-10-29 (plugin icon contract after the V1 integration; earlier: V1 model profile)
+Revision: 1.04 · Updated: 2026-10-29 (launcher icons use the selected mark; earlier: plugin icon contract)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1274,15 +1274,15 @@ one. Not built, rendered, reviewed, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
-`foreignObject`, style, text or external reference; square, at least 48×48). The manifest's
-`logo*`/`composer-icon*` files are byte copies of the owner-selected mark in `assets/brand/`
-(`scripts/render-brand-assets.cjs`): a square 64-unit `viewBox` and no width/height, so they
-have no explicit intrinsic size and the plugin test takes the `viewBox` side as their size (a
-relaxation from the earlier explicit 48×48; whether Codex accepts and shows them is only
-proven installed). The launcher embeds `icon.svg`/`icon-dark.svg` at build time (the home
-entry's tool icons and the `serverInfo.icons` fallback), so rebuild after changing them. They
-still carry the issue #8 mark, not the selected one: aligning them, and root `DESIGN.md`'s
-"The plugin's mark" section, is an open follow-up. Revision 21
+`foreignObject`, style, text or external reference; square, at least 48×48). All six
+(`logo*`, `composer-icon*` and the launcher's `icon*`) are byte copies of the owner-selected
+mark in `assets/brand/` (`scripts/render-brand-assets.cjs`): a square 64-unit `viewBox` and no
+width/height, so they have no explicit intrinsic size and the plugin test takes the `viewBox`
+side as their size (a relaxation from the earlier explicit 48×48; whether Codex accepts and
+shows them is only proven installed). The launcher embeds `icon.svg`/`icon-dark.svg` at build
+time (the home entry's tool icons and the `serverInfo.icons` fallback), so rebuild after
+changing them. Root `DESIGN.md`'s "The plugin's mark" section still describes the issue #8
+mark below and awaits its owner revision. Revision 21
 (issue #8, the owner's 2026-10-19 architecture direction; root `DESIGN.md`, "The plugin's
 mark") replaced the earlier sheet-and-handle mark in all four, same paths, sizes and wiring;
 the package and icon-wiring checks passed, but its display in Codex isn't shown and it isn't

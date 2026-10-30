@@ -75,10 +75,9 @@ test('interface icons are contained, square, static SVGs of at least 48 px', () 
   // plugin-creator 0.1.26 packaging reference (read by the operator): logo and composerIcon
   // (dark variants optional) are contained relative paths to square PNG/JPEG/WebP/SVG files
   // of at least 48x48 and at most 5 MiB. Whether Codex shows them is only proven installed.
-  // The listing and composer icons are the owner-selected mark, which
+  // The listing, composer and launcher icons are the owner-selected mark, which
   // scripts/render-brand-assets.cjs copies from assets/brand/: a square 64-unit viewBox
-  // without width/height, so their size is the viewBox. The launcher's icon.svg and
-  // icon-dark.svg keep 48x48 on a 24-unit viewBox.
+  // without width/height, so their size is the viewBox.
   const svgAt = (rel, f) => {
     const abs = inside(plugin, rel);
     assert.match(rel, /^\.\/assets\/[a-z-]+\.svg$/, f);
@@ -101,24 +100,26 @@ test('interface icons are contained, square, static SVGs of at least 48 px', () 
       else assert.ok(!svg.includes(banned), `${f}: no ${banned}`);
     }
     assert.deepEqual(svg.match(/https?:\/\/[^"]*/g), ['http://www.w3.org/2000/svg'], `${f}: no external reference`);
-    return { svg, box: Number(box[1]), width: w && Number(w) };
+    return svg;
   };
   const ui = json(join(plugin, 'plugin.json')).extensions['com.openai'].interface;
   const fields = ['logo', 'logoDark', 'composerIcon', 'composerIconDark'];
   const icons = Object.fromEntries(fields.map((f) => [f, svgAt(ui[f], f)]));
   const paths = new Set(fields.map((f) => ui[f]));
   assert.equal(paths.size, 4, 'distinct light/dark logo and composer icon');
+  // The launcher's icon.svg pair has the same bytes, so the mapping itself is pinned.
+  assert.deepEqual([...paths], ['./assets/logo.svg', './assets/logo-dark.svg',
+    './assets/composer-icon.svg', './assets/composer-icon-dark.svg']);
   const brand = (n) => readFileSync(join(repo, 'assets/brand', n), 'utf8');
   // One brand source each: the listing logo and the composer icon are the same mark.
   for (const [f, n] of [['logo', 'openpaperdesign.svg'], ['composerIcon', 'openpaperdesign.svg'],
     ['logoDark', 'openpaperdesign-dark.svg'], ['composerIconDark', 'openpaperdesign-dark.svg']]) {
-    assert.equal(icons[f].svg, brand(n), `${f}: assets/brand/${n}`);
+    assert.equal(icons[f], brand(n), `${f}: assets/brand/${n}`);
   }
-  // The launcher embeds these two (launcher.rs ICON_LIGHT, ICON_DARK). They still carry the
-  // issue #8 mark (48x48 on a 24-unit viewBox), not the selected one: an open follow-up.
-  for (const n of ['icon.svg', 'icon-dark.svg']) {
-    const i = svgAt(`./assets/${n}`, n);
-    assert.ok(i.box === 24 && i.width === 48, `${n}: 48x48 on a 24-unit viewBox`);
+  // The launcher embeds these two (launcher.rs ICON_LIGHT, ICON_DARK): the same mark.
+  for (const [n, b] of [['icon.svg', 'openpaperdesign.svg'],
+    ['icon-dark.svg', 'openpaperdesign-dark.svg']]) {
+    assert.equal(svgAt(`./assets/${n}`, n), brand(b), `${n}: assets/brand/${b}`);
   }
   // Sandboxed sessions can leave empty dot placeholders (see AGENTS.md); they aren't assets.
   const assets = readdirSync(join(plugin, 'assets')).filter((n) => !n.startsWith('.')).sort();

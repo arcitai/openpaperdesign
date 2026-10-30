@@ -1562,7 +1562,7 @@ async fn synthetic_icons_are_the_packaged_assets() {
         let decoded = unbase64(data);
         assert_eq!(decoded, std::fs::read(assets.join(file)).unwrap(), "{file}");
         let svg = String::from_utf8(decoded).unwrap();
-        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\""));
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\""));
         for banned in [
             "<script",
             "foreignObject",

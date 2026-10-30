@@ -837,9 +837,9 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
     `composer-icon-dark.svg`) icons are the owner-selected mark, byte copies that
     `scripts/render-brand-assets.cjs` makes from `assets/brand/`: a square 64-unit `viewBox`
     without width/height, so the source check takes their size from the `viewBox`.
-    `icon.svg`/`icon-dark.svg` (a 24-unit `viewBox`, 48×48) are the launcher's icons, below;
-    they still carry the issue #8 mark described next, which all four fields used before
-    that integration. Aligning the launcher pair is an open follow-up.
+    The launcher's `icon.svg`/`icon-dark.svg` (below) are the same byte copies. Before that
+    integration all four fields and the launcher used the issue #8 mark described next (a
+    24-unit `viewBox`, 48×48).
   - The mark (owner direction of 2026-10-19: architecture, systems and an editable canvas;
     before, an open sheet with a folded corner and a selection handle) is an open canvas
     frame holding a block joined by one elbow connector to a second block, which sits on the

@@ -24,7 +24,7 @@ async function render(){
  const icon=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><rect x="40" y="40" width="944" height="944" rx="212" fill="#202124"/><g color="#fafafa" transform="translate(115 115) scale(12.4)">${body}</g></svg>`;
  await fs.writeFile(path.join(root,'packaging/icons/icon.svg'),icon+'\n');
  await sharp(Buffer.from(icon)).resize(1024,1024).png().toFile(path.join(root,'packaging/icons/icon-1024.png'));
- for(const [target,source] of [['logo.svg',light],['composer-icon.svg',light],['logo-dark.svg',dark],['composer-icon-dark.svg',dark]]){
+ for(const [target,source] of [['logo.svg',light],['composer-icon.svg',light],['icon.svg',light],['logo-dark.svg',dark],['composer-icon-dark.svg',dark],['icon-dark.svg',dark]]){
   await fs.writeFile(path.join(root,'plugin/openpaperdesign/assets',target),source);
  }
 }
