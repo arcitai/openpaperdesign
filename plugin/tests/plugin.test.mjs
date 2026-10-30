@@ -75,18 +75,25 @@ test('interface icons are contained, square, static SVGs of at least 48 px', () 
   // plugin-creator 0.1.26 packaging reference (read by the operator): logo and composerIcon
   // (dark variants optional) are contained relative paths to square PNG/JPEG/WebP/SVG files
   // of at least 48x48 and at most 5 MiB. Whether Codex shows them is only proven installed.
-  const ui = json(join(plugin, 'plugin.json')).extensions['com.openai'].interface;
-  const fields = ['logo', 'logoDark', 'composerIcon', 'composerIconDark'];
-  const files = new Set();
-  for (const f of fields) {
-    const abs = inside(plugin, ui[f]);
-    assert.match(ui[f], /^\.\/assets\/[a-z-]+\.svg$/, f);
+  // The listing and composer icons are the owner-selected mark, which
+  // scripts/render-brand-assets.cjs copies from assets/brand/: a square 64-unit viewBox
+  // without width/height, so their size is the viewBox. The launcher's icon.svg and
+  // icon-dark.svg keep 48x48 on a 24-unit viewBox.
+  const svgAt = (rel, f) => {
+    const abs = inside(plugin, rel);
+    assert.match(rel, /^\.\/assets\/[a-z-]+\.svg$/, f);
     assert.ok(statSync(abs).size <= 5 * 1024 * 1024, `${f}: at most 5 MiB`);
     const svg = readFileSync(abs, 'utf8');
     assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" /, `${f}: one root svg`);
-    const attr = (k) => Number((svg.match(new RegExp(` ${k}="([0-9.]+)"`)) || [])[1]);
-    assert.ok(attr('width') >= 48 && attr('width') === attr('height'), `${f}: square, >= 48`);
-    assert.match(svg, / viewBox="0 0 24 24"/, `${f}: square viewBox`);
+    // The root element's own size: a square viewBox, and a square, unitless width/height if
+    // it has one (a unit or percentage would be an intrinsic size this check can't compare).
+    const root = svg.slice(0, svg.indexOf('>') + 1);
+    const attr = (k) => (root.match(new RegExp(` ${k}="([^"]*)"`)) || [])[1];
+    const box = root.match(/ viewBox="0 0 ([0-9.]+) ([0-9.]+)"/);
+    assert.ok(box && box[1] === box[2], `${f}: square viewBox`);
+    const [w, h] = [attr('width'), attr('height')];
+    assert.ok(w === h && (w === undefined || /^[0-9.]+$/.test(w)) && Number(w ?? box[1]) >= 48,
+      `${f}: square, >= 48`);
     // Static and self-contained: nothing that runs, styles, loads or embeds.
     for (const banned of ['<script', 'foreignObject', 'href', 'url(', '<style', 'style=', '<text',
       '<image', '@import', 'on', '<!']) {
@@ -94,12 +101,29 @@ test('interface icons are contained, square, static SVGs of at least 48 px', () 
       else assert.ok(!svg.includes(banned), `${f}: no ${banned}`);
     }
     assert.deepEqual(svg.match(/https?:\/\/[^"]*/g), ['http://www.w3.org/2000/svg'], `${f}: no external reference`);
-    files.add(ui[f]);
+    return { svg, box: Number(box[1]), width: w && Number(w) };
+  };
+  const ui = json(join(plugin, 'plugin.json')).extensions['com.openai'].interface;
+  const fields = ['logo', 'logoDark', 'composerIcon', 'composerIconDark'];
+  const icons = Object.fromEntries(fields.map((f) => [f, svgAt(ui[f], f)]));
+  const paths = new Set(fields.map((f) => ui[f]));
+  assert.equal(paths.size, 4, 'distinct light/dark logo and composer icon');
+  const brand = (n) => readFileSync(join(repo, 'assets/brand', n), 'utf8');
+  // One brand source each: the listing logo and the composer icon are the same mark.
+  for (const [f, n] of [['logo', 'openpaperdesign.svg'], ['composerIcon', 'openpaperdesign.svg'],
+    ['logoDark', 'openpaperdesign-dark.svg'], ['composerIconDark', 'openpaperdesign-dark.svg']]) {
+    assert.equal(icons[f].svg, brand(n), `${f}: assets/brand/${n}`);
   }
-  assert.equal(files.size, 4, 'distinct light/dark logo and composer icon');
+  // The launcher embeds these two (launcher.rs ICON_LIGHT, ICON_DARK). They still carry the
+  // issue #8 mark (48x48 on a 24-unit viewBox), not the selected one: an open follow-up.
+  for (const n of ['icon.svg', 'icon-dark.svg']) {
+    const i = svgAt(`./assets/${n}`, n);
+    assert.ok(i.box === 24 && i.width === 48, `${n}: 48x48 on a 24-unit viewBox`);
+  }
   // Sandboxed sessions can leave empty dot placeholders (see AGENTS.md); they aren't assets.
   const assets = readdirSync(join(plugin, 'assets')).filter((n) => !n.startsWith('.')).sort();
-  assert.deepEqual(assets, ['icon-dark.svg', 'icon.svg', 'logo-dark.svg', 'logo.svg']);
+  assert.deepEqual(assets, ['composer-icon-dark.svg', 'composer-icon.svg', 'icon-dark.svg',
+    'icon.svg', 'logo-dark.svg', 'logo.svg']);
 });
 
 test('one manifest: no .codex-plugin overlay to contradict plugin.json', () => {

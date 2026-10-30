@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 1.02 · Updated: 2026-10-29 (V1 model profile; earlier: issue #23 release/close/handover outcomes, runs 198–206)
+Revision: 1.03 · Updated: 2026-10-29 (plugin icon contract after the V1 integration; earlier: V1 model profile)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1274,8 +1274,15 @@ one. Not built, rendered, reviewed, installed or natively accepted here.
 
 A view a host already cached under an earlier key is not evicted or refreshed by this.
 The plugin's icon assets are static SVGs in `plugin/openpaperdesign/assets/` (no script,
-`foreignObject`, style, text or external reference; at least 48×48 intrinsic). The launcher
-embeds `icon.svg`/`icon-dark.svg` at build time, so rebuild after changing them. Revision 21
+`foreignObject`, style, text or external reference; square, at least 48×48). The manifest's
+`logo*`/`composer-icon*` files are byte copies of the owner-selected mark in `assets/brand/`
+(`scripts/render-brand-assets.cjs`): a square 64-unit `viewBox` and no width/height, so they
+have no explicit intrinsic size and the plugin test takes the `viewBox` side as their size (a
+relaxation from the earlier explicit 48×48; whether Codex accepts and shows them is only
+proven installed). The launcher embeds `icon.svg`/`icon-dark.svg` at build time (the home
+entry's tool icons and the `serverInfo.icons` fallback), so rebuild after changing them. They
+still carry the issue #8 mark, not the selected one: aligning them, and root `DESIGN.md`'s
+"The plugin's mark" section, is an open follow-up. Revision 21
 (issue #8, the owner's 2026-10-19 architecture direction; root `DESIGN.md`, "The plugin's
 mark") replaced the earlier sheet-and-handle mark in all four, same paths, sizes and wiring;
 the package and icon-wiring checks passed, but its display in Codex isn't shown and it isn't
@@ -1885,7 +1892,8 @@ follows the remembered active page, and its own saves keep the manifest's active
 - Owner choice 2026-10-29 for the V1 completion work; it replaces the earlier profile (implementation
   `claudeAgent` `claude-opus-5-5`, effort `high`, fastMode `false`; AgentOps, research and review
   `codex` `gpt-6.1-sol`, reasoningEffort `max`, serviceTier `default`).
-- Owner-selected defaults and native project/AgentOps readback verified 2026-10-13.
+- Thread readback of this profile (lead, implementation, review) verified 2026-10-29; the
+  earlier owner-selected defaults and native project/AgentOps readback verified 2026-10-13.
   Native project configuration owns the
   implementation default; thread selections own AgentOps and review. Preserve the actual
   settings of an in-flight turn and apply changes at its next safe continuation.

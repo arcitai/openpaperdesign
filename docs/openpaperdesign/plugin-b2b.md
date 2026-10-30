@@ -832,9 +832,14 @@ The operator checked draft `1714a58` against the installed Codex plugin-creator 
   icon fields (issue #8) follow plugin-creator 0.1.26's packaging rule: contained relative
   paths to square PNG/JPEG/WebP/SVG files of at least 48×48 and at most 5 MiB.
 - **Icon (issue #8, source only):**
-  - The static SVGs live in `assets/`: `logo.svg`/`logo-dark.svg` for the listing, and
-    `icon.svg`/`icon-dark.svg` for the composer. Each has a 24-unit `viewBox` and a 48×48
-    intrinsic size.
+  - The static SVGs live in `assets/`. Since the V1 integration of main (`1ceebd4`), the
+    listing (`logo.svg`/`logo-dark.svg`) and composer (`composer-icon.svg`/
+    `composer-icon-dark.svg`) icons are the owner-selected mark, byte copies that
+    `scripts/render-brand-assets.cjs` makes from `assets/brand/`: a square 64-unit `viewBox`
+    without width/height, so the source check takes their size from the `viewBox`.
+    `icon.svg`/`icon-dark.svg` (a 24-unit `viewBox`, 48×48) are the launcher's icons, below;
+    they still carry the issue #8 mark described next, which all four fields used before
+    that integration. Aligning the launcher pair is an open follow-up.
   - The mark (owner direction of 2026-10-19: architecture, systems and an editable canvas;
     before, an open sheet with a folded corner and a selection handle) is an open canvas
     frame holding a block joined by one elbow connector to a second block, which sits on the
