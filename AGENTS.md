@@ -1,6 +1,6 @@
 # AGENTS.md — openpaperdesign
 
-Revision: 1.05 · Updated: 2026-10-29 (owner model and quota policy; earlier: launcher icons use the selected mark)
+Revision: 1.06 · Updated: 2026-10-30 (backing configuration check; earlier: owner model and quota policy)
 
 openpaperdesign is a fork of the
 [michaelshimeles/paper-rs](https://github.com/michaelshimeles/paper-rs) repository. The goal is an editable paper-rs canvas inside an agent host, such as Codex's
@@ -1897,6 +1897,8 @@ follows the remembered active page, and its own saves keep the manifest's active
   reviewer it may read, run agreed checks and write review artifacts; it doesn't apply fixes.
   There is no Sol implementation fallback when Claude limits are hit: wait, or reassign between
   the two Claude models. All three run at ExtraHigh; effort isn't lowered to save quota.
+- Before each dispatch, verify the actual backing thread configuration (provider, model, effort,
+  and fastMode or serviceTier), not only the composer selection.
 - Before a substantial job, read the native usage status if the host exposes it (time, remaining
   pools, reset times, billing mode). Cost or token totals aren't remaining quota; an unexposed
   limit stays unknown.
