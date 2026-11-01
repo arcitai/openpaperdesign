@@ -117,8 +117,13 @@ impl App {
         p - v2(self.canvas.min.x as f64, self.canvas.min.y as f64)
     }
 
+    /// Inside the canvas rectangle and not over floating egui UI there (`ui::over_floating_ui`,
+    /// as the browser host judges it: the canvas's own menu counts only while it is open).
+    /// Within the canvas rectangle egui's background layer is the canvas, as
+    /// `Context::is_pointer_over_egui` also has it.
     fn over_canvas(&self, p: V2) -> bool {
-        self.canvas.contains(egui::pos2(p.x as f32, p.y as f32)) && !self.ctx.is_pointer_over_egui()
+        let at = egui::pos2(p.x as f32, p.y as f32);
+        self.canvas.contains(at) && !ui::over_floating_ui(&self.ctx, &self.st, at)
     }
 
     /// Before leaving a scratch (project-less) document. Projects autosave, so they never ask.
@@ -138,12 +143,22 @@ impl App {
         }
     }
 
+    /// Menu Quit and window Close use the same save boundary. A project's debounce
+    /// may not have elapsed yet; a failed save must keep the app open.
+    fn prepare_exit(&mut self) -> bool {
+        if self.session.project.is_some() {
+            self.save_project(true)
+        } else {
+            self.confirm_discard()
+        }
+    }
+
     fn error(&mut self, msg: String) {
         log::error!("{msg}");
         self.ed.status = msg.clone();
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("paper-rs")
+            .set_title("OpenPaperDesign")
             .set_description(msg)
             .show();
     }
@@ -209,11 +224,18 @@ impl App {
         true
     }
 
-    /// Autosave when due. Called after every frame and on timer wake-ups.
-    fn tick_autosave(&mut self) {
-        if self.session.autosave_due(&self.ed, Instant::now()) {
+    /// Poll on every event-loop turn, including MCP edits while the window is covered.
+    /// Preserve the fork's Theme draft guard: one in-progress edit remains one undo step.
+    fn tick_autosave(&mut self) -> bool {
+        self.tick_autosave_at(Instant::now())
+    }
+
+    fn tick_autosave_at(&mut self, now: Instant) -> bool {
+        if self.session.autosave_due_ui(&self.ed, &self.ctx, now) {
             self.save_project(false);
+            return true;
         }
+        false
     }
 
     fn show_home(&mut self) {
@@ -665,22 +687,22 @@ impl App {
             &self.ctx,
             l,
             &self.ed,
-            !self.st.show_grid_off,
+            self.st.background,
         );
         g.window.pre_present_notify();
         g.queue.present(frame);
 
         let title = if self.st.home.is_some() {
-            "paper-rs".to_string()
+            "OpenPaperDesign".to_string()
         } else if self.session.project.is_some() {
             format!(
-                "{} — {} — paper-rs",
+                "{} — {} — OpenPaperDesign",
                 self.st.project_name,
                 self.ed.page_name()
             )
         } else {
             format!(
-                "{}{} — paper-rs",
+                "{}{} — OpenPaperDesign",
                 self.ed.doc.name,
                 if self.ed.is_dirty() { " •" } else { "" }
             )
@@ -693,7 +715,6 @@ impl App {
             || self.st.home.as_ref().is_some_and(|h| !h.actions.is_empty());
         self.handle_requests();
         self.handle_home_actions();
-        self.tick_autosave();
         if self.st.library.dirty {
             self.st.library.dirty = false;
             if let Err(e) = self.st.library.library.save() {
@@ -732,7 +753,10 @@ impl App {
                 }
             };
             set(&m.snapping, self.ed.snapping);
-            set(&m.grid, !self.st.show_grid_off);
+            set(
+                &m.grid,
+                self.st.background != crate::render::scene::Background::None,
+            );
             set(&m.help, self.st.show_help);
         }
     }
@@ -743,11 +767,11 @@ impl App {
         use crate::macos::MenuCmd;
         match cmd {
             MenuCmd::Quit => {
-                if self.confirm_discard() {
+                if self.prepare_exit() {
                     event_loop.exit();
                 }
             }
-            MenuCmd::ToggleGrid => self.st.show_grid_off = !self.st.show_grid_off,
+            MenuCmd::ToggleGrid => self.st.toggle_background(),
             MenuCmd::ToggleHelp => self.st.show_help = !self.st.show_help,
             // Menu key equivalents never reach egui, so while a text field is focused, hand
             // the standard editing commands to it instead of the canvas.
@@ -822,7 +846,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("paper-rs")
+            .with_title("OpenPaperDesign")
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(720.0, 480.0));
         // PAPER_RS_OPAQUE=1 turns off vibrancy (and window transparency) on macOS.
@@ -922,10 +946,7 @@ impl ApplicationHandler<UserEvent> for App {
         let now = self.now();
         match event {
             WindowEvent::CloseRequested => {
-                if self.session.project.is_some() {
-                    self.save_project(true);
-                }
-                if self.confirm_discard() {
+                if self.prepare_exit() {
                     event_loop.exit();
                 }
             }
@@ -1000,8 +1021,18 @@ impl ApplicationHandler<UserEvent> for App {
                     .input(|i| i.pointer.latest_pos())
                     .map(|p| v2(p.x as f64, p.y as f64));
                 let Some(p) = p else { return };
+                // While a tool flyout or the canvas's menu is open the press only closes it; a
+                // press on a panel's resize handle (into the canvas) only resizes the panel.
+                // An open egui popup's press too (`ui::popup_open`): egui closes the popup, and
+                // the press never also reaches the canvas.
+                let theirs = self.st.captures_input()
+                    || ui::popup_open(&self.ctx)
+                    || self
+                        .st
+                        .chrome
+                        .on_panel_edge(egui::pos2(p.x as f32, p.y as f32));
                 match state {
-                    ElementState::Pressed if self.over_canvas(p) => {
+                    ElementState::Pressed if self.over_canvas(p) && !theirs => {
                         // Clicking the canvas takes keyboard focus away from text fields.
                         self.ctx.memory_mut(|m| {
                             if let Some(f) = m.focused() {
@@ -1076,39 +1107,32 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw = true;
             }
             WindowEvent::Touch(t) => {
-                // Pens and touch screens: forward pressure for ink.
-                let p = v2(t.location.x / scale, t.location.y / scale);
-                let pressure = t.force.map(|f| f.normalized());
-                let pos = self.to_canvas(p);
-                match t.phase {
-                    TouchPhase::Started if self.over_canvas(p) => {
-                        self.captured = true;
-                        self.ed.handle(InputEvent::PointerDown {
-                            pos,
-                            button: Button::Primary,
-                            pressure,
-                            time_ms: now,
-                        });
-                    }
-                    TouchPhase::Moved if self.captured => self.ed.handle(InputEvent::PointerMove {
-                        pos,
-                        pressure,
-                        time_ms: now,
-                    }),
-                    TouchPhase::Ended | TouchPhase::Cancelled if self.captured => {
-                        self.captured = false;
-                        self.ed.handle(InputEvent::PointerUp {
-                            pos,
-                            button: Button::Primary,
-                            time_ms: now,
-                        });
-                    }
-                    _ => {}
-                }
+                self.touch(t, scale, now);
                 redraw = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if self.ctx.egui_wants_keyboard_input() {
+                // A text field's keys are its own; an open tool flyout takes Escape (egui has
+                // the event and closes it; the tool stays as it is); a rail control with egui's
+                // keyboard focus takes Enter and Space (egui chooses it).
+                let flyout_escape = self.st.captures_input()
+                    && matches!(event.logical_key, WKey::Named(NamedKey::Escape));
+                let rail = match event.logical_key {
+                    WKey::Named(NamedKey::Enter) => Some(egui::Key::Enter),
+                    WKey::Named(NamedKey::Space) => Some(egui::Key::Space),
+                    _ => None,
+                };
+                let focused = self.ctx.memory(|m| m.focused());
+                let rail_key = rail.is_some_and(|k| self.st.rail.takes_key(k, focused));
+                // An open egui popup owns the keys pressed while it is open (`ui::popup_open`):
+                // egui moves its focus, chooses and closes it. Every release still reaches the
+                // editor, whoever has the keyboard (R61-F1): upstream acts on a release only to
+                // let go of a key it holds (Space's pan), so a key pressed on the canvas and
+                // released after a field or a menu item took the focus still ends.
+                let owned = self.ctx.egui_wants_keyboard_input()
+                    || flyout_escape
+                    || rail_key
+                    || ui::popup_open(&self.ctx);
+                if owned && event.state == ElementState::Pressed {
                     self.gfx.as_ref().unwrap().window.request_redraw();
                     return;
                 }
@@ -1145,7 +1169,7 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw = true;
             }
             WindowEvent::Ime(winit::event::Ime::Commit(s)) => {
-                if !self.ctx.egui_wants_keyboard_input() {
+                if !self.ctx.egui_wants_keyboard_input() && !ui::popup_open(&self.ctx) {
                     self.ed.handle(InputEvent::Text(s));
                 }
                 redraw = true;
@@ -1199,16 +1223,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Autosave runs off a timer so it also fires while the window sits idle.
-        if self
-            .session
-            .next_deadline()
-            .is_some_and(|d| Instant::now() >= d)
+        // This poll must run even before a deadline exists: an MCP edit can arrive
+        // without any rendered frame to start the debounce clock (upstream 6689318).
+        if self.tick_autosave()
+            && let Some(g) = &self.gfx
         {
-            self.tick_autosave();
-            if let Some(g) = &self.gfx {
-                g.window.request_redraw();
-            }
+            g.window.request_redraw();
         }
         let wake = match (self.next_repaint, self.session.next_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1304,6 +1324,48 @@ fn physical_char(c: winit::keyboard::KeyCode) -> Option<char> {
 }
 
 impl App {
+    /// Pens and touch screens (forwarding pressure for ink). The first contact is admitted as
+    /// the mouse's press is (`MouseInput`): over the canvas, and neither on a panel's resize
+    /// handle nor while an open tool flyout or the canvas's menu owns the press (egui-winit's
+    /// pointer emulation of the same touch closes it). The editor then never draws from a
+    /// touch that only dismisses a menu.
+    fn touch(&mut self, t: winit::event::Touch, scale: f64, now: f64) {
+        let p = v2(t.location.x / scale, t.location.y / scale);
+        let pressure = t.force.map(|f| f.normalized());
+        let pos = self.to_canvas(p);
+        let theirs = self.st.captures_input()
+            || ui::popup_open(&self.ctx)
+            || self
+                .st
+                .chrome
+                .on_panel_edge(egui::pos2(p.x as f32, p.y as f32));
+        match t.phase {
+            TouchPhase::Started if self.over_canvas(p) && !theirs => {
+                self.captured = true;
+                self.ed.handle(InputEvent::PointerDown {
+                    pos,
+                    button: Button::Primary,
+                    pressure,
+                    time_ms: now,
+                });
+            }
+            TouchPhase::Moved if self.captured => self.ed.handle(InputEvent::PointerMove {
+                pos,
+                pressure,
+                time_ms: now,
+            }),
+            TouchPhase::Ended | TouchPhase::Cancelled if self.captured => {
+                self.captured = false;
+                self.ed.handle(InputEvent::PointerUp {
+                    pos,
+                    button: Button::Primary,
+                    time_ms: now,
+                });
+            }
+            _ => {}
+        }
+    }
+
     /// Run the MCP tool calls that arrived since the last wake-up, then repaint.
     fn run_mcp_calls(&mut self) {
         let calls: Vec<crate::mcp::Call> = match &self.mcp {
@@ -1418,4 +1480,191 @@ pub fn run(start: Start) -> Result<(), String> {
     let mut app = App::new(start, store);
     app.mcp = start_mcp(event_loop.create_proxy());
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
+}
+
+/// The native touch admission (`App::touch`) on the real App, UI and Editor, laid out by the
+/// real `frame::layout`. No window, winit event loop, egui-winit OS dispatch or GPU: this is a
+/// source-level check of the branch, not OS input proof.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Tool;
+    use crate::editor::shortcuts::Action;
+    use crate::project::format::page_to_json;
+
+    fn app() -> App {
+        let ctx = egui::Context::default();
+        ui::setup_style(&ctx);
+        let root = std::env::temp_dir().join("opd-app-touch-unused-store");
+        App {
+            gfx: None,
+            ed: Editor::default(),
+            session: Session::new(Store { root }),
+            st: UiState::default(),
+            ctx,
+            start: Instant::now(),
+            canvas: egui::Rect::NOTHING,
+            captured: false,
+            title: String::new(),
+            next_repaint: None,
+            #[cfg(target_os = "macos")]
+            menu: None,
+            mcp: None,
+        }
+    }
+
+    #[test]
+    fn autosave_starts_without_a_rendered_frame_and_survives_reopen() {
+        let mut a = app();
+        let root = std::env::temp_dir().join(format!(
+            "opd-occluded-autosave-{}",
+            crate::project::new_id()
+        ));
+        a.session = Session::new(Store::open(root.clone()).unwrap());
+        a.session.create(&mut a.ed, "Covered window").unwrap();
+        let project = a.session.project.as_ref().unwrap().dir.clone();
+        a.ed.add_node(
+            crate::model::Node::new(
+                crate::model::NodeId(0),
+                crate::model::NodeKind::Rect,
+                crate::geom::Rect::new(10.0, 20.0, 40.0, 30.0),
+            ),
+            None,
+        );
+        assert!(a.session.next_deadline().is_none());
+        let now = Instant::now();
+        assert!(!a.tick_autosave_at(now));
+        assert_eq!(
+            a.session.next_deadline(),
+            Some(now + crate::session::AUTOSAVE_DELAY)
+        );
+        assert!(!a.tick_autosave_at(
+            now + crate::session::AUTOSAVE_DELAY - std::time::Duration::from_millis(1)
+        ));
+        assert!(a.tick_autosave_at(now + crate::session::AUTOSAVE_DELAY));
+        assert!(!a.ed.project_dirty());
+        let mut reopened = Editor::default();
+        Session::new(Store::open(root.clone()).unwrap())
+            .open(&mut reopened, &project)
+            .unwrap();
+        assert_eq!(reopened.doc.nodes.len(), 1);
+        a.ed.add_node(
+            crate::model::Node::new(
+                crate::model::NodeId(0),
+                crate::model::NodeKind::Rect,
+                crate::geom::Rect::new(60.0, 20.0, 40.0, 30.0),
+            ),
+            None,
+        );
+        assert!(a.ed.project_dirty());
+        assert!(
+            a.prepare_exit(),
+            "Quit saves immediately, before another autosave deadline"
+        );
+        let mut after_quit = Editor::default();
+        Session::new(Store::open(root.clone()).unwrap())
+            .open(&mut after_quit, &project)
+            .unwrap();
+        assert_eq!(after_quit.doc.nodes.len(), 2);
+
+        drop(a);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One layout of the real UI on a 1280 × 800 surface with these egui events.
+    fn layout_frame(a: &mut App, events: Vec<egui::Event>, t: f64) {
+        let size = egui::vec2(1280.0, 800.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let mut l = frame::layout(&a.ctx, raw, &mut a.ed, &mut a.st);
+        a.canvas = l.canvas;
+        l.output.textures_delta.clear();
+    }
+
+    fn touch(a: &mut App, phase: TouchPhase, (x, y): (f64, f64), t: f64) {
+        let event = winit::event::Touch {
+            device_id: winit::event::DeviceId::dummy(),
+            phase,
+            location: winit::dpi::PhysicalPosition::new(x, y),
+            force: None,
+            id: 1,
+        };
+        a.touch(event, 1.0, t);
+    }
+
+    fn touch_drag(a: &mut App, from: (f64, f64), to: (f64, f64), t: f64) {
+        touch(a, TouchPhase::Started, from, t);
+        touch(a, TouchPhase::Moved, to, t + 10.0);
+        touch(a, TouchPhase::Ended, to, t + 20.0);
+    }
+
+    /// egui's pointer events for one click with `button` at `p`, over two frames.
+    fn click(a: &mut App, p: egui::Pos2, button: egui::PointerButton, t: f64) {
+        for (i, pressed) in [true, false].into_iter().enumerate() {
+            let events = vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            layout_frame(a, events, t + i as f64 * 0.016);
+        }
+        for i in 0..3 {
+            layout_frame(a, vec![], t + 0.1 + i as f64 * 0.016);
+        }
+    }
+
+    #[test]
+    fn a_touch_that_dismisses_the_canvas_menu_never_draws_and_the_next_touch_does() {
+        let mut a = app();
+        for i in 0..4 {
+            layout_frame(&mut a, vec![], i as f64 * 0.016);
+        }
+        // Control: an ordinary touch drag with the Rectangle tool draws.
+        a.ed.run(Action::Tool(Tool::Rect));
+        touch_drag(&mut a, (400.0, 300.0), (440.0, 340.0), 1000.0);
+        assert_eq!(a.ed.doc.nodes.len(), 1, "an ordinary touch draws");
+        // A touch on Design's resize handle (it reaches into the canvas) is the panel's.
+        a.ed.run(Action::Tool(Tool::Rect));
+        let edge = (a.canvas.max.x as f64, 300.0);
+        let on_edge = egui::pos2(edge.0 as f32, edge.1 as f32);
+        assert!(a.st.chrome.on_panel_edge(on_edge));
+        touch(&mut a, TouchPhase::Started, edge, 1500.0);
+        assert!(!a.captured, "the handle's press");
+        touch(&mut a, TouchPhase::Ended, edge, 1520.0);
+        assert_eq!(a.ed.doc.nodes.len(), 1);
+        // The canvas's menu, opened with a real secondary click on blank canvas.
+        click(
+            &mut a,
+            egui::pos2(700.0, 400.0),
+            egui::PointerButton::Secondary,
+            2.0,
+        );
+        assert!(a.st.canvas_menu.is_some() && a.st.captures_input());
+        // Outside the open menu is ordinary canvas by the layer test: only the admission
+        // fences the press, with a creation tool active.
+        let q = (500.0, 500.0);
+        assert!(a.over_canvas(v2(q.0, q.1)));
+        assert_eq!(a.ed.tool, Tool::Rect);
+        let before = page_to_json(&a.ed.page_data(0));
+        touch(&mut a, TouchPhase::Started, q, 3000.0);
+        assert!(!a.captured, "the open menu owns the press");
+        touch(&mut a, TouchPhase::Moved, (540.0, 540.0), 3010.0);
+        touch(&mut a, TouchPhase::Ended, (540.0, 540.0), 3020.0);
+        assert_eq!(page_to_json(&a.ed.page_data(0)), before, "nothing drawn");
+        // egui-winit hands egui the same contact as a pointer press: it closes the menu.
+        let qp = egui::pos2(q.0 as f32, q.1 as f32);
+        click(&mut a, qp, egui::PointerButton::Primary, 4.0);
+        assert!(a.st.canvas_menu.is_none() && !a.st.captures_input());
+        // The next ordinary touch draws again.
+        touch_drag(&mut a, (500.0, 500.0), (560.0, 560.0), 5000.0);
+        assert_eq!(a.ed.doc.nodes.len(), 2, "the next touch draws");
+    }
 }

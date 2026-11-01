@@ -187,9 +187,17 @@ enum Gesture {
         end: usize,
         start: V2,
     },
-    /// Bending an arrow by its middle point.
+    /// Bending an arrow at one of its interior points, `point` (its index in the arrow's
+    /// points; 1 for a straight arrow's first bend), of an arrow with `count` points (3 once
+    /// a straight arrow's first bend has inserted its point): a drag moves that point only
+    /// while the arrow still has that many. `press` (screen) while the press on the bend
+    /// handle hasn't moved past the drag threshold: nothing is bent yet, so a click (the
+    /// first half of a double-click that edits the label, say) changes nothing.
     ConnectorMid {
         id: NodeId,
+        point: usize,
+        count: usize,
+        press: Option<V2>,
     },
     Laser,
     /// Dragging a point or handle of the path being edited.
@@ -438,6 +446,21 @@ impl Editor {
     pub fn mark_saved(&mut self) {
         self.history.seal();
         self.saved_marker = Some(self.history.undo_len());
+    }
+
+    /// A throwaway editor of the shown page as it stands for an edit: its document, open
+    /// transaction (with its coalescing key), text edit, selection and suspended layouts; no
+    /// history, clipboard, other pages or host state. An operation tried on it shows its whole
+    /// effect on the document, the open text edit's completion and the commit's fixup
+    /// included, without touching this editor (Theme admits a change this way before
+    /// changing anything, R69).
+    pub fn preview(&self) -> Editor {
+        let mut e = Editor::new(self.doc.clone());
+        e.rec = self.rec.clone();
+        e.text_edit = self.text_edit.clone();
+        e.selection = self.selection.clone();
+        e.layout_suspended = self.layout_suspended.clone();
+        e
     }
 
     /// Replace the document (open/new).
@@ -824,6 +847,19 @@ impl Editor {
 
     fn select_down(&mut self, pos: V2, world: V2, double: bool) {
         if self.path_edit.is_none() && self.text_edit.is_none() {
+            // A double-click on the selected arrow edits its label, before its handles (the
+            // label sits at the middle of the line).
+            if double
+                && let [id] = self.selection[..]
+                && matches!(
+                    self.doc.get(id).map(|n| &n.kind),
+                    Some(NodeKind::Connector { .. })
+                )
+                && hit::node_contains(&self.doc, id, world, self.camera.zoom)
+            {
+                self.start_text_edit(id, Some(world));
+                return;
+            }
             if let Some(&(dir, _)) = self.quick_knobs().iter().find(|(_, p)| p.dist(pos) <= 9.0) {
                 self.quick_connect(dir);
                 return;
@@ -925,7 +961,7 @@ impl Editor {
             self.start_marquee(world, Some(target));
             return;
         }
-        if double && node.kind.text().is_some() {
+        if double && node.kind.edit_text().is_some() {
             self.start_text_edit(target, Some(world));
             return;
         }
@@ -1309,6 +1345,14 @@ impl Editor {
                 self.pen_drag(world);
                 self.gesture = Gesture::Pen;
             }
+            // A connector locked or removed since the press: the gesture ends here, inert (it
+            // isn't put back), and only what was already recorded is committed.
+            Gesture::ConnectorEnd { id, .. } | Gesture::ConnectorMid { id, .. }
+                if self.connector_gesture_stale(id) =>
+            {
+                self.bind_hover = None;
+                self.commit();
+            }
             Gesture::ConnectorEnd { id, end, start } => {
                 let w = if self.snapping && !self.mods.command() {
                     world.round()
@@ -1318,9 +1362,36 @@ impl Editor {
                 self.drag_connector_end(id, end, w);
                 self.gesture = Gesture::ConnectorEnd { id, end, start };
             }
-            Gesture::ConnectorMid { id } => {
-                self.drag_connector_mid(id, world);
-                self.gesture = Gesture::ConnectorMid { id };
+            Gesture::ConnectorMid {
+                id,
+                point,
+                mut count,
+                press,
+            } => {
+                // The bend starts only with a real drag, as a move does.
+                if let Some(p) = press {
+                    if pos.dist(p) < DRAG_THRESHOLD {
+                        self.gesture = Gesture::ConnectorMid {
+                            id,
+                            point,
+                            count,
+                            press,
+                        };
+                        return;
+                    }
+                    // A straight arrow's first bend inserts its bend point.
+                    if count == 2 {
+                        self.bend_connector(id, world);
+                        count = 3;
+                    }
+                }
+                self.drag_connector_mid(id, point, count, world);
+                self.gesture = Gesture::ConnectorMid {
+                    id,
+                    point,
+                    count,
+                    press: None,
+                };
             }
             Gesture::Laser => {
                 self.laser_point(world, time_ms);
@@ -1502,6 +1573,10 @@ impl Editor {
             }
             Gesture::Erase => self.commit(),
             Gesture::Pen => self.pen_up(),
+            Gesture::ConnectorEnd { id, .. } if self.connector_gesture_stale(id) => {
+                self.bind_hover = None;
+                self.commit();
+            }
             Gesture::ConnectorEnd { id, start, .. } => self.connector_end_up(id, start, world),
             Gesture::ConnectorMid { .. } => self.commit(),
             Gesture::Laser => {}
@@ -1684,7 +1759,7 @@ impl Editor {
 
     pub fn start_text_edit(&mut self, id: NodeId, at_world: Option<V2>) {
         let Some(n) = self.doc.get(id) else { return };
-        let Some(t) = n.kind.text() else {
+        let Some(t) = n.kind.edit_text() else {
             return;
         };
         let len = t.chars().count();
@@ -1708,7 +1783,20 @@ impl Editor {
             return;
         }
         self.end_text_edit();
-        self.begin("Edit text");
+        let arrow = matches!(
+            self.doc.get(id).map(|n| &n.kind),
+            Some(NodeKind::Connector { .. })
+        );
+        self.begin(if arrow { "Edit label" } else { "Edit text" });
+        // An arrow without a label gets an empty one to type into (and loses it again if it
+        // is left empty: `end_text_edit`).
+        if arrow
+            && let Some(n) = self.tx().node_mut(id)
+            && let NodeKind::Connector { label, .. } = &mut n.kind
+            && label.is_none()
+        {
+            *label = Some(String::new());
+        }
         self.selection = vec![id];
         self.text_edit = Some(TextEdit {
             id,
@@ -1722,7 +1810,7 @@ impl Editor {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
-        let Some(text) = self.doc.get(te.id).and_then(|n| n.kind.text()) else {
+        let Some(text) = self.doc.get(te.id).and_then(|n| n.kind.edit_text()) else {
             return;
         };
         let chars: Vec<char> = text.chars().collect();
@@ -1741,8 +1829,11 @@ impl Editor {
         }
     }
 
-    /// Finish text editing; empty text nodes are removed.
+    /// Finish text editing; empty text nodes are removed. A locked layer (itself or through an
+    /// ancestor) is only left: neither removed when empty nor its blank label cleared.
     pub fn end_text_edit(&mut self) {
+        // Asked of the edit's own target before the edit is taken (it needs the edit).
+        let writable = self.text_edit_writable();
         let Some(te) = self.text_edit.take() else {
             return;
         };
@@ -1750,9 +1841,19 @@ impl Editor {
             self.gesture = Gesture::None;
         }
         let empty = matches!(self.doc.get(te.id).map(|n| &n.kind), Some(NodeKind::Text { text, .. }) if text.trim().is_empty());
-        if empty {
+        if writable && empty {
             self.tx().remove(te.id);
             self.selection.retain(|s| *s != te.id);
+        }
+        // An arrow keeps its label exactly as typed; a blank one is no label (the arrow stays),
+        // in the same undo step as the edit.
+        let blank = matches!(self.doc.get(te.id).map(|n| &n.kind), Some(NodeKind::Connector { label: Some(l), .. }) if l.trim().is_empty());
+        if writable
+            && blank
+            && let Some(n) = self.tx().node_mut(te.id)
+            && let NodeKind::Connector { label, .. } = &mut n.kind
+        {
+            *label = None;
         }
         self.commit();
     }
@@ -1828,8 +1929,9 @@ impl Editor {
                         self.start_path_edit(id);
                     } else if matches!(
                         self.doc.get(id).map(|n| &n.kind),
-                        Some(NodeKind::Text { .. })
+                        Some(NodeKind::Text { .. } | NodeKind::Connector { .. })
                     ) {
+                        // A text layer's text, or an arrow's label.
                         self.start_text_edit(id, None);
                     } else if self.doc.get(id).is_some_and(|n| !n.children.is_empty()) {
                         self.selection = self.doc.get(id).unwrap().children.clone();
@@ -1853,10 +1955,27 @@ impl Editor {
                     .filter(|id| self.doc.get(*id).unwrap().visible)
                     .collect();
             }
-            A::Copy => self.copy(),
-            A::Cut => {
+            A::Copy => {
                 self.copy();
-                self.delete_selection();
+            }
+            // While a text edit is open on a locked layer (itself or through an ancestor), Cut
+            // does nothing: no copy, no deletion of its text and no fallback to cutting the
+            // selected layers instead.
+            A::Cut if self.text_edit.is_some() && !self.text_edit_writable() => {}
+            A::Cut => {
+                // An arrow label's selected characters, or the layers (labelled ones too, in
+                // the labelled payload): nothing is deleted unless it was copied. The cut
+                // layers stay on the internal clipboard and Undo brings them back, as before.
+                if self.label_text_selection().is_some() {
+                    let sel = self.text_selection();
+                    if self.copy()
+                        && let Some((a, b)) = sel
+                    {
+                        self.delete_text(a, b);
+                    }
+                } else if self.copy() {
+                    self.delete_selection();
+                }
             }
             A::Paste => self.paste_from_clipboard(),
             A::Duplicate => {
@@ -1972,6 +2091,7 @@ impl Editor {
                 }
             }
             A::ToggleUi => self.ui_events.push(commands::UiEvent::ToggleUi),
+            A::TogglePanels => self.ui_events.push(commands::UiEvent::TogglePanels),
             A::ToggleHelp => self.ui_events.push(commands::UiEvent::ToggleHelp),
             A::ToggleGrid => self.ui_events.push(commands::UiEvent::ToggleGrid),
             A::SelectNext => self.select_sibling(true),
@@ -2057,11 +2177,25 @@ impl Editor {
         self.selection.clear();
     }
 
-    /// Copy to the internal clipboard and, when available, the system clipboard.
-    fn copy(&mut self) {
+    /// Copy to the internal clipboard and, when available, the system clipboard. Returns
+    /// whether something was copied.
+    ///
+    /// While an arrow's label is edited with characters selected, those characters are copied
+    /// as plain text. Layers holding an arrow label go on the system clipboard in the labelled
+    /// payload (`io::clipboard::LABELLED_TYPE`, versioned), which a reader of the unversioned
+    /// `paper-rs/clipboard` alone doesn't take for layers, so their labels are never dropped
+    /// on the way; other layers are written as before.
+    fn copy(&mut self) -> bool {
+        if let Some(text) = self.label_text_selection() {
+            if let Some(io) = &mut self.clipboard_io {
+                io.write_text(&text);
+            }
+            self.status = "Copied text".into();
+            return true;
+        }
         self.copy_internal();
         if self.clipboard_roots.is_empty() {
-            return;
+            return false;
         }
         if let Some(io) = &mut self.clipboard_io {
             let text = crate::io::clipboard::encode(
@@ -2073,18 +2207,71 @@ impl Editor {
             io.write_text(&text);
             self.clipboard_written = Some(text);
         }
+        true
+    }
+
+    /// Whether the text being edited is an arrow's label.
+    fn editing_label(&self) -> bool {
+        self.text_edit.as_ref().is_some_and(|te| {
+            matches!(
+                self.doc.get(te.id).map(|n| &n.kind),
+                Some(NodeKind::Connector { .. })
+            )
+        })
+    }
+
+    /// The selected characters of the arrow label being edited, if any.
+    fn label_text_selection(&self) -> Option<String> {
+        let te = self.text_edit.as_ref()?;
+        let n = self.doc.get(te.id)?;
+        if !matches!(n.kind, NodeKind::Connector { .. }) {
+            return None;
+        }
+        let (a, b) = self.text_selection()?;
+        Some(n.kind.edit_text()?.chars().skip(a).take(b - a).collect())
+    }
+
+    /// Whether the selected layers (or anything inside them) hold an arrow label.
+    pub fn selection_has_labels(&self) -> bool {
+        self.top_selection()
+            .into_iter()
+            .flat_map(|r| self.doc.subtree(r))
+            .any(|id| self.doc.get(id).is_some_and(|n| n.kind.label().is_some()))
     }
 
     /// Paste from the system clipboard when it holds something newer than our own copy
     /// (layers from another window, Excalidraw JSON, SVG, an image or text); otherwise from
-    /// the internal clipboard.
+    /// the internal clipboard. Labelled layers keep their labels; a labelled payload this
+    /// reader refuses (another version, a broken layer tree) changes nothing and says why.
+    ///
+    /// While an arrow's label is being edited, the clipboard's text goes into that label as
+    /// plain text, at the caret or over the selected characters, in the label's own edit (one
+    /// undo step with it). It is never read as layers, SVG or a new text layer, whatever it
+    /// looks like, and nothing else in the document changes. Without text, nothing happens.
+    /// While any text edit is open on a locked layer, itself or through a locked group (Lock
+    /// can come while the edit is open), nothing happens: the text is kept, the clipboard isn't
+    /// read, and nothing is pasted anywhere else instead.
     pub fn paste_from_clipboard(&mut self) {
         use crate::io::clipboard::{self, Content};
+        if self.text_edit.is_some() && !self.text_edit_writable() {
+            return;
+        }
+        if self.editing_label() {
+            let text = self.clipboard_io.as_mut().and_then(|io| io.read_text());
+            let text = text.map(|t| label_paste_text(&t)).unwrap_or_default();
+            if !text.is_empty() {
+                self.insert_text(&text);
+            }
+            return;
+        }
         let external = self.clipboard_io.as_mut().and_then(|io| io.read_text());
         let center = self.camera.screen_to_world(self.viewport * 0.5);
         match external {
             Some(t) if self.clipboard_written.as_deref() != Some(t.as_str()) => {
                 match clipboard::decode(&t) {
+                    // Layers of a format this reader doesn't take: said, and nothing changes
+                    // (no layer, no text layer instead, no image registered).
+                    Content::Refused(why) => self.status = why,
                     Content::Layers(p) => {
                         let same = p.page.as_deref() == Some(self.active_page_id());
                         let d = if same { PASTE_OFFSET } else { 0.0 };
@@ -2096,6 +2283,8 @@ impl Editor {
                             v2(d, d),
                             false,
                         );
+                        // Said as every paste says it (so an earlier refusal's note goes).
+                        self.status = format!("Pasted {} layer(s)", ids.len());
                         self.selection = ids;
                     }
                     Content::Foreign(nodes, what) => {
@@ -2123,6 +2312,7 @@ impl Editor {
                             .take(24)
                             .collect();
                         let id = self.add_node(n, None);
+                        self.status = "Pasted text".into();
                         self.selection = vec![id];
                     }
                     Content::Text(_) => {}
@@ -2415,6 +2605,22 @@ fn is_desc(nodes: &[Node], id: NodeId, ancestor: NodeId) -> bool {
         cur = nodes.iter().find(|n| n.id == p).and_then(|n| n.parent);
     }
     false
+}
+
+/// Clipboard text as an arrow label takes it: line breaks become `\n` (a label is multiline,
+/// as typing Enter makes it), a tab a space, and other control characters are dropped, as
+/// they are when typed. Everything else is kept exactly.
+fn label_paste_text(t: &str) -> String {
+    t.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 fn dedup(mut v: Vec<NodeId>) -> Vec<NodeId> {

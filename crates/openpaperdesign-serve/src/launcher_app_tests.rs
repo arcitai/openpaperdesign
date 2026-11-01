@@ -1,0 +1,7071 @@
+//! The app library (`--app-library`) through the real launcher, rmcp stream protocol, axum
+//! routes and HTTP API the editor uses, with no workspace or Codex metadata. Two launchers in
+//! one test stand for two host processes sharing the library: the lease is a real OS file lock
+//! on separate open files, so it excludes them as it excludes separate processes (that case
+//! runs as real child processes in `tests/app_library.rs`). Only the listener is in memory.
+//! This is not a browser or a native Codex host: the renderer and navigation are not exercised.
+use super::*;
+use crate::library::{Lease, NewDocument};
+
+struct Lib {
+    root: PathBuf,
+    l: Launcher,
+    c: Arc<Client>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Lib {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn library_root() -> PathBuf {
+    use std::hash::{BuildHasher, RandomState};
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "opd-app-library-{:016x}",
+        RandomState::new().hash_one(std::time::SystemTime::now())
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// A library launcher with no request metadata at all.
+async fn launch(root: &Path) -> (Launcher, Arc<Client>, tokio::task::JoinHandle<()>) {
+    let l = Launcher::with_library(Library::open(root.to_str().unwrap()).unwrap());
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    (l, c, task)
+}
+
+async fn library() -> Lib {
+    let root = library_root();
+    let (l, c, task) = launch(&root).await;
+    Lib { root, l, c, task }
+}
+
+fn url(v: &Value) -> (u16, String) {
+    let (port, token) = v["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://127.0.0.1:")
+        .unwrap()
+        .split_once("/#token=")
+        .unwrap();
+    (port.parse().unwrap(), token.to_string())
+}
+
+/// The binding identity an editor result names (views send it back with their actions).
+fn binding(v: &Value) -> String {
+    v["binding"].as_str().unwrap().to_string()
+}
+
+async fn bound_server(l: &Launcher) -> Arc<Server> {
+    l.state.lock().await.bound.as_ref().unwrap().server.clone()
+}
+
+async fn open_doc(l: &Launcher) -> Option<String> {
+    l.state
+        .lock()
+        .await
+        .bound
+        .as_ref()
+        .and_then(|b| b.doc.clone())
+}
+
+/// One raw HTTP request; returns (status, head, body text).
+async fn raw(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    extra: &str,
+    body: &str,
+) -> (u16, String, String) {
+    let mut client = connect(port).await;
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    bounded(client.read_to_end(&mut bytes)).await.unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head.to_string(), body.to_string())
+}
+
+fn etag_of(head: &str) -> String {
+    head.lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                .map(|(_, v)| v.trim().to_string())
+        })
+        .unwrap()
+}
+
+/// What the browser editor does for one edit in a newly opened tab: it is issued its own view
+/// (which takes the editing, issue #23), loads the active page, changes it, saves it with its
+/// revision. Returns the page id and its node count after the save.
+async fn browser_edit(port: u16, token: &str) -> (String, usize) {
+    let view = tab(port, token).await;
+    let (st, page, nodes, answer) = try_edit(port, token, &view).await;
+    assert_eq!(st, 200, "{answer}");
+    (page, nodes)
+}
+
+/// A new browser tab of the editor at `port`: its issued view (`POST /api/view`).
+async fn tab(port: u16, token: &str) -> String {
+    let (st, _, body) = raw(port, token, "POST", "/api/view", "", "").await;
+    assert_eq!(st, 200, "{body}");
+    serde_json::from_str::<Value>(&body).unwrap()["view"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The header line naming a browser view.
+fn view_line(view: &str) -> String {
+    format!("X-OPD-View: {view}\r\n")
+}
+
+/// [`browser_edit`] in tab `view`, reporting the save's status and answer instead of asserting
+/// it: (status, page id, node count the save would make, answer).
+async fn try_edit(port: u16, token: &str, view: &str) -> (u16, String, usize, String) {
+    let (st, _, project) = raw(port, token, "GET", "/api/project", "", "").await;
+    assert_eq!(st, 200, "{project}");
+    let page = serde_json::from_str::<Value>(&project).unwrap()["active_page"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, head, body) = raw(port, token, "GET", &format!("/api/pages/{page}"), "", "").await;
+    assert_eq!(st, 200, "{body}");
+    let mut data = paper_rs::project::format::page_from_json(&body).unwrap();
+    let id = data.doc.alloc_id();
+    data.doc.nodes.insert(
+        id,
+        paper_rs::model::Node::new(
+            id,
+            paper_rs::model::NodeKind::Rect,
+            paper_rs::geom::Rect::new(5.0, 5.0, 40.0, 30.0),
+        ),
+    );
+    data.doc.root.push(id);
+    let (st, _, answer) = raw(
+        port,
+        token,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {}\r\n{}", etag_of(&head), view_line(view)),
+        &paper_rs::project::format::page_to_json(&data),
+    )
+    .await;
+    (st, page, data.doc.nodes.len(), answer)
+}
+
+/// Whether browser tab `view` is told it has the canvas's editing (issue #23).
+async fn editing(port: u16, token: &str, view: &str) -> bool {
+    let (st, _, body) = raw(
+        port,
+        token,
+        "GET",
+        "/api/canvas/revision",
+        &view_line(view),
+        "",
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    serde_json::from_str::<Value>(&body).unwrap()["editing"]
+        .as_bool()
+        .expect("the revision says whether this view edits")
+}
+
+async fn page_nodes(port: u16, token: &str, page: &str) -> usize {
+    let (st, _, body) = raw(port, token, "GET", &format!("/api/pages/{page}"), "", "").await;
+    assert_eq!(st, 200, "{body}");
+    paper_rs::project::format::page_from_json(&body)
+        .unwrap()
+        .doc
+        .nodes
+        .len()
+}
+
+/// An HTTP MCP session on a canvas's loopback server that has read the active page.
+async fn mcp_session(port: u16, token: &str, page: &str) -> String {
+    let (status, head, v) = http(port, token, "POST", "/mcp", "", &json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"library-test", "version":"1"}}}).to_string()).await;
+    assert_eq!(status, 200, "{v}");
+    let sid = head
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+                .map(|(_, v)| v.trim().to_string())
+        })
+        .unwrap();
+    let extra = format!("Mcp-Session-Id: {sid}\r\n");
+    let note = json!({"jsonrpc":"2.0", "method":"notifications/initialized"}).to_string();
+    assert_eq!(
+        http(port, token, "POST", "/mcp", &extra, &note).await.0,
+        202
+    );
+    http_call(
+        port,
+        token,
+        &sid,
+        "get_tree_summary",
+        json!({"nodeId":"root", "pageId": page}),
+    )
+    .await
+    .unwrap();
+    sid
+}
+
+fn shape() -> Value {
+    json!({"type": "rectangle", "x": 1, "y": 1, "width": 9, "height": 9})
+}
+
+/// A late request on an already accepted connection (a retained router), as other tests do.
+async fn late_get(server: &Arc<Server>, port: u16, token: &str) -> StatusCode {
+    router(server.clone())
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/project")
+                .header("Host", format!("127.0.0.1:{port}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The positive workflow with no metadata on any call: list (creates nothing), create, the
+/// editor's own load and save, the editor's readiness report, close (needs force once the
+/// editor link was given; saves nothing), then a fresh launcher on the same root lists and
+/// reopens the same canvas with the edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_create_edit_save_close_and_reopen_without_metadata() {
+    let lib = library().await;
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"], json!([]));
+    assert_eq!(listed["complete"], true);
+    assert!(
+        !lib.root.join("library").exists(),
+        "listing creates nothing"
+    );
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Plan"})).await);
+    assert_eq!(created["action"], "created");
+    assert_eq!(created["storage"], "app-library");
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    assert!(crate::library::valid_id(&id));
+    assert_eq!(created["canvas"]["name"], "Plan");
+    let dir = lib.root.join("library/v1/canvases").join(&id);
+    assert_eq!(created["location"], json!(dir));
+    assert!(dir.join("project.json").is_file());
+    // A new file's first page is named as people see pages (a Paper); the stored key and
+    // format are upstream's, and the reopen below reads it back exactly.
+    let first = crate::read_manifest_checked(&dir).unwrap();
+    let names: Vec<&str> = first.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, [crate::library::FIRST_PAPER]);
+    assert_eq!(crate::library::FIRST_PAPER, "Paper 1");
+    assert!(!lib.root.join("DESIGN.md").exists() && !lib.root.join("design.md").exists());
+    assert!(
+        !dir.join("DESIGN.md").exists(),
+        "no design system is applied to a blank canvas"
+    );
+    assert_eq!(created["editor_loaded"], false, "a link is not a load");
+    let (port, token) = url(&created);
+    let (page, nodes) = browser_edit(port, &token).await;
+    assert_eq!(nodes, 1);
+    assert_eq!(raw(port, &token, "POST", "/api/ready", "", "").await.0, 204);
+    let b = binding(&created);
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b})).await);
+    assert_eq!(state["editor_loaded"], true);
+    assert_eq!(state["browser_saves"], 1);
+    assert_eq!(url(&state), (port, token.clone()), "the same binding");
+    assert_eq!(binding(&state), b);
+    let old = bound_server(&lib.l).await;
+    let refusal = call(&lib.c, app::CLOSE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert!(refusal.contains("force: true"), "{refusal}");
+    let closed = value(call(&lib.c, app::CLOSE, json!({"binding": b, "force": true})).await);
+    assert_eq!(closed["action"], "closed");
+    assert!(
+        closed["note"]
+            .as_str()
+            .unwrap()
+            .contains("not saved by closing")
+    );
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        lib.root
+            .join(format!("library/v1/locks/{id}.lock"))
+            .is_file(),
+        "lease file stays"
+    );
+    // A fresh launcher (a new process) on the same root.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let listed = value(call(&c2, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["id"], json!(id));
+    assert_eq!(listed["canvases"][0]["name"], "Plan");
+    assert_eq!(listed["canvases"][0]["open"], false);
+    let reopened = value(call(&c2, app::OPEN, json!({"id": id})).await);
+    assert_eq!(reopened["action"], "opened");
+    let (port2, token2) = url(&reopened);
+    assert_eq!(
+        page_nodes(port2, &token2, &page).await,
+        1,
+        "the saved edit is there"
+    );
+    let reread = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(reread.pages[0].name, "Paper 1", "its name as saved");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// The views' appearance is a library preference: the list reports System until one is kept
+/// (and listing creates nothing), a kept one survives a new process, an unknown value or
+/// argument is refused with nothing written, and damaged contents read as System. No canvas,
+/// lease or binding is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kept_appearance_survives_a_new_process_and_touches_no_canvas() {
+    let lib = library().await;
+    let file = lib.root.join("library/v1/appearance");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["appearance"], "system");
+    assert!(
+        !lib.root.join("library").exists(),
+        "listing creates nothing"
+    );
+    for bad in [
+        json!({"appearance": "sepia"}),
+        json!({}),
+        json!({"appearance": "dark", "id": "0123456789abcdef"}),
+        json!({"appearance": true}),
+    ] {
+        assert!(
+            call(&lib.c, app::APPEARANCE, bad.clone()).await.is_err(),
+            "{bad}"
+        );
+    }
+    assert!(!file.exists(), "a refusal writes nothing");
+    let kept = value(call(&lib.c, app::APPEARANCE, json!({"appearance": "dark"})).await);
+    assert_eq!(kept["appearance"], "dark");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "dark");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "dark"
+    );
+    // A new process (a reopened view) on the same root.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    assert_eq!(
+        value(call(&c2, app::LIST, json!({})).await)["appearance"],
+        "dark"
+    );
+    let kept = value(call(&c2, app::APPEARANCE, json!({"appearance": "light"})).await);
+    assert_eq!(kept["appearance"], "light");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "light"
+    );
+    // Unknown contents read as System.
+    std::fs::write(&file, "purple").unwrap();
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "system"
+    );
+    // No canvas, lease or binding came of any of it.
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"], json!([]));
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
+/// The views' other preferences (revision 2, slices 4 and 5): the home's layout and the canvas
+/// background, one small record with two keys beside the appearance's own file. The list
+/// reports Grid and no background until either is kept (and listing creates nothing); keeping
+/// one key keeps the other as it is; a kept record survives a new process; unknown values,
+/// unknown or missing keys are refused with nothing written; damaged contents read as the
+/// defaults; the appearance is untouched. No canvas, lease or binding is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kept_view_preferences_survive_a_new_process_and_touch_no_canvas() {
+    let lib = library().await;
+    let file = lib.root.join("library/v1/view");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    let fresh = json!({"home_layout": "grid", "background": "none"});
+    assert_eq!(listed["view"], fresh, "the fresh defaults");
+    assert!(
+        !lib.root.join("library").exists(),
+        "listing creates nothing"
+    );
+    for bad in [
+        json!({}),
+        json!({"home_layout": "cards"}),
+        json!({"background": "grid"}),
+        json!({"background": true}),
+        json!({"home_layout": "list", "appearance": "dark"}),
+        json!({"background": "dots", "id": "0123456789abcdef"}),
+    ] {
+        assert!(call(&lib.c, app::VIEW, bad.clone()).await.is_err(), "{bad}");
+    }
+    assert!(!file.exists(), "a refusal writes nothing");
+    let kept = value(call(&lib.c, app::VIEW, json!({"home_layout": "list"})).await);
+    let list = json!({"home_layout": "list", "background": "none"});
+    assert_eq!(kept["view"], list);
+    let kept = value(call(&lib.c, app::VIEW, json!({"background": "lines"})).await);
+    let both = json!({"home_layout": "list", "background": "lines"});
+    assert_eq!(kept["view"], both, "one key keeps the other");
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["view"],
+        both
+    );
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["appearance"],
+        "system",
+        "the appearance is its own preference"
+    );
+    assert!(!lib.root.join("library/v1/appearance").exists());
+    // A new process (a reopened view) on the same root.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    assert_eq!(value(call(&c2, app::LIST, json!({})).await)["view"], both);
+    // Damaged or unknown contents read as the defaults, key by key.
+    std::fs::write(&file, r#"{"home_layout": "cards", "background": "dots"}"#).unwrap();
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    let dots = json!({"home_layout": "grid", "background": "dots"});
+    assert_eq!(listed["view"], dots);
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(
+        value(call(&lib.c, app::LIST, json!({})).await)["view"],
+        fresh
+    );
+    // No canvas, lease or binding came of any of it.
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"], json!([]));
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
+/// Two library processes keeping different view preferences at the same moment both keep
+/// theirs (R34-F2): each keep reads and replaces the record under one lock file every
+/// OpenPaperDesign process shares (`library/v1/view.lock`). Two independent launchers on one
+/// root stand for the two processes; the lock is an OS file lock on separate open files, so it
+/// excludes them as it excludes processes. Another holder of the lock (as another process
+/// would hold it) makes a keep wait, and past its bound refuses it with nothing written: a keep
+/// is never acknowledged without being kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_keeps_of_different_view_preferences_both_stay_kept() {
+    let lib = library().await;
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    let both = json!({"home_layout": "list", "background": "lines"});
+    for trial in 0..24 {
+        let reset = json!({"home_layout": "grid", "background": "none"});
+        value(call(&lib.c, app::VIEW, reset).await);
+        let (a, b) = tokio::join!(
+            call(&lib.c, app::VIEW, json!({"home_layout": "list"})),
+            call(&c2, app::VIEW, json!({"background": "lines"})),
+        );
+        assert_eq!(value(a)["view"]["home_layout"], "list", "{trial}");
+        assert_eq!(value(b)["view"]["background"], "lines", "{trial}");
+        for c in [&lib.c, &c2] {
+            let listed = value(call(c, app::LIST, json!({})).await);
+            assert_eq!(listed["view"], both, "{trial}: both acknowledged keys stay");
+        }
+    }
+    // Held by another process: a keep waits for it, then keeps on what that one left.
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(lib.root.join("library/v1/view.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let c = lib.c.clone();
+    let waiting =
+        tokio::spawn(async move { call(&c, app::VIEW, json!({"home_layout": "grid"})).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "it waits for the other keep");
+    lock.unlock().unwrap();
+    let kept = value(bounded(waiting).await.unwrap());
+    let grid_lines = json!({"home_layout": "grid", "background": "lines"});
+    assert_eq!(kept["view"], grid_lines);
+    // Held past the bound: refused, and nothing is written.
+    let file = lib.root.join("library/v1/view");
+    let before = std::fs::read(&file).unwrap();
+    lock.lock().unwrap();
+    let e = call(&lib.c, app::VIEW, json!({"background": "dots"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("wasn't kept"), "{e}");
+    assert_eq!(std::fs::read(&file).unwrap(), before, "nothing written");
+    lock.unlock().unwrap();
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(
+        listed["view"], grid_lines,
+        "the refused keep changed nothing"
+    );
+    // No canvas, lease or binding came of any of it.
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/locks"))
+            .unwrap()
+            .count(),
+        0
+    );
+    task2.abort();
+}
+
+/// A keep that waited for the view lock while the library's root, or its `library` folder,
+/// was replaced is refused once it holds the lock, with the record's bytes as they were
+/// (R35-F1): the read under the lock checks the pinned library again, and that failure is never
+/// taken for the defaults. The lock file (the same single-link file) and every deeper folder
+/// are moved along into the replacement, so only the replaced folder can refuse the keep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_that_waited_while_the_library_was_replaced_keeps_nothing() {
+    for replaced in ["root", "library"] {
+        let lib = library().await;
+        let kept = json!({"home_layout": "grid", "background": "lines"});
+        assert_eq!(
+            value(call(&lib.c, app::VIEW, kept.clone()).await)["view"],
+            kept
+        );
+        let lock = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(lib.root.join("library/v1/view.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let c = lib.c.clone();
+        let waiting =
+            tokio::spawn(async move { call(&c, app::VIEW, json!({"home_layout": "list"})).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "{replaced}: it waits for the lock");
+        let aside = lib.root.with_extension("aside");
+        if replaced == "root" {
+            std::fs::rename(&lib.root, &aside).unwrap();
+            std::fs::create_dir(&lib.root).unwrap();
+            std::fs::rename(aside.join("library"), lib.root.join("library")).unwrap();
+        } else {
+            std::fs::rename(lib.root.join("library"), &aside).unwrap();
+            std::fs::create_dir(lib.root.join("library")).unwrap();
+            std::fs::rename(aside.join("v1"), lib.root.join("library/v1")).unwrap();
+        }
+        let file = lib.root.join("library/v1/view");
+        let before = std::fs::read(&file).unwrap();
+        lock.unlock().unwrap();
+        let e = bounded(waiting).await.unwrap().unwrap_err();
+        assert!(
+            e.contains("weren't kept") && e.contains("replaced"),
+            "{replaced}: {e}"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "{replaced}: nothing written"
+        );
+        assert_eq!(
+            std::fs::read_dir(lib.root.join("library/v1/locks"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&aside);
+    }
+}
+
+/// Library mode refuses every project route without admission, whatever the arguments or
+/// metadata say, and a workspace process refuses library actions without retiring anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_mode_has_no_project_routes_and_takes_no_paths() {
+    let lib = library().await;
+    let elsewhere = lib.root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    call(&lib.c, app::CREATE, json!({"name": "Only"}))
+        .await
+        .unwrap();
+    for meta in [Default::default(), context::writable(&elsewhere)] {
+        for (tool, args) in [
+            ("bind_project", json!({"path": elsewhere})),
+            ("create_project", json!({"name": "Repo"})),
+            ("open_editor", json!({})),
+            ("openpaperdesign_canvases", json!({})),
+            (
+                "openpaperdesign_ui_open",
+                json!({"root": elsewhere, "project": "design/X"}),
+            ),
+            ("openpaperdesign_choose_folder", json!({})),
+        ] {
+            let e = call_meta(&lib.c, tool, args, meta.clone())
+                .await
+                .unwrap_err();
+            assert!(e.contains("runs the app library"), "{tool}: {e}");
+        }
+        // Upstream design tools work only on the open library canvas the call names, never
+        // on a path or a workspace, whatever the metadata says.
+        let e = call_meta(
+            &lib.c,
+            "get_tree_summary",
+            json!({"nodeId": "root"}),
+            meta.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("Name the canvas you mean"), "{e}");
+        let e = call_meta(
+            &lib.c,
+            "open_file",
+            json!({"fileId": elsewhere, "binding": "0123456789abcdef.1"}),
+            meta.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("isn't the canvas open"), "{e}");
+        for refused in ["export", "create_file", "export_combined_pdf"] {
+            let e = call_meta(&lib.c, refused, json!({}), meta.clone())
+                .await
+                .unwrap_err();
+            assert!(e.contains("runs the app library"), "{refused}: {e}");
+        }
+        for (tool, args, want) in [
+            (app::OPEN, json!({"id": "../../elsewhere"}), "canvas id"),
+            (
+                app::OPEN,
+                json!({"id": "0123456789abcdef", "path": "/etc"}),
+                "unexpected argument",
+            ),
+            (
+                app::CREATE,
+                json!({"name": "x", "root": elsewhere}),
+                "unexpected argument",
+            ),
+            (
+                app::CREATE,
+                json!({"name": "a\u{7}b"}),
+                "control characters",
+            ),
+            (app::CREATE, json!({"name": "x".repeat(61)}), "1 to 60"),
+            (
+                app::OPEN,
+                json!({"id": "0123456789abcdef"}),
+                "no such canvas",
+            ),
+        ] {
+            let e = call_meta(&lib.c, tool, args, meta.clone())
+                .await
+                .unwrap_err();
+            assert!(e.contains(want), "{tool}: {e}");
+        }
+    }
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nothing reached it"
+    );
+    assert!(
+        !lib.root
+            .join("library/v1/locks/0123456789abcdef.lock")
+            .exists(),
+        "no lease file for a canvas that doesn't exist"
+    );
+    let status = value(call(&lib.c, "openpaperdesign_status", json!({})).await);
+    assert_eq!(status["mode"], "app-library");
+    assert_eq!(status["workspace_usable"], false);
+    bound_server(&lib.l).await.retire().await;
+    // A packaged workspace process without metadata: refused, nothing retired or pinned.
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    let e = call(&c, app::LIST, json!({})).await.unwrap_err();
+    assert!(e.contains("wasn't started for the app library"), "{e}");
+    let st = l.state.lock().await;
+    assert!(st.invalidated.is_none() && st.workspace.is_none() && st.bound.is_none());
+    drop(st);
+    task.abort();
+}
+
+/// Issue #23 across two "processes" (the old exclusive lease is gone, deliberately): the same
+/// canvas opens in a second view while the first still has it open, with nothing to find or
+/// close first; the newest open edits, and the earlier view is read-only (told so, its save
+/// refused unwritten with 423) while it keeps showing what the editing view saves. Its Edit
+/// here takes the editing back, and a save based on what it had before is then a conflict,
+/// never an overwrite. A view that isn't editing closes without taking the editing from the one
+/// that is, and an editing view whose process ended (no close) leaves nothing that blocks a new
+/// view. A different canvas is independent; opening the open canvas again is the same binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_views_share_a_canvas_and_the_newest_open_edits() {
+    let a = library().await;
+    let (lb, b, task_b) = launch(&a.root).await;
+    let one = value(call(&a.c, app::CREATE, json!({"name": "One"})).await);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir1 = location(&one);
+    let (pa, ta) = url(&one);
+    assert_eq!(one["editing"], "here");
+    let va = tab(pa, &ta).await;
+    let (st, page, n, answer) = try_edit(pa, &ta, &va).await;
+    assert_eq!((st, n), (200, 1), "{answer}");
+    let file = dir1.join("pages").join(format!("{page}.json"));
+    // A second view (another process) opens the same canvas while A has it open.
+    let in_b = value(call(&b, app::OPEN, json!({"id": id1})).await);
+    assert_eq!(in_b["action"], "opened");
+    assert_eq!(in_b["editing"], "here");
+    let (pb, tb) = url(&in_b);
+    let vb = tab(pb, &tb).await;
+    assert_eq!(
+        page_nodes(pb, &tb, &page).await,
+        1,
+        "the saved edit, in the other view"
+    );
+    // A is read-only now: told so, its save refused before anything is written, its reads kept.
+    assert!(!editing(pa, &ta, &va).await, "A no longer edits");
+    assert!(editing(pb, &tb, &vb).await, "B, opened last, edits");
+    let before = std::fs::read(&file).unwrap();
+    let (st, _, _, answer) = try_edit(pa, &ta, &va).await;
+    assert_eq!(st, 423, "{answer}");
+    assert!(answer.contains("another OpenPaperDesign view"), "{answer}");
+    assert_eq!(std::fs::read(&file).unwrap(), before, "nothing written");
+    assert_eq!(page_nodes(pa, &ta, &page).await, 1);
+    // What A loaded before B's next change (its tab's base revision).
+    let (_, head, _) = raw(pa, &ta, "GET", &format!("/api/pages/{page}"), "", "").await;
+    let a_base = etag_of(&head);
+    // B edits; A's view shows it (the same canvas files: A's reads follow what B saved).
+    let (st, _, n, _) = try_edit(pb, &tb, &vb).await;
+    assert_eq!((st, n), (200, 2));
+    assert_eq!(
+        page_nodes(pa, &ta, &page).await,
+        2,
+        "B's saved change shows in A"
+    );
+    // A's Edit here: A edits again, B is read-only. A's save based on what it had before B's
+    // change is a conflict (409, nothing written), never an overwrite of B's change.
+    let (st, _, body) = raw(pa, &ta, "POST", "/api/claim", &view_line(&va), "").await;
+    assert_eq!(st, 200, "{body}");
+    assert!(editing(pa, &ta, &va).await && !editing(pb, &tb, &vb).await);
+    let saved_by_b = std::fs::read(&file).unwrap();
+    let mut stale =
+        paper_rs::project::format::page_from_json(std::str::from_utf8(&before).unwrap()).unwrap();
+    let extra = stale.doc.alloc_id();
+    stale.doc.nodes.insert(
+        extra,
+        paper_rs::model::Node::new(
+            extra,
+            paper_rs::model::NodeKind::Rect,
+            paper_rs::geom::Rect::new(9.0, 9.0, 9.0, 9.0),
+        ),
+    );
+    stale.doc.root.push(extra);
+    let (st, _, answer) = raw(
+        pa,
+        &ta,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {a_base}\r\n{}", view_line(&va)),
+        &paper_rs::project::format::page_to_json(&stale),
+    )
+    .await;
+    assert_eq!(st, 409, "{answer}");
+    assert_eq!(std::fs::read(&file).unwrap(), saved_by_b, "B's change kept");
+    let (st, _, _, _) = try_edit(pb, &tb, &vb).await;
+    assert_eq!(st, 423, "B is read-only now");
+    assert_eq!(std::fs::read(&file).unwrap(), saved_by_b);
+    // Opening the open canvas again in B is B asking to edit: the same binding and URL (its
+    // next view, the tab opened from that link, edits).
+    let again = value(call(&b, app::OPEN, json!({"id": id1})).await);
+    assert_eq!(again["action"], "already-open");
+    assert_eq!(again["editing"], "here");
+    assert_eq!(url(&again), (pb, tb.clone()));
+    assert!(!editing(pa, &ta, &va).await);
+    // A, not editing, closes: B keeps the editing (a non-editor's close takes nothing).
+    call(
+        &a.c,
+        app::CLOSE,
+        json!({"binding": binding(&one), "force": true}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        bound_server(&lb).await.editing_here(None),
+        "A's close left B editing"
+    );
+    let (_, n) = browser_edit(pb, &tb).await;
+    assert_eq!(n, 3);
+    // A different canvas meanwhile is independent.
+    let two = value(call(&a.c, app::CREATE, json!({"name": "Two"})).await);
+    let id2 = two["canvas"]["id"].as_str().unwrap().to_string();
+    assert_ne!(id1, id2);
+    assert_eq!(two["editing"], "here");
+    // B, still editing One, ends without closing (its binding dropped as a process's end
+    // drops it): nothing waits for it, and a new view opens One and edits at once.
+    task_b.abort();
+    let _ = task_b.await;
+    drop(b);
+    drop(lb);
+    let (l3, c3, task3) = launch(&a.root).await;
+    let in_c = value(call(&c3, app::OPEN, json!({"id": id1})).await);
+    assert_eq!(in_c["editing"], "here");
+    let (pc, tc) = url(&in_c);
+    assert_eq!(
+        page_nodes(pc, &tc, &page).await,
+        3,
+        "every saved change is there"
+    );
+    let (_, n) = browser_edit(pc, &tc).await;
+    assert_eq!(n, 4);
+    bound_server(&l3).await.retire().await;
+    bound_server(&a.l).await.retire().await;
+    task3.abort();
+}
+
+/// Every file under `dir`, with its bytes.
+fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.insert(p.clone(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// The home's Rename for a canvas that isn't open here: done under its own lease, taken for the
+/// write and released after. Only its `project.json` changes (the name and modified time); its
+/// id, pages, page names, active page and content stay, and the list shows the new name. A
+/// canvas another window holds is refused unchanged, and a bad id or name is refused before
+/// anything is read or written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_of_a_closed_canvas_changes_its_name_only() {
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    let (port, token) = url(&made);
+    browser_edit(port, &token).await;
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let before = tree(&dir);
+    let old = crate::read_manifest_checked(&dir).unwrap();
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": id, "name": "  Launch plan "}),
+        )
+        .await,
+    );
+    assert_eq!(
+        renamed,
+        json!({"action": "renamed", "canvas": {"id": id, "name": "Launch plan"}})
+    );
+    let after = tree(&dir);
+    let changed: Vec<&PathBuf> = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    assert_eq!(changed, [&dir.join("project.json")], "only the manifest");
+    let new = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(new.name, "Launch plan");
+    let pages = |m: &paper_rs::project::Manifest| -> Vec<(String, String)> {
+        m.pages
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect()
+    };
+    assert_eq!(pages(&new), pages(&old));
+    assert_eq!(new.active_page, old.active_page);
+    assert!(new.modified >= old.modified);
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["id"], json!(id));
+    assert_eq!(listed["canvases"][0]["name"], "Launch plan");
+    assert_eq!(open_doc(&lib.l).await, None, "renaming opens nothing");
+    // Its lease was released: another window opens it, under the new name.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let opened = value(call(&c2, app::OPEN, json!({"id": id})).await);
+    assert_eq!(opened["canvas"]["name"], "Launch plan");
+    // Edited in that window (issue #23: its open took the editing): refused here, unchanged,
+    // with the way to do it (open it here first).
+    let held = tree(&dir);
+    let e = call(&lib.c, app::RENAME, json!({"id": id, "name": "Other"}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("open for editing in another OpenPaperDesign view")
+            && e.contains("Open it here"),
+        "{e}"
+    );
+    assert_eq!(tree(&dir), held);
+    for (args, want) in [
+        (json!({"id": "../x", "name": "A"}), "canvas id"),
+        (json!({"name": "A"}), "canvas id"),
+        (json!({"id": id}), "Nothing was renamed"),
+        (json!({"id": id, "name": "   "}), "Nothing was renamed"),
+        (json!({"id": id, "name": "a\u{7}b"}), "control characters"),
+        (json!({"id": id, "name": "x".repeat(61)}), "1 to 60"),
+        (
+            json!({"id": id, "name": "A", "path": "/etc"}),
+            "unexpected argument",
+        ),
+        (
+            json!({"id": "0123456789abcdef", "name": "A"}),
+            "can't be renamed",
+        ),
+    ] {
+        let e = call(&lib.c, app::RENAME, args.clone()).await.unwrap_err();
+        assert!(e.contains(want), "{args}: {e}");
+    }
+    assert_eq!(tree(&dir), held, "no refusal touched it");
+    assert!(
+        !lib.root
+            .join("library/v1/locks/0123456789abcdef.lock")
+            .exists(),
+        "no lease file for a canvas that doesn't exist"
+    );
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// A failed Rename of a canvas that isn't open is undone; one whose undo fails too fences that
+/// canvas, as every server write is fenced (`commit_fenced`, `Broken`). The failures are
+/// injected on this thread (`commit::fault`, thread-local), around a synchronous
+/// `Library::rename_document` on the launcher's own library, with no await in between: a
+/// one-file commit stages (step 0), renames (1) and syncs its folder (2); its undo stages the
+/// old bytes (3), renames them back (4) and syncs (5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_whose_undo_fails_fences_that_canvas_only() {
+    use crate::library::{LeaseError, Library};
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let library = lib.l.library.clone().unwrap();
+    let lease = |library: &Library| {
+        Lease::acquire(library, &id)
+            .ok()
+            .expect("the canvas's lease")
+    };
+
+    // The folder sync fails and the old bytes are put back: nothing changed, nothing fenced.
+    let before = tree(&dir);
+    let held = lease(&library);
+    crate::commit::fault::fail_at(&[2]);
+    let undone = library.rename_document(held, "First");
+    crate::commit::fault::fail_at(&[]);
+    let e = undone.unwrap_err();
+    assert!(
+        e.starts_with(
+            "Not renamed: not saved; nothing was written (directory sync: injected failure at \
+             step 2)"
+        ),
+        "{e}"
+    );
+    assert_eq!(tree(&dir), before, "put back");
+    library.refuse_if_broken(&id).unwrap();
+    let renamed = value(call(&lib.c, app::RENAME, json!({"id": id, "name": "Second"})).await);
+    assert_eq!(renamed["canvas"]["name"], "Second", "a later rename works");
+
+    // The sync fails and putting the old bytes back fails too: the canvas is fenced.
+    let held = lease(&library);
+    crate::commit::fault::fail_at(&[2, 3]);
+    let broken = library.rename_document(held, "Third");
+    crate::commit::fault::fail_at(&[]);
+    let e = broken.unwrap_err();
+    assert!(
+        e.starts_with("Not renamed: not saved, and undoing the partial save failed")
+            && e.contains("may now be inconsistent: project.json (injected failure at step 3)"),
+        "{e}"
+    );
+    // The new bytes stayed (the undo failed); nothing claims they were put back.
+    assert_eq!(crate::read_manifest_checked(&dir).unwrap().name, "Third");
+    let fenced = tree(&dir);
+    // Every later rename, open or export of it here is refused with the file named.
+    for (tool, args) in [
+        (app::RENAME, json!({"id": id, "name": "Later"})),
+        (app::OPEN, json!({"id": id})),
+        (app::EXPORT, json!({"id": id})),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(
+            e.contains("may be inconsistent: project.json (injected failure at step 3)"),
+            "{tool}: {e}"
+        );
+    }
+    assert!(library.refuse_if_broken(&id).is_err());
+    assert!(
+        matches!(Lease::acquire(&library, &id), Err(LeaseError::Busy)),
+        "its lease is kept"
+    );
+    assert_eq!(open_doc(&lib.l).await, None, "never opened writable");
+    assert_eq!(tree(&dir), fenced);
+    // Another process finds it busy (the kept lease, after its bounded wait): it can neither
+    // open nor rename it. Issue #23's multiple views never reach past a kept lease.
+    let (_l2, c2, task2) = launch(&lib.root).await;
+    for (tool, args) in [
+        (app::OPEN, json!({"id": id})),
+        (app::RENAME, json!({"id": id, "name": "Elsewhere"})),
+    ] {
+        let e = call(&c2, tool, args).await.unwrap_err();
+        assert!(e.contains("another OpenPaperDesign window"), "{tool}: {e}");
+    }
+    assert_eq!(tree(&dir), fenced);
+    // Other canvases are unaffected.
+    let other = value(call(&lib.c, app::CREATE, json!({"name": "Other"})).await);
+    let other_id = other["canvas"]["id"].as_str().unwrap().to_string();
+    library.refuse_if_broken(&other_id).unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&other), "force": true}),
+    )
+    .await
+    .unwrap();
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": other_id, "name": "Other two"}),
+        )
+        .await,
+    );
+    assert_eq!(renamed["canvas"]["name"], "Other two");
+    task2.abort();
+}
+
+/// Renaming the canvas open here goes through its binding's server (writer fence, commit,
+/// rollback): the open editors read the new name in the canvas envelope (`canvas.name`, the
+/// workspace's top-bar title) under a new canvas revision, so an editor that polls picks it up;
+/// the binding, its URL and its pages stay. A retired binding refuses it, unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_rename_of_the_open_canvas_goes_through_its_binding() {
+    let lib = library().await;
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Landing"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(made["location"].clone()).unwrap();
+    let b = binding(&made);
+    let (port, token) = url(&made);
+    let (st, head, body) = raw(port, &token, "GET", "/api/canvas", "", "").await;
+    assert_eq!(st, 200, "{body}");
+    let before: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(before["canvas"]["name"], "Landing");
+    let rev = etag_of(&head);
+    let server = bound_server(&lib.l).await;
+    let renamed = value(
+        call(
+            &lib.c,
+            app::RENAME,
+            json!({"id": id, "name": "Launch plan"}),
+        )
+        .await,
+    );
+    assert_eq!(renamed["canvas"]["name"], "Launch plan");
+    assert!(
+        Arc::ptr_eq(&bound_server(&lib.l).await, &server),
+        "the same binding"
+    );
+    let (st, head, body) = raw(port, &token, "GET", "/api/canvas", "", "").await;
+    assert_eq!(st, 200, "{body}");
+    let after: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(after["canvas"]["name"], "Launch plan");
+    assert_eq!(after["pages"], before["pages"], "pages untouched");
+    assert_eq!(after["active_page"], before["active_page"]);
+    assert_ne!(etag_of(&head), rev, "a new canvas revision");
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b})).await);
+    assert_eq!(state["canvas"]["name"], "Launch plan");
+    assert_eq!(binding(&state), b);
+    assert_eq!(url(&state), (port, token.clone()));
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["name"], "Launch plan");
+    assert_eq!(listed["canvases"][0]["open"], true);
+    // Retired (its admission closed): refused, nothing written.
+    server.retire().await;
+    let kept = tree(&dir);
+    let e = call(&lib.c, app::RENAME, json!({"id": id, "name": "Late"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("Not renamed"), "{e}");
+    assert_eq!(tree(&dir), kept);
+    assert_eq!(
+        crate::read_manifest_checked(&dir).unwrap().name,
+        "Launch plan"
+    );
+}
+
+/// Export from the home's file menu names a canvas by its id. The open one is read through its
+/// binding's writer fence (the same bytes as exporting it by binding); any other one under its
+/// own lease, released after. Nothing is opened, bound or written; one another window holds is
+/// refused as busy, and naming both a binding and an id is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_export_by_id_reads_the_saved_canvas_without_opening_it() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir1: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    browser_edit(port, &token).await;
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&one), "force": true}),
+    )
+    .await
+    .unwrap();
+    let two = value(call(&lib.c, app::CREATE, json!({"name": "Two"})).await);
+    let id2 = two["canvas"]["id"].as_str().unwrap().to_string();
+    let b2 = binding(&two);
+    let before = tree(&dir1);
+    let by_id = value(call(&lib.c, app::EXPORT, json!({"id": id1})).await);
+    assert_eq!(by_id["action"], "exported");
+    assert_eq!(by_id["binding"], Value::Null, "not an open binding's");
+    assert_eq!(by_id["canvas"], json!({"id": id1, "name": "One"}));
+    assert_eq!(by_id["file_name"], "One.opdcanvas.json");
+    let file = by_id["payload"].as_str().unwrap();
+    crate::library::payload::validate(file).unwrap();
+    assert_eq!(by_id["bytes"], json!(file.len()));
+    assert_eq!(tree(&dir1), before, "nothing written");
+    assert_eq!(
+        open_doc(&lib.l).await.as_deref(),
+        Some(id2.as_str()),
+        "nothing opened or switched"
+    );
+    // The open canvas by id: the same bytes as by its binding.
+    let open_by_id = value(call(&lib.c, app::EXPORT, json!({"id": id2})).await);
+    let open_by_binding = value(call(&lib.c, app::EXPORT, json!({"binding": b2})).await);
+    assert_eq!(open_by_id["payload"], open_by_binding["payload"]);
+    assert_eq!(open_by_id["binding"], json!(b2));
+    for (args, want) in [
+        (json!({"binding": b2, "id": id2}), "not both"),
+        (json!({"id": "../x"}), "canvas id"),
+        (json!({"id": "0123456789abcdef"}), "can't be exported"),
+        (json!({"id": id1, "path": "/etc"}), "unexpected argument"),
+    ] {
+        let e = call(&lib.c, app::EXPORT, args.clone()).await.unwrap_err();
+        assert!(e.contains(want), "{args}: {e}");
+    }
+    // Open in another window (issue #23: that is no lease held any more): exported as last
+    // saved all the same, the same bytes, and still nothing written.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    value(call(&c2, app::OPEN, json!({"id": id1})).await);
+    let held = tree(&dir1);
+    let elsewhere = value(call(&lib.c, app::EXPORT, json!({"id": id1})).await);
+    assert_eq!(elsewhere["payload"], by_id["payload"]);
+    assert_eq!(elsewhere["binding"], Value::Null);
+    assert_eq!(tree(&dir1), held);
+    bound_server(&l2).await.retire().await;
+    bound_server(&lib.l).await.retire().await;
+    task2.abort();
+}
+
+/// A switch keeps the old canvas's lease until its started writer finished: another process
+/// can't open it meanwhile. A caller that goes away doesn't stop the handoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_switch_holds_the_lease_until_the_started_writer_drained() {
+    let a = library().await;
+    let (lb, b, task_b) = launch(&a.root).await;
+    let two = value(call(&b, app::CREATE, json!({"name": "Two"})).await);
+    let id2 = two["canvas"]["id"].as_str().unwrap().to_string();
+    call(
+        &b,
+        app::CLOSE,
+        json!({"binding": binding(&two), "force": true}),
+    )
+    .await
+    .unwrap();
+    let one = value(call(&a.c, app::CREATE, json!({"name": "One"})).await);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir1: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    let page = crate::read_manifest_checked(&dir1).unwrap().pages[0]
+        .id
+        .clone();
+    let sid = mcp_session(port, &token, &page).await;
+    let old = bound_server(&a.l).await;
+    let mut snapshot = Point::arm(&dir1, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    let l = a.l.clone();
+    // The switch target, for the cancelled caller; `id2` is checked again below.
+    let target = id2.clone();
+    let replace = binding(&one);
+    let switch = tokio::spawn(async move {
+        l.app(
+            l.library.as_ref().unwrap(),
+            app::OPEN,
+            json!({"id": target, "force": true, "replace": replace}),
+        )
+        .await
+    });
+    bounded(old.lifecycle.retiring.notified()).await;
+    switch.abort();
+    assert!(switch.await.unwrap_err().is_cancelled());
+    let e = call(&b, app::OPEN, json!({"id": id1})).await.unwrap_err();
+    assert!(
+        e.contains("another OpenPaperDesign window"),
+        "lease held during drain: {e}"
+    );
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    // The owned handoff finished without its caller.
+    for _ in 0..100 {
+        if open_doc(&a.l).await.as_deref() == Some(id2.as_str()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(open_doc(&a.l).await.as_deref(), Some(id2.as_str()));
+    let reopened = value(call(&b, app::OPEN, json!({"id": id1})).await);
+    let (p, t) = url(&reopened);
+    assert_eq!(
+        page_nodes(p, &t, &page).await,
+        1,
+        "the started write was kept"
+    );
+    bound_server(&lb).await.retire().await;
+    bound_server(&a.l).await.retire().await;
+    task_b.abort();
+}
+
+/// Failures before the handoff (listener, directory sync, commit, preparation) keep the open
+/// canvas and its URL and remove exactly what the failed call made. The thread-local commit
+/// fault needs the owned task on this same thread.
+#[tokio::test(flavor = "current_thread")]
+async fn library_failed_creation_keeps_the_open_canvas_and_removes_its_own_files() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let (port, token) = url(&one);
+    let server = bound_server(&lib.l).await;
+    let canvases = lib.root.join("library/v1/canvases");
+    let entries = || std::fs::read_dir(&canvases).unwrap().count();
+    let check = |e: String, want: &str| {
+        assert!(
+            e.contains(want) && e.contains("Nothing was created"),
+            "{want}: {e}"
+        );
+    };
+    // Each switch confirms replacing exactly the open canvas.
+    let create = |name: &str| json!({"name": name, "force": true, "replace": binding(&one)});
+    let _listen = Point::arm(lib.root.as_path(), "listen_fails", false);
+    check(
+        call(&lib.c, app::CREATE, create("A")).await.unwrap_err(),
+        "listen",
+    );
+    let _sync = Point::arm(&canvases, "sync_dir", false);
+    check(
+        call(&lib.c, app::CREATE, create("B")).await.unwrap_err(),
+        "injected sync failure",
+    );
+    // Stage page, stage manifest, rename page, rename manifest (fails), then the rollback.
+    crate::commit::fault::fail_at(&[3]);
+    let e = call(&lib.c, app::CREATE, create("C")).await.unwrap_err();
+    crate::commit::fault::fail_at(&[]);
+    check(e, "nothing was written");
+    let _prepare = Point::arm(lib.root.as_path(), "app_prepare_fails", false);
+    check(
+        call(&lib.c, app::CREATE, create("D")).await.unwrap_err(),
+        "injected test failure",
+    );
+    assert_eq!(entries(), 1, "only the first canvas exists");
+    assert!(
+        Arc::ptr_eq(&bound_server(&lib.l).await, &server),
+        "the open canvas is kept"
+    );
+    assert_eq!(
+        raw(port, &token, "GET", "/api/project", "", "").await.0,
+        200
+    );
+    // A removal that can't be made durable is named, never reported as clean.
+    let lib2 = Library::open(lib.root.to_str().unwrap()).unwrap();
+    let lease = Lease::fresh(&lib2).unwrap();
+    let (dir, created) = lib2
+        .create_document(&lease, &NewDocument::blank("E").fresh())
+        .unwrap();
+    let _sync = Point::arm(&canvases, "sync_dir", false);
+    let left = created.undo();
+    assert!(!dir.exists());
+    assert!(
+        left.iter().any(|l| l.contains("may not be durable")),
+        "{left:?}"
+    );
+    server.retire().await;
+}
+
+/// The lease file or the library replaced under an open canvas fences it for browser and MCP
+/// access, also after the original comes back; the next action closes it. A lease file that is
+/// a link is refused before anything opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_replaced_lease_or_root_fences_old_handles() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let (port, token) = url(&one);
+    let lock = lib.root.join(format!("library/v1/locks/{id}.lock"));
+    let aside = lock.with_extension("aside");
+    std::fs::rename(&lock, &aside).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    assert_eq!(
+        raw(port, &token, "GET", "/api/project", "", "").await.0,
+        403
+    );
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::rename(&aside, &lock).unwrap();
+    assert_eq!(
+        raw(port, &token, "GET", "/api/project", "", "").await.0,
+        403,
+        "stays fenced"
+    );
+    let old = bound_server(&lib.l).await;
+    let e = call(&lib.c, app::EDITOR, json!({})).await.unwrap_err();
+    assert!(e.contains("so it was closed"), "{e}");
+    assert_eq!(open_doc(&lib.l).await, None);
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // A second link to the lease file.
+    let two = value(call(&lib.c, app::OPEN, json!({"id": id})).await);
+    let (port, token) = url(&two);
+    std::fs::hard_link(&lock, lib.root.join("second-link")).unwrap();
+    assert_eq!(
+        raw(port, &token, "GET", "/api/project", "", "").await.0,
+        403
+    );
+    std::fs::remove_file(lib.root.join("second-link")).unwrap();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&two), "force": true}),
+    )
+    .await
+    .unwrap();
+    // A lease path that is a link is never followed or opened through.
+    let target = lib.root.join("target-file");
+    std::fs::remove_file(&lock).unwrap();
+    std::os::unix::fs::symlink(&target, &lock).unwrap();
+    let e = call(&lib.c, app::OPEN, json!({"id": id}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("symbolic link") && e.contains("Nothing was opened"),
+        "{e}"
+    );
+    assert!(!target.exists());
+    // The library folder itself replaced.
+    let moved = lib.root.with_extension("moved");
+    let fresh = value(call(&lib.c, app::CREATE, json!({"name": "Three"})).await);
+    let (port, token) = url(&fresh);
+    std::fs::rename(&lib.root, &moved).unwrap();
+    std::fs::create_dir(&lib.root).unwrap();
+    assert_eq!(
+        raw(port, &token, "GET", "/api/project", "", "").await.0,
+        403
+    );
+    let e = call(&lib.c, app::LIST, json!({})).await.unwrap_err();
+    assert!(e.contains("moved or replaced"), "{e}");
+    let _ = std::fs::remove_dir_all(&moved);
+}
+
+/// Export waits for a save under way and contains it; import validates the whole file and
+/// publishes a new canvas without touching the source; a bad file creates nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_export_waits_for_a_started_save_and_import_makes_a_new_canvas() {
+    let lib = library().await;
+    let e = call(&lib.c, app::EXPORT, json!({})).await.unwrap_err();
+    assert!(e.contains("Open the canvas"), "{e}");
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "Export me"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let sid = mcp_session(port, &token, &page).await;
+    let mut snapshot = Point::arm(&dir, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    let c = lib.c.clone();
+    let b1 = binding(&one);
+    let args = json!({"binding": b1});
+    let export = tokio::spawn(async move { call(&c, app::EXPORT, args).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!export.is_finished(), "export waits for the save under way");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    let exported = value(bounded(export).await.unwrap());
+    assert_eq!(exported["content"], "canvas-only");
+    assert_eq!(
+        binding(&exported),
+        b1,
+        "the export names the binding it read"
+    );
+    assert!(
+        exported["file_name"]
+            .as_str()
+            .unwrap()
+            .ends_with(".opdcanvas.json")
+    );
+    let file = exported["payload"].as_str().unwrap().to_string();
+    let parsed: Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(
+        parsed["pages"][0]["nodes"].as_array().unwrap().len(),
+        1,
+        "the save is in it"
+    );
+    let source = crate::read_manifest_checked(&dir).unwrap();
+    let source_page = std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap();
+    // A bad file creates nothing and keeps the open canvas.
+    let bad = file.replacen("\"format\":", "\"format\":\"x\",\"format\":", 1);
+    let e = call(
+        &lib.c,
+        app::IMPORT,
+        json!({"payload": bad, "force": true, "replace": b1}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("appears twice") && e.contains("Nothing was imported"),
+        "{e}"
+    );
+    assert_eq!(open_doc(&lib.l).await.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        std::fs::read_dir(lib.root.join("library/v1/canvases"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let imported = value(
+        call(
+            &lib.c,
+            app::IMPORT,
+            json!({"payload": file, "force": true, "replace": b1}),
+        )
+        .await,
+    );
+    assert_eq!(imported["action"], "imported");
+    let new_id = imported["canvas"]["id"].as_str().unwrap();
+    assert_ne!(new_id, id);
+    assert_eq!(imported["canvas"]["name"], "Export me");
+    let (p, t) = url(&imported);
+    assert_eq!(page_nodes(p, &t, &page).await, 1);
+    let new_dir: PathBuf = serde_json::from_value(imported["location"].clone()).unwrap();
+    let copy = crate::read_manifest_checked(&new_dir).unwrap();
+    assert_ne!(copy.id, source.id, "a fresh identity");
+    assert_eq!(copy.pages, source.pages);
+    assert_eq!(
+        crate::read_manifest_checked(&dir).unwrap(),
+        source,
+        "source untouched"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap(),
+        source_page
+    );
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// A file with a node id the upstream parser would overflow on, a self-consistent group no top
+/// level reaches, a page version upstream's migration would mis-handle, or a nested field the
+/// parser would drop is an ordinary refusal: nothing is published, and the open canvas, its
+/// URL and the session keep working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_refused_imports_keep_the_open_canvas_and_the_session() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "Keep"})).await);
+    let (port, token) = url(&one);
+    let b1 = binding(&one);
+    let server = bound_server(&lib.l).await;
+    // A saved rectangle, so the file has one real node with its canonical style.
+    browser_edit(port, &token).await;
+    let exported = value(call(&lib.c, app::EXPORT, json!({"binding": b1})).await);
+    let file: Value = serde_json::from_str(exported["payload"].as_str().unwrap()).unwrap();
+    let mut version0 = file.clone();
+    version0["pages"][0]["version"] = json!(0);
+    let mut lossy = file.clone();
+    lossy["pages"][0]["nodes"][0]["style"]["fill"] = json!("#ff0000");
+    let rect = |id: u64| json!({"id": id, "name": "R", "type": "rect", "rect": {"x": 0, "y": 0, "w": 5, "h": 5}});
+    let mut huge = file.clone();
+    huge["pages"][0]["nodes"] = json!([rect(u64::MAX)]);
+    huge["pages"][0]["root"] = json!([u64::MAX]);
+    let mut cycle = file.clone();
+    let (mut a, mut b) = (rect(900), rect(901));
+    a["parent"] = json!(901);
+    a["children"] = json!([901]);
+    b["parent"] = json!(900);
+    b["children"] = json!([900]);
+    cycle["pages"][0]["nodes"] = json!([a, b]);
+    cycle["pages"][0]["root"] = json!([]);
+    cycle["pages"][0]["next_id"] = json!(902);
+    for (bad, want) in [
+        (huge, "above the largest allowed id"),
+        (cycle, "aren't reachable"),
+        (version0, "must have version 3"),
+        (lossy, "style.fill"),
+    ] {
+        let args = json!({"payload": bad.to_string(), "force": true, "replace": b1});
+        let e = call(&lib.c, app::IMPORT, args).await.unwrap_err();
+        assert!(
+            e.contains(want) && e.contains("Nothing was imported"),
+            "{want}: {e}"
+        );
+        assert!(Arc::ptr_eq(&bound_server(&lib.l).await, &server));
+        assert_eq!(
+            raw(port, &token, "GET", "/api/project", "", "").await.0,
+            200
+        );
+        let listed = value(call(&lib.c, app::LIST, json!({})).await);
+        assert_eq!(listed["canvases"].as_array().unwrap().len(), 1);
+    }
+    let again = value(call(&lib.c, app::EDITOR, json!({"binding": b1})).await);
+    assert_eq!(
+        url(&again),
+        (port, token.clone()),
+        "the session still works"
+    );
+    server.retire().await;
+}
+
+/// Two views of one process share its one binding. After the other view switches, the first
+/// view's close, export, readiness poll and switch confirmation all name a binding that is no
+/// longer open: each is refused, and the current canvas, its URL, files and lease stay. A
+/// switch refusal names the current binding, so a confirmation is bound to exactly that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_stale_views_never_act_on_another_canvas() {
+    let lib = library().await;
+    let (view2, task2) = connect_launcher(lib.l.clone(), Default::default()).await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let b1 = binding(&one);
+    let id1 = one["canvas"]["id"].as_str().unwrap().to_string();
+    // View 2 is asked to confirm replacing exactly One's binding, and does.
+    let e = call(&view2, app::CREATE, json!({"name": "Two"}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("force: true") && e.contains(&format!("(open canvas: {b1})")),
+        "{e}"
+    );
+    let two = value(
+        call(
+            &view2,
+            app::CREATE,
+            json!({"name": "Two", "force": true, "replace": b1}),
+        )
+        .await,
+    );
+    let b2 = binding(&two);
+    assert_ne!(b1, b2);
+    let (port2, token2) = url(&two);
+    let server2 = bound_server(&lib.l).await;
+    let dir2: PathBuf = serde_json::from_value(two["location"].clone()).unwrap();
+    let files = || std::fs::read(dir2.join("project.json")).unwrap();
+    let before = files();
+    // View 1 still shows One.
+    for (tool, args) in [
+        (app::CLOSE, json!({"binding": b1, "force": true})),
+        (app::EXPORT, json!({"binding": b1})),
+        (app::EDITOR, json!({"binding": b1})),
+        (app::OPEN, json!({"id": id1, "force": true, "replace": b1})),
+        (
+            app::CREATE,
+            json!({"name": "Three", "force": true, "replace": b1}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(e.contains("another view changed it"), "{tool}: {e}");
+        assert!(Arc::ptr_eq(&bound_server(&lib.l).await, &server2), "{tool}");
+        assert_eq!(
+            raw(port2, &token2, "GET", "/api/project", "", "").await.0,
+            200,
+            "{tool}"
+        );
+    }
+    assert_eq!(files(), before, "Two's files are untouched");
+    let listed = value(call(&lib.c, app::LIST, json!({})).await);
+    assert_eq!(
+        listed["canvases"].as_array().unwrap().len(),
+        2,
+        "nothing created"
+    );
+    // A switch without the confirmation, or confirming nothing open, is refused too.
+    let e = call(&lib.c, app::OPEN, json!({"id": id1, "force": true}))
+        .await
+        .unwrap_err();
+    assert!(e.contains(&format!("(open canvas: {b2})")), "{e}");
+    let e = call(&lib.c, app::CLOSE, json!({"binding": "0123456789abcdef"}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("isn't a binding"), "{e}");
+    // Without a binding, "Open current canvas" shows what is open now: Two, with its binding.
+    let current = value(call(&lib.c, app::EDITOR, json!({})).await);
+    assert_eq!(binding(&current), b2);
+    // View 2 closes Two; its old confirmation can't then open anything.
+    call(&view2, app::CLOSE, json!({"binding": b2, "force": true}))
+        .await
+        .unwrap();
+    let e = call(
+        &view2,
+        app::OPEN,
+        json!({"id": id1, "force": true, "replace": b2}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("another view changed it"), "{e}");
+    assert_eq!(open_doc(&lib.l).await, None);
+    task2.abort();
+}
+
+/// The normal end of the service (its stdio client goes away) while a started MCP write is
+/// paused on the canvas's own server. `Launcher::shutdown`, run as `main` runs it after the
+/// service ends, keeps the binding and its lease until that write drained: another launcher on
+/// the same library stays busy meanwhile, a browser save queued behind the write and late
+/// requests to the old server or launcher are refused, and only then is the canvas free, with
+/// the started write saved. In-process: an in-memory stdio pair and the real rmcp protocol, not
+/// a spawned executable (the executable's own idle exit is in `tests/app_library.rs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_service_end_drains_the_started_writer_before_releasing_the_lease() {
+    let root = library_root();
+    let l = Launcher::with_library(Library::open(root.to_str().unwrap()).unwrap());
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let (svc, owner) = (l.clone(), l.clone());
+    // The production end path: serve until the connection ends, then shut down.
+    let service = tokio::spawn(async move {
+        let running = svc.serve(server).await.unwrap();
+        let _ = running.waiting().await;
+        owner.shutdown().await;
+    });
+    let c = Client {
+        peer: ().serve(client).await.unwrap(),
+        meta: Default::default(),
+    };
+    let one = value(call(&c, app::CREATE, json!({"name": "One"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    // The browser editor's tab (its own view, which edits).
+    let bt = tab(port, &token).await;
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let page_file = dir.join("pages").join(format!("{page}.json"));
+    let before = std::fs::read(&page_file).unwrap();
+    let sid = mcp_session(port, &token, &page).await;
+    let old = bound_server(&l).await;
+    // A started MCP write, paused while it holds the canvas's writer lock.
+    let mut snapshot = Point::arm(&dir, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    // A browser save queued behind it.
+    let mut queued = Point::arm(&dir, "browser_queued", false);
+    let t = token.clone();
+    let body = String::from_utf8(before.clone()).unwrap();
+    let extra = format!("If-Match: {}\r\n{}", crate::etag(&before), view_line(&bt));
+    let path = format!("/api/pages/{page}");
+    let browser = tokio::spawn(async move { raw(port, &t, "PUT", &path, &extra, &body).await });
+    queued.reached().await;
+    // The stdio client goes away: the service ends and shutdown starts retiring the canvas.
+    c.peer.cancel().await.unwrap();
+    bounded(old.lifecycle.retiring.notified()).await;
+    let (lb, b, task_b) = launch(&root).await;
+    let e = call(&b, app::OPEN, json!({"id": id})).await.unwrap_err();
+    assert!(
+        e.contains("another OpenPaperDesign window"),
+        "the lease is kept while the started write drains: {e}"
+    );
+    assert!(
+        !service.is_finished(),
+        "shutdown waits for the started write"
+    );
+    assert_eq!(std::fs::read(&page_file).unwrap(), before, "not saved yet");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    assert_eq!(
+        bounded(browser).await.unwrap().0,
+        503,
+        "the queued browser save is refused"
+    );
+    bounded(service).await.unwrap();
+    // Late work on the old server and on the old launcher is refused; nothing new is made.
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let e = l
+        .app(
+            l.library.as_ref().unwrap(),
+            app::CREATE,
+            json!({"name": "Late"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+    assert_eq!(
+        std::fs::read_dir(root.join("library/v1/canvases"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert!(l.state.lock().await.bound.is_none());
+    // Only now is the canvas free, with the started write saved.
+    let reopened = value(call(&b, app::OPEN, json!({"id": id})).await);
+    let (p, t) = url(&reopened);
+    assert_eq!(
+        page_nodes(p, &t, &page).await,
+        1,
+        "the started write was saved"
+    );
+    bound_server(&lb).await.retire().await;
+    task_b.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Shutdown's owned drain exists before its first wait. Its caller is cancelled while a request
+/// in flight still holds the launcher's state (before shutdown could take it); once the state is
+/// free, the drain still retires the canvas, keeps the lease until the started write drained,
+/// refuses late work and only then frees the canvas. Without the owned task made up front, the
+/// cancelled caller would leave nothing to retire it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_shutdown_survives_a_waiter_cancelled_before_it_got_the_state() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One"})).await);
+    let id = one["canvas"]["id"].as_str().unwrap().to_string();
+    let dir: PathBuf = serde_json::from_value(one["location"].clone()).unwrap();
+    let (port, token) = url(&one);
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let sid = mcp_session(port, &token, &page).await;
+    let old = bound_server(&lib.l).await;
+    let mut snapshot = Point::arm(&dir, "snapshot", true);
+    let t = token.clone();
+    let running =
+        tokio::spawn(async move { http_call(port, &t, &sid, "create_shape", shape()).await });
+    snapshot.reached().await;
+    // A request in flight holds the launcher's state; the shutdown caller is polled (it can't
+    // get the state) and then cancelled.
+    let held = lib.l.state.clone().lock_owned().await;
+    let waiter = tokio::time::timeout(Duration::from_millis(50), lib.l.shutdown()).await;
+    assert!(
+        waiter.is_err(),
+        "the caller was still waiting for the state"
+    );
+    drop(held);
+    // The owned drain runs anyway: it retires the canvas, and keeps the lease meanwhile.
+    bounded(old.lifecycle.retiring.notified()).await;
+    let (lb, b, task_b) = launch(&lib.root).await;
+    let e = call(&b, app::OPEN, json!({"id": id})).await.unwrap_err();
+    assert!(e.contains("another OpenPaperDesign window"), "{e}");
+    snapshot.resume();
+    bounded(running).await.unwrap().unwrap();
+    // Only after the started write drained is the canvas free.
+    let mut reopened = None;
+    for _ in 0..100 {
+        match call(&b, app::OPEN, json!({"id": id})).await {
+            Ok(out) => {
+                reopened = Some(value(Ok(out)));
+                break;
+            }
+            Err(e) if e.contains("another OpenPaperDesign window") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let reopened = reopened.expect("the canvas is released after the drain");
+    assert_eq!(
+        late_get(&old, port, &token).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let e = lib
+        .l
+        .app(
+            lib.l.library.as_ref().unwrap(),
+            app::CREATE,
+            json!({"name": "Late"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+    let (p, t) = url(&reopened);
+    assert_eq!(
+        page_nodes(p, &t, &page).await,
+        1,
+        "the started write was saved"
+    );
+    bound_server(&lb).await.retire().await;
+    task_b.abort();
+}
+
+// ---- the home view's own editor: its app-only page, revision, save, Ready, release and
+// renderer-part tools, through the real launcher and rmcp stream, on canonical library files.
+// The renderer bytes here are the inert unit fixture (`FIXTURE_WASM`); nothing renders.
+
+/// A panel tool's refusal (`panel_refusal`): its status, message and current revision.
+fn refusal(e: &str) -> Value {
+    serde_json::from_str(e).unwrap_or_else(|_| panic!("not a panel refusal: {e}"))
+}
+
+/// What the editor would save after one more rectangle on `text`.
+fn edited(text: &str) -> String {
+    let mut data = paper_rs::project::format::page_from_json(text).unwrap();
+    let id = data.doc.alloc_id();
+    data.doc.nodes.insert(
+        id,
+        paper_rs::model::Node::new(
+            id,
+            paper_rs::model::NodeKind::Rect,
+            paper_rs::geom::Rect::new(5.0, 5.0, 40.0, 30.0),
+        ),
+    );
+    data.doc.root.push(id);
+    paper_rs::project::format::page_to_json(&data)
+}
+
+fn node_count(text: &str) -> usize {
+    paper_rs::project::format::page_from_json(text)
+        .unwrap()
+        .doc
+        .nodes
+        .len()
+}
+
+fn location(v: &Value) -> PathBuf {
+    serde_json::from_value(v["location"].clone()).unwrap()
+}
+
+/// The page file and the manifest, byte for byte.
+fn files(dir: &Path, page: &str) -> (Vec<u8>, Vec<u8>) {
+    (
+        std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap(),
+        std::fs::read(dir.join("project.json")).unwrap(),
+    )
+}
+
+/// The first page read of a view's editor: (page id, mount, revision, text).
+async fn first_read(c: &Client, b: &str) -> (String, u64, String, String) {
+    let v = value(call(c, app::PAGE, json!({"binding": b})).await);
+    assert_eq!(v["binding"], json!(b));
+    (
+        v["page"]["id"].as_str().unwrap().to_string(),
+        v["mount"].as_u64().unwrap(),
+        v["revision"].as_str().unwrap().to_string(),
+        v["text"].as_str().unwrap().to_string(),
+    )
+}
+
+/// The owner's workflow with the view's own editor and no link: create, first read, save,
+/// Ready, release, close (no confirmation needed), then a fresh launcher (a new process) reopens
+/// the canvas with the edit. A link is never given, and nothing needs `ui/open-link`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_create_edit_save_close_and_reopen_through_the_app_tools() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Plan", "panel": true})).await);
+    assert_eq!(created["panel"], true);
+    assert!(created.get("url").is_none(), "no browser link: {created}");
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let b = binding(&created);
+    let dir = location(&created);
+    assert!(
+        !lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .unwrap()
+            .editor_opened,
+        "no link was given"
+    );
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    assert_eq!(
+        text.as_bytes(),
+        before.0.as_slice(),
+        "the canonical page file"
+    );
+    assert_eq!(rev, crate::etag(&before.0));
+    // The editor's own Ready report (its renderer's; this records it for the binding).
+    value(call(&lib.c, app::READY, json!({"binding": b, "mount": mount})).await);
+    let saved = value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    let after = files(&dir, &page);
+    assert_eq!(saved["revision"], json!(crate::etag(&after.0)));
+    assert_eq!(node_count(std::str::from_utf8(&after.0).unwrap()), 1);
+    let polled = value(
+        call(
+            &lib.c,
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": mount}),
+        )
+        .await,
+    );
+    assert_eq!(polled["revision"], saved["revision"]);
+    let state = value(call(&lib.c, app::EDITOR, json!({"binding": b, "panel": true})).await);
+    assert_eq!(state["editor_loaded"], true);
+    assert_eq!(state["browser_saves"], 1);
+    assert!(state.get("url").is_none());
+    // While an editor is mounted, closing asks first (it may hold edits).
+    let e = call(&lib.c, app::CLOSE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("force: true"), "{e}");
+    let released = value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    assert_eq!(released["released"], true);
+    // A released editor is refused, with nothing written.
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": saved["revision"], "text": edited(&text)}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!(files(&dir, &page), after);
+    let closed = value(call(&lib.c, app::CLOSE, json!({"binding": b})).await);
+    assert_eq!(closed["action"], "closed");
+    let e = call(&lib.c, app::PAGE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refusal(&e)["status"],
+        410,
+        "a closed binding reads nothing: {e}"
+    );
+    // A fresh launcher on the same root.
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::OPEN, json!({"id": id, "panel": true})).await);
+    let (page2, _, _, text2) = first_read(&c2, &binding(&reopened)).await;
+    assert_eq!(page2, page);
+    assert_eq!(node_count(&text2), 1, "the saved edit is there");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// One save transaction for both editors: the browser's HTTP save and the panel's save tool
+/// refuse each other's stale revisions (409, with the current revision, nothing written), and
+/// every commit step that fails is rolled back to byte-identical files; a failed rollback
+/// fences both. Single-threaded, so the injected commit faults reach the tool's save.
+#[tokio::test(flavor = "current_thread")]
+async fn panel_and_browser_saves_share_one_transaction_with_conflicts_and_rollback() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Shared"})).await);
+    let (port, token) = url(&created);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    // Each editor saves as the view that edits (issue #23): the other takes it back with its
+    // Edit here before its own save.
+    let claim_panel = async || {
+        value(call(&lib.c, app::CLAIM, json!({"binding": b, "mount": mount})).await);
+    };
+    // The browser saves first (its new tab edits): the panel's save on the older revision is a
+    // conflict.
+    let bt = tab(port, &token).await;
+    let (st, _, _, answer) = try_edit(port, &token, &bt).await;
+    assert_eq!(st, 200, "{answer}");
+    claim_panel().await;
+    let now = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 409, "{e}");
+    assert_eq!(
+        r["revision"],
+        json!(crate::etag(&now.0)),
+        "the current revision"
+    );
+    assert!(r["error"].as_str().unwrap().contains("nothing was written"));
+    assert_eq!(files(&dir, &page), now);
+    // The panel saves on the current revision; then the browser's older one is refused.
+    let current = crate::etag(&now.0);
+    let mine = edited(std::str::from_utf8(&now.0).unwrap());
+    let saved = value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": current, "text": mine}),
+        )
+        .await,
+    );
+    let (st, head, _) = raw(
+        port,
+        &token,
+        "GET",
+        &format!("/api/pages/{page}/revision"),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        json!(etag_of(&head)),
+        saved["revision"],
+        "the same revision"
+    );
+    let (st, _, _) = raw(port, &token, "POST", "/api/claim", &view_line(&bt), "").await;
+    assert_eq!(st, 200);
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {current}\r\n{}", view_line(&bt)),
+        &mine,
+    )
+    .await;
+    assert_eq!(st, 409, "the browser's stale save is refused too");
+    claim_panel().await;
+    // Every failing commit step leaves both files byte-identical.
+    for at in 0..6 {
+        let before = files(&dir, &page);
+        crate::commit::fault::fail_at(&[at]);
+        let e = call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount,
+                "if_match": crate::etag(&before.0), "text": edited(std::str::from_utf8(&before.0).unwrap())}),
+        )
+        .await
+        .unwrap_err();
+        crate::commit::fault::fail_at(&[]);
+        let r = refusal(&e);
+        assert_eq!(r["status"], 500, "step {at}: {e}");
+        assert!(
+            r["error"].as_str().unwrap().contains("nothing was written"),
+            "step {at}: {e}"
+        );
+        assert_eq!(files(&dir, &page), before, "step {at}");
+    }
+    // A failed rollback fences every later write, the panel's and the browser's.
+    let before = files(&dir, &page);
+    crate::commit::fault::fail_at(&[3, 4]);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount,
+            "if_match": crate::etag(&before.0), "text": edited(std::str::from_utf8(&before.0).unwrap())}),
+    )
+    .await
+    .unwrap_err();
+    crate::commit::fault::fail_at(&[]);
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("may now be inconsistent"),
+        "{e}"
+    );
+    let fenced = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount,
+            "if_match": crate::etag(&fenced.0), "text": edited(std::str::from_utf8(&fenced.0).unwrap())}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 503, "{e}");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{page}.json")),
+        "{e}"
+    );
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "PUT",
+        &format!("/api/pages/{page}"),
+        &format!("If-Match: {}\r\n{}", crate::etag(&fenced.0), view_line(&bt)),
+        &edited(std::str::from_utf8(&fenced.0).unwrap()),
+    )
+    .await;
+    assert_eq!(st, 503);
+    assert_eq!(files(&dir, &page), fenced);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// The first read takes the manifest's active page (not the first one), and later calls stay
+/// on that exact page even when the active page changes; a save changes only that page and the
+/// manifest's `modified`, keeping the other page, the page list, names, order and active page.
+/// A page removed from the manifest is refused, with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_pins_its_page_and_preserves_the_rest_of_a_multi_page_canvas() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Pages", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let mut m = crate::read_manifest_checked(&dir).unwrap();
+    let first = m.pages[0].id.clone();
+    let second = "second-page".to_string();
+    m.pages.push(paper_rs::project::PageRef {
+        id: second.clone(),
+        name: "Second".into(),
+    });
+    m.active_page = Some(second.clone());
+    std::fs::write(dir.join("project.json"), m.to_json()).unwrap();
+    let blank = paper_rs::project::PageData {
+        id: second.clone(),
+        name: "Second".into(),
+        doc: paper_rs::model::Document {
+            name: "Second".into(),
+            ..Default::default()
+        },
+        camera: None,
+    };
+    std::fs::write(
+        dir.join("pages").join(format!("{second}.json")),
+        paper_rs::project::format::page_to_json(&blank),
+    )
+    .unwrap();
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    assert_eq!(page, second, "the active page, not the first");
+    // The active page changes elsewhere; this editor's reads stay on its page.
+    let mut m2 = crate::read_manifest_checked(&dir).unwrap();
+    m2.active_page = Some(first.clone());
+    std::fs::write(dir.join("project.json"), m2.to_json()).unwrap();
+    let again = value(
+        call(
+            &lib.c,
+            app::PAGE,
+            json!({"binding": b, "page_id": page, "mount": mount}),
+        )
+        .await,
+    );
+    assert_eq!(again["page"]["id"], json!(second));
+    assert_eq!(again["mount"], json!(mount));
+    let other_before = std::fs::read(dir.join("pages").join(format!("{first}.json"))).unwrap();
+    let manifest_before = crate::read_manifest_checked(&dir).unwrap();
+    value(
+        call(
+            &lib.c,
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": edited(&text)}),
+        )
+        .await,
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pages").join(format!("{first}.json"))).unwrap(),
+        other_before,
+        "the other page is untouched"
+    );
+    let manifest_after = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            manifest_after
+                .pages
+                .iter()
+                .map(|p| (&p.id, &p.name))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        serde_json::to_value(
+            manifest_before
+                .pages
+                .iter()
+                .map(|p| (&p.id, &p.name))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        "page list, names and order"
+    );
+    assert_eq!(
+        manifest_after.active_page,
+        Some(first.clone()),
+        "the active page as it is on disk"
+    );
+    assert_eq!(manifest_after.id, manifest_before.id);
+    assert_eq!(manifest_after.name, manifest_before.name);
+    // A malformed or unknown page id is refused before anything is read.
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": "../project", "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 400, "{e}");
+    // The page is removed from the manifest: every call for it is refused, nothing written.
+    let mut m3 = crate::read_manifest_checked(&dir).unwrap();
+    m3.pages.retain(|p| p.id != second);
+    m3.active_page = Some(first.clone());
+    std::fs::write(dir.join("project.json"), m3.to_json()).unwrap();
+    let before = files(&dir, &second);
+    for (tool, args) in [
+        (
+            app::PAGE,
+            json!({"binding": b, "page_id": second, "mount": mount}),
+        ),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": second, "mount": mount}),
+        ),
+        (
+            app::SAVE,
+            json!({"binding": b, "page_id": second, "mount": mount, "if_match": crate::etag(&before.0), "text": edited(&text)}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 404, "{tool}: {e}");
+    }
+    assert_eq!(files(&dir, &second), before);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// The in-panel editor's canvas tools (what panel.js uses since the pages panel is live): the
+/// first read names only the binding and returns every page, the active page, the canvas
+/// revision and a mount; a save of the page list, names, active page and the changed pages'
+/// content is one commit on the current revision, which the poll and a re-read follow; a save
+/// on the old revision is a conflict with nothing written; a cancelled save never starts; a
+/// released mount is refused; arguments are strict; and a fresh process reopens the canvas with
+/// every page and the remembered active page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_canvas_tools_save_every_page_and_the_active_page_and_reopen_them() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Pages", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let b = binding(&created);
+    let dir = location(&created);
+    let read = value(call(&lib.c, app::CANVAS, json!({"binding": b})).await);
+    assert_eq!(binding(&read), b);
+    let mount = read["mount"].as_u64().unwrap();
+    let rev = read["revision"].as_str().unwrap().to_string();
+    let first = read["active_page"].as_str().unwrap().to_string();
+    assert_eq!(read["pages"].as_array().unwrap().len(), 1);
+    let text = read["pages"][0]["text"].as_str().unwrap().to_string();
+    assert_eq!(text.as_bytes(), files(&dir, &first).0.as_slice());
+    let ids = json!({"binding": b, "mount": mount});
+    // The first page renamed and edited, a new page with its content, the new page active.
+    let second: String = first
+        .chars()
+        .enumerate()
+        .map(|(i, c)| match (i < 6, c) {
+            (true, '0') => '1',
+            (true, _) => '0',
+            (false, c) => c,
+        })
+        .collect();
+    let blank = paper_rs::project::PageData {
+        id: second.clone(),
+        name: "Notes".into(),
+        doc: Default::default(),
+        camera: None,
+    };
+    let save = json!({"active_page": second, "pages": [
+        {"id": first, "name": "Plan", "text": edited(&text)},
+        {"id": second, "name": "Notes", "text": paper_rs::project::format::page_to_json(&blank)},
+    ]})
+    .to_string();
+    let saved = value(
+        call(
+            &lib.c,
+            app::CANVAS_SAVE,
+            json!({"binding": b, "mount": mount, "if_match": rev, "text": save}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    let polled = value(call(&lib.c, app::CANVAS_REVISION, ids.clone()).await);
+    assert_eq!(polled["revision"], saved["revision"]);
+    let m = crate::read_manifest_checked(&dir).unwrap();
+    assert_eq!(m.active_page.as_deref(), Some(second.as_str()));
+    let names: Vec<&str> = m.pages.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Plan", "Notes"]);
+    let page1 = files(&dir, &first);
+    assert_eq!(node_count(std::str::from_utf8(&page1.0).unwrap()), 1);
+    assert!(dir.join("pages").join(format!("{second}.json")).is_file());
+    let reread = value(call(&lib.c, app::CANVAS, ids.clone()).await);
+    assert_eq!(reread["mount"], json!(mount));
+    assert_eq!(reread["revision"], saved["revision"]);
+    assert_eq!(reread["active_page"], json!(second));
+    // A save on the old revision: a conflict naming the current one; nothing written.
+    let before = (files(&dir, &first), files(&dir, &second));
+    let stale = json!({"binding": b, "mount": mount, "if_match": rev, "text": save});
+    let e = call(&lib.c, app::CANVAS_SAVE, stale).await.unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 409, "{e}");
+    assert_eq!(r["revision"], saved["revision"]);
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // A cancelled save never starts.
+    let args = json!({"binding": b, "mount": mount, "if_match": saved["revision"], "text": save});
+    let e = lib
+        .l
+        .panel_call(app::CANVAS_SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // Strict arguments.
+    for (tool, bad) in [
+        (app::CANVAS, json!({"binding": b, "page_id": first})),
+        (app::CANVAS_REVISION, json!({"binding": b})),
+        (
+            app::CANVAS_SAVE,
+            json!({"binding": b, "mount": mount, "text": save}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, bad).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 400, "{tool}: {e}");
+    }
+    // Released: refused, nothing written.
+    value(call(&lib.c, app::RELEASE, json!({"binding": b, "mount": mount})).await);
+    let e = call(&lib.c, app::CANVAS_SAVE, args).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    let e = call(&lib.c, app::CANVAS_REVISION, ids).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!((files(&dir, &first), files(&dir, &second)), before);
+    // Closed, then a fresh process: every page and the remembered active page.
+    value(call(&lib.c, app::CLOSE, json!({"binding": b})).await);
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::OPEN, json!({"id": id, "panel": true})).await);
+    let again = value(call(&c2, app::CANVAS, json!({"binding": binding(&reopened)})).await);
+    assert_eq!(again["active_page"], json!(second));
+    let names: Vec<&str> = again["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Plan", "Notes"]);
+    assert_eq!(node_count(again["pages"][0]["text"].as_str().unwrap()), 1);
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// Issue #23 through the in-panel editor's own tools, in two "processes" (two Codex chats with
+/// the same canvas in their views; the real host's panels need their own rendered proof). A's
+/// view has a save already started when B opens the canvas: that save finishes first (B's open
+/// waits for it, boundedly) and B's view loads it. B edits now. A's view is told it is
+/// read-only (with each revision poll); its next save is refused (423) with nothing written and
+/// its mount kept, and it keeps following what B saves. A's Edit here takes the editing back:
+/// its save on the revision it had is then a conflict naming B's, never an overwrite, and B is
+/// refused as A was. Closing B (not editing) leaves A editing, and A's change, redone on B's
+/// version, is saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_views_in_two_processes_hand_editing_to_the_newest_and_never_overwrite() {
+    let a = library().await;
+    let (lb, b, task_b) = launch(&a.root).await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Plan", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let ba = binding(&created);
+    let dir = location(&created);
+    let read_a = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    assert_eq!(read_a["editing"], true);
+    let ma = read_a["mount"].as_u64().unwrap();
+    let page = read_a["active_page"].as_str().unwrap().to_string();
+    let name = read_a["pages"][0]["name"].as_str().unwrap().to_string();
+    let text = read_a["pages"][0]["text"].as_str().unwrap().to_string();
+    let save_of = |text: &str| {
+        json!({"active_page": page, "pages": [{"id": page, "name": name, "text": text}]})
+            .to_string()
+    };
+    let ids_a = json!({"binding": ba, "mount": ma});
+    // A's change: its save started (paused once it holds the lease) when B opens the canvas.
+    let mut started = Point::arm(&dir, "save_started", true);
+    let args = json!({"binding": ba, "mount": ma, "if_match": read_a["revision"],
+        "text": save_of(&edited(&text))});
+    let c = a.c.clone();
+    let saving = tokio::spawn(async move { call(&c, app::CANVAS_SAVE, args).await });
+    started.reached().await;
+    let (b2, id2) = (b.clone(), id.clone());
+    let opening =
+        tokio::spawn(async move { call(&b2, app::OPEN, json!({"id": id2, "panel": true})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !opening.is_finished(),
+        "B's open waits for A's started save"
+    );
+    started.resume();
+    let saved_a = value(bounded(saving).await.unwrap());
+    assert_eq!(saved_a["saved"], true, "the started save finished");
+    let opened = value(bounded(opening).await.unwrap());
+    assert_eq!(opened["editing"], "here");
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    assert_eq!(read_b["editing"], true);
+    assert_eq!(
+        read_b["revision"], saved_a["revision"],
+        "B loads A's started save"
+    );
+    let mb = read_b["mount"].as_u64().unwrap();
+    // A is read-only now: its poll says so; its next save is refused, unwritten, mount kept.
+    let polled = value(call(&a.c, app::CANVAS_REVISION, ids_a.clone()).await);
+    assert_eq!(polled["editing"], false);
+    assert_eq!(polled["revision"], saved_a["revision"]);
+    let second_a = save_of(&edited(&edited(&text)));
+    let before = files(&dir, &page);
+    let e = call(
+        &a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": ba, "mount": ma, "if_match": saved_a["revision"], "text": second_a}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 423, "{e}");
+    assert!(r["error"].as_str().unwrap().contains("Edit here"), "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    // B saves its change; A's view follows it (its mount is still there).
+    let b_text = read_b["pages"][0]["text"].as_str().unwrap().to_string();
+    let saved_b = value(
+        call(
+            &b,
+            app::CANVAS_SAVE,
+            json!({"binding": bb, "mount": mb, "if_match": read_b["revision"],
+                "text": save_of(&edited(&b_text))}),
+        )
+        .await,
+    );
+    assert_eq!(saved_b["saved"], true);
+    let polled = value(call(&a.c, app::CANVAS_REVISION, ids_a.clone()).await);
+    assert_eq!(
+        polled["revision"], saved_b["revision"],
+        "A follows B's save"
+    );
+    assert_eq!(polled["editing"], false);
+    // A's Edit here: A edits; its save on the revision it had is a conflict naming B's.
+    let claimed = value(call(&a.c, app::CLAIM, ids_a.clone()).await);
+    assert_eq!(claimed["editing"], true);
+    let polled = value(call(&a.c, app::CANVAS_REVISION, ids_a.clone()).await);
+    assert_eq!(polled["editing"], true);
+    let before = files(&dir, &page);
+    let e = call(
+        &a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": ba, "mount": ma, "if_match": saved_a["revision"], "text": second_a}),
+    )
+    .await
+    .unwrap_err();
+    let r = refusal(&e);
+    assert_eq!(r["status"], 409, "{e}");
+    assert_eq!(r["revision"], saved_b["revision"]);
+    assert_eq!(files(&dir, &page), before, "B's change kept");
+    // B is read-only now, refused as A was.
+    let e = call(
+        &b,
+        app::CANVAS_SAVE,
+        json!({"binding": bb, "mount": mb, "if_match": saved_b["revision"],
+            "text": save_of(&edited(&b_text))}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 423, "{e}");
+    assert_eq!(files(&dir, &page), before);
+    // B leaves and closes (it isn't editing): A keeps the editing.
+    value(call(&b, app::RELEASE, json!({"binding": bb, "mount": mb})).await);
+    value(call(&b, app::CLOSE, json!({"binding": bb})).await);
+    let polled = value(call(&a.c, app::CANVAS_REVISION, ids_a.clone()).await);
+    assert_eq!(polled["editing"], true, "B's close left A editing");
+    // A's change redone on B's version: saved, with both.
+    let latest = value(call(&a.c, app::CANVAS, ids_a.clone()).await);
+    let redone = save_of(&edited(latest["pages"][0]["text"].as_str().unwrap()));
+    let saved = value(
+        call(
+            &a.c,
+            app::CANVAS_SAVE,
+            json!({"binding": ba, "mount": ma, "if_match": latest["revision"], "text": redone}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    assert_eq!(
+        node_count(std::str::from_utf8(&files(&dir, &page).0).unwrap()),
+        3
+    );
+    drop(lb);
+    task_b.abort();
+    bound_server(&a.l).await.retire().await;
+}
+
+/// Issue #23 correction 23-A in the browser: two tabs of one editor URL (one binding). The
+/// qualification saw both Ready, neither read-only. Now each tab is issued its own view (`POST
+/// /api/view`) and sends it (`X-OPD-View`): the newer tab edits, the older is told it is
+/// read-only and its canvas save is refused (423) unwritten, and it takes nothing back but by
+/// its Edit here. It answers the handover with its change (`POST /api/draft`), which the editing
+/// tab applies by its id (`/api/draft/apply`); the older tab can't, and the same id twice
+/// writes once. (R78-01's missing, malformed, unissued and released views: the next test.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_tabs_of_one_binding_hand_editing_to_the_newest() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Tabs"})).await);
+    let dir = location(&created);
+    let (port, token) = url(&created);
+    let view = |v: &str| format!("X-OPD-View: {v}\r\n");
+    let open_tab = async || {
+        let (st, _, body) = raw(port, &token, "POST", "/api/view", "", "").await;
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let first = open_tab().await;
+    assert_eq!(first["editing"], true);
+    let second = open_tab().await;
+    assert_eq!(second["editing"], true);
+    let (t1, t2) = (
+        first["view"].as_str().unwrap().to_string(),
+        second["view"].as_str().unwrap().to_string(),
+    );
+    assert_ne!(t1, t2);
+    let poll = async |v: &str| {
+        let (st, _, body) = raw(port, &token, "GET", "/api/canvas/revision", &view(v), "").await;
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    assert_eq!(
+        poll(&t1).await["editing"],
+        false,
+        "the older tab is read-only"
+    );
+    assert_eq!(poll(&t2).await["editing"], true, "the newer tab edits");
+    // The older tab's canvas save, at the current revision: refused, nothing written.
+    let (st, head, canvas) = raw(port, &token, "GET", "/api/canvas", &view(&t1), "").await;
+    assert_eq!(st, 200);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-opd-editing: elsewhere"),
+        "{head}"
+    );
+    let rev = etag_of(&head);
+    let canvas: Value = serde_json::from_str(&canvas).unwrap();
+    let page = canvas["active_page"].as_str().unwrap().to_string();
+    let save_of = |text: &str| {
+        json!({"active_page": page, "pages": [{"id": page, "name": canvas["pages"][0]["name"],
+            "text": text}]})
+        .to_string()
+    };
+    let text = canvas["pages"][0]["text"].as_str().unwrap().to_string();
+    let mine = save_of(&edited(&text));
+    let before = files(&dir, &page);
+    let if_match = |r: &str, v: &str| format!("If-Match: {r}\r\n{}", view(v));
+    let (st, _, answer) = raw(
+        port,
+        &token,
+        "PUT",
+        "/api/canvas",
+        &if_match(&rev, &t1),
+        &mine,
+    )
+    .await;
+    assert_eq!(st, 423, "{answer}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    assert_eq!(poll(&t2).await["editing"], true, "and nothing taken back");
+    // It answers the handover with its change (its whole canvas, on the revision it was made
+    // on); the newer tab is told and applies it by its id; the older can't.
+    let offer = json!({"base": rev, "canvas": mine, "changed": true, "unfinished": []});
+    let (st, _, answer) = raw(
+        port,
+        &token,
+        "POST",
+        "/api/draft",
+        &view(&t1),
+        &offer.to_string(),
+    )
+    .await;
+    assert_eq!(st, 200, "{answer}");
+    let offer_id = serde_json::from_str::<Value>(&answer).unwrap()["offer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "answering writes no canvas file"
+    );
+    let seen = poll(&t2).await["handover"]["offers"][0].clone();
+    assert_eq!(seen["id"], offer_id.as_str());
+    assert_eq!(
+        (seen["from_here"].clone(), seen["changed"].clone()),
+        (json!(false), json!(true))
+    );
+    assert_eq!(poll(&t1).await["handover"]["offers"][0]["from_here"], true);
+    let id_body = json!({"id": offer_id}).to_string();
+    let apply =
+        async |v: &str| raw(port, &token, "POST", "/api/draft/apply", &view(v), &id_body).await;
+    let (st, _, _) = apply(&t1).await;
+    assert_eq!(st, 423);
+    let (st, _, answer) = apply(&t2).await;
+    assert_eq!(st, 200, "{answer}");
+    let applied: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(
+        (applied["applied"].clone(), applied["left"].clone()),
+        (json!(true), Value::Null)
+    );
+    assert_eq!(
+        node_count(std::str::from_utf8(&files(&dir, &page).0).unwrap()),
+        1
+    );
+    assert_eq!(poll(&t2).await["handover"], Value::Null);
+    // The same id again: it waits no more (nothing written twice).
+    let after = files(&dir, &page);
+    let (st, _, _) = apply(&t2).await;
+    assert_eq!(st, 404);
+    assert_eq!(files(&dir, &page), after);
+    // The older tab's explicit Edit here: it edits; the newer one is refused now.
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view(&t1), "").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(poll(&t1).await["editing"], true);
+    let (_, head, _) = raw(port, &token, "GET", "/api/canvas", &view(&t2), "").await;
+    let rev = etag_of(&head);
+    let (st, _, answer) = raw(
+        port,
+        &token,
+        "PUT",
+        "/api/canvas",
+        &if_match(&rev, &t2),
+        &mine,
+    )
+    .await;
+    assert_eq!(st, 423, "{answer}");
+    bound_server(&a.l).await.retire().await;
+}
+
+/// R78-01: on a library canvas no browser request acts without an issued, live view of its
+/// own. With the CURRENT revision (so a refusal can't be a stale-revision 409), every mutation
+/// (canvas and page saves, Claim, the handover's answer, Apply and Dismiss) is refused for a
+/// missing (428), malformed (400: empty, `bad`, a panel's `m1`, `t1x`, too long), never issued
+/// (410), released (410) and old (423) view, and the saved bytes, the editing view and the
+/// waiting offer are exactly as before each refusal. A headerless read is told it doesn't edit,
+/// and why. The current view still edits; the chat's agent (its MCP binding) is not this route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn library_browser_mutations_need_an_issued_live_view() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Views"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let (port, token) = url(&created);
+    let locks = a.root.join("library/v1/locks");
+    let record = || std::fs::read(locks.join(format!("{id}.editor"))).unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    let old = tab(port, &token).await;
+    let current = tab(port, &token).await;
+    let released = tab(port, &token).await;
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "POST",
+        "/api/view/release",
+        &view_line(&released),
+        "",
+    )
+    .await;
+    assert_eq!(st, 204);
+    // The current view takes the editing back from `released` (opened after it) explicitly.
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view_line(&current), "").await;
+    assert_eq!(st, 200, "{body}");
+    // An offer from the old view waits (so Apply/Dismiss refusals can be told apart).
+    let (_, head, canvas) = raw(port, &token, "GET", "/api/canvas", &view_line(&old), "").await;
+    let rev = etag_of(&head);
+    let canvas: Value = serde_json::from_str(&canvas).unwrap();
+    let page = canvas["active_page"].as_str().unwrap().to_string();
+    let text = canvas["pages"][0]["text"].as_str().unwrap().to_string();
+    let save = json!({"active_page": page, "pages": [{"id": page,
+        "name": canvas["pages"][0]["name"], "text": edited(&text)}]})
+    .to_string();
+    let offer = json!({"base": rev, "canvas": save, "changed": true, "unfinished": []}).to_string();
+    let (st, _, answer) = raw(port, &token, "POST", "/api/draft", &view_line(&old), &offer).await;
+    assert_eq!(st, 200, "{answer}");
+    let offer_id = serde_json::from_str::<Value>(&answer).unwrap()["offer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id_body = json!({"id": offer_id}).to_string();
+    let (_, page_head, _) = raw(port, &token, "GET", &format!("/api/pages/{page}"), "", "").await;
+    let page_rev = etag_of(&page_head);
+    let page_body = {
+        let (_, _, b) = raw(port, &token, "GET", &format!("/api/pages/{page}"), "", "").await;
+        edited(&b)
+    };
+    let (files0, record0, handover0) = (files(&dir, &page), record(), handover());
+    let cases: [(String, u16); 9] = [
+        (String::new(), 428),
+        ("X-OPD-View: \r\n".into(), 400),
+        ("X-OPD-View: bad\r\n".into(), 400),
+        ("X-OPD-View: m1\r\n".into(), 400),
+        ("X-OPD-View: t1x\r\n".into(), 400),
+        (format!("X-OPD-View: t{}\r\n", "9".repeat(21)), 400),
+        ("X-OPD-View: t999\r\n".into(), 410),
+        (view_line(&released), 410),
+        (view_line(&old), 423),
+    ];
+    for (h, want) in &cases {
+        let action = |path: &str| ("POST", path.to_string(), h.clone(), id_body.clone());
+        let attempts = [
+            (
+                "PUT",
+                "/api/canvas".to_string(),
+                format!("If-Match: {rev}\r\n{h}"),
+                save.clone(),
+            ),
+            (
+                "PUT",
+                format!("/api/pages/{page}"),
+                format!("If-Match: {page_rev}\r\n{h}"),
+                page_body.clone(),
+            ),
+            action("/api/draft/apply"),
+            action("/api/draft/dismiss"),
+            action("/api/draft/keep"),
+        ];
+        for (method, path, extra, body) in &attempts {
+            let (st, _, answer) = raw(port, &token, method, path, extra, body).await;
+            assert_eq!(st, *want, "{method} {path} with {h:?}: {answer}");
+            let at = format!("{path} with {h:?}");
+            assert_eq!(files(&dir, &page), files0, "{at}: nothing written");
+            assert_eq!(record(), record0, "{at}: the editing view stays");
+            assert_eq!(handover(), handover0, "{at}: the offer stays");
+        }
+        // Claim and the handover's answer: an old (issued, live) view may claim explicitly and
+        // answer; every unidentified one is refused, with nothing changed.
+        if *want != 423 {
+            for (path, body) in [("/api/claim", String::new()), ("/api/draft", offer.clone())] {
+                let (st, _, answer) = raw(port, &token, "POST", path, h, &body).await;
+                assert_eq!(st, *want, "POST {path} with {h:?}: {answer}");
+                let at = format!("{path} with {h:?}");
+                assert_eq!(record(), record0, "{at}: the editing view stays");
+                assert_eq!(handover(), handover0, "{at}: the offer stays");
+            }
+        }
+    }
+    // A headerless read: not editing, and told why.
+    let (_, _, body) = raw(port, &token, "GET", "/api/canvas/revision", "", "").await;
+    let polled: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (polled["editing"].clone(), polled["view"].clone()),
+        (json!(false), json!("missing"))
+    );
+    let (_, head, _) = raw(port, &token, "GET", "/api/canvas", "", "").await;
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-opd-editing: elsewhere"),
+        "{head}"
+    );
+    // The current view still edits.
+    let (st, _, n, answer) = try_edit(port, &token, &current).await;
+    assert_eq!((st, n), (200, 1), "{answer}");
+    bound_server(&a.l).await.retire().await;
+}
+
+/// Issue #23 correction 23-A within ONE binding (one process, one chat): the qualification saw
+/// mounts 1 and 2 both told `editing: true`, and mount 1's save written after mount 2 opened.
+/// Now each mount is a view of its own: the newer mount edits, the older one is told it is
+/// read-only and its save (and a delayed one) is refused unwritten; it never takes the editing
+/// back but by its explicit Edit here. The handover (R78-03/04): the editing mount is told it
+/// waits for mount 1 (pending) until mount 1 answers; mount 1 answers with its whole canvas and
+/// the actual text of its unfinished Canvas name (nothing in the canvas changes); the editing
+/// mount sees both, applies by id strictly on its base (a conflict once anything was saved
+/// since, the offer kept), keeps a conflicting one as a new canvas (same pages and content, a
+/// separate canvas; never merged), dismisses, or stops waiting for a view that never answers;
+/// several views' offers wait side by side; a released mount still pending is marked ended; a
+/// non-editing view can't act on offers, and an editing one can't answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_mounts_of_one_binding_hand_editing_to_the_newest_and_hand_over_drafts() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Plan", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let ba = binding(&created);
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    assert_eq!(one["editing"], true);
+    let m1 = one["mount"].as_u64().unwrap();
+    let page = one["active_page"].as_str().unwrap().to_string();
+    let name = one["pages"][0]["name"].as_str().unwrap().to_string();
+    let text = one["pages"][0]["text"].as_str().unwrap().to_string();
+    let save_of = |text: &str| {
+        json!({"active_page": page, "pages": [{"id": page, "name": name, "text": text}]})
+            .to_string()
+    };
+    let ids1 = json!({"binding": ba, "mount": m1});
+    // A second mount of the same binding (the same chat's panel opened again).
+    let two = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let m2 = two["mount"].as_u64().unwrap();
+    assert_ne!(m1, m2);
+    assert_eq!(two["editing"], true, "the newest mount edits");
+    let ids2 = json!({"binding": ba, "mount": m2});
+    let polled1 = value(call(&a.c, app::CANVAS_REVISION, ids1.clone()).await);
+    assert_eq!(
+        polled1["editing"], false,
+        "the older mount is told it no longer edits"
+    );
+    assert_eq!(
+        polled1["handover"]["pending"][0]["from_here"], true,
+        "and that it is waited for"
+    );
+    let polled2 = value(call(&a.c, app::CANVAS_REVISION, ids2.clone()).await);
+    assert_eq!(polled2["editing"], true);
+    let waiting = polled2["handover"]["pending"][0].clone();
+    assert_eq!(
+        (waiting["from_here"].clone(), waiting["ended"].clone()),
+        (json!(false), json!(false)),
+        "the editing mount waits for mount 1, without finding it"
+    );
+    // The counterexample: mount 1's save at the current revision after mount 2 opened.
+    let before = files(&dir, &page);
+    let mine = save_of(&edited(&text));
+    let e = call(
+        &a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": ba, "mount": m1, "if_match": one["revision"], "text": mine}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 423, "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    // ...and it took nothing back: mount 2 still edits.
+    let polled2 = value(call(&a.c, app::CANVAS_REVISION, ids2.clone()).await);
+    assert_eq!(
+        polled2["editing"], true,
+        "a late old-mount call never reacquires"
+    );
+    let draft = |m: u64, args: Value| {
+        let mut a2 = json!({"binding": ba, "mount": m});
+        a2.as_object_mut()
+            .unwrap()
+            .extend(args.as_object().unwrap().clone());
+        let c = a.c.clone();
+        async move { call(&c, app::DRAFT, a2).await }
+    };
+    // Mount 1 answers it has nothing: the editing mount stops waiting.
+    let answered = value(draft(m1, json!({"action": "answer"})).await);
+    assert_eq!(answered["offer"], Value::Null);
+    let handover_of = async |ids: &Value| {
+        value(call(&a.c, app::CANVAS_REVISION, ids.clone()).await)["handover"].clone()
+    };
+    assert_eq!(handover_of(&ids2).await, Value::Null);
+    // Mount 1 answers with its change and the actual text of its unfinished Canvas name.
+    let title = json!([{"kind": "title", "text": "D"}]).to_string();
+    let answer = json!({"action": "answer", "if_match": one["revision"], "text": mine,
+        "changed": true, "unfinished": title});
+    let o1 = value(draft(m1, answer).await)["offer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "answering writes no canvas file"
+    );
+    assert!(locks.join(format!("{id}.offer-{o1}")).exists());
+    let polled1 = value(call(&a.c, app::CANVAS_REVISION, ids1.clone()).await);
+    assert_eq!(polled1["handover"]["offers"][0]["from_here"], true);
+    let polled2 = value(call(&a.c, app::CANVAS_REVISION, ids2.clone()).await);
+    let seen = &polled2["handover"]["offers"][0];
+    assert_eq!(seen["id"], o1.as_str());
+    assert_eq!(seen["from_here"], false);
+    assert_eq!(seen["changed"], true);
+    assert_eq!(seen["base"], one["revision"]);
+    assert_eq!(
+        seen["unfinished"],
+        json!([{"kind": "title", "text": "D"}]),
+        "the unfinished name's own text reaches the editing mount"
+    );
+    // Only the editing view acts on offers; the editing view can't answer.
+    for action in ["apply", "dismiss", "keep"] {
+        let e = draft(m1, json!({"action": action, "id": o1}))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal(&e)["status"], 423, "{action}: {e}");
+    }
+    let answer = json!({"action": "answer", "if_match": one["revision"], "text": mine,
+        "changed": true});
+    let e = draft(m2, answer).await.unwrap_err();
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("has the editing"),
+        "{e}"
+    );
+    // Mount 2 saved meanwhile: applying the change made on the older revision is a conflict,
+    // nothing written, and it stays.
+    let two_text = two["pages"][0]["text"].as_str().unwrap().to_string();
+    let saved2 = value(
+        call(
+            &a.c,
+            app::CANVAS_SAVE,
+            json!({"binding": ba, "mount": m2, "if_match": two["revision"],
+                "text": save_of(&edited(&two_text))}),
+        )
+        .await,
+    );
+    let after2 = files(&dir, &page);
+    let e = draft(m2, json!({"action": "apply", "id": o1}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 409, "{e}");
+    assert_eq!(files(&dir, &page), after2, "mount 2's save kept");
+    // Recovered whole instead: kept as a new canvas (its own folder, same page and content),
+    // then the offer leaves; this canvas is unchanged.
+    let kept = value(draft(m2, json!({"action": "keep", "id": o1})).await);
+    assert_eq!(kept["left"], Value::Null);
+    let kept_id = kept["kept"]["id"].as_str().unwrap().to_string();
+    assert_eq!(kept["kept"]["name"], "Plan (handed over)");
+    assert_ne!(kept_id, id);
+    let copy = a.root.join("library/v1/canvases").join(&kept_id);
+    let copied = std::fs::read_to_string(copy.join("pages").join(format!("{page}.json"))).unwrap();
+    assert_eq!(
+        node_count(&copied),
+        1,
+        "the handed-over content, with its page id"
+    );
+    assert_eq!(files(&dir, &page), after2, "this canvas unchanged");
+    assert!(!locks.join(format!("{id}.offer-{o1}")).exists());
+    let polled2 = value(call(&a.c, app::CANVAS_REVISION, ids2.clone()).await);
+    assert_eq!(polled2["handover"], Value::Null);
+    // Offered on the current revision: applied by id, as a save of the editing view.
+    let redone = save_of(&edited(&edited(&two_text)));
+    let answer = json!({"action": "answer", "if_match": saved2["revision"], "text": redone,
+        "changed": true});
+    let o2 = value(draft(m1, answer).await)["offer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let applied = value(draft(m2, json!({"action": "apply", "id": o2})).await);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["left"], Value::Null);
+    assert_ne!(applied["revision"], saved2["revision"]);
+    assert_eq!(
+        node_count(std::str::from_utf8(&files(&dir, &page).0).unwrap()),
+        2
+    );
+    let polled1 = value(call(&a.c, app::CANVAS_REVISION, ids1.clone()).await);
+    assert_eq!(
+        polled1["revision"], applied["revision"],
+        "the older mount follows it"
+    );
+    // A third mount: mount 2 is waited for now; mount 1 and mount 2 both answer, side by side.
+    let three = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    assert_eq!(three["editing"], true);
+    let m3 = three["mount"].as_u64().unwrap();
+    let ids3 = json!({"binding": ba, "mount": m3});
+    let text_edit = json!([{"kind": "text", "page": page, "node": 7, "text": "Hel", "caret": 3}]);
+    let base = applied["revision"].clone();
+    let answer = |u: String| json!({"action": "answer", "unfinished": u, "if_match": base});
+    value(draft(m1, answer(text_edit.to_string())).await);
+    value(draft(m2, answer(title.clone())).await);
+    let polled3 = value(call(&a.c, app::CANVAS_REVISION, ids3.clone()).await);
+    assert_eq!(polled3["handover"]["offers"].as_array().unwrap().len(), 2);
+    assert_eq!(polled3["handover"]["pending"], json!([]), "both answered");
+    for o in polled3["handover"]["offers"].as_array().unwrap() {
+        value(draft(m3, json!({"action": "dismiss", "id": o["id"]})).await);
+    }
+    // A fourth mount: mount 3 is waited for and never answers; the editing mount stops waiting.
+    let four = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let m4 = four["mount"].as_u64().unwrap();
+    let ids4 = json!({"binding": ba, "mount": m4});
+    let pending = handover_of(&ids4).await["pending"][0].clone();
+    assert_eq!(pending["ended"], false);
+    value(draft(m4, json!({"action": "stop", "id": pending["id"]})).await);
+    assert_eq!(handover_of(&ids4).await, Value::Null);
+    // A fifth mount: mount 4 is waited for, then released without answering: marked ended.
+    let five = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let ids5 = json!({"binding": ba, "mount": five["mount"]});
+    value(call(&a.c, app::RELEASE, ids4.clone()).await);
+    let pending = handover_of(&ids5).await["pending"][0].clone();
+    assert_eq!(pending["ended"], true, "it left without answering");
+    // Mount 1's explicit Edit here: it edits, mount 5 is refused.
+    value(call(&a.c, app::CLAIM, ids1.clone()).await);
+    let polled1 = value(call(&a.c, app::CANVAS_REVISION, ids1.clone()).await);
+    assert_eq!(polled1["editing"], true);
+    let e = call(
+        &a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": ba, "mount": five["mount"], "if_match": applied["revision"],
+            "text": save_of(&edited(&two_text))}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 423, "{e}");
+    bound_server(&a.l).await.retire().await;
+}
+
+/// R83 (run 194): a kept recovery is handed over on its own, and only an editor that says it
+/// holds or resolves it may apply, keep or dismiss the offer carrying it, which leaves a receipt
+/// in the same record write; an older editor is refused (426) and nothing changes.
+#[tokio::test]
+async fn r194_a_kept_recovery_goes_alone_and_is_resolved_only_with_a_receipt() {
+    let t = TwoMounts::new().await;
+    let recovery = json!({"kind": "recovery", "v": 1, "id": "rec-a", "state": "applied",
+        "revision": t.revision, "packets": [{"kind": "title", "base": "Plan", "text": "Dz-194"}]});
+    let title = json!({"kind": "title", "base": "Plan", "text": "X"});
+    let status = |r: Result<Value, String>| refusal(&r.unwrap_err())["status"].clone();
+    // Mixed with a change, a canvas or another unfinished edit: refused, nothing handed over.
+    let mixed = [
+        json!({"action": "answer", "if_match": t.revision, "text": t.change, "changed": true,
+            "unfinished": json!([recovery]).to_string()}),
+        json!({"action": "answer", "if_match": t.revision,
+            "unfinished": json!([recovery, title]).to_string()}),
+    ];
+    // (The record already waits for mount 1: mount 2 opened after it.)
+    let start = t.handover();
+    for answer in mixed {
+        assert_eq!(status(t.draft(t.m1, answer).await), 400);
+        assert_eq!(t.handover(), start, "nothing was handed over");
+    }
+    // On its own: kept, as it was.
+    let alone = json!({"action": "answer", "if_match": t.revision,
+        "unfinished": json!([recovery]).to_string()});
+    let o = t.draft(t.m1, alone.clone()).await.unwrap()["offer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let polled = value(
+        call(
+            &t.a.c,
+            app::CANVAS_REVISION,
+            json!({"binding": t.ba, "mount": t.m2}),
+        )
+        .await,
+    );
+    assert_eq!(
+        polled["handover"]["offers"][0]["unfinished"],
+        json!([recovery])
+    );
+    // An editor that doesn't say it holds it (an older one), or names another: 426, nothing
+    // changed (the record byte for byte).
+    let held = t.handover();
+    for action in ["apply", "keep", "dismiss"] {
+        assert_eq!(status(t.act(action, &o).await), 426, "{action}");
+        assert_eq!(t.handover(), held, "{action}: nothing changed");
+    }
+    // (`resolved` is a JSON list as text, as the panel sends it.)
+    let other = json!({"action": "dismiss", "id": o, "resolved": r#"["rec-b"]"#});
+    let e = t.draft(t.m2, other).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 426, "{e}");
+    assert_eq!(t.handover(), held);
+    // Applying or keeping it says it holds it, but it carries no change or canvas: 404.
+    for action in ["apply", "keep"] {
+        let declared = json!({"action": action, "id": o, "resolved": r#"["rec-a"]"#});
+        assert_eq!(status(t.draft(t.m2, declared).await), 404, "{action}");
+        assert_eq!(t.handover(), held, "{action}: nothing changed");
+    }
+    // Dismissed by an editor that says it resolves it: gone, with its receipt, which every view
+    // reads and the record keeps.
+    let dismiss = json!({"action": "dismiss", "id": o, "resolved": r#"["rec-a"]"#});
+    t.draft(t.m2, dismiss).await.unwrap();
+    let polled = value(
+        call(
+            &t.a.c,
+            app::CANVAS_REVISION,
+            json!({"binding": t.ba, "mount": t.m1}),
+        )
+        .await,
+    );
+    assert_eq!(polled["handover"]["offers"], json!([]));
+    assert_eq!(
+        polled["handover"]["resolved"],
+        json!([{"offer": o, "recovery": "rec-a"}])
+    );
+    let on_disk: Value = serde_json::from_slice(&t.handover().unwrap()).unwrap();
+    assert_eq!(on_disk["format"], 2, "in this version's form (run 195)");
+    assert_eq!(
+        on_disk["handover"]["resolved"],
+        json!([{"offer": o, "recovery": "rec-a"}])
+    );
+    // A record written before run 194 (no receipts) still reads.
+    let old = json!({"offers": [], "pending": [{"id": "0123456789abcdef", "from": "x",
+        "since": 1, "ended": false}]});
+    std::fs::write(
+        t.locks().join(format!("{}.handover", t.id)),
+        old.to_string(),
+    )
+    .unwrap();
+    let polled = value(
+        call(
+            &t.a.c,
+            app::CANVAS_REVISION,
+            json!({"binding": t.ba, "mount": t.m2}),
+        )
+        .await,
+    );
+    assert_eq!(polled["handover"]["pending"][0]["id"], "0123456789abcdef");
+    assert_eq!(polled["handover"]["resolved"], json!([]));
+    bound_server(&t.a.l).await.retire().await;
+}
+
+/// A panel canvas with two mounts (`m1` read-only, `m2` editing) and the bits the issue #23
+/// fault and race tests use.
+struct TwoMounts {
+    a: Lib,
+    id: String,
+    ba: String,
+    dir: PathBuf,
+    page: String,
+    m1: u64,
+    m2: u64,
+    /// The canvas save one more rectangle on the page makes.
+    change: String,
+    revision: Value,
+}
+
+impl TwoMounts {
+    async fn new() -> TwoMounts {
+        let a = library().await;
+        let created = value(call(&a.c, app::CREATE, json!({"name": "Plan", "panel": true})).await);
+        let id = created["canvas"]["id"].as_str().unwrap().to_string();
+        let ba = binding(&created);
+        let dir = location(&created);
+        let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        let two = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        let page = one["active_page"].as_str().unwrap().to_string();
+        let change = json!({"active_page": page, "pages": [{"id": page,
+            "name": one["pages"][0]["name"],
+            "text": edited(one["pages"][0]["text"].as_str().unwrap())}]})
+        .to_string();
+        TwoMounts {
+            m1: one["mount"].as_u64().unwrap(),
+            m2: two["mount"].as_u64().unwrap(),
+            revision: two["revision"].clone(),
+            a,
+            id,
+            ba,
+            dir,
+            page,
+            change,
+        }
+    }
+
+    fn locks(&self) -> PathBuf {
+        self.a.root.join("library/v1/locks")
+    }
+
+    fn record(&self) -> Vec<u8> {
+        std::fs::read(self.locks().join(format!("{}.editor", self.id))).unwrap()
+    }
+
+    fn handover(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.locks().join(format!("{}.handover", self.id))).ok()
+    }
+
+    async fn draft(&self, m: u64, args: Value) -> Result<Value, String> {
+        let mut all = json!({"binding": self.ba, "mount": m});
+        all.as_object_mut()
+            .unwrap()
+            .extend(args.as_object().unwrap().clone());
+        call(&self.a.c, app::DRAFT, all).await.map(|v| value(Ok(v)))
+    }
+
+    /// The editing mount's `action` on offer `id`.
+    async fn act(&self, action: &str, id: &str) -> Result<Value, String> {
+        self.draft(self.m2, json!({"action": action, "id": id}))
+            .await
+    }
+
+    /// Mount 1's offer of `change` on the current revision.
+    async fn offer(&self) -> String {
+        self.draft(
+            self.m1,
+            json!({"action": "answer", "if_match": self.revision, "text": self.change,
+                "changed": true}),
+        )
+        .await
+        .unwrap()["offer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Mount `m`'s revision poll.
+    async fn polled(&self, m: u64) -> Value {
+        let ids = json!({"binding": self.ba, "mount": m});
+        value(call(&self.a.c, app::CANVAS_REVISION, ids).await)
+    }
+
+    async fn editing(&self, m: u64) -> bool {
+        self.polled(m).await["editing"].as_bool().unwrap()
+    }
+
+    async fn server(&self) -> Arc<Server> {
+        bound_server(&self.a.l).await
+    }
+
+    /// Whether another process (another library handle) finds the canvas's lease held.
+    fn busy_elsewhere(&self) -> bool {
+        let other = Library::open(self.a.root.to_str().unwrap()).unwrap();
+        matches!(
+            Lease::acquire(&other, &self.id),
+            Err(crate::library::LeaseError::Busy)
+        )
+    }
+
+    /// A new mount of this binding (the newest view: it takes the editing).
+    async fn mount(&self) -> u64 {
+        value(call(&self.a.c, app::CANVAS, json!({"binding": self.ba})).await)["mount"]
+            .as_u64()
+            .unwrap()
+    }
+}
+
+/// Whether mount `m` of the open binding is still registered.
+async fn mounted(l: &Launcher, m: u64) -> bool {
+    let state = l.state.lock().await;
+    state
+        .bound
+        .as_ref()
+        .is_some_and(|b| b.mounts.contains_key(&m))
+}
+
+/// R78-05: a Claim, an answer, an Apply or a Dismiss of a mount that is released while it
+/// waits for the writer fence never acts: the editing view, the files and the handover record
+/// stay exactly as they were. Each schedule: the fence is held, the call queues behind it, the
+/// release revokes the mount (and queues behind the call for its drain), the fence goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_calls_of_a_released_mount_never_act() {
+    let t = TwoMounts::new().await;
+    let server = t.server().await;
+    for what in ["claim", "answer", "apply", "dismiss"] {
+        // A read-only mount that answered (nothing pending of it) and the editing one after it.
+        let reader = t.mount().await;
+        let editor = t.mount().await;
+        t.draft(reader, json!({"action": "answer"})).await.unwrap();
+        let answer = json!({"action": "answer", "if_match": t.revision, "text": t.change,
+            "changed": true});
+        let offer = if what == "apply" || what == "dismiss" {
+            let made = t.draft(reader, answer.clone()).await.unwrap();
+            Some(made["offer"].as_str().unwrap().to_string())
+        } else {
+            None
+        };
+        let (m, args) = match what {
+            "claim" => (reader, None),
+            "answer" => (reader, Some(answer.clone())),
+            _ => (
+                editor,
+                Some(json!({"action": what, "id": offer.clone().unwrap()})),
+            ),
+        };
+        let (record, handover, files0) = (t.record(), t.handover(), files(&t.dir, &t.page));
+        let fence = server.lifecycle.write.lock().await;
+        let (c, ba) = (t.a.c.clone(), t.ba.clone());
+        let queued = tokio::spawn(async move {
+            match args {
+                None => call(&c, app::CLAIM, json!({"binding": ba, "mount": m})).await,
+                Some(args) => {
+                    let mut all = json!({"binding": ba, "mount": m});
+                    all.as_object_mut()
+                        .unwrap()
+                        .extend(args.as_object().unwrap().clone());
+                    call(&c, app::DRAFT, all).await
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!queued.is_finished(), "{what}: waits for the fence");
+        let (c, ba) = (t.a.c.clone(), t.ba.clone());
+        let release = tokio::spawn(async move {
+            call(&c, app::RELEASE, json!({"binding": ba, "mount": m})).await
+        });
+        // The release revokes the mount under the state lock, then waits for the fence.
+        for _ in 0..400 {
+            if !mounted(&t.a.l, m).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !release.is_finished(),
+            "{what}: the release waits for the queued call"
+        );
+        drop(fence);
+        let e = bounded(queued).await.unwrap().expect_err(&format!(
+            "{what}: a released mount's queued call must not act"
+        ));
+        // Released is released for every call, the claim too (R185 CLAIM contract: never a
+        // blanket conflict).
+        assert_eq!(refusal(&e)["status"].as_u64(), Some(410), "{what}: {e}");
+        assert!(e.contains("released"), "{what}: {e}");
+        value(bounded(release).await.unwrap());
+        // The queued call changed nothing. The release itself, of the editing mount (Apply,
+        // Dismiss), leaves the record naming only its binding (run 198: never a view that left);
+        // of a read-only one (Claim, answer), the editing view is exactly as it was.
+        let expected = if m == editor {
+            record.split(|b| *b == b':').next().unwrap().to_vec()
+        } else {
+            record.clone()
+        };
+        assert_eq!(t.record(), expected, "{what}: the editing record");
+        assert_eq!(
+            t.handover(),
+            handover,
+            "{what}: the handover record is unchanged"
+        );
+        assert_eq!(files(&t.dir, &t.page), files0, "{what}: nothing written");
+    }
+    server.retire().await;
+}
+
+/// R78-04: Apply consumes its offer in the same admission as its commit. A cleanup that fails
+/// after the save (its record sync; then also putting the record back) still reports the
+/// committed save truthfully (`applied`, the new revision, and why the offer stays); an
+/// uncertain record fences later writes and keeps the lease. A Dismiss queued before an Apply
+/// of the same offer wins, and the Apply then writes nothing (`404`); an Apply queued behind a
+/// retirement never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_is_one_admission_and_says_what_it_committed() {
+    // The record sync fails after the commit; the record is put back: applied, offer stays.
+    let t = TwoMounts::new().await;
+    let offer = t.offer().await;
+    let _sync = Point::arm(&t.locks(), "record_sync", false);
+    let applied = t.act("apply", &offer).await.unwrap();
+    assert_eq!(applied["applied"], true);
+    let left = applied["left"].as_str().unwrap();
+    assert!(left.contains("put back as it was"), "{applied}");
+    assert_eq!(
+        node_count(std::str::from_utf8(&files(&t.dir, &t.page).0).unwrap()),
+        1,
+        "the change was written"
+    );
+    let rev = t.polled(t.m2).await;
+    assert_eq!(rev["revision"], applied["revision"], "its revision");
+    assert_eq!(rev["handover"]["offers"][0]["id"], offer.as_str(), "waits");
+    // Applying it again is a conflict (its base is gone), never a second write.
+    let before = files(&t.dir, &t.page);
+    let e = t.act("apply", &offer).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 409, "{e}");
+    assert_eq!(files(&t.dir, &t.page), before);
+    t.act("dismiss", &offer).await.unwrap();
+    // The sync and putting it back both fail: still applied, and the canvas is fenced.
+    let t2 = TwoMounts::new().await;
+    let offer = t2.offer().await;
+    let _sync = Point::arm(&t2.locks(), "record_sync", false);
+    let _restore = Point::arm(&t2.locks(), "record_restore", false);
+    let applied = t2.act("apply", &offer).await.unwrap();
+    assert_eq!(applied["applied"], true, "committed, so never a refusal");
+    let left = applied["left"].as_str().unwrap();
+    assert!(left.contains("may now be either"), "{applied}");
+    let e = call(
+        &t2.a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": t2.ba, "mount": t2.m2, "if_match": applied["revision"],
+            "text": t2.change}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("writes are disabled"), "{e}");
+    assert!(t2.busy_elsewhere(), "the lease stays held");
+    // A Dismiss queued before an Apply of the same offer: the Apply finds it gone.
+    let t3 = TwoMounts::new().await;
+    let offer = t3.offer().await;
+    let before = files(&t3.dir, &t3.page);
+    let server = t3.server().await;
+    let fence = server.lifecycle.write.lock().await;
+    let queue = |action: &str, id: &str| {
+        let c = t3.a.c.clone();
+        let args = json!({"binding": t3.ba, "mount": t3.m2, "action": action, "id": id});
+        tokio::spawn(async move { call(&c, app::DRAFT, args).await })
+    };
+    let dismiss = queue("dismiss", &offer);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let apply = queue("apply", &offer);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(fence);
+    bounded(dismiss).await.unwrap().unwrap();
+    let e = bounded(apply).await.unwrap().unwrap_err();
+    assert_eq!(refusal(&e)["status"], 404, "{e}");
+    assert_eq!(files(&t3.dir, &t3.page), before, "nothing written");
+    // An Apply queued behind a held fence when the binding retires: never runs.
+    let offer = t3.offer().await;
+    let fence = server.lifecycle.write.lock().await;
+    let apply = queue("apply", &offer);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let s2 = server.clone();
+    let retiring = tokio::spawn(async move { s2.retire().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(fence);
+    let r = bounded(apply).await.unwrap();
+    assert!(r.is_err(), "{r:?}");
+    bounded(retiring).await.unwrap();
+    assert_eq!(files(&t3.dir, &t3.page), before, "nothing written");
+    t.server().await.retire().await;
+    t2.server().await.retire().await;
+}
+
+/// R78-06: a Claim or a Dismiss whose record change fails after the rename or removal puts the
+/// record back (the claim is refused and the editing view stays; the offer stays); when putting
+/// it back fails too, the server is fenced (`Broken`, naming the record), later writes are
+/// refused and the lease stays held, so no other process writes over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_record_changes_put_back_or_fence() {
+    let t = TwoMounts::new().await;
+    let record = t.record();
+    // Claim: the sync fails, the record is put back.
+    let _sync = Point::arm(&t.locks(), "record_sync", false);
+    let e = call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("put back as it was"), "{e}");
+    assert_eq!(refusal(&e)["status"], 500, "not written, put back: {e}");
+    assert_eq!(t.record(), record, "the editing view stays");
+    assert!(t.editing(t.m2).await && !t.editing(t.m1).await);
+    // Dismiss: the removal's sync fails, the offer is put back.
+    let offer = t.offer().await;
+    let handover = t.handover();
+    let _sync = Point::arm(&t.locks(), "record_sync", false);
+    let e = t.act("dismiss", &offer).await.unwrap_err();
+    assert!(e.contains("put back as it was"), "{e}");
+    assert_eq!(t.handover(), handover, "the offer stays");
+    // Nothing was fenced: the editing mount still saves.
+    let saved = value(
+        call(
+            &t.a.c,
+            app::CANVAS_SAVE,
+            json!({"binding": t.ba, "mount": t.m2, "if_match": t.revision, "text": t.change}),
+        )
+        .await,
+    );
+    assert_eq!(saved["saved"], true);
+    assert!(!t.busy_elsewhere(), "the lease is let go between writes");
+    // Claim: the sync and putting it back both fail: fenced, the lease kept.
+    let _sync = Point::arm(&t.locks(), "record_sync", false);
+    let _restore = Point::arm(&t.locks(), "record_restore", false);
+    let e = call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("may now be either"), "{e}");
+    assert_eq!(refusal(&e)["status"], 503, "fenced, not a conflict: {e}");
+    // A later claim is refused as fenced too, with nothing changed.
+    let e = call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    assert!(e.contains("writes are disabled"), "{e}");
+    let e = call(
+        &t.a.c,
+        app::CANVAS_SAVE,
+        json!({"binding": t.ba, "mount": t.m2, "if_match": saved["revision"], "text": t.change}),
+    )
+    .await
+    .unwrap_err();
+    let fenced = e.contains("writes are disabled") && e.contains(".editor");
+    assert!(fenced, "{e}");
+    let e = t.act("dismiss", &offer).await.unwrap_err();
+    assert!(e.contains("writes are disabled"), "{e}");
+    assert!(t.busy_elsewhere(), "no other process can write over it");
+    t.server().await.retire().await;
+}
+
+/// R185 CLAIM contract: a claim's outcome keeps its condition, the same on both transports.
+/// Committed and then its handover bookkeeping failed: taken (`200`), with a note saying what
+/// didn't happen. Could not start in time (the writer fence held): `503`, nothing changed. The
+/// binding retired: `410`. Over HTTP, a released tab's claim is `410` and a record that
+/// couldn't be written is `500`, put back, nothing changed; the editing view stays exactly as it
+/// was after every refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claim_outcomes_keep_their_condition_on_both_transports() {
+    let t = TwoMounts::new().await;
+    let server = t.server().await;
+    // Taken, then the handover record couldn't be written: a claim, said truthfully.
+    let _fault = Point::arm(&t.locks(), "handover_write", false);
+    let claimed = value(call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1})).await);
+    assert_eq!(claimed["editing"], true);
+    let note = claimed["note"].as_str().unwrap();
+    assert!(note.contains("Editing was taken here"), "{note}");
+    // Never a promise that a handover still arrives (R85-01, run 196).
+    assert!(
+        note.contains("isn't confirmed here") && !note.contains("still arrives"),
+        "{note}"
+    );
+    assert!(t.editing(t.m1).await && !t.editing(t.m2).await, "it stands");
+    // Couldn't start in time: transient, nothing changed.
+    let record = t.record();
+    let fence = server.lifecycle.write.lock().await;
+    let e = server
+        .claim_within(Duration::from_millis(20), Some(&format!("m{}", t.m2)), None)
+        .await
+        .err()
+        .unwrap();
+    drop(fence);
+    assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE, "{}", e.msg);
+    assert!(
+        e.msg.contains("busy") && e.msg.contains("nothing was"),
+        "{}",
+        e.msg
+    );
+    assert_eq!(t.record(), record);
+    // Retired (its close cleared its own record): permanent, nothing changed.
+    server.retire().await;
+    let editor = t.locks().join(format!("{}.editor", t.id));
+    let after = std::fs::read(&editor).ok();
+    let e = server.claim(Some("m9"), None).await.err().unwrap();
+    assert_eq!(e.status, StatusCode::GONE, "{}", e.msg);
+    assert_eq!(std::fs::read(&editor).ok(), after);
+    // Over HTTP.
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Claims"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let (port, token) = url(&created);
+    let locks = a.root.join("library/v1/locks");
+    let record = || std::fs::read(locks.join(format!("{id}.editor"))).unwrap();
+    let old = tab(port, &token).await;
+    let current = tab(port, &token).await;
+    let before = record();
+    let _sync = Point::arm(&locks, "record_sync", false);
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view_line(&old), "").await;
+    assert_eq!(st, 500, "{body}");
+    assert!(body.contains("put back as it was"), "{body}");
+    assert_eq!(record(), before, "the editing view stays");
+    assert!(editing(port, &token, &current).await);
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "POST",
+        "/api/view/release",
+        &view_line(&old),
+        "",
+    )
+    .await;
+    assert_eq!(st, 204);
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view_line(&old), "").await;
+    assert_eq!(st, 410, "{body}");
+    assert_eq!(record(), before);
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view_line(&current), "").await;
+    assert_eq!(st, 200, "{body}");
+    bound_server(&a.l).await.retire().await;
+}
+
+/// R85-01 (run 196): over a handover record this version can't read (here a newer form), a
+/// claim takes the editing (`200`) and its note, the same on both transports, says the record
+/// was left as it is and nothing can be handed over to this view while it stays so; the earlier
+/// view's answer is then refused (`403`) and the record's bytes stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r196_a_claim_over_an_unreadable_handover_record_says_what_it_leaves_on_both_transports() {
+    let unknown = json!({"format": 3, "handover": {"offers": [], "pending": [], "resolved": []}});
+    let says = |note: &str| {
+        note.contains("couldn't be read")
+            && note.contains("nothing can be handed over to this view")
+            && !note.contains("still arrives")
+    };
+    // The panel's claim.
+    let t = TwoMounts::new().await;
+    std::fs::write(
+        t.locks().join(format!("{}.handover", t.id)),
+        unknown.to_string(),
+    )
+    .unwrap();
+    let bytes = t.handover();
+    let claimed = value(call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1})).await);
+    assert_eq!(claimed["editing"], true);
+    let note = claimed["note"].as_str().unwrap();
+    assert!(says(note), "{note}");
+    assert!(t.editing(t.m1).await && !t.editing(t.m2).await, "it stands");
+    let answer = json!({"action": "answer", "if_match": t.revision,
+        "unfinished": json!([{"kind": "title", "base": "Plan", "text": "X"}]).to_string()});
+    let e = t.draft(t.m2, answer).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 403, "{e}");
+    assert_eq!(t.handover(), bytes, "left as it is");
+    bound_server(&t.a.l).await.retire().await;
+    // Over HTTP.
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Claims"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let (port, token) = url(&created);
+    let old = tab(port, &token).await;
+    let _current = tab(port, &token).await;
+    let path = a.root.join(format!("library/v1/locks/{id}.handover"));
+    std::fs::write(&path, unknown.to_string()).unwrap();
+    let (st, _, body) = raw(port, &token, "POST", "/api/claim", &view_line(&old), "").await;
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(says(v["note"].as_str().unwrap()), "{body}");
+    assert!(editing(port, &token, &old).await);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        unknown.to_string().into_bytes()
+    );
+    bound_server(&a.l).await.retire().await;
+}
+
+/// The pending entries of a canvas's handover record as written: `(from, ended)`.
+fn pending_of(bytes: Option<Vec<u8>>) -> Vec<(String, bool)> {
+    let v: Value = bytes
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or(Value::Null);
+    v["handover"]["pending"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            (
+                p["from"].as_str().unwrap().to_string(),
+                p["ended"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Run 198 (the parent's actual197 Linux runtime): the editing mount m2 went Home (its normal
+/// release) while Saved, and the same canvas reopened in m3, which then waited, with no end, for
+/// m2 to hand over: m2 was gone and could never answer. A released view that edits leaves the
+/// editing record naming only its binding (as before any of its views opened: its agent still
+/// acts for it), so the next view to take the editing waits for nobody; one that doesn't edit
+/// leaves the record and every offer as they are, its own pending entry marked ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r198_a_released_editing_mount_is_never_waited_for_by_the_next_view() {
+    let t = TwoMounts::new().await;
+    let server = t.server().await;
+    let m2 = format!(":m{}", t.m2);
+    // m1 (read-only, waited for) hands its change over first: an offer for whoever edits.
+    let offer = t.offer().await;
+    // m2, the editing mount, is released (Home, Saved).
+    value(
+        call(
+            &t.a.c,
+            app::RELEASE,
+            json!({"binding": t.ba, "mount": t.m2}),
+        )
+        .await,
+    );
+    let released = String::from_utf8(t.record()).unwrap();
+    let agent = server.editing_here(None);
+    let other = server.editing_here(Some(&format!("m{}", t.m1)));
+    // The same canvas reopened: m3 takes the editing and waits for no one that left.
+    let m3 = t.mount().await;
+    assert!(t.editing(m3).await);
+    let pending = pending_of(t.handover());
+    assert!(
+        !pending
+            .iter()
+            .any(|(from, ended)| from.ends_with(&m2) && !ended),
+        "m2 isn't waited for: {pending:?}"
+    );
+    // Meanwhile the record named only the binding: its agent still edited, no view did.
+    assert!(!released.contains(':'), "names no view: {released}");
+    assert!(agent, "the binding's agent still edits");
+    assert!(!other);
+    let polled = t.polled(m3).await;
+    assert!(
+        polled["handover"]["pending"]
+            .as_array()
+            .is_none_or(|p| p.iter().all(|p| p["ended"] == true)),
+        "{polled}"
+    );
+    // m1's offer is still there for m3.
+    assert_eq!(polled["handover"]["offers"][0]["id"], offer.as_str());
+    // A view that doesn't edit (m1) leaving changes neither the editing nor the offers: its own
+    // pending entry, if any, is ended.
+    let (record, before) = (t.record(), t.handover());
+    value(
+        call(
+            &t.a.c,
+            app::RELEASE,
+            json!({"binding": t.ba, "mount": t.m1}),
+        )
+        .await,
+    );
+    assert_eq!(t.record(), record, "m3 still edits");
+    assert!(t.editing(m3).await);
+    let after = t.handover();
+    let offers = |b: &Option<Vec<u8>>| {
+        serde_json::from_slice::<Value>(b.as_ref().unwrap()).unwrap()["handover"]["offers"].clone()
+    };
+    assert_eq!(offers(&after), offers(&before), "its offer stays");
+    let m1 = format!(":m{}", t.m1);
+    assert!(
+        pending_of(after)
+            .iter()
+            .all(|(from, ended)| !from.ends_with(&m1) || *ended)
+    );
+    // The released mounts can't act.
+    let e = t
+        .draft(t.m2, json!({"action": "dismiss", "id": offer}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    server.retire().await;
+}
+
+/// Run 198, browser tabs: the same release (`POST /api/view/release`) of the editing tab, then
+/// a new tab of the same canvas waits for nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r198_a_released_editing_tab_is_never_waited_for_by_the_next_tab() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Tabs"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let (port, token) = url(&created);
+    let locks = a.root.join("library/v1/locks");
+    let _one = tab(port, &token).await;
+    let two = tab(port, &token).await;
+    assert!(editing(port, &token, &two).await);
+    let (st, _, _) = raw(
+        port,
+        &token,
+        "POST",
+        "/api/view/release",
+        &view_line(&two),
+        "",
+    )
+    .await;
+    assert_eq!(st, 204);
+    let three = tab(port, &token).await;
+    assert!(editing(port, &token, &three).await);
+    let pending = pending_of(std::fs::read(locks.join(format!("{id}.handover"))).ok());
+    let gone = format!(":{two}");
+    assert!(
+        !pending
+            .iter()
+            .any(|(from, ended)| from.ends_with(&gone) && !ended),
+        "the released tab isn't waited for: {pending:?}"
+    );
+    bound_server(&a.l).await.retire().await;
+}
+
+/// R89-01 (run 199): the editing mount's release whose record cleanup failed and was put back.
+/// The mount is released for good, and the answer says so and what didn't happen (`note`, with
+/// that condition's status), never a plain success; the next view to take the editing in this
+/// window waits for nobody (the cleanup is done first, under that claim's hold). Then the
+/// cleanup couldn't be put back either: said (the record named), fenced, the lease kept, and no
+/// later claim or write accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r199_a_release_whose_record_cleanup_failed_says_so_and_is_never_waited_for() {
+    let t = TwoMounts::new().await;
+    let offer = t.offer().await;
+    let files0 = files(&t.dir, &t.page);
+    let released = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        value(
+            call(
+                &t.a.c,
+                app::RELEASE,
+                json!({"binding": t.ba, "mount": t.m2}),
+            )
+            .await,
+        )
+    };
+    // The next view takes the editing: nobody that left is waited for.
+    let m3 = t.mount().await;
+    assert!(t.editing(m3).await);
+    let m2 = format!(":m{}", t.m2);
+    let pending = pending_of(t.handover());
+    assert!(
+        !pending
+            .iter()
+            .any(|(from, ended)| from.ends_with(&m2) && !ended),
+        "m2 isn't waited for: {pending:?}"
+    );
+    // What the release said: released, and what of its cleanup didn't happen, with its status.
+    assert_eq!(released["released"], true, "{released}");
+    let note = released["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("released") && note.contains("put back as it was"),
+        "{released}"
+    );
+    assert_eq!(released["cleanup_status"], 500, "{released}");
+    // m2 stays released; m1's offer and the files are as they were.
+    let e = t
+        .draft(t.m2, json!({"action": "dismiss", "id": offer}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!(
+        t.polled(m3).await["handover"]["offers"][0]["id"],
+        offer.as_str()
+    );
+    assert_eq!(files(&t.dir, &t.page), files0);
+    t.server().await.retire().await;
+    // Putting it back fails too: said, with the record named; fenced, the lease kept.
+    let t = TwoMounts::new().await;
+    let released = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        let _restore = Point::arm(&t.locks(), "record_restore", false);
+        value(
+            call(
+                &t.a.c,
+                app::RELEASE,
+                json!({"binding": t.ba, "mount": t.m2}),
+            )
+            .await,
+        )
+    };
+    assert_eq!(released["released"], true, "{released}");
+    let note = released["note"].as_str().unwrap_or_default();
+    assert!(note.contains("may now be either version"), "{released}");
+    assert!(note.contains(".editor"), "the record named: {released}");
+    assert_eq!(released["cleanup_status"], 503, "{released}");
+    let e = call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    assert!(t.busy_elsewhere(), "the lease stays held");
+    t.server().await.retire().await;
+}
+
+/// R89-01 (run 199), browser tabs: `POST /api/view/release` of the editing tab whose record
+/// cleanup failed answers `200` with what didn't happen (never `204`, which says it all did);
+/// the next tab waits for nobody. Uncertain: named, fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r199_a_tab_release_whose_record_cleanup_failed_says_so_and_is_never_waited_for() {
+    for uncertain in [false, true] {
+        let a = library().await;
+        let created = value(call(&a.c, app::CREATE, json!({"name": "Tabs"})).await);
+        let id = created["canvas"]["id"].as_str().unwrap().to_string();
+        let (port, token) = url(&created);
+        let locks = a.root.join("library/v1/locks");
+        let _one = tab(port, &token).await;
+        let two = tab(port, &token).await;
+        let (st, body) = {
+            let _sync = Point::arm(&locks, "record_sync", false);
+            let _restore = uncertain.then(|| Point::arm(&locks, "record_restore", false));
+            let (st, _, body) = raw(
+                port,
+                &token,
+                "POST",
+                "/api/view/release",
+                &view_line(&two),
+                "",
+            )
+            .await;
+            (st, body)
+        };
+        // Released for good either way.
+        let (again, _, _) = raw(port, &token, "POST", "/api/claim", &view_line(&two), "").await;
+        assert_eq!(again, 410, "{uncertain}");
+        if !uncertain {
+            let three = tab(port, &token).await;
+            assert!(editing(port, &token, &three).await);
+            let pending = pending_of(std::fs::read(locks.join(format!("{id}.handover"))).ok());
+            let gone = format!(":{two}");
+            assert!(
+                !pending
+                    .iter()
+                    .any(|(from, ended)| from.ends_with(&gone) && !ended),
+                "the released tab isn't waited for: {pending:?}"
+            );
+        }
+        assert_eq!(st, 200, "{uncertain}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["released"], true, "{body}");
+        let note = v["note"].as_str().unwrap();
+        if uncertain {
+            assert!(note.contains("may now be either version"), "{body}");
+            assert_eq!(v["cleanup_status"], 503, "{body}");
+            let three = tab(port, &token).await;
+            assert!(!editing(port, &token, &three).await, "no claim accepted");
+        } else {
+            assert!(note.contains("put back as it was"), "{body}");
+            assert_eq!(v["cleanup_status"], 500, "{body}");
+        }
+        bound_server(&a.l).await.retire().await;
+    }
+}
+
+/// R90-01 (run 200): binding A's editing mount m2 is released and recording that fails (put
+/// back); A then stays idle (no change, no poll). Another window (binding B, its own launcher)
+/// opens the same canvas and takes the editing: an ordinary claim, and nobody waits for m2 (the
+/// failed release noted that it left), on B's open, mount or poll. A's own offer stays whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r200_a_failed_release_is_never_waited_for_by_another_window_while_its_own_is_idle() {
+    let t = TwoMounts::new().await;
+    let offer = t.offer().await;
+    let files0 = files(&t.dir, &t.page);
+    let released = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        value(
+            call(
+                &t.a.c,
+                app::RELEASE,
+                json!({"binding": t.ba, "mount": t.m2}),
+            )
+            .await,
+        )
+    };
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(released["cleanup_status"], 500, "{released}");
+    let note = released["note"].as_str().unwrap();
+    assert!(note.contains("no view waits for it"), "{released}");
+    // Another window: its own launcher, the same library.
+    let (_l2, c2, task2) = launch(&t.a.root).await;
+    let opened = value(call(&c2, app::OPEN, json!({"id": t.id, "panel": true})).await);
+    assert_eq!(opened["editing"], "here", "{opened}");
+    let bb = binding(&opened);
+    let read = value(call(&c2, app::CANVAS, json!({"binding": bb})).await);
+    assert_eq!(read["editing"], true);
+    let mb = read["mount"].as_u64().unwrap();
+    let polled = value(
+        call(
+            &c2,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let m2 = format!(":m{}", t.m2);
+    let pending = pending_of(t.handover());
+    assert!(
+        !pending
+            .iter()
+            .any(|(from, ended)| from.ends_with(&m2) && !ended),
+        "B waits for the released m2: {pending:?}"
+    );
+    assert!(
+        polled["handover"]["pending"]
+            .as_array()
+            .is_none_or(|p| p.iter().all(|p| p["ended"] == true)),
+        "{polled}"
+    );
+    // A's offer is B's to act on, whole; the canvas is as it was.
+    assert_eq!(polled["handover"]["offers"][0]["id"], offer.as_str());
+    assert_eq!(files(&t.dir, &t.page), files0);
+    bound_server(&t.a.l).await.retire().await;
+    task2.abort();
+}
+
+/// R90-01 (run 200), browser tabs: the same with A's editing tab released by
+/// `POST /api/view/release` (`200` with what didn't happen) and B's own tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r200_a_failed_tab_release_is_never_waited_for_by_another_window() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Tabs"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let (port, token) = url(&created);
+    let locks = a.root.join("library/v1/locks");
+    let _one = tab(port, &token).await;
+    let two = tab(port, &token).await;
+    let (st, body) = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        let (st, _, body) = raw(
+            port,
+            &token,
+            "POST",
+            "/api/view/release",
+            &view_line(&two),
+            "",
+        )
+        .await;
+        (st, body)
+    };
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        v["note"].as_str().unwrap().contains("no view waits for it"),
+        "{body}"
+    );
+    let (_l2, c2, task2) = launch(&a.root).await;
+    let opened = value(call(&c2, app::OPEN, json!({"id": id})).await);
+    let (port2, token2) = url(&opened);
+    let three = tab(port2, &token2).await;
+    assert!(editing(port2, &token2, &three).await);
+    let pending = pending_of(std::fs::read(locks.join(format!("{id}.handover"))).ok());
+    let gone = format!(":{two}");
+    assert!(
+        !pending
+            .iter()
+            .any(|(from, ended)| from.ends_with(&gone) && !ended),
+        "B waits for the released tab: {pending:?}"
+    );
+    bound_server(&a.l).await.retire().await;
+    task2.abort();
+}
+
+/// R90-01/03 (run 200), R91-02 (run 202): neither record can say that A's editing mount left:
+/// the release says so (both causes, both put back) and A keeps the canvas locked, so another
+/// window can't take the editing (a truthful refusal, never a claim that waits for m2); nothing
+/// is written. A's close then records it, and the other window opens with nobody waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r200_a_release_neither_record_can_note_is_fenced_and_no_other_window_claims() {
+    let t = TwoMounts::new().await;
+    let files0 = files(&t.dir, &t.page);
+    let (record, handover) = (t.record(), t.handover());
+    let released = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        let _note = Point::arm(&t.locks(), "departure_note", false);
+        value(
+            call(
+                &t.a.c,
+                app::RELEASE,
+                json!({"binding": t.ba, "mount": t.m2}),
+            )
+            .await,
+        )
+    };
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(released["cleanup_status"], 500, "{released}");
+    let note = released["note"].as_str().unwrap();
+    assert!(
+        note.contains("editing record couldn't be written")
+            && note.contains("handover record couldn't be written")
+            && note.contains("keeps the canvas locked"),
+        "{released}"
+    );
+    assert!(t.busy_elsewhere(), "the lease stays held");
+    let (_l2, c2, task2) = launch(&t.a.root).await;
+    let e = call(&c2, app::OPEN, json!({"id": t.id, "panel": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("held right now by another OpenPaperDesign window")
+            && e.contains("Nothing was changed"),
+        "{e}"
+    );
+    assert_eq!(t.record(), record);
+    assert_eq!(t.handover(), handover);
+    assert_eq!(files(&t.dir, &t.page), files0);
+    // A's close records that its views ended; the other window then opens, waiting for none.
+    bound_server(&t.a.l).await.retire().await;
+    let opened = value(call(&c2, app::OPEN, json!({"id": t.id, "panel": true})).await);
+    assert_eq!(opened["editing"], "here", "{opened}");
+    let m2 = format!(":m{}", t.m2);
+    let pending = pending_of(t.handover());
+    assert!(
+        !pending.iter().any(|(f, e)| f.ends_with(&m2) && !e),
+        "{pending:?}"
+    );
+    task2.abort();
+}
+
+/// Run 201 (the R90-01 busy case): A's editing mount m2 was waited for by B (another window,
+/// which then took the editing). B's save holds the lease (paused) when A releases m2, longer
+/// than any ordinary wait. A's release stays under way (A's writes wait behind it) until B's save
+/// ends, then records that m2 left; A then does nothing more (no poll, change or close). B's next
+/// view waits for nobody. `release` is A's release, by panel mount (`None`) or tab.
+async fn r201_busy_release(tab_release: bool) {
+    let a = library().await;
+    let created = if tab_release {
+        value(call(&a.c, app::CREATE, json!({"name": "Busy"})).await)
+    } else {
+        value(call(&a.c, app::CREATE, json!({"name": "Busy", "panel": true})).await)
+    };
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    // A's two views: the first read-only, the second editing (released later).
+    let (port, token) = if tab_release {
+        url(&created)
+    } else {
+        (0, String::new())
+    };
+    let (first, second) = if tab_release {
+        (tab(port, &token).await, tab(port, &token).await)
+    } else {
+        let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        let two = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        (
+            format!("m{}", one["mount"].as_u64().unwrap()),
+            format!("m{}", two["mount"].as_u64().unwrap()),
+        )
+    };
+    let _ = first;
+    // B (its own launcher) opens the same canvas and takes the editing: it waits for A's view.
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let gone = format!(":{second}");
+    let live = |p: &[(String, bool)]| p.iter().any(|(f, e)| f.ends_with(&gone) && !e);
+    assert!(
+        live(&pending_of(
+            std::fs::read(locks.join(format!("{id}.handover"))).ok()
+        )),
+        "B waits for A's view while it is open"
+    );
+    // B's save holds the lease (paused once it does).
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let text = read_b["pages"][0]["text"].as_str().unwrap().to_string();
+    let save = json!({"active_page": page, "pages": [{"id": page,
+        "name": read_b["pages"][0]["name"], "text": edited(&text)}]})
+    .to_string();
+    let mut started = Point::arm(&dir, "save_started", true);
+    let (b2, bb2) = (b.clone(), bb.clone());
+    let args = json!({"binding": bb2, "mount": mb, "if_match": read_b["revision"], "text": save});
+    let saving = tokio::spawn(async move { call(&b2, app::CANVAS_SAVE, args).await });
+    started.reached().await;
+    // A releases its view meanwhile, through its normal route.
+    let (ac, ba2, second2, token2) = (a.c.clone(), ba.clone(), second.clone(), token.clone());
+    let releasing = tokio::spawn(async move {
+        if tab_release {
+            let (st, _, body) = raw(
+                port,
+                &token2,
+                "POST",
+                "/api/view/release",
+                &view_line(&second2),
+                "",
+            )
+            .await;
+            json!({"status": st, "body": body})
+        } else {
+            let m: u64 = second2[1..].parse().unwrap();
+            let r = value(call(&ac, app::RELEASE, json!({"binding": ba2, "mount": m})).await);
+            json!({"status": 200, "body": r})
+        }
+    });
+    // Longer than any ordinary wait for the lease: still under way, not a plain answer.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let early = releasing.is_finished();
+    // B's save ends normally.
+    started.resume();
+    let saved = value(bounded(saving).await.unwrap());
+    assert_eq!(saved["saved"], true);
+    let files_b = files(&dir, &page);
+    let released = bounded(releasing).await.unwrap();
+    // A does nothing more. B's next view: nobody that left is waited for.
+    let three = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let m3 = three["mount"].as_u64().unwrap();
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": m3}),
+        )
+        .await,
+    );
+    let pending = pending_of(std::fs::read(locks.join(format!("{id}.handover"))).ok());
+    // (The other entries are views still open: A's first one and B's earlier mount, rightly
+    // waited for until they answer; only the released one must not be.)
+    let outcome = json!({
+        "release_answered_while_held": early,
+        "a_view_still_waited_for": live(&pending),
+        "a_view_said_closed": pending.iter().any(|(f, e)| f.ends_with(&gone) && *e),
+        "b_poll_lists_entries": polled["handover"]["pending"].as_array().map(Vec::len),
+    });
+    assert_eq!(
+        outcome,
+        json!({"release_answered_while_held": false, "a_view_still_waited_for": false,
+            "a_view_said_closed": true, "b_poll_lists_entries": pending.len()}),
+        "{tab_release}: {released} {pending:?}"
+    );
+    // The release completed: a plain answer (204 for a tab; no note for a mount).
+    if tab_release {
+        assert_eq!(released["status"], 204, "{released}");
+    } else {
+        assert_eq!(released["body"]["released"], true, "{released}");
+        assert!(released["body"].get("note").is_none(), "{released}");
+    }
+    // B's save is the canvas, untouched by the release.
+    assert_eq!(files(&dir, &page), files_b);
+    bound_server(&a.l).await.retire().await;
+    task_b.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r201_a_mount_release_while_another_window_holds_the_lease_is_never_waited_for() {
+    r201_busy_release(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r201_a_tab_release_while_another_window_holds_the_lease_is_never_waited_for() {
+    r201_busy_release(true).await;
+}
+
+/// The full pending entries of a canvas's handover record as written: `(id, from, ended)`.
+fn pending_full(bytes: Option<Vec<u8>>) -> Vec<(String, String, bool)> {
+    let v: Value = bytes
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or(Value::Null);
+    v["handover"]["pending"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap().to_string(),
+                p["from"].as_str().unwrap().to_string(),
+                p["ended"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// R91-01 (run 202): A (a panel binding, its second mount editing) is waited for by B (its own
+/// launcher), whose save holds the lease (paused) when A's confirmed Close starts. The Close
+/// stays under way until B's save ends, then records that every view of A ended; A is gone
+/// after that. B's next view and poll wait for none of A's views. The Close says it closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r202_a_close_while_another_window_holds_the_lease_leaves_none_of_its_views_waited_for() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Close", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    let a_token = |from: &str| from.split(':').next().unwrap().to_string();
+    let before = pending_full(handover());
+    let a_tok = before
+        .iter()
+        .find(|(_, f, _)| f.ends_with(":m2"))
+        .map(|(_, f, _)| a_token(f))
+        .expect("B waits for A's editing mount");
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let text = read_b["pages"][0]["text"].as_str().unwrap().to_string();
+    let save = json!({"active_page": page, "pages": [{"id": page,
+        "name": read_b["pages"][0]["name"], "text": edited(&text)}]})
+    .to_string();
+    let mut started = Point::arm(&dir, "save_started", true);
+    let (b2, bb2) = (b.clone(), bb.clone());
+    let args = json!({"binding": bb2, "mount": mb, "if_match": read_b["revision"], "text": save});
+    let saving = tokio::spawn(async move { call(&b2, app::CANVAS_SAVE, args).await });
+    started.reached().await;
+    // A's confirmed Close (its editors are mounted: `force`, as the person confirms it).
+    let (ac, ba2) = (a.c.clone(), ba.clone());
+    let closing =
+        tokio::spawn(
+            async move { call(&ac, app::CLOSE, json!({"binding": ba2, "force": true})).await },
+        );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let early = closing.is_finished();
+    started.resume();
+    assert_eq!(value(bounded(saving).await.unwrap())["saved"], true);
+    let files_b = files(&dir, &page);
+    let closed = value(bounded(closing).await.unwrap());
+    // A is gone. B's next view and its poll.
+    let three = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let m3 = three["mount"].as_u64().unwrap();
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": m3}),
+        )
+        .await,
+    );
+    let after = pending_full(handover());
+    let a_live: Vec<_> = after
+        .iter()
+        .filter(|(_, f, e)| a_token(f) == a_tok && !e)
+        .collect();
+    let outcome = json!({
+        "close_answered_while_held": early,
+        "a_views_still_waited_for": a_live.len(),
+        "closed": closed["action"],
+        "cleanup_note": closed.get("cleanup"),
+    });
+    assert_eq!(
+        outcome,
+        json!({"close_answered_while_held": false, "a_views_still_waited_for": 0,
+            "closed": "closed", "cleanup_note": null}),
+        "{closed} {after:?}"
+    );
+    // A's entries are the same ones, ended; B's own are as they were.
+    for (pid, from, ended) in &before {
+        let now = after.iter().find(|(i, _, _)| i == pid).unwrap();
+        if a_token(from) == a_tok {
+            assert!(now.2, "{from} ended");
+        } else {
+            assert_eq!(now.2, *ended, "{from}");
+        }
+    }
+    let listed = polled["handover"]["pending"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(listed.len(), after.len(), "{polled}");
+    assert_eq!(files(&dir, &page), files_b, "B's save is the canvas");
+    task_b.abort();
+}
+
+/// R91-02 (run 202): B already waits for A's view m1 (B took the editing from it). A releases
+/// m1, and ending that wait can't be written (put back). A then does nothing more. A's view is
+/// released (410) and the release says what didn't happen; A keeps the canvas locked, so B is
+/// told that the canvas is held (no handover can arrive while it is), its record unchanged
+/// (nothing forged or deleted), and B can't take the editing to wait for m1 anew. Through the
+/// panel route and a browser tab's.
+async fn r202_existing_wait(tab_release: bool) {
+    let a = library().await;
+    let created = if tab_release {
+        value(call(&a.c, app::CREATE, json!({"name": "Wait"})).await)
+    } else {
+        value(call(&a.c, app::CREATE, json!({"name": "Wait", "panel": true})).await)
+    };
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    let (port, token) = if tab_release {
+        url(&created)
+    } else {
+        (0, String::new())
+    };
+    let view = if tab_release {
+        tab(port, &token).await
+    } else {
+        let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        format!("m{}", one["mount"].as_u64().unwrap())
+    };
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    let before_bytes = handover();
+    let before = pending_full(before_bytes.clone());
+    let gone = format!(":{view}");
+    assert!(
+        before.iter().any(|(_, f, e)| f.ends_with(&gone) && !e),
+        "B waits for A's view: {before:?}"
+    );
+    let (page, files0) = {
+        let page = read_b["active_page"].as_str().unwrap().to_string();
+        let f = files(&dir, &page);
+        (page, f)
+    };
+    // A releases its view; ending B's wait for it can't be written (put back).
+    let released = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        if tab_release {
+            let (st, _, body) = raw(
+                port,
+                &token,
+                "POST",
+                "/api/view/release",
+                &view_line(&view),
+                "",
+            )
+            .await;
+            json!({"status": st, "body": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)})
+        } else {
+            let m: u64 = view[1..].parse().unwrap();
+            json!({"status": 200, "body": value(call(&a.c, app::RELEASE,
+                json!({"binding": ba, "mount": m})).await)})
+        }
+    };
+    // A does nothing more. B's poll.
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after_bytes = handover();
+    let lease_held = {
+        let other = Library::open(a.root.to_str().unwrap()).unwrap();
+        matches!(
+            Lease::acquire(&other, &id),
+            Err(crate::library::LeaseError::Busy)
+        )
+    };
+    let outcome = json!({
+        "release_status": released["status"],
+        "cleanup_status": released["body"]["cleanup_status"],
+        "record_unchanged": after_bytes == before_bytes,
+        "b_told_held": polled["handover"]["held"],
+        "lease_held": lease_held,
+    });
+    assert_eq!(
+        outcome,
+        json!({"release_status": 200, "cleanup_status": 500, "record_unchanged": true,
+            "b_told_held": true, "lease_held": true}),
+        "{tab_release}: {released} {polled}"
+    );
+    let note = released["body"]["note"].as_str().unwrap();
+    assert!(note.contains("keeps the canvas locked"), "{note}");
+    // B can't take the editing anew meanwhile (a truthful busy refusal, nothing changed).
+    let e = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    assert_eq!(handover(), before_bytes);
+    assert_eq!(files(&dir, &page), files0);
+    // A's view is released for good.
+    if tab_release {
+        let (st, _, _) = raw(port, &token, "POST", "/api/claim", &view_line(&view), "").await;
+        assert_eq!(st, 410);
+    } else {
+        let m: u64 = view[1..].parse().unwrap();
+        let e = call(&a.c, app::CLAIM, json!({"binding": ba, "mount": m}))
+            .await
+            .unwrap_err();
+        assert_eq!(refusal(&e)["status"], 410, "{e}");
+    }
+    bound_server(&a.l).await.retire().await;
+    task_b.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r202_a_mount_release_whose_wait_ending_fails_never_leaves_b_promised_a_live_answer() {
+    r202_existing_wait(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r202_a_tab_release_whose_wait_ending_fails_never_leaves_b_promised_a_live_answer() {
+    r202_existing_wait(true).await;
+}
+
+/// A canvas's handover record as written: its `handover` (`Null`: there is none).
+fn packet(bytes: Option<Vec<u8>>) -> Value {
+    bytes.map_or(Value::Null, |b| {
+        serde_json::from_slice::<Value>(&b).unwrap()["handover"].clone()
+    })
+}
+
+/// Run 203: the canvas's handover record as it is, with what no end of a binding may change added
+/// to it: a kept recovery offered by a view of no binding here, a plain unfinished edit offered
+/// by another, and the receipt of a recovery resolved earlier. Returns the bytes written.
+fn seed_packet(locks: &Path, id: &str) -> Vec<u8> {
+    let path = locks.join(format!("{id}.handover"));
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let elsewhere = "e".repeat(64);
+    let recovery = json!({"kind": "recovery", "v": 1, "id": "rec-203", "state": "applied",
+        "revision": "r-203", "packets": [{"kind": "title", "base": "Plan", "text": "Dz-203"}]});
+    v["handover"]["offers"] = json!([
+        {"id": "0000000000203a01", "from": format!("{elsewhere}:m9"), "base": "r-203",
+            "canvas": false, "changed": false, "unfinished": [recovery], "at": 1},
+        {"id": "0000000000203a02", "from": format!("{elsewhere}:t9"), "base": "r-203",
+            "canvas": false, "changed": false,
+            "unfinished": [{"kind": "title", "base": "Plan", "text": "X-203"}], "at": 2},
+    ]);
+    v["handover"]["resolved"] = json!([{"offer": "0000000000203b01", "recovery": "rec-192"}]);
+    let bytes = v.to_string().into_bytes();
+    std::fs::write(&path, &bytes).unwrap();
+    bytes
+}
+
+/// The live (not ended) entries of a handover packet (as written, or as a view is told it).
+fn waits(h: &Value) -> usize {
+    h["pending"]
+        .as_array()
+        .map_or(0, |p| p.iter().filter(|e| e["ended"] == false).count())
+}
+
+/// R92-01 (run 203), one record write put back at a Close: A's editing mount m2 has no pending
+/// entry (its first mount, m1, has one: m2 took the editing from it). A's confirmed Close can't
+/// clear the editing record (its write is put back exactly; nothing else fails), so that record
+/// still names m2 after A is gone. A does nothing more (its binding is gone). B (its own
+/// launcher) then opens the canvas and polls: none of A's views is waited for. The handover
+/// record says each of them left: the same entries as before (m1's ended) and an ended one for
+/// m2; its offers, kept recovery and resolved receipt are as they were; the canvas is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r203_a_close_whose_editing_record_was_put_back_leaves_none_of_its_views_waited_for() {
+    let t = TwoMounts::new().await;
+    let named = String::from_utf8(t.record()).unwrap();
+    let a_tok = named.split(':').next().unwrap().to_string();
+    assert_eq!(named, format!("{a_tok}:m{}", t.m2));
+    let before = packet(Some(seed_packet(&t.locks(), &t.id)));
+    let m1 = format!("{a_tok}:m{}", t.m1);
+    assert_eq!(before["pending"].as_array().unwrap().len(), 1, "{before}");
+    assert_eq!(
+        (
+            &before["pending"][0]["from"],
+            &before["pending"][0]["ended"]
+        ),
+        (&json!(m1), &json!(false)),
+        "m2 took the editing from m1; nothing waits for m2"
+    );
+    let files0 = files(&t.dir, &t.page);
+    let closed = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        value(call(&t.a.c, app::CLOSE, json!({"binding": t.ba, "force": true})).await)
+    };
+    assert_eq!(
+        t.record(),
+        named.as_bytes(),
+        "the editing record was put back"
+    );
+    // A is gone. B opens the canvas (it takes the editing) and its view polls.
+    let (_lb, b, task_b) = launch(&t.a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": t.id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after = packet(t.handover());
+    let a_live = after["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ended"] == false && p["from"].as_str().unwrap().starts_with(&a_tok))
+        .count();
+    let outcome = json!({
+        "closed": closed["action"],
+        "cleanup_status": closed["cleanup"]["cleanup_status"],
+        "a_views_waited_for": a_live,
+        "b_poll_waits": waits(&polled["handover"]),
+        "b_told_held": polled["handover"]["held"],
+        "b_editing": opened["editing"],
+    });
+    assert_eq!(
+        outcome,
+        json!({"closed": "closed", "cleanup_status": 500, "a_views_waited_for": 0,
+            "b_poll_waits": 0, "b_told_held": false, "b_editing": "here"}),
+        "{closed} {after}"
+    );
+    let note = closed["cleanup"]["note"].as_str().unwrap();
+    assert!(
+        note.contains("editing record couldn't be written")
+            && note.contains("put back")
+            && note.contains("no view waits for them"),
+        "{note}"
+    );
+    // The whole record: m1's entry as it was, ended; one ended entry for m2; nothing else.
+    let pending = after["pending"].as_array().unwrap();
+    let mut was = before["pending"][0].clone();
+    was["ended"] = json!(true);
+    assert_eq!(pending.len(), 2, "{after}");
+    assert_eq!(pending[0], was);
+    assert_eq!(
+        (&pending[1]["from"], &pending[1]["ended"]),
+        (&json!(named), &json!(true))
+    );
+    assert_eq!(after["offers"], before["offers"]);
+    assert_eq!(after["resolved"], before["resolved"]);
+    // B's view is told exactly those entries and offers.
+    let told = |k: &str, f: &[&str]| -> Vec<Value> {
+        polled["handover"][k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| json!(f.iter().map(|x| e[*x].clone()).collect::<Vec<_>>()))
+            .collect()
+    };
+    let written = |k: &str, f: &[&str]| -> Vec<Value> {
+        after[k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| json!(f.iter().map(|x| e[*x].clone()).collect::<Vec<_>>()))
+            .collect()
+    };
+    let p = ["id", "since", "ended"];
+    let o = ["id", "base", "unfinished", "at"];
+    assert_eq!(told("pending", &p), written("pending", &p));
+    assert_eq!(told("offers", &o), written("offers", &o));
+    assert_eq!(polled["handover"]["resolved"], after["resolved"]);
+    assert_eq!(files(&t.dir, &t.page), files0, "the canvas is untouched");
+    // A's views act no more: its closed binding is refused, nothing changed.
+    let e = call(
+        &t.a.c,
+        app::CANVAS_REVISION,
+        json!({"binding": t.ba, "mount": t.m2}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("Nothing was changed"), "{e}");
+    assert_eq!(packet(t.handover()), after);
+    task_b.abort();
+}
+
+/// How A's binding ends in [`r203_existing_wait_through_end`].
+#[derive(Clone, Copy, Debug)]
+enum End {
+    /// Its confirmed Close.
+    Close,
+    /// Opening another canvas in its place (a confirmed switch).
+    Switch,
+}
+
+/// What of A's process then uses the library in [`r203_existing_wait_through_end`]: no view of
+/// A's (they are all gone), only the process itself.
+#[derive(Clone, Copy, Debug)]
+enum Later {
+    /// Its home's list of canvases.
+    List,
+    /// Its end (the stdio connection closed).
+    Shutdown,
+}
+
+/// R92-01 (run 203), an existing wait whose ending fails through A's end: B already waits for
+/// A's view (B took the editing from it). A releases that view, and ending the wait is put back:
+/// A keeps the canvas locked (R91-02). A's end (its confirmed Close, or a switch to another
+/// canvas) can't end it either (put back again). A does nothing more; its binding is gone. A's
+/// process still keeps the canvas locked, truthfully: B is told the canvas is held, the lease is
+/// held, the record is byte for byte as it was (nothing forged or deleted, the seeded offers,
+/// recovery and receipt included) and B can't take the editing, nothing changed. Then the
+/// process's next use of the library (`later`) records that A's view left: B's next poll waits
+/// for none of A's views, the same entries otherwise, and B takes the editing. Through a panel
+/// mount's release or a browser tab's.
+async fn r203_existing_wait_through_end(tab_release: bool, end: End, later: Later) {
+    let a = library().await;
+    let other = if matches!(end, End::Switch) {
+        let o = value(call(&a.c, app::CREATE, json!({"name": "Other", "panel": true})).await);
+        Some(o["canvas"]["id"].as_str().unwrap().to_string())
+    } else {
+        None
+    };
+    let created = if tab_release {
+        value(call(&a.c, app::CREATE, json!({"name": "Wait"})).await)
+    } else {
+        value(call(&a.c, app::CREATE, json!({"name": "Wait", "panel": true})).await)
+    };
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    let (port, token) = if tab_release {
+        url(&created)
+    } else {
+        (0, String::new())
+    };
+    let view = if tab_release {
+        tab(port, &token).await
+    } else {
+        let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+        format!("m{}", one["mount"].as_u64().unwrap())
+    };
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    let seeded = seed_packet(&locks, &id);
+    let before = packet(Some(seeded.clone()));
+    let gone = format!(":{view}");
+    let from_view = |h: &Value| -> Vec<Value> {
+        h["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["from"].as_str().unwrap().ends_with(&gone))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(from_view(&before).len(), 1, "{before}");
+    assert_eq!(
+        from_view(&before)[0]["ended"],
+        false,
+        "B waits for A's view"
+    );
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let files0 = files(&dir, &page);
+    // A releases its view; ending B's wait for it is put back (A keeps the canvas locked).
+    let released = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        if tab_release {
+            let (st, _, body) = raw(
+                port,
+                &token,
+                "POST",
+                "/api/view/release",
+                &view_line(&view),
+                "",
+            )
+            .await;
+            json!({"status": st, "body": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null)})
+        } else {
+            let m: u64 = view[1..].parse().unwrap();
+            json!({"status": 200, "body": value(call(&a.c, app::RELEASE,
+                json!({"binding": ba, "mount": m})).await)})
+        }
+    };
+    assert_eq!(released["body"]["cleanup_status"], 500, "{released}");
+    // A's end: ending that wait is put back again.
+    let ended = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        match end {
+            End::Close => {
+                value(call(&a.c, app::CLOSE, json!({"binding": ba, "force": true})).await)
+            }
+            End::Switch => value(
+                call(
+                    &a.c,
+                    app::OPEN,
+                    json!({"id": other.as_deref().unwrap(), "panel": true, "force": true,
+                        "replace": ba}),
+                )
+                .await,
+            ),
+        }
+    };
+    if matches!(end, End::Switch) {
+        assert_eq!(ended["canvas"]["id"], json!(other.as_deref().unwrap()));
+    }
+    // A does nothing more (its binding is gone). B's poll.
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let lease_held = || {
+        let other = Library::open(a.root.to_str().unwrap()).unwrap();
+        matches!(
+            Lease::acquire(&other, &id),
+            Err(crate::library::LeaseError::Busy)
+        )
+    };
+    let claim_b = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb})).await;
+    let outcome = json!({
+        "a_ended": match end { End::Close => ended["action"].clone(), End::Switch => json!("switched") },
+        "cleanup_status": ended.get("cleanup").map(|c| c["cleanup_status"].clone()),
+        "b_told_held": polled["handover"]["held"],
+        "lease_held": lease_held(),
+        "record_unchanged": handover() == Some(seeded.clone()),
+        "b_claim_status": claim_b.as_ref().err().map(|e| refusal(e)["status"].clone()),
+    });
+    let want_cleanup = match end {
+        End::Close => json!(500),
+        End::Switch => Value::Null,
+    };
+    let want_end = match end {
+        End::Close => json!("closed"),
+        End::Switch => json!("switched"),
+    };
+    assert_eq!(
+        outcome,
+        json!({"a_ended": want_end, "cleanup_status": want_cleanup, "b_told_held": true,
+            "lease_held": true, "record_unchanged": true, "b_claim_status": 503}),
+        "{tab_release} {end:?}: {ended} {polled}"
+    );
+    if matches!(end, End::Close) {
+        let note = ended["cleanup"]["note"].as_str().unwrap();
+        assert!(note.contains("keeps the canvas locked"), "{note}");
+    }
+    assert_eq!(handover(), Some(seeded.clone()));
+    assert_eq!(files(&dir, &page), files0);
+    // The process's next use of the library records that A's view left.
+    match later {
+        Later::List => {
+            value(call(&a.c, app::LIST, json!({})).await);
+        }
+        Later::Shutdown => a.l.shutdown().await,
+    }
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after = packet(handover());
+    assert!(!lease_held(), "A's process let the canvas go");
+    assert_eq!(polled["handover"]["held"], false, "{polled}");
+    // The same entries, A's view's ended; offers, recovery and receipt as they were.
+    let mut want = before.clone();
+    for p in want["pending"].as_array_mut().unwrap() {
+        if p["from"].as_str().unwrap().ends_with(&gone) {
+            p["ended"] = json!(true);
+        }
+    }
+    assert_eq!(after, want, "{tab_release} {end:?} {later:?}");
+    assert_eq!(
+        polled["handover"]["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>(),
+        after["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>()
+    );
+    // B takes the editing now; the canvas is still untouched.
+    call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap();
+    assert_eq!(files(&dir, &page), files0);
+    task_b.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r203_a_mount_wait_that_a_close_cant_end_keeps_the_canvas_held_until_it_is_recorded() {
+    r203_existing_wait_through_end(false, End::Close, Later::List).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r203_a_tab_wait_that_a_close_cant_end_is_recorded_at_the_process_end() {
+    r203_existing_wait_through_end(true, End::Close, Later::Shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r203_a_mount_wait_that_a_switch_cant_end_keeps_the_canvas_held_until_it_is_recorded() {
+    r203_existing_wait_through_end(false, End::Switch, Later::List).await;
+}
+
+/// R90-03 (run 203): at A's Close, the editing record's write is put back (an earlier, exactly
+/// restored failure), then the handover record's write can't be put back (a later uncertainty).
+/// The later, named uncertainty is what the Close says (503, the handover record named, not the
+/// editing record's put-back), A's writes are fenced (`Broken`), and the canvas stays locked:
+/// no other window opens it while A's process runs, and A's own process doesn't open it
+/// writable again. A release of A's view arriving after the Close is told that same condition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r203_a_close_whose_later_handover_write_is_uncertain_says_that_fence() {
+    let t = TwoMounts::new().await;
+    let server = t.server().await;
+    let editor0 = t.record();
+    let closed = {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        let _handover = Point::arm(&t.locks(), "handover_sync", false);
+        let _restore = Point::arm(&t.locks(), "handover_restore", false);
+        value(call(&t.a.c, app::CLOSE, json!({"binding": t.ba, "force": true})).await)
+    };
+    assert_eq!(closed["action"], "closed", "{closed}");
+    assert_eq!(closed["cleanup"]["cleanup_status"], 503, "{closed}");
+    let note = closed["cleanup"]["note"].as_str().unwrap();
+    assert!(
+        note.contains(&format!("{}.handover may now be either version", t.id)),
+        "{note}"
+    );
+    assert!(
+        !note.contains(".editor"),
+        "the earlier put-back isn't what is said: {note}"
+    );
+    assert_eq!(t.record(), editor0, "the editing record was put back");
+    let fence = crate::refuse_if_broken(&server.broken).unwrap_err();
+    assert!(fence.contains(&format!("{}.handover", t.id)), "{fence}");
+    assert!(
+        t.busy_elsewhere(),
+        "the canvas stays locked past A's binding"
+    );
+    // A's own process doesn't open it again while that is so.
+    let e = call(&t.a.c, app::OPEN, json!({"id": t.id, "panel": true}))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("can't be opened") && e.contains("either version"),
+        "{e}"
+    );
+    assert!(t.busy_elsewhere());
+    // A late release of A's view: that same condition, typed.
+    let late = server
+        .release_view(&format!("m{}", t.m1))
+        .await
+        .unwrap_err();
+    assert_eq!(late.status.as_u16(), 503, "{}", late.msg);
+    assert!(
+        late.msg
+            .contains(&format!("{}.handover may now be either version", t.id)),
+        "{}",
+        late.msg
+    );
+}
+
+/// The canvas's handover record as it is (one pending entry, B's live `m1`), with the seeded
+/// offers, kept recovery and receipt (`seed_packet`), filled to the record's 16 pending entries
+/// (`library::MAX_PENDING`) by 15 complete entries of views of no binding here, every other one
+/// ended. Returns the bytes written.
+fn seed_full(locks: &Path, id: &str) -> Vec<u8> {
+    seed_packet(locks, id);
+    let path = locks.join(format!("{id}.handover"));
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let pending = v["handover"]["pending"].as_array_mut().unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    for i in 1..16u64 {
+        pending.push(json!({"id": format!("00000000002040{i:02x}"),
+            "from": format!("{}:x{i}", format!("{i:x}").repeat(64).get(..64).unwrap()),
+            "since": 1000 + i, "ended": i % 2 == 0}));
+    }
+    let bytes = v.to_string().into_bytes();
+    std::fs::write(&path, &bytes).unwrap();
+    bytes
+}
+
+/// R93-01 (run 204): the handover record already lists the most views it can (16, valid): B's
+/// view m1, which A's view took the editing from, and 15 others; A's editing view itself has no
+/// entry. A's confirmed Close can't clear the editing record (its write put back exactly;
+/// nothing else fails), and the record has no room for an ended entry for A's view. A does
+/// nothing more. Then B's m1 takes the editing back (Edit here, which first removes its own
+/// entry) and polls. A's view must never come back as a view B waits for: A's process keeps the
+/// canvas locked (B is told it is held, its Edit here refused, nothing in the record changed),
+/// and says so; a list in A's process that can't record it either says that, changing nothing;
+/// one that can records it and lets the canvas go (`cleanup`). Then B takes the editing, waits
+/// for none of A's views, and every other entry, offer, recovery and receipt is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r204_a_close_whose_departure_doesnt_fit_a_full_record_never_leaves_it_waited_for() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Full", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    let editor = || std::fs::read_to_string(locks.join(format!("{id}.editor"))).unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    // B opens the canvas, and its view m1 takes the editing.
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let b_view = editor();
+    // A's view then takes it (the newest view edits): B's m1 is waited for, A's view isn't.
+    let read_a = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let a_view = editor();
+    let a_tok = a_view.split(':').next().unwrap().to_string();
+    assert_eq!(
+        a_view,
+        format!("{a_tok}:m{}", read_a["mount"].as_u64().unwrap())
+    );
+    let seeded = seed_full(&locks, &id);
+    let before = packet(Some(seeded.clone()));
+    let pending0 = before["pending"].as_array().unwrap().clone();
+    assert_eq!(pending0.len(), 16);
+    assert_eq!(
+        (&pending0[0]["from"], &pending0[0]["ended"]),
+        (&json!(b_view), &json!(false))
+    );
+    assert!(
+        pending0
+            .iter()
+            .all(|p| !p["from"].as_str().unwrap().starts_with(&a_tok))
+    );
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let files0 = files(&dir, &page);
+    let closed = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        value(call(&a.c, app::CLOSE, json!({"binding": ba, "force": true})).await)
+    };
+    // A does nothing more. B's view takes the editing back, then polls.
+    let claim_b = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb})).await;
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after = packet(handover());
+    let a_live = after["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ended"] == false && p["from"].as_str().unwrap().starts_with(&a_tok))
+        .count();
+    let note = closed["cleanup"]["note"].as_str().unwrap_or("").to_string();
+    let outcome = json!({
+        "closed": closed["action"],
+        "cleanup_status": closed["cleanup"]["cleanup_status"],
+        "says_no_view_waits": note.contains("no view waits"),
+        "b_claim_status": claim_b.as_ref().err().map(|e| refusal(e)["status"].clone()),
+        "a_views_waited_for": a_live,
+        "b_told_held": polled["handover"]["held"],
+        "record_unchanged": handover() == Some(seeded.clone()),
+    });
+    assert_eq!(
+        outcome,
+        json!({"closed": "closed", "cleanup_status": 500, "says_no_view_waits": false,
+            "b_claim_status": 503, "a_views_waited_for": 0, "b_told_held": true,
+            "record_unchanged": true}),
+        "{closed} {after}"
+    );
+    assert!(
+        note.contains("can't wait for more views")
+            && note.contains("keeps the canvas locked until it records"),
+        "{note}"
+    );
+    assert_eq!(editor(), a_view, "the editing record was put back");
+    assert_eq!(files(&dir, &page), files0);
+    // A's closed binding acts no more (refused, nothing changed).
+    let e = call(
+        &a.c,
+        app::CANVAS_REVISION,
+        json!({"binding": ba, "mount": read_a["mount"]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("Nothing was changed"), "{e}");
+    // A's home lists the library while the record still can't be written: said, nothing
+    // changed, the canvas still held.
+    let listed = {
+        let _sync = Point::arm(&locks, "record_sync", false);
+        value(call(&a.c, app::LIST, json!({})).await)
+    };
+    let mine = |l: &Value| -> Vec<Value> {
+        l["cleanup"]
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .filter(|x| x["canvas"] == json!(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], false, "{listed}");
+    assert!(
+        mine(&listed)[0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("keeps the canvas locked"),
+        "{listed}"
+    );
+    assert_eq!(handover(), Some(seeded.clone()));
+    assert_eq!(editor(), a_view);
+    assert_eq!(files(&dir, &page), files0);
+    let e = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    // The model's list in A's process once it can: recorded (the editing record names nobody
+    // of A), the canvas let go, and said.
+    let listed = value(call(&a.c, app::AGENT_LIST, json!({})).await);
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], true, "{listed}");
+    assert!(
+        listed["canvases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == json!(id))
+    );
+    assert_eq!(files(&dir, &page), files0, "the drawing is untouched");
+    // B takes the editing back now and waits for none of A's views.
+    call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap();
+    assert_eq!(editor(), b_view);
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    assert_eq!(polled["handover"]["held"], false, "{polled}");
+    // The whole record: B's own entry gone (it edits again), the 15 others exactly as they
+    // were, no entry of A's; offers, recovery and receipt as they were.
+    let after = packet(handover());
+    let mut want = before.clone();
+    want["pending"].as_array_mut().unwrap().remove(0);
+    assert_eq!(after, want);
+    assert_eq!(
+        polled["handover"]["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>(),
+        after["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(polled["handover"]["resolved"], after["resolved"]);
+    assert_eq!(files(&dir, &page), files0);
+    task_b.abort();
+}
+
+/// R93-02 (run 204): both public library lists (the model's and the home's) say what they may
+/// write: before listing they may finish this window's own bookkeeping of canvases it closed
+/// (their editing and handover records) and let go of one it still kept locked for that; they
+/// never change a drawing. The catalogue says so (the model's list isn't marked read-only), and
+/// so does every list result. A canvas whose writes are fenced is listed as still kept locked,
+/// with why, and nothing of it changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r204_the_library_lists_say_what_they_may_write() {
+    let t = TwoMounts::new().await;
+    let tools: Vec<Value> =
+        t.a.c
+            .peer
+            .list_all_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| serde_json::to_value(t).unwrap())
+            .collect();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).cloned().unwrap();
+    let model = tool(app::AGENT_LIST);
+    assert_eq!(model["annotations"]["readOnlyHint"], false, "{model}");
+    assert_eq!(model["annotations"]["destructiveHint"], false, "{model}");
+    for t in [model, tool(app::LIST)] {
+        let d = t["description"].as_str().unwrap();
+        assert!(!d.to_lowercase().contains("read-only"), "{d}");
+        assert!(
+            d.contains("editing and handover records")
+                && d.contains("lets go")
+                && d.contains("never changes a drawing"),
+            "{d}"
+        );
+    }
+    // A Close whose cleanup is fenced: its canvas stays locked by this process.
+    let editor0 = t.record();
+    let handover0 = t.handover();
+    let files0 = files(&t.dir, &t.page);
+    {
+        let _sync = Point::arm(&t.locks(), "record_sync", false);
+        let _handover = Point::arm(&t.locks(), "handover_sync", false);
+        let _restore = Point::arm(&t.locks(), "handover_restore", false);
+        value(call(&t.a.c, app::CLOSE, json!({"binding": t.ba, "force": true})).await);
+    }
+    let uncertain = t.handover();
+    for list in [app::LIST, app::AGENT_LIST] {
+        let listed = value(call(&t.a.c, list, json!({})).await);
+        let note = listed["note"].as_str().unwrap();
+        assert!(
+            note.contains("never changes a drawing") && note.contains("cleanup"),
+            "{list}: {note}"
+        );
+        let kept: Vec<_> = listed["cleanup"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["canvas"] == json!(t.id))
+            .collect();
+        assert_eq!(kept.len(), 1, "{list}: {listed}");
+        assert_eq!(kept[0]["done"], false);
+        assert!(
+            kept[0]["note"].as_str().unwrap().contains("either version"),
+            "{list}: {listed}"
+        );
+        assert_eq!(t.record(), editor0, "{list}");
+        assert_eq!(t.handover(), uncertain, "{list}");
+        assert_eq!(files(&t.dir, &t.page), files0, "{list}");
+        assert!(t.busy_elsewhere(), "{list}");
+    }
+    let _ = handover0;
+}
+
+/// R94-01 (run 205): the same full record as R93-01 (B's view m1, which A's view took the
+/// editing from, and 15 others; A's editing view has no entry), and A's confirmed Close. Reading
+/// the editing record fails once (an I/O error, not NotFound: the record is there, valid and
+/// unchanged; nothing else fails), so the Close can't tell whether it still names A's view. A
+/// does nothing more. That isn't taken as "A is gone": A's process keeps the canvas locked (the
+/// real cause said, `403`), so B's m1, taking the editing back, is refused (`503`, told the
+/// canvas is held) and never waits for A's closed view; nothing in either record changes. A's
+/// home list that still can't read the record says so; A's model list that can records it and
+/// lets go. Then B takes the editing and waits for none of A's views, every other entry, offer,
+/// recovery and receipt as it was, the drawing untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r205_a_close_that_cant_read_the_editing_record_never_leaves_its_view_waited_for() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Read", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    let editor_path = locks.join(format!("{id}.editor"));
+    let editor = || std::fs::read_to_string(&editor_path).unwrap();
+    let handover = || std::fs::read(locks.join(format!("{id}.handover"))).ok();
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let b_view = editor();
+    let read_a = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let a_view = editor();
+    let a_tok = a_view.split(':').next().unwrap().to_string();
+    assert_eq!(
+        a_view,
+        format!("{a_tok}:m{}", read_a["mount"].as_u64().unwrap())
+    );
+    let seeded = seed_full(&locks, &id);
+    let before = packet(Some(seeded.clone()));
+    let pending0 = before["pending"].as_array().unwrap().clone();
+    assert_eq!(pending0.len(), 16);
+    assert_eq!(
+        (&pending0[0]["from"], &pending0[0]["ended"]),
+        (&json!(b_view), &json!(false))
+    );
+    assert!(
+        pending0
+            .iter()
+            .all(|p| !p["from"].as_str().unwrap().starts_with(&a_tok))
+    );
+    let editor0 = std::fs::read(&editor_path).unwrap();
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let files0 = files(&dir, &page);
+    let closed = {
+        let mut read = Point::arm(&locks, "editor_read", false);
+        let closed = value(call(&a.c, app::CLOSE, json!({"binding": ba, "force": true})).await);
+        read.reached().await;
+        closed
+    };
+    assert_eq!(
+        std::fs::read(&editor_path).unwrap(),
+        editor0,
+        "the record is as it was"
+    );
+    // A does nothing more. B's view takes the editing back, then polls.
+    let claim_b = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb})).await;
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after = packet(handover());
+    let a_live = after["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ended"] == false && p["from"].as_str().unwrap().starts_with(&a_tok))
+        .count();
+    let note = closed["cleanup"]["note"].as_str().unwrap_or("").to_string();
+    let outcome = json!({
+        "closed": closed["action"],
+        "cleanup_status": closed["cleanup"]["cleanup_status"],
+        "says_the_read_failed": note.contains("injected read failure"),
+        "b_claim_status": claim_b.as_ref().err().map(|e| refusal(e)["status"].clone()),
+        "a_views_waited_for": a_live,
+        "b_told_held": polled["handover"]["held"],
+        "record_unchanged": handover() == Some(seeded.clone()),
+        "editor_unchanged": std::fs::read(&editor_path).unwrap() == editor0,
+    });
+    assert_eq!(
+        outcome,
+        json!({"closed": "closed", "cleanup_status": 403, "says_the_read_failed": true,
+            "b_claim_status": 503, "a_views_waited_for": 0, "b_told_held": true,
+            "record_unchanged": true, "editor_unchanged": true}),
+        "{closed} {after}"
+    );
+    assert!(
+        note.contains("keeps the canvas locked until it can read")
+            && !note.contains("no view waits"),
+        "{note}"
+    );
+    assert_eq!(files(&dir, &page), files0);
+    // A's closed binding acts no more (refused, nothing changed).
+    let e = call(
+        &a.c,
+        app::CANVAS_REVISION,
+        json!({"binding": ba, "mount": read_a["mount"]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("Nothing was changed"), "{e}");
+    // A's home list while the record still can't be read: said, nothing changed, still held.
+    let mine = |l: &Value| -> Vec<Value> {
+        l["cleanup"]
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .filter(|x| x["canvas"] == json!(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let listed = {
+        let mut read = Point::arm(&locks, "editor_read", false);
+        let listed = value(call(&a.c, app::LIST, json!({})).await);
+        read.reached().await;
+        listed
+    };
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], false, "{listed}");
+    assert!(
+        mine(&listed)[0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("injected read failure"),
+        "{listed}"
+    );
+    assert_eq!(handover(), Some(seeded.clone()));
+    assert_eq!(std::fs::read(&editor_path).unwrap(), editor0);
+    assert_eq!(files(&dir, &page), files0);
+    let e = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    // A's model list once it can read it: the record names nobody of A any more, the canvas
+    // let go, and said.
+    let listed = value(call(&a.c, app::AGENT_LIST, json!({})).await);
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], true, "{listed}");
+    assert_eq!(files(&dir, &page), files0, "the drawing is untouched");
+    // B takes the editing back now and waits for none of A's views.
+    call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap();
+    assert_eq!(editor(), b_view);
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    assert_eq!(polled["handover"]["held"], false, "{polled}");
+    let after = packet(handover());
+    let mut want = before.clone();
+    want["pending"].as_array_mut().unwrap().remove(0);
+    assert_eq!(after, want);
+    assert_eq!(
+        polled["handover"]["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>(),
+        after["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(polled["handover"]["resolved"], after["resolved"]);
+    assert_eq!(files(&dir, &page), files0);
+    task_b.abort();
+}
+
+/// LEAD205-01 (run 206): A's first view m1 is already waited for (B's view took the editing
+/// from it), and B's view is waited for in turn (A's second view took it back), beside three
+/// complete entries of other windows' views, the seeded offers, kept recovery and receipt. A's
+/// confirmed Close clears the editing record, then reading the handover record fails once (an
+/// I/O error, not NotFound: the record is there, valid and unchanged). That isn't taken as "no
+/// claim can wait on it": A's m1 entry couldn't be ended, so A's process keeps the canvas
+/// locked (the real cause said, `403`), B is told it is held and refused (`503`), and the
+/// handover record stays exactly as it was. A does nothing more. A's home list that still can't
+/// read it says so; A's model list that can records it (only A's m1 entry ended) and lets go.
+/// B then takes the editing and waits for none of A's views; everything else is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r206_a_close_that_cant_read_the_handover_record_never_leaves_its_view_waited_for() {
+    let a = library().await;
+    let created = value(call(&a.c, app::CREATE, json!({"name": "Wait", "panel": true})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let locks = a.root.join("library/v1/locks");
+    let ba = binding(&created);
+    let editor_path = locks.join(format!("{id}.editor"));
+    let editor = || std::fs::read_to_string(&editor_path).ok();
+    let handover_path = locks.join(format!("{id}.handover"));
+    let handover = || std::fs::read(&handover_path).ok();
+    // A's m1 edits; B's view takes it (m1 waited for); A's m2 takes it back (B's waited for).
+    let one = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    let a_m1 = editor().unwrap();
+    let a_tok = a_m1.split(':').next().unwrap().to_string();
+    assert_eq!(a_m1, format!("{a_tok}:m{}", one["mount"].as_u64().unwrap()));
+    let (_lb, b, task_b) = launch(&a.root).await;
+    let opened = value(call(&b, app::OPEN, json!({"id": id, "panel": true})).await);
+    let bb = binding(&opened);
+    let read_b = value(call(&b, app::CANVAS, json!({"binding": bb})).await);
+    let mb = read_b["mount"].as_u64().unwrap();
+    let b_view = editor().unwrap();
+    let two = value(call(&a.c, app::CANVAS, json!({"binding": ba})).await);
+    assert_eq!(
+        editor().unwrap(),
+        format!("{a_tok}:m{}", two["mount"].as_u64().unwrap())
+    );
+    // The seeded offers, recovery and receipt, and three complete entries of other windows.
+    seed_packet(&locks, &id);
+    let mut v: Value = serde_json::from_slice(&handover().unwrap()).unwrap();
+    for i in 1..4u64 {
+        v["handover"]["pending"].as_array_mut().unwrap().push(
+            json!({"id": format!("00000000002060{i:02x}"),
+                "from": format!("{}:x{i}", format!("{i:x}").repeat(64).get(..64).unwrap()),
+                "since": 3000 + i, "ended": i == 2}),
+        );
+    }
+    std::fs::write(&handover_path, v.to_string()).unwrap();
+    let seeded = handover().unwrap();
+    let before = packet(Some(seeded.clone()));
+    let froms: Vec<(String, bool)> = before["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["from"].as_str().unwrap().to_string(),
+                p["ended"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(froms.len(), 5, "{froms:?}");
+    assert_eq!(froms[0], (a_m1.clone(), false), "A's m1 is waited for");
+    assert_eq!(froms[1], (b_view.clone(), false), "B's view is waited for");
+    let page = read_b["active_page"].as_str().unwrap().to_string();
+    let files0 = files(&dir, &page);
+    let closed = {
+        let mut read = Point::arm(&locks, "handover_read", false);
+        let closed = value(call(&a.c, app::CLOSE, json!({"binding": ba, "force": true})).await);
+        read.reached().await;
+        closed
+    };
+    // (Clearing the editing record before it is legitimate: it names nobody now.)
+    assert_eq!(editor(), None, "the editing record was cleared");
+    // A does nothing more. B's view takes the editing, then polls.
+    let claim_b = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb})).await;
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    let after = packet(handover());
+    let a_live = after["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["ended"] == false && p["from"].as_str().unwrap().starts_with(&a_tok))
+        .count();
+    let note = closed["cleanup"]["note"].as_str().unwrap_or("").to_string();
+    let lease_held = || {
+        let other = Library::open(a.root.to_str().unwrap()).unwrap();
+        matches!(
+            Lease::acquire(&other, &id),
+            Err(crate::library::LeaseError::Busy)
+        )
+    };
+    let outcome = json!({
+        "closed": closed["action"],
+        "cleanup_status": closed["cleanup"]["cleanup_status"],
+        "says_the_read_failed": note.contains("injected read failure"),
+        "says_no_view_can_wait": note.contains("no view can wait"),
+        "b_claim_status": claim_b.as_ref().err().map(|e| refusal(e)["status"].clone()),
+        "a_views_waited_for": a_live,
+        "b_told_held": polled["handover"]["held"],
+        "lease_held": lease_held(),
+        "record_unchanged": handover() == Some(seeded.clone()),
+    });
+    assert_eq!(
+        outcome,
+        json!({"closed": "closed", "cleanup_status": 403, "says_the_read_failed": true,
+            "says_no_view_can_wait": false, "b_claim_status": 503, "a_views_waited_for": 1,
+            "b_told_held": true, "lease_held": true, "record_unchanged": true}),
+        "{closed} {after}"
+    );
+    // (A's m1 is still in the record, unended, only because the record is held untouched: B is
+    // told it is held, never that m1 may answer, and can't take the editing to rely on it.)
+    assert!(note.contains("keeps the canvas locked"), "{note}");
+    assert_eq!(editor(), None);
+    assert_eq!(files(&dir, &page), files0);
+    // A's closed binding acts no more (refused, nothing changed).
+    let e = call(
+        &a.c,
+        app::CANVAS_REVISION,
+        json!({"binding": ba, "mount": two["mount"]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("Nothing was changed"), "{e}");
+    // A's home list while the record still can't be read: said, nothing changed, still held.
+    let mine = |l: &Value| -> Vec<Value> {
+        l["cleanup"]
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .filter(|x| x["canvas"] == json!(id))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let listed = {
+        let mut read = Point::arm(&locks, "handover_read", false);
+        let listed = value(call(&a.c, app::LIST, json!({})).await);
+        read.reached().await;
+        listed
+    };
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], false, "{listed}");
+    assert!(
+        mine(&listed)[0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("injected read failure"),
+        "{listed}"
+    );
+    assert_eq!(handover(), Some(seeded.clone()));
+    assert!(lease_held());
+    let e = call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 503, "{e}");
+    // A's model list once it can read it: A's m1 ended, the canvas let go, said.
+    let listed = value(call(&a.c, app::AGENT_LIST, json!({})).await);
+    assert_eq!(mine(&listed).len(), 1, "{listed}");
+    assert_eq!(mine(&listed)[0]["done"], true, "{listed}");
+    let mut want = before.clone();
+    want["pending"][0]["ended"] = json!(true);
+    assert_eq!(packet(handover()), want, "only A's m1 entry changed");
+    assert!(!lease_held());
+    // B takes the editing now: its own entry goes, none of A's views is waited for.
+    call(&b, app::CLAIM, json!({"binding": bb, "mount": mb}))
+        .await
+        .unwrap();
+    assert_eq!(editor(), Some(b_view.clone()));
+    let polled = value(
+        call(
+            &b,
+            app::CANVAS_REVISION,
+            json!({"binding": bb, "mount": mb}),
+        )
+        .await,
+    );
+    assert_eq!(polled["handover"]["held"], false, "{polled}");
+    let after = packet(handover());
+    want["pending"].as_array_mut().unwrap().remove(1);
+    assert_eq!(after, want);
+    assert!(
+        after["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !p["from"].as_str().unwrap().starts_with(&a_tok) || p["ended"] == true)
+    );
+    assert_eq!(
+        polled["handover"]["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>(),
+        after["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["id"].clone(), p["since"].clone(), p["ended"].clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(polled["handover"]["resolved"], after["resolved"]);
+    assert_eq!(files(&dir, &page), files0);
+    task_b.abort();
+}
+
+/// R78-02: once a save and its rollback both failed (`Broken`), the canvas's exclusive lease
+/// stays held for as long as the binding lives: a canvas read (the editors' snapshot), a
+/// saved export and a read that fails all leave another process unable to take it, and the
+/// files the failed rollback left are not changed by them.
+#[tokio::test]
+async fn a_broken_rollback_keeps_the_lease_through_reads_and_exports() {
+    let t = TwoMounts::new().await;
+    let server = t.server().await;
+    assert!(!t.busy_elsewhere(), "between writes the lease is free");
+    // The manifest's rename fails, and putting the page back fails too (one thread: the
+    // commit runs on this test's thread, where the fault is armed).
+    crate::commit::fault::fail_at(&[3, 4]);
+    let r = server
+        .save_canvas_within(
+            std::time::Duration::from_secs(5),
+            None,
+            Some(&format!("m{}", t.m2)),
+            t.revision.as_str().unwrap(),
+            &t.change,
+        )
+        .await;
+    crate::commit::fault::fail_at(&[]);
+    assert!(r.is_err(), "the save failed");
+    assert!(crate::refuse_if_broken(&server.broken).is_err(), "Broken");
+    let left = tree(&t.dir);
+    assert!(t.busy_elsewhere(), "the failed rollback keeps the lease");
+    // A canvas read, a saved export: the lease stays held, the files as they are.
+    let _ = server.canvas().await;
+    assert!(t.busy_elsewhere(), "after a canvas read");
+    let _ = server.saved_snapshot().await;
+    assert!(t.busy_elsewhere(), "after an export");
+    let _ = value(
+        call(
+            &t.a.c,
+            app::CANVAS_REVISION,
+            json!({"binding": t.ba, "mount": t.m1}),
+        )
+        .await,
+    );
+    assert_eq!(tree(&t.dir), left, "nothing changed by the reads");
+    // A read that fails after it took its hold (a page file that can't be read).
+    let page_file = t.dir.join("pages").join(format!("{}.json", t.page));
+    let bytes = std::fs::read(&page_file).unwrap();
+    std::fs::remove_file(&page_file).unwrap();
+    std::fs::create_dir(&page_file).unwrap();
+    assert!(server.canvas().await.is_err(), "the read failed");
+    assert!(t.busy_elsewhere(), "after a failed read");
+    std::fs::remove_dir(&page_file).unwrap();
+    std::fs::write(&page_file, bytes).unwrap();
+    // No claim or record change either.
+    let e = call(&t.a.c, app::CLAIM, json!({"binding": t.ba, "mount": t.m1}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("writes are disabled"), "{e}");
+    assert!(t.busy_elsewhere());
+}
+
+/// The renderer parts: fixed packaged bytes only, numbered from 0, strictly whole numbers, each
+/// naming the same identity, size and count; anything else is refused and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_renderer_parts_are_bounded_strict_and_complete() {
+    let lib = library().await;
+    let identity = crate::etag(&super::FIXTURE_WASM);
+    let mut joined = String::new();
+    for part in 0..3u64 {
+        let v = value(call(&lib.c, app::ASSET, json!({"part": part})).await);
+        let start = part as usize * app::PART_BYTES;
+        let end = (start + app::PART_BYTES).min(super::FIXTURE_WASM.len());
+        assert_eq!(v["asset"], "openpaperdesign_web_bg.wasm");
+        assert_eq!(v["identity"], json!(identity));
+        assert_eq!(v["bytes"], json!(super::FIXTURE_WASM.len()));
+        assert_eq!(v["parts"], 3);
+        assert_eq!(v["part"], json!(part));
+        assert_eq!(v["offset"], json!(start));
+        assert_eq!(v["part_bytes"], json!(end - start));
+        assert_eq!(v["data"], json!(base64(&super::FIXTURE_WASM[start..end])));
+        joined.push_str(v["data"].as_str().unwrap());
+    }
+    assert!(!joined.is_empty());
+    for args in [
+        json!({"part": 3}),
+        json!({"part": 64}),
+        json!({"part": -1}),
+        json!({"part": 1.5}),
+        json!({"part": 1.0}),
+        json!({"part": "1"}),
+        json!({"part": null}),
+        json!({}),
+        json!({"part": 0, "path": "/etc/passwd"}),
+        json!({"part": 0, "binding": "0123456789abcdef.1"}),
+    ] {
+        let e = call(&lib.c, app::ASSET, args.clone()).await.unwrap_err();
+        assert!(
+            e.contains("unexpected argument")
+                || e.contains("no renderer part")
+                || e.contains("is required"),
+            "{args}: {e}"
+        );
+    }
+    // The pure part function: its bounds.
+    assert!(app::asset_part(&[], "x", 0).is_err());
+    assert!(app::asset_part(&vec![0; app::MAX_ASSET_BYTES + 1], "x", 0).is_err());
+    let exact = vec![1u8; app::PART_BYTES * 2];
+    assert_eq!(
+        app::asset_part(&exact, "x", 1).unwrap()["part_bytes"],
+        json!(app::PART_BYTES)
+    );
+    assert!(
+        app::asset_part(&exact, "x", 2).is_err(),
+        "no empty last part"
+    );
+    // Revision 23: the renderer bound is 18 MiB for the bundled fonts (it was 16 MiB); the
+    // part size, the panel message bound and the host allowance stay as they were.
+    assert_eq!(app::MAX_ASSET_BYTES, 18 * 1024 * 1024);
+    assert_eq!(
+        (app::PART_BYTES, app::MAX_PANEL_MESSAGE, app::HOST_OVERHEAD),
+        (256 * 1024, 4 * 1024 * 1024, 16 * 1024)
+    );
+    let largest = vec![2u8; app::MAX_ASSET_BYTES];
+    let last = app::asset_part(&largest, "x", 71).unwrap();
+    assert_eq!(
+        (last["parts"].clone(), last["part"].clone()),
+        (json!(72), json!(71))
+    );
+    assert_eq!(last["part_bytes"], json!(app::PART_BYTES));
+    assert!(app::asset_part(&largest, "x", 72).is_err(), "no part 72");
+    // Just past the old bound is sent now; one byte past the new one isn't.
+    let past_old = vec![3u8; 16 * 1024 * 1024 + 1];
+    assert_eq!(
+        app::asset_part(&past_old, "x", 64).unwrap()["part_bytes"],
+        json!(1)
+    );
+    let e = app::asset_part(&vec![4u8; app::MAX_ASSET_BYTES + 1], "x", 0).unwrap_err();
+    assert!(e.contains("18874368"), "{e}");
+    // The view's schema offers exactly those parts.
+    let tool = app::listed_tools()
+        .into_iter()
+        .find(|t| t.name == app::ASSET)
+        .unwrap();
+    let schema = Value::Object((*tool.input_schema).clone());
+    assert_eq!(schema["properties"]["part"]["maximum"], json!(71));
+    // Nothing was bound, locked or created for any of it.
+    assert!(lib.l.state.lock().await.bound.is_none());
+    assert!(!lib.root.join("library").exists());
+}
+
+/// Page messages are bounded for the panel separately from the 64 MiB page limit, counting
+/// JSON escaping: a page too large to send isn't opened here, and a save too large isn't sent
+/// on; neither changes a file. Bad, missing or extra arguments are refused before anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_messages_are_bounded_and_arguments_strict() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Big", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    // Mostly quotes: under the limit as bytes, over it once escaped.
+    let quoted = "\"".repeat(app::MAX_PANEL_MESSAGE / 2 + 16);
+    assert!(quoted.len() < app::MAX_PANEL_MESSAGE);
+    let before = files(&dir, &page);
+    let e = call(
+        &lib.c,
+        app::SAVE,
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": quoted}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    // A page file too large for the panel: refused, unread by the editor, untouched.
+    let big = format!("{}{}", text, " ".repeat(app::MAX_PANEL_MESSAGE));
+    std::fs::write(dir.join("pages").join(format!("{page}.json")), &big).unwrap();
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": page, "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("browser editor")
+    );
+    assert_eq!(
+        std::fs::read(dir.join("pages").join(format!("{page}.json"))).unwrap(),
+        big.as_bytes()
+    );
+    for (tool, args) in [
+        (app::PAGE, json!({})),
+        (app::PAGE, json!({"binding": b, "page_id": page})),
+        (app::PAGE, json!({"binding": b, "mount": mount})),
+        (app::PAGE, json!({"binding": b, "extra": 1})),
+        (app::PAGE, json!({"binding": "not-a-binding"})),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": "1"}),
+        ),
+        (
+            app::REVISION,
+            json!({"binding": b, "page_id": page, "mount": 1.0}),
+        ),
+        (app::REVISION, json!({"binding": b, "page_id": page})),
+        (
+            app::SAVE,
+            json!({"binding": b, "page_id": page, "mount": mount, "text": "{}"}),
+        ),
+        (app::READY, json!({"binding": b, "mount": -1})),
+        (
+            app::RELEASE,
+            json!({"binding": b, "mount": mount, "force": true}),
+        ),
+    ] {
+        let e = call(&lib.c, tool, args.clone()).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 400, "{tool} {args}: {e}");
+    }
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// Stale views: another binding's, a released mount, a canvas whose lease broke, a process that
+/// shut down: each is refused before anything is read or written. A workspace process refuses
+/// the new tool names like the other library actions, without admission or state change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_refuses_stale_bindings_broken_leases_shutdown_and_workspace_processes() {
+    let lib = library().await;
+    let one = value(call(&lib.c, app::CREATE, json!({"name": "One", "panel": true})).await);
+    let b1 = binding(&one);
+    let (_, m1, _, _) = first_read(&lib.c, &b1).await;
+    value(call(&lib.c, app::RELEASE, json!({"binding": b1, "mount": m1})).await);
+    // Switching needs no confirmation once no editor is mounted and no link was given.
+    let two = value(call(&lib.c, app::CREATE, json!({"name": "Two", "panel": true})).await);
+    let b2 = binding(&two);
+    let e = call(&lib.c, app::PAGE, json!({"binding": b1}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "the old binding: {e}");
+    let (page, m2, _, _) = first_read(&lib.c, &b2).await;
+    // With an editor mounted, a switch asks first.
+    let e = call(&lib.c, app::CREATE, json!({"name": "Three", "panel": true}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("force: true") && e.contains(&b2), "{e}");
+    // The lease file is replaced: the canvas is fenced and closed, nothing read.
+    let dir = location(&two);
+    let id2 = two["canvas"]["id"].as_str().unwrap();
+    let lock = lib.root.join(format!("library/v1/locks/{id2}.lock"));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    let e = call(
+        &lib.c,
+        app::REVISION,
+        json!({"binding": b2, "page_id": page, "mount": m2}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert!(
+        lib.l.state.lock().await.bound.is_none(),
+        "the canvas was closed"
+    );
+    assert!(dir.join("project.json").is_file(), "its files stay");
+    // After shutdown nothing is answered from a binding.
+    lib.l.shutdown().await;
+    let e = call(&lib.c, app::PAGE, json!({"binding": b2}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    // A workspace process.
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    for tool in app::PANEL_TOOLS {
+        let e = call(&c, tool, json!({"binding": b2, "part": 0}))
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("wasn't started for the app library"),
+            "{tool}: {e}"
+        );
+    }
+    let st = l.state.lock().await;
+    assert!(st.invalidated.is_none() && st.workspace.is_none() && st.bound.is_none());
+    drop(st);
+    task.abort();
+}
+
+/// The writer fence: a save that can't start in time, or whose caller stopped waiting before it
+/// started (the tool's request cancelled), never runs; a started save finishes its commit even
+/// while Close retires the binding, and Close waits for it; afterwards the retained server
+/// refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_saves_queue_boundedly_and_a_started_save_drains_through_close() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Fence", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let server = bound_server(&lib.l).await;
+    let before = files(&dir, &page);
+    let body = edited(&text);
+    // Expired while queued.
+    let held = server.lifecycle.write.clone().lock_owned().await;
+    let e = server
+        .save_page_within(Duration::from_millis(50), None, None, &page, &rev, &body)
+        .await
+        .expect_err("refused");
+    assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(e.msg.contains("could not start in time"), "{}", e.msg);
+    // The tool's request cancelled while queued.
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    let e = lib
+        .l
+        .panel_call(app::SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(
+        refusal(&e)["error"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled before it started"),
+        "{e}"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(files(&dir, &page), before, "neither queued save ran");
+    // A started save, paused inside its transaction, while Close retires the binding.
+    let mut started = Point::arm(&dir, "save_started", true);
+    let c = lib.c.clone();
+    let saving = tokio::spawn(async move { call(&c, app::SAVE, args).await });
+    started.reached().await;
+    // Leaving the editor: its mount is revoked at once; the release itself is acknowledged
+    // only after the started save (so it is spawned, not awaited, here).
+    let c = lib.c.clone();
+    let b1 = b.clone();
+    let releasing = tokio::spawn(async move {
+        call(&c, app::RELEASE, json!({"binding": b1, "mount": mount})).await
+    });
+    mount_revoked(&lib.l, mount).await;
+    let c = lib.c.clone();
+    let b2 = b.clone();
+    let closing = tokio::spawn(async move { call(&c, app::CLOSE, json!({"binding": b2})).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !releasing.is_finished(),
+        "the release waits for the started save"
+    );
+    assert!(!closing.is_finished(), "Close waits for the started save");
+    started.resume();
+    let saved = value(bounded(saving).await.unwrap());
+    assert_eq!(
+        saved["saved"], true,
+        "the started save finished and says so"
+    );
+    assert_eq!(value(bounded(releasing).await.unwrap())["released"], true);
+    value(bounded(closing).await.unwrap());
+    let after = files(&dir, &page);
+    assert_eq!(saved["revision"], json!(crate::etag(&after.0)));
+    assert_eq!(node_count(std::str::from_utf8(&after.0).unwrap()), 1);
+    // The retained server is retired: a late save is refused, unwritten.
+    let e = server
+        .save_page(
+            &page,
+            &crate::etag(&after.0),
+            &edited(std::str::from_utf8(&after.0).unwrap()),
+        )
+        .await
+        .expect_err("refused");
+    assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(server.page(Some(&page)).is_err(), "and reads nothing");
+    assert_eq!(files(&dir, &page), after);
+}
+
+/// Wait (bounded) until `mount` is no longer one of the open binding's mounts.
+async fn mount_revoked(l: &Launcher, mount: u64) {
+    for _ in 0..1000 {
+        let gone = !l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .is_some_and(|b| b.mounts.contains_key(&mount));
+        if gone {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("mount {mount} was not revoked");
+}
+
+/// R8 F1, adapted from the independent reviewer's diagnostic (Codex review work): a release
+/// revokes its mount at once. A save of that mount admitted earlier, still waiting for the
+/// writer fence, then never runs (no page or manifest change), and the release is acknowledged
+/// only once the fence is free. The binding itself stays open: Back isn't Close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_release_revokes_a_queued_save_before_it_can_start() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Queue", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let server = bound_server(&lib.l).await;
+    let before = files(&dir, &page);
+    let held = server.lifecycle.write.clone().lock_owned().await;
+    let mut queued = Point::arm(&dir, "browser_queued", false);
+    let c = lib.c.clone();
+    let body = edited(&text);
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    let saving = tokio::spawn(async move { call(&c, app::SAVE, args).await });
+    queued.reached().await;
+    let c = lib.c.clone();
+    let b1 = b.clone();
+    let releasing = tokio::spawn(async move {
+        call(&c, app::RELEASE, json!({"binding": b1, "mount": mount})).await
+    });
+    mount_revoked(&lib.l, mount).await;
+    assert!(
+        !releasing.is_finished(),
+        "acknowledged only once the writer fence is free"
+    );
+    drop(held);
+    let result = bounded(saving).await.unwrap();
+    assert_eq!(value(bounded(releasing).await.unwrap())["released"], true);
+    let e = result.expect_err("a released queued save must never execute");
+    assert_eq!(refusal(&e)["status"], 410, "{e}");
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "neither page nor manifest changed"
+    );
+    assert!(
+        lib.l.state.lock().await.bound.is_some(),
+        "the canvas stays open"
+    );
+    server.retire().await;
+}
+
+/// R8 F2, adapted from the independent reviewer's diagnostic (Codex review work): a save whose
+/// request is cancelled while it waits for admission (the launcher's state) is refused and
+/// never starts, even though the writer fence is free once the state is; an already
+/// cancelled save never takes a free fence either. Not cancelled, the same save is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_cancelled_save_never_starts_from_admission_or_a_free_fence() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Cancel", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    let body = edited(&text);
+    let args =
+        json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": body});
+    // Cancelled while it waits for the state.
+    let held = lib.l.state.clone().lock_owned().await;
+    let l = lib.l.clone();
+    let a = args.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let saving = tokio::spawn(async move {
+        l.panel_call(app::SAVE, &a, async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tx.send(()).unwrap();
+    let e = bounded(saving).await.unwrap().unwrap_err();
+    drop(held);
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!(files(&dir, &page), before);
+    // Already cancelled, with the state and the writer fence both free.
+    let e = lib
+        .l
+        .panel_call(app::SAVE, &args, async {})
+        .await
+        .unwrap_err();
+    assert!(e.contains("cancelled before it started"), "{e}");
+    assert_eq!(
+        files(&dir, &page),
+        before,
+        "no fence taken, nothing written"
+    );
+    // The control: the same save, not cancelled, is written.
+    let saved = value(
+        lib.l
+            .panel_call(app::SAVE, &args, std::future::pending::<()>())
+            .await,
+    );
+    assert_eq!(saved["saved"], true);
+    assert_ne!(files(&dir, &page), before);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// A page file whose node name is `quotes` quote characters (each escaped once in the file).
+fn quote_heavy_page(text: &str, quotes: usize) -> String {
+    let mut data = paper_rs::project::format::page_from_json(&edited(text)).unwrap();
+    let node = data.doc.root[0];
+    data.doc.nodes.get_mut(&node).unwrap().name = "\"".repeat(quotes);
+    let body = paper_rs::project::format::page_to_json(&data);
+    assert!(paper_rs::project::format::page_from_json(&body).is_ok());
+    body
+}
+
+/// #6's large canvas: refused in the panel (413, nothing mounted or changed), then opened
+/// through that same binding's own editor result in the browser editor, which loads the whole
+/// canonical canvas and saves into its files; a stale binding gets no link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_canvas_refused_in_the_panel_opens_through_its_own_binding_in_the_browser() {
+    // #6 (owner comment 6388936169): a legitimate canvas whose panel message is larger than
+    // the panel's bound. A representative fixture: many ordinary layers with short names (not
+    // one pathological name), valid page data.
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Large", "panel": true})).await);
+    let b = binding(&created);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let dir = location(&created);
+    let page = crate::read_manifest_checked(&dir).unwrap().pages[0]
+        .id
+        .clone();
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let mut data =
+        paper_rs::project::format::page_from_json(&std::fs::read_to_string(&path).unwrap())
+            .unwrap();
+    for i in 0..30_000 {
+        let n = data.doc.alloc_id();
+        let mut node = paper_rs::model::Node::new(
+            n,
+            paper_rs::model::NodeKind::Rect,
+            paper_rs::geom::Rect::new((i % 200) as f64 * 12.0, (i / 200) as f64 * 12.0, 10.0, 10.0),
+        );
+        node.name = format!("Cell {i}");
+        data.doc.nodes.insert(n, node);
+        data.doc.root.push(n);
+    }
+    std::fs::write(&path, paper_rs::project::format::page_to_json(&data)).unwrap();
+    let before = files(&dir, &page);
+    let mounts = || async {
+        lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .map_or(0, |b| b.mounts.len())
+    };
+    // The panel refuses it before any mount, nothing changed (the existing safe 413).
+    let e = call(&lib.c, app::CANVAS, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    assert!(e.contains("Open it in the browser editor instead"), "{e}");
+    assert_eq!(mounts().await, 0, "no mount for it");
+    assert_eq!(files(&dir, &page), before, "files unchanged");
+    // The view's action: the same binding's own editor result, its link.
+    let editor = value(call(&lib.c, app::EDITOR, json!({"binding": b})).await);
+    assert_eq!(editor["binding"], b.as_str(), "the same binding");
+    assert_eq!(editor["canvas"]["id"], id.as_str(), "the same canvas");
+    assert_eq!(editor["browser_editor"], "built in");
+    let (port, token) = url(&editor);
+    // A stale binding gets nothing.
+    let stale = format!("{id}.99");
+    let e = call(&lib.c, app::EDITOR, json!({"binding": stale}))
+        .await
+        .unwrap_err();
+    assert!(e.contains("binding") || e.contains("open"), "{e}");
+    // The browser editor opens the same canonical canvas whole (no bound there, nothing copied)
+    // and saves into those same files.
+    let view = tab(port, &token).await;
+    let (st, head, body) = raw(port, &token, "GET", "/api/canvas", &view_line(&view), "").await;
+    assert_eq!(st, 200);
+    assert!(body.len() > app::MAX_PANEL_MESSAGE, "{}", body.len());
+    assert!(
+        head.to_ascii_lowercase().contains("x-opd-editing: here"),
+        "{head}"
+    );
+    let (st, _, n, answer) = try_edit(port, &token, &view).await;
+    assert_eq!((st, n), (200, 30_001), "{answer}");
+    assert_ne!(files(&dir, &page), before, "saved into the same canvas");
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// R8 F3, adapted from the independent reviewer's diagnostic (Codex review work): a page read
+/// is bounded as the whole tool response it would be (the pretty JSON text inside the tool
+/// result inside the JSON-RPC response, escaped at each level, plus the host allowance), not
+/// only as its inner JSON. A quote-heavy page whose inner message fits is refused, before a
+/// mount is registered; a smaller one is answered within the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_page_reads_are_bounded_as_the_whole_tool_response() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::CREATE, json!({"name": "Big", "panel": true})).await);
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, _, text) = first_read(&lib.c, &b).await;
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let big = quote_heavy_page(&text, 700_000);
+    let inner = json!({"text": big}).to_string().len();
+    assert!(
+        inner < app::MAX_PANEL_MESSAGE,
+        "the inner message alone fits"
+    );
+    std::fs::write(&path, &big).unwrap();
+    let before = files(&dir, &page);
+    let mounts = || async {
+        lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .map_or(0, |b| b.mounts.len())
+    };
+    let e = call(
+        &lib.c,
+        app::PAGE,
+        json!({"binding": b, "page_id": page, "mount": mount}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "{e}");
+    let registered = mounts().await;
+    let e = call(&lib.c, app::PAGE, json!({"binding": b}))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal(&e)["status"], 413, "a first read too: {e}");
+    assert_eq!(mounts().await, registered, "no mount registered for it");
+    assert_eq!(files(&dir, &page), before, "files unchanged");
+    // A smaller quote-heavy page: answered, and its whole response is within the limit.
+    std::fs::write(&path, quote_heavy_page(&text, 200_000)).unwrap();
+    let mut params = CallToolRequestParams::new(app::PAGE);
+    params.arguments = json!({"binding": b, "page_id": page, "mount": mount})
+        .as_object()
+        .cloned();
+    let response = bounded(lib.c.peer.call_tool(params)).await.unwrap();
+    assert_ne!(response.is_error, Some(true));
+    let envelope = json!({"jsonrpc": "2.0", "id": 1, "result": response});
+    let wire = serde_json::to_vec(&envelope).unwrap();
+    assert!(wire.len() <= app::MAX_PANEL_MESSAGE, "{}", wire.len());
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// R8 F3 for requests: a save is bounded as the whole `tools/call` request it came in (the
+/// JSON-RPC request with its arguments, plus the host allowance), not only its arguments: an
+/// escaping-heavy save and a plain one whose arguments alone fit are refused, unwritten; one
+/// within the limit is admitted (and then refused only as not a page).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_saves_are_bounded_as_the_whole_tool_request() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Request", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, _) = first_read(&lib.c, &b).await;
+    let before = files(&dir, &page);
+    let args = |text: &str| json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev, "text": text});
+    for (what, text) in [
+        ("quotes", "\"".repeat(app::MAX_PANEL_MESSAGE / 2 - 4096)),
+        ("plain", "x".repeat(app::MAX_PANEL_MESSAGE - 1024)),
+    ] {
+        let a = args(&text);
+        assert!(
+            serde_json::to_string(&a).unwrap().len() < app::MAX_PANEL_MESSAGE,
+            "{what}: the arguments alone fit"
+        );
+        let wrapped = app::request_bytes(app::SAVE, &a);
+        assert!(wrapped > app::MAX_PANEL_MESSAGE, "{what}: {wrapped}");
+        let e = call(&lib.c, app::SAVE, a).await.unwrap_err();
+        assert_eq!(refusal(&e)["status"], 413, "{what}: {e}");
+        assert_eq!(files(&dir, &page), before, "{what}: nothing written");
+    }
+    let fits = "x".repeat(app::MAX_PANEL_MESSAGE - 64 * 1024);
+    let e = call(&lib.c, app::SAVE, args(&fits)).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 422, "admitted, then not a page: {e}");
+    assert_eq!(files(&dir, &page), before);
+    bound_server(&lib.l).await.retire().await;
+}
+
+/// Stand-in parts for `panel_module` (inert text, not the real glue or editor).
+static MODULE_PARTS: [(&str, &[u8]); 6] = [
+    (
+        "openpaperdesign_web.js",
+        b"export function start() {}\nexport { start as default };",
+    ),
+    ("session.js", b"export class Session {}"),
+    ("page.js", b"export function frameStep() {}"),
+    ("editor.js", b"export function opdMountEditor() {}"),
+    (
+        "panel.js",
+        b"export function opdCreatePanel(o) { return o; }",
+    ),
+    ("openpaperdesign_web_bg.wasm", b"\0asm"),
+];
+
+fn module_parts_with(name: &str, text: &str) -> crate::EmbeddedBundle {
+    let bytes: &'static [u8] = Box::leak(text.as_bytes().to_vec().into_boxed_slice());
+    let files: Vec<(&'static str, &'static [u8])> = MODULE_PARTS
+        .iter()
+        .map(|&(f, b)| (f, if f == name { bytes } else { b }))
+        .collect();
+    Box::leak(files.into_boxed_slice())
+}
+
+/// The in-panel module is made only of the fixed packaged parts, in order, after the renderer
+/// identity, and only when it is safe inside the view's script element; otherwise the view
+/// keeps its null editor slot (and its primary actions are refused, see below).
+#[test]
+fn panel_module_is_fixed_ordered_and_safe_to_embed() {
+    let m = panel_module(&MODULE_PARTS, "\"0011\"").unwrap();
+    assert!(
+        m.contains("const OPD_WASM_IDENTITY = \"\\\"0011\\\"\";"),
+        "{m}"
+    );
+    let at = |s: &str| m.find(s).unwrap();
+    assert!(at("OPD_WASM_IDENTITY") < at("export function start"));
+    assert!(at("export function start") < at("export class Session"));
+    assert!(at("export class Session") < at("export function frameStep"));
+    assert!(at("export function frameStep") < at("export function opdMountEditor"));
+    assert!(at("export function opdMountEditor") < at("function opdCreatePanel("));
+    for (name, text, want) in [
+        ("session.js", "const s = '</SCRIPT>';", "</script"),
+        ("page.js", "// <!-- x", "<!--"),
+        ("editor.js", "const t = '<script>';", "<script"),
+        ("editor.js", "import { a } from './x.js';", "import"),
+        ("panel.js", "  import('./x.js');", "import"),
+        ("openpaperdesign_web.js", "", "isn't in this build"),
+        ("panel.js", "export function other() {}", "opdCreatePanel"),
+    ] {
+        let e = panel_module(module_parts_with(name, text), "\"0011\"").unwrap_err();
+        assert!(e.contains(want), "{name}: {e}");
+    }
+    // This test build's inert fixture parts assemble: the library view gets them in its slot,
+    // after this build's renderer identity; a workspace view never does.
+    assert!(panel_editor().is_ok());
+    let library = home_html_for(true);
+    assert!(!library.contains(PANEL_SLOT));
+    let inert = "export function opdCreatePanel() { return null; }";
+    assert!(library.contains(inert));
+    let identity = format!(
+        "const OPD_WASM_IDENTITY = {};",
+        serde_json::to_string(&crate::etag(&super::FIXTURE_WASM)).unwrap()
+    );
+    assert!(library.contains(&identity));
+    assert!(home_html_for(false).contains(PANEL_SLOT));
+    assert_eq!(library.matches("<script").count(), 1, "one script element");
+    assert!(library.contains("<script type=\"module\">"));
+    assert_eq!(
+        HOME_URI, "ui://openpaperdesign/home-24.html",
+        "versioned for issue #23's multiple views (a changed in-panel editor and view)"
+    );
+}
+
+/// A request for the view's own editor (`panel: true`) from a build that can't serve it is
+/// refused before anything happens: no canvas file, lease, binding, switch, mount or link.
+/// The unavailable build is simulated by a one-shot test fault; plain (link) requests from
+/// other callers keep working as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panel_requests_are_refused_before_any_effect_when_the_build_has_no_panel() {
+    let lib = library().await;
+    let unavailable = || Point::arm(lib.root.as_path(), "panel_unavailable", false);
+    let refused = |e: String| {
+        assert!(
+            e.contains("in-panel editor isn't available")
+                && e.contains("nothing was created, imported, opened or changed"),
+            "{e}"
+        );
+    };
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::CREATE, json!({"name": "None", "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        !lib.root.join("library").exists(),
+        "no canvas, lease or folder"
+    );
+    drop(fault);
+    // An existing canvas, made by a plain (link) request and closed again.
+    let made = value(call(&lib.c, app::CREATE, json!({"name": "Made"})).await);
+    let id = made["canvas"]["id"].as_str().unwrap().to_string();
+    call(
+        &lib.c,
+        app::CLOSE,
+        json!({"binding": binding(&made), "force": true}),
+    )
+    .await
+    .unwrap();
+    let canvases = || {
+        std::fs::read_dir(lib.root.join("library/v1/canvases"))
+            .unwrap()
+            .count()
+    };
+    let count = canvases();
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::OPEN, json!({"id": id, "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    assert!(lib.l.state.lock().await.bound.is_none(), "nothing opened");
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::IMPORT, json!({"payload": "{}", "panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    assert_eq!(canvases(), count, "nothing imported");
+    let fault = unavailable();
+    refused(
+        call(&lib.c, app::EDITOR, json!({"panel": true}))
+            .await
+            .unwrap_err(),
+    );
+    drop(fault);
+    // Opened for the panel (the build serves it again), then a switch request is refused
+    // before it is weighed, and the open canvas, its mounts and link state stay as they were.
+    let opened = value(call(&lib.c, app::OPEN, json!({"id": id, "panel": true})).await);
+    let b = binding(&opened);
+    let fault = unavailable();
+    refused(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Other", "panel": true, "force": true, "replace": b}),
+        )
+        .await
+        .unwrap_err(),
+    );
+    drop(fault);
+    {
+        let st = lib.l.state.lock().await;
+        let bound = st.bound.as_ref().unwrap();
+        assert_eq!(
+            bound.binding.as_deref(),
+            Some(b.as_str()),
+            "still the same canvas"
+        );
+        assert!(bound.mounts.is_empty() && !bound.editor_opened);
+    }
+    assert_eq!(canvases(), count);
+    bound_server(&lib.l).await.retire().await;
+}
+
+// ---- the agent on the library canvas (`launcher_library_agent.rs`): model-visible library
+// controls and upstream's own design tools, on the canvas the person's view shows. The engine
+// here is upstream paper-rs (`exec::call` on the server's host); only the unit-test bundle is
+// a stand-in, and nothing renders.
+
+/// Every text block of a tool result, joined.
+fn out_text(r: ToolResult) -> String {
+    r.unwrap()
+        .into_iter()
+        .filter_map(|o| match o {
+            Out::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The saved node named `name` on `page` of the canvas in `dir` (upstream's page file format),
+/// with its tool id (`<first six characters of the page id>:<n>`).
+fn saved_node(dir: &Path, page: &str, name: &str) -> (String, paper_rs::model::Node) {
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let text = std::fs::read_to_string(path).unwrap();
+    let data = paper_rs::project::format::page_from_json(&text).unwrap();
+    let node = data
+        .doc
+        .nodes
+        .values()
+        .find(|n| n.name == name)
+        .unwrap_or_else(|| panic!("no saved node {name}"))
+        .clone();
+    (format!("{}:{}", &page[..6], node.id.0), node)
+}
+
+/// The catalogue a model sees from an app-library process: the library controls (no app-only
+/// visibility), and every upstream design tool the adapter offers, under its own name,
+/// description and schema, with `binding` required on top. Export, file creation and the
+/// project routes aren't there; the view's own tools stay app-only. A workspace process's
+/// catalogue is unchanged, and it refuses the library controls without any state change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_catalogue_shows_library_controls_and_binding_guarded_upstream_tools() {
+    let lib = library().await;
+    let tools: Vec<Value> = lib
+        .c
+        .peer
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    let tool = |n: &str| tools.iter().find(|t| t["name"] == n).cloned();
+    for n in app::AGENT_TOOLS {
+        let t = tool(n).unwrap_or_else(|| panic!("{n} is listed"));
+        assert!(
+            t["_meta"]["ui"]["visibility"].is_null(),
+            "{n} is model-visible"
+        );
+    }
+    for upstream in crate::agent::offered_tools() {
+        let name = upstream.name.to_string();
+        let original = serde_json::to_value(upstream).unwrap();
+        let t = tool(&name).unwrap_or_else(|| panic!("{name} is listed"));
+        let schema = &t["inputSchema"];
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("binding")),
+            "{name}"
+        );
+        assert!(schema["properties"]["binding"].is_object(), "{name}");
+        for (k, v) in original["inputSchema"]["properties"].as_object().unwrap() {
+            assert_eq!(
+                &schema["properties"][k], v,
+                "{name}.{k}: upstream's own schema"
+            );
+        }
+        let desc = original["description"].as_str().unwrap();
+        assert!(
+            t["description"].as_str().unwrap().starts_with(desc),
+            "{name}"
+        );
+    }
+    for gone in [
+        "export",
+        "export_combined_pdf",
+        "create_file",
+        "bind_project",
+        "create_project",
+        "open_editor",
+    ] {
+        assert!(tool(gone).is_none(), "{gone} isn't offered here");
+    }
+    for n in app::TOOLS {
+        assert_eq!(
+            tool(n).unwrap()["_meta"]["ui"]["visibility"],
+            json!(["app"]),
+            "{n}"
+        );
+    }
+    // A workspace process.
+    let l = Launcher::new(None);
+    let (c, task) = connect_launcher(l.clone(), Default::default()).await;
+    let ws: Vec<Value> = c
+        .peer
+        .list_all_tools()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| serde_json::to_value(t).unwrap())
+        .collect();
+    assert!(
+        ws.iter()
+            .all(|t| !app::AGENT_TOOLS.contains(&t["name"].as_str().unwrap()))
+    );
+    let summary = ws.iter().find(|t| t["name"] == "get_tree_summary").unwrap();
+    assert!(summary["inputSchema"]["properties"]["binding"].is_null());
+    for n in app::AGENT_TOOLS {
+        let e = call(&c, n, json!({})).await.unwrap_err();
+        assert!(e.contains("wasn't started for the app library"), "{n}: {e}");
+    }
+    let st = l.state.lock().await;
+    assert!(st.bound.is_none() && st.workspace.is_none() && st.invalidated.is_none());
+    drop(st);
+    task.abort();
+}
+
+/// The agent's whole path on an app-owned canvas, with upstream's own commands: create it
+/// (no link, no token), see it as the open canvas, read the page, draw a rectangle, move and
+/// recolour it, read the results back, close, and reopen it in a fresh process with the
+/// drawing there. A change before the page is read, a missing or stale binding and a forged
+/// session field are refused with nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_creates_reads_draws_moves_recolours_and_a_fresh_process_reopens_it() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::AGENT_CREATE, json!({"name": "Agent board"})).await);
+    assert!(created.get("url").is_none(), "no link or token: {created}");
+    let b = binding(&created);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["active_page"], json!(page));
+    let dir = lib.root.join("library/v1/canvases").join(&id);
+    let current = value(call(&lib.c, app::AGENT_CURRENT, json!({})).await);
+    assert_eq!(binding(&current), b);
+    assert_eq!(current["canvas"]["id"], json!(id));
+    let shape = json!({"binding": b, "pageId": page, "type": "rectangle", "name": "Agent box",
+        "x": 10, "y": 20, "width": 80, "height": 40, "styles": {"backgroundColor": "#ff0000"}});
+    // Neither a library result nor the current view counts as reading the page.
+    let before = files(&dir, &page);
+    let e = call(&lib.c, "create_shape", shape.clone())
+        .await
+        .unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), before, "nothing written");
+    let mut unbound = shape.clone();
+    unbound.as_object_mut().unwrap().remove("binding");
+    let e = call(&lib.c, "create_shape", unbound).await.unwrap_err();
+    assert!(e.contains("Name the canvas you mean"), "{e}");
+    let stale = json!({"binding": "0123456789abcdef.99999", "nodeId": "root"});
+    let e = call(&lib.c, "get_tree_summary", stale).await.unwrap_err();
+    assert!(e.contains("isn't the canvas open"), "{e}");
+    let forged = json!({"binding": b, "nodeId": "root", "_openpaperdesignSession": 1});
+    let e = call(&lib.c, "get_tree_summary", forged).await.unwrap_err();
+    assert!(e.contains("unexpected argument"), "{e}");
+    assert_eq!(files(&dir, &page), before);
+    // Read the page, then draw.
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read).await);
+    call(&lib.c, "create_shape", shape).await.unwrap();
+    let (nid, node) = saved_node(&dir, &page, "Agent box");
+    assert_eq!(
+        (node.rect.x, node.rect.y, node.rect.w, node.rect.h),
+        (10.0, 20.0, 80.0, 40.0)
+    );
+    // Move it and recolour it (its own committed change counts as read).
+    let moved = json!({"binding": b, "updates": [{"nodeIds": [nid],
+        "styles": {"left": "120px", "top": "60px"}}]});
+    call(&lib.c, "update_styles", moved).await.unwrap();
+    let (_, node) = saved_node(&dir, &page, "Agent box");
+    assert_eq!((node.rect.x, node.rect.y), (120.0, 60.0));
+    let before_fill = files(&dir, &page);
+    let fill = json!({"binding": b, "updates": [{"nodeIds": [nid],
+        "styles": {"backgroundColor": "#00ff00"}}]});
+    call(&lib.c, "update_styles", fill).await.unwrap();
+    assert_ne!(files(&dir, &page).0, before_fill.0, "the fill was saved");
+    // Read the results back through upstream's readers.
+    let ask = json!({"binding": b, "nodeId": nid});
+    let info = out_text(call(&lib.c, "get_node_info", ask).await);
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["worldX"].as_f64(), Some(120.0), "{info}");
+    assert_eq!(info["worldY"].as_f64(), Some(60.0), "{info}");
+    let ask = json!({"binding": b, "nodeIds": [nid]});
+    let styles = out_text(call(&lib.c, "get_computed_styles", ask).await);
+    let styles = styles.to_ascii_lowercase();
+    assert!(
+        styles.contains("#00ff00") || styles.contains("rgb(0, 255, 0)"),
+        "{styles}"
+    );
+    // Close (no editor holds anything), then a fresh process reopens it.
+    let closed = value(call(&lib.c, app::AGENT_CLOSE, json!({"binding": b})).await);
+    assert_eq!(closed["action"], "closed");
+    let late = json!({"binding": b, "nodeId": "root", "pageId": page});
+    let e = call(&lib.c, "get_tree_summary", late).await.unwrap_err();
+    assert!(e.contains("No canvas is open"), "{e}");
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::AGENT_OPEN, json!({"id": id})).await);
+    let b2 = binding(&reopened);
+    assert_ne!(b2, b, "a new binding");
+    let read = json!({"binding": b2, "nodeId": "root", "pageId": page});
+    let tree = out_text(call(&c2, "get_tree_summary", read).await);
+    assert!(tree.contains("Agent box"), "{tree}");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// The agent and the person on one canvas: the person's panel (and then a browser tab from the
+/// agent's link) and the agent's tools share the binding, its server and its revisions. A clean
+/// panel sees the agent's commit; a panel save based on the old revision is a conflict and
+/// overwrites nothing; after the person saves, the agent's stale change is refused. The agent
+/// can't switch or close the canvas while the person's editor is mounted or a link was given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_and_person_share_the_canvas_with_strict_conflicts_and_no_forced_switch() {
+    let lib = library().await;
+    let created = value(
+        call(
+            &lib.c,
+            app::CREATE,
+            json!({"name": "Shared", "panel": true}),
+        )
+        .await,
+    );
+    let b = binding(&created);
+    let dir = location(&created);
+    let (page, mount, rev, text) = first_read(&lib.c, &b).await;
+    let current = value(call(&lib.c, app::AGENT_CURRENT, json!({})).await);
+    assert_eq!(binding(&current), b, "the canvas the person's panel shows");
+    assert_eq!(current["editors"]["panel_editors"], 1);
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    let shape = |name: &str| json!({"binding": b, "pageId": page, "type": "rectangle", "name": name, "x": 1, "y": 1, "width": 9, "height": 9});
+    call(&lib.c, "create_shape", shape("From the agent"))
+        .await
+        .unwrap();
+    let agent_bytes = files(&dir, &page);
+    // The clean panel's poll and re-read see the commit.
+    let ids = json!({"binding": b, "page_id": page, "mount": mount});
+    let polled = value(call(&lib.c, app::REVISION, ids.clone()).await);
+    assert_ne!(polled["revision"], json!(rev));
+    assert_eq!(polled["revision"], json!(crate::etag(&agent_bytes.0)));
+    let reread = value(call(&lib.c, app::PAGE, ids).await);
+    let reread_text = reread["text"].as_str().unwrap().to_string();
+    assert!(reread_text.contains("From the agent"));
+    // A dirty panel's save on the old revision: a conflict, nothing overwritten.
+    let stale = json!({"binding": b, "page_id": page, "mount": mount, "if_match": rev,
+        "text": edited(&text)});
+    let e = call(&lib.c, app::SAVE, stale).await.unwrap_err();
+    assert_eq!(refusal(&e)["status"], 409, "{e}");
+    assert_eq!(files(&dir, &page), agent_bytes, "the agent's bytes stay");
+    // The person saves on the current revision; the agent's next change is then stale.
+    let human = json!({"binding": b, "page_id": page, "mount": mount,
+        "if_match": polled["revision"], "text": edited(&reread_text)});
+    value(call(&lib.c, app::SAVE, human).await);
+    let human_bytes = files(&dir, &page);
+    let e = call(&lib.c, "create_shape", shape("Stale"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), human_bytes, "the person's bytes stay");
+    // No switch or close from the agent while the person's editor is mounted.
+    for (tool, args) in [
+        (app::AGENT_CREATE, json!({"name": "Other"})),
+        (app::AGENT_CLOSE, json!({"binding": b})),
+    ] {
+        let e = call(&lib.c, tool, args).await.unwrap_err();
+        assert!(e.contains("can't be switched or closed"), "{tool}: {e}");
+        let st = lib.l.state.lock().await;
+        assert_eq!(
+            st.bound.as_ref().unwrap().binding.as_deref(),
+            Some(b.as_str())
+        );
+    }
+    let e = call(
+        &lib.c,
+        app::AGENT_OPEN,
+        json!({"id": "0123456789abcdef", "force": true}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("unexpected argument"),
+        "no confirmation from the agent: {e}"
+    );
+    // The browser editor link, for Codex's built-in browser: the same binding's loopback
+    // editor, whose save and the agent's tools share one revision check.
+    let link = value(call(&lib.c, app::AGENT_EDITOR, json!({"binding": b})).await);
+    assert_eq!(binding(&link), b);
+    let (port, token) = url(&link);
+    assert!(
+        lib.l
+            .state
+            .lock()
+            .await
+            .bound
+            .as_ref()
+            .unwrap()
+            .editor_opened
+    );
+    browser_edit(port, &token).await;
+    let e = call(&lib.c, "create_shape", shape("Before reading"))
+        .await
+        .unwrap_err();
+    assert!(
+        e.contains("conflict"),
+        "the browser's save made the agent's read stale: {e}"
+    );
+    out_text(call(&lib.c, "get_tree_summary", read).await);
+    let before = page_nodes(port, &token, &page).await;
+    call(&lib.c, "create_shape", shape("After reading"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page_nodes(port, &token, &page).await,
+        before + 1,
+        "the browser reads it"
+    );
+    // After the service ends, nothing more is done through the binding.
+    lib.l.shutdown().await;
+    let e = call(&lib.c, "create_shape", shape("Late"))
+        .await
+        .unwrap_err();
+    assert!(e.contains("shutting down"), "{e}");
+}
+
+// ---- revision 2 slice 7: a diagram drawn by the agent on the library canvas with upstream's
+// own whiteboard tools (create_shape arrows bound with startNodeId/endNodeId), read back from
+// the saved page file. Proof of current behaviour before any repair.
+
+/// The canvas's saved page (upstream's page file format).
+fn saved_page(dir: &Path, page: &str) -> paper_rs::project::PageData {
+    let path = dir.join("pages").join(format!("{page}.json"));
+    let text = std::fs::read_to_string(path).unwrap();
+    paper_rs::project::format::page_from_json(&text).unwrap()
+}
+
+/// The node number of a tool id (`<page prefix>:<n>`).
+fn node_num(key: &str) -> paper_rs::model::NodeId {
+    paper_rs::model::NodeId(key.rsplit(':').next().unwrap().parse().unwrap())
+}
+
+/// One `create_shape` on the open canvas's page; returns the new tool id.
+async fn agent_shape(c: &Client, b: &str, page: &str, mut args: Value) -> String {
+    args["binding"] = json!(b);
+    args["pageId"] = json!(page);
+    value(call(c, "create_shape", args).await)["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A saved arrow: its world points and the nodes its ends are bound to.
+struct SavedArrow {
+    pts: Vec<paper_rs::geom::V2>,
+    start: Option<paper_rs::model::NodeId>,
+    end: Option<paper_rs::model::NodeId>,
+    route: paper_rs::model::Route,
+}
+
+fn saved_arrow(data: &paper_rs::project::PageData, id: &str) -> SavedArrow {
+    let doc = &data.doc;
+    let n = doc
+        .get(node_num(id))
+        .unwrap_or_else(|| panic!("no arrow {id}"));
+    let paper_rs::model::NodeKind::Connector {
+        points,
+        start,
+        end,
+        route,
+        ..
+    } = &n.kind
+    else {
+        panic!("{id} isn't an arrow: {:?}", n.kind)
+    };
+    let o = doc.world_rect(n.id).unwrap().min();
+    SavedArrow {
+        pts: points.iter().map(|p| o + *p).collect(),
+        start: start.map(|b| b.node),
+        end: end.map(|b| b.node),
+        route: *route,
+    }
+}
+
+/// An end attached to `target`'s outline in the saved file: within the binding gap of its box
+/// (5 + stroke/2, with room for rounding).
+fn near(data: &paper_rs::project::PageData, target: &str, p: paper_rs::geom::V2) -> bool {
+    let r = data.doc.world_rect(node_num(target)).unwrap();
+    r.inflate(15.0).contains(p)
+}
+
+/// The architecture an agent draws with upstream's own tools on a library canvas: User →
+/// Service → Datastore and a branch (Service → Cached? → Datastore / Fallback), each box with a
+/// text label, each arrow bound to its boxes. Saved at once, read back exactly from the file;
+/// moving, resizing and relabelling keep the arrows on their boxes; a change on a stale read
+/// is refused with nothing written; duplicate leaves the arrows on the originals; delete lets go
+/// and the agent's undo restores; close and a fresh process reopen the same drawing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_diagram_arrows_stay_bound_through_edits_stale_refusal_undo_and_reopen() {
+    let lib = library().await;
+    let created = value(call(&lib.c, app::AGENT_CREATE, json!({"name": "Architecture"})).await);
+    let b = binding(&created);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    let dir = lib.root.join("library/v1/canvases").join(&id);
+    let read = json!({"binding": b, "nodeId": "root", "pageId": page});
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    // Boxes (rectangles and a decision diamond), then their labels, then the arrows.
+    let mut ids = Vec::new();
+    for (ty, name, x, y, h) in [
+        ("rectangle", "User", 0.0, 0.0, 80.0),
+        ("rectangle", "Service", 320.0, 0.0, 80.0),
+        ("rectangle", "Datastore", 640.0, 0.0, 80.0),
+        ("rectangle", "Fallback", 640.0, 360.0, 80.0),
+        ("diamond", "Cached?", 320.0, 200.0, 100.0),
+    ] {
+        let shape = json!({"type": ty, "name": name, "x": x, "y": y, "width": 160, "height": h});
+        ids.push(agent_shape(&lib.c, &b, &page, shape).await);
+    }
+    let [user, service, store, fallback, cached] = <[String; 5]>::try_from(ids).unwrap();
+    let mut labels = Vec::new();
+    for (text, x) in [
+        ("User", 50.0),
+        ("Orders service", 340.0),
+        ("Postgres", 680.0),
+    ] {
+        let label = json!({"type": "text", "text": text, "x": x, "y": 28});
+        labels.push(agent_shape(&lib.c, &b, &page, label).await);
+    }
+    let service_label = labels[1].clone();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    for (name, from, to, route) in [
+        ("user-service", &user, &service, "straight"),
+        ("service-store", &service, &store, "elbow"),
+        ("service-cached", &service, &cached, "straight"),
+        ("cached-store", &cached, &store, "curved"),
+        ("cached-fallback", &cached, &fallback, "elbow"),
+    ] {
+        let arrow = json!({"type": "arrow", "name": name, "startNodeId": from,
+            "endNodeId": to, "route": route});
+        let a = agent_shape(&lib.c, &b, &page, arrow).await;
+        edges.push((a, from.clone(), to.clone()));
+    }
+    let (a1, a2, a4) = (edges[0].0.clone(), edges[1].0.clone(), edges[3].0.clone());
+    // Saved at once, exactly as drawn: every end bound and attached to its box.
+    let check = |data: &paper_rs::project::PageData, why: &str| {
+        for (a, from, to) in &edges {
+            let s = saved_arrow(data, a);
+            let want = (Some(node_num(from)), Some(node_num(to)));
+            assert_eq!((s.start, s.end), want, "{why}: {a} bound");
+            let (first, last) = (s.pts[0], *s.pts.last().unwrap());
+            assert!(near(data, from, first), "{why}: {a} start {:?}", s.pts);
+            assert!(near(data, to, last), "{why}: {a} end {:?}", s.pts);
+        }
+    };
+    let data = saved_page(&dir, &page);
+    check(&data, "drawn");
+    use paper_rs::model::Route;
+    assert_eq!(saved_arrow(&data, &a2).route, Route::Elbow);
+    assert_eq!(saved_arrow(&data, &a4).route, Route::Curved);
+    let elbow = saved_arrow(&data, &a2).pts;
+    assert!(
+        elbow
+            .windows(2)
+            .all(|w| (w[0].x - w[1].x).abs() < 1e-6 || (w[0].y - w[1].y).abs() < 1e-6),
+        "{elbow:?}"
+    );
+    // Move and resize the service; relabel it. Its arrows follow, in the saved file.
+    let before = saved_arrow(&data, &a1).pts;
+    let moved = json!({"binding": b, "updates": [{"nodeIds": [service],
+        "styles": {"left": "360px", "top": "-140px"}}]});
+    call(&lib.c, "update_styles", moved).await.unwrap();
+    let data = saved_page(&dir, &page);
+    check(&data, "moved");
+    let after = saved_arrow(&data, &a1).pts;
+    assert_ne!(after, before, "the arrow was rerouted");
+    let grown = json!({"binding": b, "updates": [{"nodeIds": [service],
+        "styles": {"width": "240px", "height": "120px"}}]});
+    call(&lib.c, "update_styles", grown).await.unwrap();
+    let data = saved_page(&dir, &page);
+    let sr = data.doc.world_rect(node_num(&service)).unwrap();
+    assert_eq!((sr.x, sr.y, sr.w, sr.h), (360.0, -140.0, 240.0, 120.0));
+    check(&data, "resized");
+    let relabel = json!({"binding": b, "updates": [{"nodeId": service_label,
+        "textContent": "Orders API \"v2\""}]});
+    call(&lib.c, "set_text_content", relabel).await.unwrap();
+    let data = saved_page(&dir, &page);
+    let t = data.doc.get(node_num(&service_label)).unwrap();
+    let shown = t.kind.text().unwrap();
+    assert_eq!(shown, "Orders API \"v2\"", "the label, byte for byte");
+    check(&data, "relabelled");
+    // The person saves from a browser tab: the agent's next change is on a stale read and is
+    // refused, with nothing written and the arrows as they were.
+    let link = value(call(&lib.c, app::AGENT_EDITOR, json!({"binding": b})).await);
+    let (port, token) = url(&link);
+    browser_edit(port, &token).await;
+    let after_person = files(&dir, &page);
+    let stale = json!({"binding": b, "updates": [{"nodeIds": [user],
+        "styles": {"left": "0px", "top": "400px"}}]});
+    let e = call(&lib.c, "update_styles", stale).await.unwrap_err();
+    assert!(e.contains("conflict"), "{e}");
+    assert_eq!(files(&dir, &page), after_person, "nothing written");
+    let data = saved_page(&dir, &page);
+    check(&data, "after a refused stale write");
+    // Read again; duplicate the service: the copy is free, the arrows stay on the original.
+    out_text(call(&lib.c, "get_tree_summary", read.clone()).await);
+    let dup = json!({"binding": b, "nodes": [{"id": service}]});
+    let dup = value(call(&lib.c, "duplicate_nodes", dup).await);
+    let copy = dup["duplicates"][0]["newId"].as_str().unwrap().to_string();
+    let data = saved_page(&dir, &page);
+    assert!(data.doc.get(node_num(&copy)).is_some());
+    check(&data, "duplicated");
+    let c = Some(node_num(&copy));
+    for (a, _, _) in &edges {
+        let s = saved_arrow(&data, a);
+        assert!(s.start != c && s.end != c, "{a} stays on the original");
+    }
+    // Delete the datastore: its arrows stay and let go; the agent's undo restores it all.
+    let bound = files(&dir, &page);
+    let del = json!({"binding": b, "nodeIds": [store]});
+    call(&lib.c, "delete_nodes", del).await.unwrap();
+    let data = saved_page(&dir, &page);
+    assert!(data.doc.get(node_num(&store)).is_none());
+    for a in [&a2, &a4] {
+        let s = saved_arrow(&data, a);
+        assert_eq!(s.end, None, "{a} let go of the deleted datastore");
+    }
+    let undo = json!({"binding": b, "pageId": page});
+    call(&lib.c, "undo", undo).await.unwrap();
+    let data = saved_page(&dir, &page);
+    check(&data, "undone");
+    let restored = files(&dir, &page).0;
+    assert_eq!(restored, bound.0, "the page as it was before the delete");
+    // Close (a link was given, so it is the person's view that closes), then a fresh process
+    // reopens the same drawing.
+    let kept = files(&dir, &page);
+    call(&lib.c, app::CLOSE, json!({"binding": b, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(files(&dir, &page), kept, "closing writes nothing");
+    let (l2, c2, task2) = launch(&lib.root).await;
+    let reopened = value(call(&c2, app::AGENT_OPEN, json!({"id": id})).await);
+    let b2 = binding(&reopened);
+    let read = json!({"binding": b2, "nodeId": "root", "pageId": page});
+    let tree = out_text(call(&c2, "get_tree_summary", read).await);
+    for want in ["Orders API", "Postgres", "user-service", "cached-fallback"] {
+        assert!(tree.contains(want), "{want}: {tree}");
+    }
+    check(&saved_page(&dir, &page), "reopened");
+    bound_server(&l2).await.retire().await;
+    task2.abort();
+}
+
+/// Issue #23 for agents (this replaces the old "busy, no transfer" refusal, deliberately): an
+/// agent in another process opens a canvas this one has open, and edits it there; this
+/// process's agent is then refused (its change undone, nothing written, its session observing
+/// nothing) with how to take the editing back, while its reads go on and follow what the other
+/// saves. A non-saving call (selection) is still answered. Opening it again here takes the
+/// editing back on the same binding; then the other process's change is refused the same way,
+/// and a session that read before the other's change must read again (strict as always).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_views_in_two_processes_share_a_canvas_and_the_newest_open_edits() {
+    let a = library().await;
+    let (lb, b, task_b) = launch(&a.root).await;
+    let created = value(call(&a.c, app::AGENT_CREATE, json!({"name": "Held"})).await);
+    let id = created["canvas"]["id"].as_str().unwrap().to_string();
+    let ba = binding(&created);
+    let dir = a.root.join("library/v1/canvases").join(&id);
+    let page = created["pages"][0]["id"].as_str().unwrap().to_string();
+    let read = |b: &str| json!({"binding": b, "nodeId": "root", "pageId": page});
+    let rect = |name: &str| json!({"type": "rectangle", "name": name, "x": 10, "y": 10, "width": 20, "height": 20});
+    out_text(call(&a.c, "get_tree_summary", read(&ba)).await);
+    agent_shape(&a.c, &ba, &page, rect("From A")).await;
+    // B lists it, then opens the same canvas: no refusal, and B edits it now.
+    let listed = value(call(&b, app::AGENT_LIST, json!({})).await);
+    assert_eq!(listed["canvases"][0]["id"], json!(id));
+    let in_b = value(call(&b, app::AGENT_OPEN, json!({"id": id})).await);
+    assert_eq!(in_b["editing"], "here");
+    let bb = binding(&in_b);
+    assert!(lb.state.lock().await.bound.is_some());
+    let current_a = value(call(&a.c, app::AGENT_CURRENT, json!({})).await);
+    assert_eq!(current_a["editing"], "elsewhere");
+    // A's change is refused before anything is written; it says how to edit here again.
+    let kept = files(&dir, &page);
+    let shape = json!({"binding": ba, "pageId": page, "type": "rectangle", "name": "Lost?",
+        "x": 1, "y": 1, "width": 5, "height": 5});
+    let e = call(&a.c, "create_shape", shape.clone()).await.unwrap_err();
+    assert!(
+        e.contains("another OpenPaperDesign view") && e.contains("openpaperdesign_library_open"),
+        "{e}"
+    );
+    assert_eq!(files(&dir, &page), kept, "nothing written");
+    // A's selection changes nothing on disk, so it is still answered.
+    call(&a.c, "select_nodes", json!({"binding": ba, "nodeIds": []}))
+        .await
+        .unwrap();
+    assert_eq!(files(&dir, &page), kept);
+    // B reads and draws; A's reads show it.
+    out_text(call(&b, "get_tree_summary", read(&bb)).await);
+    agent_shape(&b, &bb, &page, rect("From B")).await;
+    let tree = out_text(call(&a.c, "get_tree_summary", read(&ba)).await);
+    assert!(tree.contains("From A") && tree.contains("From B"), "{tree}");
+    // A opens it again: the same binding, editing here; B's change is now refused unwritten.
+    let again = value(call(&a.c, app::AGENT_OPEN, json!({"id": id})).await);
+    assert_eq!(binding(&again), ba);
+    assert_eq!(again["editing"], "here");
+    let kept = files(&dir, &page);
+    let shape_b = json!({"binding": bb, "pageId": page, "type": "rectangle", "name": "B again",
+        "x": 2, "y": 2, "width": 5, "height": 5});
+    let e = call(&b, "create_shape", shape_b).await.unwrap_err();
+    assert!(e.contains("another OpenPaperDesign view"), "{e}");
+    assert_eq!(files(&dir, &page), kept);
+    // A read the page after B's change above, so its change is admitted and saved.
+    call(&a.c, "create_shape", shape).await.unwrap();
+    let saved = saved_page(&dir, &page);
+    for name in ["From A", "From B", "Lost?"] {
+        assert!(saved.doc.nodes.values().any(|n| n.name == name), "{name}");
+    }
+    assert!(!saved.doc.nodes.values().any(|n| n.name == "B again"));
+    bound_server(&lb).await.retire().await;
+    bound_server(&a.l).await.retire().await;
+    task_b.abort();
+}

@@ -57,6 +57,9 @@ pub enum Action {
     CommandPalette,
     Rename,
     ToggleUi,
+    /// Collapse both side panels, or restore the arrangement they had (menu and palette; no
+    /// shortcut yet, see DESIGN.md).
+    TogglePanels,
     ToggleHelp,
     ToggleGrid,
     SelectNext,
@@ -163,12 +166,17 @@ fn bindings() -> Vec<(Key, Chord, Action, &'static str)> {
         (Char('\\'), CMD, A::ToggleUi, "Show / hide UI"),
         (Char('/'), CMD, A::ToggleHelp, "Keyboard shortcuts"),
         (Char('?'), SHIFT, A::ToggleHelp, "Keyboard shortcuts"),
-        (Char('\''), CMD_SHIFT, A::ToggleGrid, "Show / hide dot grid"),
+        (
+            Char('\''),
+            CMD_SHIFT,
+            A::ToggleGrid,
+            "Show / hide background",
+        ),
         (Tab, PLAIN, A::SelectNext, "Select next sibling"),
         (Tab, SHIFT, A::SelectPrev, "Select previous sibling"),
         (Enter, SHIFT, A::SelectParent, "Select parent"),
-        (PageDown, PLAIN, A::NextPage, "Next page"),
-        (PageUp, PLAIN, A::PrevPage, "Previous page"),
+        (PageDown, PLAIN, A::NextPage, "Next Paper"),
+        (PageUp, PLAIN, A::PrevPage, "Previous Paper"),
         (Char('h'), SHIFT, A::FlipH, "Flip horizontal"),
         (Char('v'), SHIFT, A::FlipV, "Flip vertical"),
         (Char('c'), CMD_ALT, A::CopyProps, "Copy properties"),
@@ -420,6 +428,7 @@ pub fn category(a: Action) -> &'static str {
         | A::ToggleSnapping
         | A::ToggleGrid
         | A::ToggleUi
+        | A::TogglePanels
         | A::ToggleHelp
         | A::NextPage
         | A::PrevPage => "View",
@@ -596,11 +605,12 @@ pub fn menus() -> Vec<(&'static str, Vec<MenuEntry>)> {
                 I("Zoom to Fit", A::ZoomFit),
                 I("Zoom to Selection", A::ZoomSelection),
                 S,
-                I("Next Page", A::NextPage),
-                I("Previous Page", A::PrevPage),
+                I("Next Paper", A::NextPage),
+                I("Previous Paper", A::PrevPage),
                 S,
                 I("Snapping", A::ToggleSnapping),
-                I("Dot Grid", A::ToggleGrid),
+                I("Background On/Off", A::ToggleGrid),
+                I("Collapse / Restore Panels", A::TogglePanels),
                 I("Show/Hide UI", A::ToggleUi),
                 I("Keyboard Shortcuts", A::ToggleHelp),
             ],
@@ -652,9 +662,14 @@ mod tests {
                     match x {
                         super::MenuEntry::Item(label, a) => {
                             // Delete is bound to the Delete key; everything should be reachable.
+                            // Collapse panels is menu and palette only until a shortcut has
+                            // been checked against the hosts' own key handling.
                             assert!(
                                 super::chord_of(*a).is_some()
-                                    || matches!(a, super::Action::ExportSvg),
+                                    || matches!(
+                                        a,
+                                        super::Action::ExportSvg | super::Action::TogglePanels
+                                    ),
                                 "{label} has no shortcut"
                             );
                         }

@@ -73,6 +73,25 @@ impl Session {
         now.duration_since(since) >= AUTOSAVE_DELAY && !ed.is_busy()
     }
 
+    /// [`Session::autosave_due`] for a host drawing the shared UI in `ctx` (the native app):
+    /// while a Theme value change is under way (its colour picker or text style editor open,
+    /// `ui::design_system::editing`), that whole use is one undo step, and this save's
+    /// acknowledgement (`Editor::mark_page_saved`, which seals the history) would split it
+    /// (R67: three saves while typing 1, 5, 0 into R left one Undo at 15). So the save waits;
+    /// the deadline moves on meanwhile, so the host's timer doesn't spin, and the save is due
+    /// again an autosave delay after the use ends (its picker or editor closes, or isn't
+    /// shown, or the document changes otherwise). Closing the project saves regardless.
+    pub fn autosave_due_ui(&mut self, ed: &Editor, ctx: &egui::Context, now: Instant) -> bool {
+        if self.project.is_some()
+            && ed.project_dirty()
+            && crate::ui::design_system::editing(ctx, ed)
+        {
+            self.dirty_since = Some(now);
+            return false;
+        }
+        self.autosave_due(ed, now)
+    }
+
     /// Retry later (after a failed save) instead of spinning on an overdue deadline.
     pub fn defer(&mut self) {
         self.dirty_since = Some(Instant::now());

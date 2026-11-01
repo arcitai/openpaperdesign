@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const plugin = join(repo, 'plugin/openpaperdesign');
@@ -70,6 +71,62 @@ test('every ./ path in the manifests exists inside its root', () => {
   assert.ok(n >= 2, 'the onboarding skill and the marketplace path were checked');
 });
 
+test('interface icons are contained, square, static SVGs of at least 48 px', () => {
+  // plugin-creator 0.1.26 packaging reference (read by the operator): logo and composerIcon
+  // (dark variants optional) are contained relative paths to square PNG/JPEG/WebP/SVG files
+  // of at least 48x48 and at most 5 MiB. Whether Codex shows them is only proven installed.
+  // The listing, composer and launcher icons are the owner-selected mark, which
+  // scripts/render-brand-assets.cjs copies from assets/brand/: a square 64-unit viewBox
+  // without width/height, so their size is the viewBox.
+  const svgAt = (rel, f) => {
+    const abs = inside(plugin, rel);
+    assert.match(rel, /^\.\/assets\/[a-z-]+\.svg$/, f);
+    assert.ok(statSync(abs).size <= 5 * 1024 * 1024, `${f}: at most 5 MiB`);
+    const svg = readFileSync(abs, 'utf8');
+    assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" /, `${f}: one root svg`);
+    // The root element's own size: a square viewBox, and a square, unitless width/height if
+    // it has one (a unit or percentage would be an intrinsic size this check can't compare).
+    const root = svg.slice(0, svg.indexOf('>') + 1);
+    const attr = (k) => (root.match(new RegExp(` ${k}="([^"]*)"`)) || [])[1];
+    const box = root.match(/ viewBox="0 0 ([0-9.]+) ([0-9.]+)"/);
+    assert.ok(box && box[1] === box[2], `${f}: square viewBox`);
+    const [w, h] = [attr('width'), attr('height')];
+    assert.ok(w === h && (w === undefined || /^[0-9.]+$/.test(w)) && Number(w ?? box[1]) >= 48,
+      `${f}: square, >= 48`);
+    // Static and self-contained: nothing that runs, styles, loads or embeds.
+    for (const banned of ['<script', 'foreignObject', 'href', 'url(', '<style', 'style=', '<text',
+      '<image', '@import', 'on', '<!']) {
+      if (banned === 'on') assert.doesNotMatch(svg, /\son[a-z]+=/i, `${f}: no event handler`);
+      else assert.ok(!svg.includes(banned), `${f}: no ${banned}`);
+    }
+    assert.deepEqual(svg.match(/https?:\/\/[^"]*/g), ['http://www.w3.org/2000/svg'], `${f}: no external reference`);
+    return svg;
+  };
+  const ui = json(join(plugin, 'plugin.json')).extensions['com.openai'].interface;
+  const fields = ['logo', 'logoDark', 'composerIcon', 'composerIconDark'];
+  const icons = Object.fromEntries(fields.map((f) => [f, svgAt(ui[f], f)]));
+  const paths = new Set(fields.map((f) => ui[f]));
+  assert.equal(paths.size, 4, 'distinct light/dark logo and composer icon');
+  // The launcher's icon.svg pair has the same bytes, so the mapping itself is pinned.
+  assert.deepEqual([...paths], ['./assets/logo.svg', './assets/logo-dark.svg',
+    './assets/composer-icon.svg', './assets/composer-icon-dark.svg']);
+  const brand = (n) => readFileSync(join(repo, 'assets/brand', n), 'utf8');
+  // One brand source each: the listing logo and the composer icon are the same mark.
+  for (const [f, n] of [['logo', 'openpaperdesign.svg'], ['composerIcon', 'openpaperdesign.svg'],
+    ['logoDark', 'openpaperdesign-dark.svg'], ['composerIconDark', 'openpaperdesign-dark.svg']]) {
+    assert.equal(icons[f], brand(n), `${f}: assets/brand/${n}`);
+  }
+  // The launcher embeds these two (launcher.rs ICON_LIGHT, ICON_DARK): the same mark.
+  for (const [n, b] of [['icon.svg', 'openpaperdesign.svg'],
+    ['icon-dark.svg', 'openpaperdesign-dark.svg']]) {
+    assert.equal(svgAt(`./assets/${n}`, n), brand(b), `${n}: assets/brand/${b}`);
+  }
+  // Sandboxed sessions can leave empty dot placeholders (see AGENTS.md); they aren't assets.
+  const assets = readdirSync(join(plugin, 'assets')).filter((n) => !n.startsWith('.')).sort();
+  assert.deepEqual(assets, ['composer-icon-dark.svg', 'composer-icon.svg', 'icon-dark.svg',
+    'icon.svg', 'logo-dark.svg', 'logo.svg']);
+});
+
 test('one manifest: no .codex-plugin overlay to contradict plugin.json', () => {
   assert.ok(!existsSync(join(plugin, '.codex-plugin')));
 });
@@ -84,10 +141,13 @@ test('mcp.json starts the stdio launcher from PATH', () => {
   assert.ok(!('url' in s));
   assert.equal(s.command, 'openpaperdesign-mcp');
   assert.ok(!s.command.includes('/'), 'a command on PATH, never a bundled relative path');
-  assert.deepEqual(s.args, ['--codex-context']);
-  // Codex 0.162.1 starts plugin servers in the plugin folder. Workspace authority
-  // comes only from the experimental metadata on actual model tool calls.
+  // The packaged server is the app library, in the plugin's host-configured data folder:
+  // Codex 0.162.1's Agent Plugin MCP loader expands the literal ${PLUGIN_DATA} placeholder in
+  // stdio arguments (no shell). No working directory, environment override or tool argument
+  // names the folder. Workspace projects use a separately started --codex-context server.
+  assert.deepEqual(s.args, ['--app-library', '${PLUGIN_DATA}']);
   assert.ok(!('cwd' in s));
+  assert.ok(!('env' in s), 'no environment override');
   assert.ok(!JSON.stringify(m).includes('token'), 'no token in config');
 });
 
@@ -132,4 +192,22 @@ test('notices and licenses are present', () => {
   for (const n of ['design', 'review-design']) {
     assert.match(readFileSync(join(plugin, 'skills', n, 'LICENSE'), 'utf8'), /MIT License/);
   }
+});
+
+test('the home view font is the unmodified Geist Pixel Square with its license and notice', () => {
+  const assets = join(repo, 'crates/openpaperdesign-serve/assets');
+  const sha = (p) => createHash('sha256').update(readFileSync(join(assets, p))).digest('hex');
+  assert.equal(sha('geist-pixel-square.woff2'), '04f9cf917a824370c77fecbd743c99d0b3dfd2c6c906de959996ac6f7fb343b3');
+  assert.equal(sha('geist-OFL.txt'), '942560b236adfa83745b2c64e5fc09ebaf91cb331751b1157eb92187e5d6e930');
+  assert.deepEqual(readFileSync(join(assets, 'geist-pixel-square.woff2')).subarray(0, 4), Buffer.from('wOF2'));
+  const license = readFileSync(join(assets, 'geist-OFL.txt'), 'utf8');
+  assert.match(license, /Copyright 2024 The Geist Project Authors/);
+  assert.match(license, /SIL OPEN FONT LICENSE Version 1\.1/);
+  const notice = readFileSync(join(plugin, 'NOTICE.md'), 'utf8');
+  assert.match(notice, /Geist Pixel Square/);
+  assert.match(readFileSync(join(repo, 'THIRD_PARTY.md'), 'utf8'), /Geist Pixel Square/);
+  // Served from the binary as a data URI: the view names no font service or font URL.
+  const home = readFileSync(join(repo, 'crates/openpaperdesign-serve/src/home.html'), 'utf8');
+  assert.ok(!/fonts\.(googleapis|gstatic)|vercel\.com|@import/.test(home));
+  assert.match(home, /url\("data:font\/woff2;base64,__OPD_WORDMARK_FONT__"\)/);
 });

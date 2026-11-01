@@ -54,8 +54,9 @@ impl Change {
     }
 }
 
-/// Before-state captured by an open transaction.
-#[derive(Debug, Default)]
+/// Before-state captured by an open transaction. `Clone` (derive only) lets
+/// `Editor::preview` carry an open transaction into a throwaway editor.
+#[derive(Debug, Default, Clone)]
 pub struct Recording {
     label: String,
     before: HashMap<NodeId, Option<Node>>,

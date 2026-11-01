@@ -240,22 +240,23 @@ pub fn install_menu() -> NativeMenu {
         idx
     }
 
-    let quit = MenuItem::new("Quit paper-rs", true, acc(cmd, Code::KeyQ));
+    let quit = MenuItem::new("Quit OpenPaperDesign", true, acc(cmd, Code::KeyQ));
     cmds.insert(quit.id().clone(), MenuCmd::Quit);
     let _ = (A::Undo, Run(A::Undo));
     let snapping = CheckMenuItem::new("Snapping", true, true, acc(cmd, Code::Quote));
     cmds.insert(snapping.id().clone(), Run(A::ToggleSnapping));
-    let grid = CheckMenuItem::new("Dot Grid", true, true, None);
+    // The background pattern on or off (None by default; on is the last pattern, Dots at first).
+    let grid = CheckMenuItem::new("Background", true, false, None);
     cmds.insert(grid.id().clone(), MenuCmd::ToggleGrid);
     let help = CheckMenuItem::new("Keyboard Shortcuts", true, false, acc(cmd, Code::Slash));
     cmds.insert(help.id().clone(), MenuCmd::ToggleHelp);
 
     let sep = PredefinedMenuItem::separator;
     let app_menu = Submenu::with_items(
-        "paper-rs",
+        "OpenPaperDesign",
         true,
         &[
-            &PredefinedMenuItem::about(Some("About paper-rs"), None),
+            &PredefinedMenuItem::about(Some("About OpenPaperDesign"), None),
             &sep(),
             &PredefinedMenuItem::services(None),
             &sep(),

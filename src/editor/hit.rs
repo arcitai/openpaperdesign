@@ -43,6 +43,10 @@ pub fn node_contains(doc: &Document, id: NodeId, p: V2, zoom: f64) -> bool {
             if !draw::draw_bounds(n, r).inflate(slop).contains(p) {
                 return false;
             }
+            // An arrow's label is part of the arrow.
+            if draw::label_rect(n, r).is_some_and(|l| l.contains(p)) {
+                return true;
+            }
             let Some(path) = draw::shape_path(n, r) else {
                 return false;
             };

@@ -138,10 +138,14 @@ impl Editor {
         n
     }
 
-    /// Add an empty page after the active one and switch to it.
+    /// Add an empty page after the active one and switch to it. A page a person adds is named
+    /// "Paper N", as OpenPaperDesign shows pages (made unique as before); every existing name,
+    /// "Page 1" included, stays exactly as stored, and agents' unnamed pages
+    /// (`add_page_in_background`) keep upstream's "Page N".
     pub fn add_page(&mut self) -> usize {
         let at = self.active_page + 1;
-        self.insert_empty_page(at, None);
+        let name = format!("Paper {}", self.pages.len() + 1);
+        self.insert_empty_page(at, Some(&name));
         self.switch_page(at);
         self.status = format!("Added {}", self.pages[at].name);
         at
@@ -261,7 +265,8 @@ impl Editor {
         self.revision += 1;
     }
 
-    fn page_gen(&self, i: usize) -> u64 {
+    /// Page `i`'s history generation (what `dirty_pages` compares with its `saved_gen`).
+    pub fn page_gen(&self, i: usize) -> u64 {
         if i == self.active_page {
             self.history.generation()
         } else {

@@ -306,6 +306,10 @@ impl Writer<'_> {
         let label = esc(&nd.name);
         let aria = match &nd.kind {
             NodeKind::Text { text, .. } => format!(" aria-label=\"{}\"", esc(text)),
+            // An arrow's label (drawn as glyph outlines with its line, from `node_draw`).
+            NodeKind::Connector { label: Some(l), .. } if !l.is_empty() => {
+                format!(" aria-label=\"{}\"", esc(l))
+            }
             _ => String::new(),
         };
         let _ = writeln!(

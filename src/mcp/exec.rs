@@ -496,7 +496,8 @@ fn basic_info(host: &mut dyn Host, a: &Args) -> ToolResult {
         "nodeCount": doc.nodes.len(),
         "artboards": artboards,
         "otherTopLevelLayers": others,
-        "fontFamilies": ["Inter"],
+        // The bundled families text can be set to (`get_font_family_info` has their faces).
+        "fontFamilies": crate::model::FontFamily::ALL.map(|f| f.name()),
         "selectionCount": if page == ed.active_page { ed.selection.len() } else { 0 },
         "nodeIdFormat": "\"<page>:<n>\", e.g. \"".to_string() + &node_key(ed, page, NodeId(1)) + "\"",
     }))
@@ -540,6 +541,8 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
     );
     if let Some(t) = n.kind.text() {
         v["text"] = json!(t);
+        // The family it is drawn in (a whole layer's).
+        v["fontFamily"] = json!(n.text_style.family.name());
     }
     if let Some(ab) = artboard_of(doc, id) {
         v["artboardId"] = json!(node_key(ed, page, ab));
@@ -551,6 +554,37 @@ fn node_info(ed: &mut Editor, a: &Args) -> ToolResult {
         v["instance"] = json!(true);
     }
     v["autoLayout"] = json!(n.layout.is_some());
+    // An arrow's ends, named as create_shape takes them: the layer each end is bound to (null
+    // when the end is free), where on that layer's box it attaches (0..1 of its width and
+    // height; `inside`: on that point rather than at the outline), its route and its routed
+    // points in world space.
+    if let NodeKind::Connector {
+        points,
+        start,
+        end,
+        route,
+        label,
+        ..
+    } = &n.kind
+    {
+        // Its label (null without one), set with set_text_content or create_shape's `text`.
+        v["label"] = json!(label);
+        for (k, b) in [("start", start), ("end", end)] {
+            let b = b.filter(|b| doc.get(b.node).is_some());
+            v[format!("{k}NodeId")] = json!(b.map(|b| node_key(ed, page, b.node)));
+            v[format!("{k}Anchor")] =
+                json!(b.map(|b| {
+                    json!({"x": r2(b.fixed.x), "y": r2(b.fixed.y), "inside": b.inside})
+                }));
+        }
+        v["route"] = json!(route);
+        let o = doc.world_rect(id).unwrap_or(n.rect).min();
+        let world: Vec<Value> = points
+            .iter()
+            .map(|p| json!([r2(o.x + p.x), r2(o.y + p.y)]))
+            .collect();
+        v["points"] = json!(world);
+    }
     text(v)
 }
 
@@ -606,6 +640,18 @@ fn tree_summary(ed: &mut Editor, a: &Args) -> ToolResult {
         if let Some(t) = n.kind.text() {
             let short: String = t.chars().take(40).collect();
             line += &format!(" {:?}", short);
+        }
+        // An arrow's label and its ends: the layer each is bound to, or "free".
+        if let Some(l) = n.kind.label() {
+            let short: String = l.chars().take(40).collect();
+            line += &format!(" {:?}", short);
+        }
+        if let NodeKind::Connector { start, end, .. } = &n.kind {
+            let end_of = |b: &Option<Binding>| match b.filter(|b| doc.get(b.node).is_some()) {
+                Some(b) => format!("[{}]", node_key(ed, page, b.node)),
+                None => "free".to_string(),
+            };
+            line += &format!(" from {} to {}", end_of(start), end_of(end));
         }
         if !n.visible {
             line += " (hidden)";
@@ -835,25 +881,55 @@ fn find_nodes(ed: &mut Editor, a: &Args) -> ToolResult {
     text(json!({"count": results.len(), "results": results}))
 }
 
+/// The bundled font catalogue for the requested names: a bundled family (Inter, Geist Mono) is
+/// available in its four faces; a generic family says which one it is drawn in; any other name
+/// isn't available, and text set to it is drawn in Inter (nothing else is loaded or claimed).
 fn font_info(a: &Args) -> ToolResult {
+    use crate::model::FontFamily;
+    let styles = json!([
+        {"weight": 400, "style": "normal"}, {"weight": 700, "style": "normal"},
+        {"weight": 400, "style": "italic"}, {"weight": 700, "style": "italic"}]);
     let fams: Vec<Value> = a
         .strs("familyNames")?
         .iter()
         .map(|f| {
-            let inter = f.trim().eq_ignore_ascii_case("inter");
-            json!({
-                "family": f,
-                "available": inter,
-                "styles": if inter { json!([
-                    {"weight": 400, "style": "normal"}, {"weight": 700, "style": "normal"},
-                    {"weight": 400, "style": "italic"}, {"weight": 700, "style": "italic"}]) } else { json!([]) },
-                "note": if inter { "" } else { "not available; text renders in Inter" },
-            })
+            let exact = FontFamily::ALL
+                .into_iter()
+                .find(|b| b.name().eq_ignore_ascii_case(f.trim()));
+            match (exact, css::bundled_family(f)) {
+                (Some(b), _) => json!({
+                    "family": f,
+                    "name": b.name(),
+                    "available": true,
+                    "monospace": b.is_monospace(),
+                    "styles": styles.clone(),
+                    "note": "",
+                }),
+                (None, Some(b)) => json!({
+                    "family": f,
+                    "available": false,
+                    "rendersAs": b.name(),
+                    "styles": [],
+                    "note": format!("a generic family: text set to it renders in {}", b.name()),
+                }),
+                (None, None) => json!({
+                    "family": f,
+                    "available": false,
+                    "rendersAs": FontFamily::Inter.name(),
+                    "styles": [],
+                    "note": "not available; text renders in Inter",
+                }),
+            }
         })
         .collect();
-    text(
-        json!({"families": fams, "weights": "fontWeight ≥ 600 renders bold, below renders regular"}),
-    )
+    let bundled: Vec<&str> = FontFamily::ALL.iter().map(|f| f.name()).collect();
+    text(json!({
+        "families": fams,
+        "bundled": bundled,
+        "weights": "fontWeight ≥ 600 renders bold, below renders regular",
+        "scope": "a family belongs to a whole text layer; a character Geist Mono lacks is drawn \
+                  in Inter",
+    }))
 }
 
 fn guide(a: &Args) -> ToolResult {
@@ -2332,6 +2408,8 @@ fn create_shape(ed: &mut Editor, a: &Args) -> ToolResult {
                         route,
                         start_head,
                         end_head: if ty == "line" { head(None, Head::None)? } else { end_head },
+                        // `text` is the arrow's label (none when blank).
+                        label: (!txt.trim().is_empty()).then(|| txt.clone()),
                     };
                     n.style = style;
                     n.name = name.clone().unwrap_or_else(|| "Arrow".into());
@@ -2504,6 +2582,11 @@ fn set_text_content(ed: &mut Editor, a: &Args) -> ToolResult {
         },
         |tx, id, t| {
             let node = tx.node_mut(id).unwrap();
+            // An arrow's label, exactly as given; blank text removes it (the arrow stays).
+            if let NodeKind::Connector { label, .. } = &mut node.kind {
+                *label = (!t.trim().is_empty()).then(|| t.clone());
+                return Ok(());
+            }
             let old_len = node.kind.text().map(|s| s.chars().count()).ok_or_else(|| {
                 format!(
                     "{} is a {}, not a text layer",

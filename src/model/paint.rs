@@ -277,12 +277,67 @@ pub struct TextSpan {
     pub strike: Option<bool>,
 }
 
+/// One of the font families bundled with the app (`assets/fonts`), each with the same four
+/// static faces (Regular, Bold, Italic, Bold Italic: weights 400 and 700, upright and italic).
+/// A closed set: there is no system font, upload or download, so a document can only name a
+/// family every build that reads it can draw. Inter is the default, and what every document
+/// had before families existed. Stored by its name; a name this build doesn't have is refused
+/// when a page or clipboard payload is read (never taken for another family).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
+pub enum FontFamily {
+    #[default]
+    Inter,
+    /// Vercel's Geist Mono (SIL OFL 1.1): monospaced, for code, data and diagram labels.
+    #[serde(rename = "Geist Mono")]
+    GeistMono,
+}
+
+impl FontFamily {
+    pub const ALL: [FontFamily; 2] = [FontFamily::Inter, FontFamily::GeistMono];
+
+    /// Its name, as stored and shown ("Inter", "Geist Mono").
+    pub fn name(self) -> &'static str {
+        match self {
+            FontFamily::Inter => "Inter",
+            FontFamily::GeistMono => "Geist Mono",
+        }
+    }
+
+    /// The family with exactly this stored name.
+    pub fn from_name(name: &str) -> Option<FontFamily> {
+        FontFamily::ALL.into_iter().find(|f| f.name() == name)
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == FontFamily::Inter
+    }
+
+    /// Every glyph has the same advance.
+    pub fn is_monospace(self) -> bool {
+        self == FontFamily::GeistMono
+    }
+
+    /// Its place in [`FontFamily::ALL`].
+    pub fn index(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Node-wide text attributes beyond size and alignment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
+    /// The whole layer's font family (a family isn't a per-character style: no span has one).
+    /// Omitted when Inter, so a page or payload without another family is written exactly as
+    /// before families existed; one with another family needs page version 5
+    /// (`project::format`) or clipboard version 2 (`io::clipboard`), which older readers refuse
+    /// instead of drawing it in Inter and saving it without its family.
+    #[serde(skip_serializing_if = "FontFamily::is_default")]
+    pub family: FontFamily,
     /// Line height as a multiple of the font size (None = font default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_height: Option<f64>,
@@ -601,6 +656,55 @@ mod tests {
         assert_eq!(t.spans.len(), 3);
         t.apply_range(0, 10, |s| s.bold = Some(false));
         assert!(!t.char_style(1, 12.0, Color::BLACK).bold);
+    }
+
+    #[test]
+    fn an_inter_style_is_written_as_before_and_another_family_by_its_name() {
+        // Inter (the default) adds nothing: the bytes every earlier reader wrote and reads.
+        let inter = TextStyle {
+            bold: true,
+            line_height: Some(1.4),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&inter).unwrap();
+        assert_eq!(
+            s,
+            r#"{"bold":true,"italic":false,"line_height":1.4,"letter_spacing":0.0}"#
+        );
+        assert_eq!(serde_json::from_str::<TextStyle>(&s).unwrap(), inter);
+        assert!(TextStyle::default().is_default());
+        // Another family by its exact name, read back as itself.
+        let mono = TextStyle {
+            family: FontFamily::GeistMono,
+            ..inter.clone()
+        };
+        let m = serde_json::to_string(&mono).unwrap();
+        assert!(m.contains(r#""family":"Geist Mono""#), "{m}");
+        assert_eq!(serde_json::from_str::<TextStyle>(&m).unwrap(), mono);
+        assert!(!mono.is_default());
+        // A name this build doesn't have (or another spelling) is an error, never a guess.
+        for bad in [
+            r#"{"family":"Helvetica"}"#,
+            r#"{"family":"geist mono"}"#,
+            r#"{"family":"GeistMono"}"#,
+            r#"{"family":7}"#,
+            r#"{"family":null}"#,
+        ] {
+            assert!(serde_json::from_str::<TextStyle>(bad).is_err(), "{bad}");
+        }
+        // An explicit "Inter" is Inter, and is written back without it.
+        let explicit: TextStyle = serde_json::from_str(r#"{"family":"Inter"}"#).unwrap();
+        assert!(explicit.is_default());
+        let written = serde_json::to_string(&explicit).unwrap();
+        assert_eq!(
+            written,
+            serde_json::to_string(&TextStyle::default()).unwrap()
+        );
+        for f in FontFamily::ALL {
+            assert_eq!(FontFamily::from_name(f.name()), Some(f));
+            assert_eq!(FontFamily::ALL[f.index() as usize], f);
+        }
+        assert_eq!(FontFamily::from_name("Inter Display"), None);
     }
 
     #[test]

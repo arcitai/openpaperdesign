@@ -24,9 +24,8 @@ pub fn override_key(field: &str) -> &'static str {
         "radius" | "radii" => "radius",
         "opacity" | "blend" => "opacity",
         "text" => "text",
-        "font size" | "font" | "bold" | "italic" | "align" | "line height" | "letter spacing" => {
-            "font"
-        }
+        "font size" | "font" | "font family" | "bold" | "italic" | "align" | "line height"
+        | "letter spacing" => "font",
         "visible" => "visible",
         "name" => "name",
         _ => "layout",

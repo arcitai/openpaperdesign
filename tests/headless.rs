@@ -12,7 +12,7 @@ use paper_rs::io::{file, png, svg};
 use paper_rs::model::{Color, Node, NodeId, NodeKind};
 use paper_rs::render::frame;
 use paper_rs::render::scene::{self, ACCENT, CANVAS_BG, GUIDE};
-use paper_rs::ui::UiState;
+use paper_rs::ui::{NarrowPanel, Tier, UiState};
 
 #[test]
 fn m1_infinite_canvas_pan_and_zoom() {
@@ -546,11 +546,26 @@ fn app_full_ui_screenshot() {
     let mut e = demo::showcase();
     let sel = e.doc.get(e.doc.root[0]).unwrap().children[2];
     let mut st = UiState::default();
+    // A fresh workspace keeps Layers closed (DESIGN.md: Layers is optional and starts closed;
+    // Design starts open on a wide surface).
+    let fresh = st.panels.wanted(Tier::Wide);
+    assert!(
+        !fresh.layers && fresh.design,
+        "fresh default: Layers closed, Design open"
+    );
+    // This screenshot shows the whole workspace, so Layers is opened as a person opens it, and
+    // the appearance is Light rather than System (which follows the machine's OS).
+    st.panels.open(NarrowPanel::Layers, Tier::Wide);
+    st.appearance = egui::ThemePreference::Light;
     let img = frame::capture(g, &mut e, &mut st, [1440.0, 900.0], 2.0, |e| {
         e.zoom_to_fit();
         e.select(vec![sel]);
     });
     img.save(shot("app_demo.png")).unwrap();
+    assert!(
+        st.narrow.shown().is_some_and(|a| a.layers && a.design),
+        "both panels laid out"
+    );
     // Chrome present: left panel background and canvas background both visible.
     assert!(
         close(

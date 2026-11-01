@@ -9,8 +9,8 @@
 use crate::geom::v2;
 use crate::model::rough::{FillStyle, Rough};
 use crate::model::{
-    Align, AutoLayout, BlendMode, Color, Direction, ImageMode, Node, NodeKind, Paint, Sizing, Stop,
-    TextAlign,
+    Align, AutoLayout, BlendMode, Color, Direction, FontFamily, ImageMode, Node, NodeKind, Paint,
+    Sizing, Stop, TextAlign,
 };
 use serde_json::{Map, Value};
 
@@ -481,6 +481,39 @@ fn gradient_css(p: &Paint) -> Option<String> {
     }
 }
 
+/// The bundled family one `font-family` entry names (quoted or not, any case: "Geist Mono",
+/// `'geist mono'`, `Inter`), or the one a generic family stands for: `monospace` and
+/// `ui-monospace` are drawn in Geist Mono, `sans-serif`, `system-ui` and `ui-sans-serif` in
+/// Inter. `None` for any other name: the app has no other font.
+pub fn bundled_family(entry: &str) -> Option<FontFamily> {
+    let name = entry
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .to_ascii_lowercase();
+    if let Some(f) = FontFamily::ALL
+        .into_iter()
+        .find(|f| f.name().to_ascii_lowercase() == name)
+    {
+        return Some(f);
+    }
+    match name.as_str() {
+        "monospace" | "ui-monospace" => Some(FontFamily::GeistMono),
+        "sans-serif" | "system-ui" | "ui-sans-serif" => Some(FontFamily::Inter),
+        _ => None,
+    }
+}
+
+/// The family a CSS `font-family` list is drawn in: its first entry that is a bundled family
+/// or stands for one ([`bundled_family`]). A list naming none of them is drawn in Inter, as
+/// text with an unknown family always has been here (and `get_font_family_info` says so).
+pub fn font_family(list: &str) -> FontFamily {
+    split_top(list, ',')
+        .iter()
+        .find_map(|e| bundled_family(e))
+        .unwrap_or_default()
+}
+
 /// `url(...)` target.
 pub fn url(s: &str) -> Option<String> {
     let inner = s.trim().strip_prefix("url(")?.strip_suffix(')')?;
@@ -838,10 +871,16 @@ pub fn apply(n: &mut Node, styles: &[(String, String)], ctx: &Context) -> Applie
                 }
                 _ => false,
             },
+            "fontFamily" if is_text => {
+                // A bundled family, or Inter for a list naming none (see `font_family`).
+                n.text_style.family = font_family(v);
+                true
+            }
             "flexShrink" | "flexBasis" | "boxSizing" | "minWidth" | "minHeight" | "maxWidth"
             | "maxHeight" | "zIndex" | "cursor" | "whiteSpace" | "fontFamily" | "wordBreak"
             | "overflowWrap" => {
-                // Accepted without an equivalent; harmless. fontFamily: Inter is the only face.
+                // Accepted without an equivalent; harmless. fontFamily on a box: inherited by
+                // its text children.
                 !matches!(
                     k.as_str(),
                     "minWidth" | "minHeight" | "maxWidth" | "maxHeight"
@@ -1286,7 +1325,8 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
         NodeKind::Text {
             font_size, align, ..
         } => {
-            put("fontFamily", "Inter".into());
+            // The family it is drawn in (what an agent sets with `fontFamily`).
+            put("fontFamily", n.text_style.family.name().into());
             put("fontSize", px(*font_size));
             put(
                 "fontWeight",
@@ -1321,6 +1361,9 @@ pub fn computed(n: &Node, parent_layout: Option<&AutoLayout>, is_root: bool) -> 
             }
         }
         _ => {
+            if matches!(n.kind, NodeKind::Sticky { .. }) && !n.text_style.family.is_default() {
+                put("fontFamily", n.text_style.family.name().into());
+            }
             let layers: Vec<String> = n
                 .style
                 .fills
@@ -1474,5 +1517,59 @@ mod tests {
         );
         let r = n.style.rough.unwrap();
         assert_eq!((r.roughness, r.fill_style), (2.0, FillStyle::CrossHatch));
+    }
+
+    #[test]
+    fn font_family_maps_to_a_bundled_family_and_reads_back() {
+        for (list, want) in [
+            ("Geist Mono", FontFamily::GeistMono),
+            ("'geist mono', monospace", FontFamily::GeistMono),
+            (
+                "\"Fira Code\", ui-monospace, monospace",
+                FontFamily::GeistMono,
+            ),
+            ("Inter, sans-serif", FontFamily::Inter),
+            ("system-ui", FontFamily::Inter),
+            // None bundled: Inter, as an unknown family has always rendered.
+            ("Helvetica, Arial", FontFamily::Inter),
+            ("Georgia, serif", FontFamily::Inter),
+        ] {
+            assert_eq!(font_family(list), want, "{list}");
+        }
+        let mut t = Node::new(
+            NodeId(4),
+            NodeKind::Text {
+                text: "let x = 1;".into(),
+                font_size: 14.0,
+                auto_width: true,
+                align: TextAlign::Left,
+            },
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+        );
+        assert_eq!(computed(&t, None, true)["fontFamily"], "Inter");
+        let a = apply(
+            &mut t,
+            &parse_inline("font-family: 'Geist Mono', monospace"),
+            &Context::default(),
+        );
+        assert!(a.ignored.is_empty(), "{:?}", a.ignored);
+        assert_eq!(t.text_style.family, FontFamily::GeistMono);
+        assert_eq!(computed(&t, None, true)["fontFamily"], "Geist Mono");
+        // Back to an unknown family: drawn (and read back) as Inter, never claimed otherwise.
+        apply(
+            &mut t,
+            &parse_inline("font-family: Helvetica"),
+            &Context::default(),
+        );
+        assert_eq!(t.text_style.family, FontFamily::Inter);
+        assert_eq!(computed(&t, None, true)["fontFamily"], "Inter");
+        // On a box it is inherited by text children, so accepted there without effect.
+        let mut f = Node::new(NodeId(5), NodeKind::Rect, Rect::new(0.0, 0.0, 10.0, 10.0));
+        let a = apply(
+            &mut f,
+            &parse_inline("font-family: monospace"),
+            &Context::default(),
+        );
+        assert!(a.ignored.is_empty() && f.text_style.is_default());
     }
 }

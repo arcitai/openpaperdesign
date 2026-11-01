@@ -9,7 +9,7 @@ impl Editor {
     fn text_len(&self, id: NodeId) -> usize {
         self.doc
             .get(id)
-            .and_then(|n| n.kind.text())
+            .and_then(|n| n.kind.edit_text())
             .map_or(0, |t| t.chars().count())
     }
 
@@ -20,16 +20,34 @@ impl Editor {
         (a != te.caret).then(|| (a.min(te.caret), a.max(te.caret)))
     }
 
-    /// Replace the selection (or insert at the caret), keeping style spans attached.
+    /// Whether the open text edit may change its text: its target still exists, has text to
+    /// edit, and isn't locked, itself or through an ancestor. Lock can come while an edit is
+    /// open (it empties the selection, not the edit), so every change an edit makes asks this
+    /// of the edit's own target, never of the selection. A refused change leaves the edit,
+    /// its caret and selected characters, the document and the history as they were.
+    pub(super) fn text_edit_writable(&self) -> bool {
+        self.text_edit.as_ref().is_some_and(|te| {
+            self.doc
+                .get(te.id)
+                .is_some_and(|n| n.kind.edit_text().is_some())
+                && !self.doc.is_effectively_locked(te.id)
+        })
+    }
+
+    /// Replace the selection (or insert at the caret), keeping style spans attached. Nothing
+    /// changes while the edit's target is locked (see [`Editor::text_edit_writable`]).
     pub fn insert_text(&mut self, s: &str) {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
+        if !self.text_edit_writable() {
+            return;
+        }
         let sel = self.text_selection();
         let n_new = s.chars().count();
         let mut caret = te.caret;
         if let Some(n) = self.tx().node_mut(te.id)
-            && let Some(text) = n.kind.text_mut()
+            && let Some(text) = n.kind.edit_text_mut()
         {
             // Replacement text takes the style of the first replaced character.
             let mut inherit: Option<TextSpan> = None;
@@ -68,15 +86,15 @@ impl Editor {
         self.fit_text(te.id);
     }
 
-    fn delete_text(&mut self, a: usize, b: usize) {
+    pub(super) fn delete_text(&mut self, a: usize, b: usize) {
         let Some(te) = self.text_edit.clone() else {
             return;
         };
-        if a >= b {
+        if a >= b || !self.text_edit_writable() {
             return;
         }
         if let Some(n) = self.tx().node_mut(te.id)
-            && let Some(text) = n.kind.text_mut()
+            && let Some(text) = n.kind.edit_text_mut()
         {
             let (ba, bb) = (byte_at(text, a), byte_at(text, b));
             text.replace_range(ba..bb, "");
@@ -180,6 +198,30 @@ impl Editor {
     /// Apply a style change to the selected text range, or to whole text layers when not
     /// editing (or editing without a selection).
     pub fn style_text(&mut self, field: &str, f: impl Fn(&mut TextSpan)) {
+        self.style_text_with(field, false, f);
+    }
+
+    /// [`Editor::style_text`] from one interaction with an inspector field (typing a value in
+    /// it, dragging it): a whole-layer change coalesces with that field's previous change to the
+    /// same layers into one undo step until the field seals it (released, or its focus gone),
+    /// as the inspector's other fields do. A text range's change is part of its text edit, as
+    /// before.
+    pub fn style_text_coalesced(&mut self, field: &str, f: impl Fn(&mut TextSpan)) {
+        self.style_text_with(field, true, f);
+    }
+
+    fn style_text_with(&mut self, field: &str, coalesce: bool, f: impl Fn(&mut TextSpan)) {
+        // An arrow's label is plain text in the arrow's style: no character styles.
+        let label = self.text_edit.as_ref().is_some_and(|te| {
+            matches!(
+                self.doc.get(te.id).map(|n| &n.kind),
+                Some(NodeKind::Connector { .. })
+            )
+        });
+        // Nor does the text being edited take a style while it is locked.
+        if label || (self.text_edit.is_some() && !self.text_edit_writable()) {
+            return;
+        }
         if let (Some(te), Some((a, b))) = (self.text_edit.clone(), self.text_selection()) {
             {
                 let mut tx = self.tx();
@@ -209,7 +251,11 @@ impl Editor {
             return;
         }
         let editing = self.text_edit.is_some();
-        if !editing {
+        if !editing && coalesce {
+            // The inspector's key: the field and the layers it changes (`inspector::apply`).
+            let key = format!("{field}:{ids:?}");
+            self.begin_coalescing(&format!("Change {field}"), Some(&key));
+        } else if !editing {
             self.begin(&format!("Change {field}"));
         }
         for id in &ids {
