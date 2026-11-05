@@ -5,6 +5,10 @@
 
 # OpenPaperDesign
 
+> **Legacy desktop track:** active OpenPaperDesign development has moved to the [lightweight Paper plugin](https://github.com/gustavonline/openpaperdesign). Development of this Rust/standalone implementation is stopped.
+>
+> The source, releases and instructions below describe the legacy application. Keep existing documents and recovery information; the new plugin uses a different Paper format and does not automatically convert these projects. Website, documentation and backlog transition is tracked in [the successor issue](https://github.com/gustavonline/openpaperdesign/issues/4).
+
 A free, open-source canvas for ideas, diagrams, interfaces and visual work. Work on your own, or connect an AI agent over MCP.
 
 ![New UI/UX development snapshot rendered by paper-rs --screenshot](site/assets/product-architecture.png)
