@@ -22,7 +22,7 @@ jobs:
           python3 scripts/sync-site-assets.py --check
           python3 scripts/refresh-site-versions.py --check
           node --check site/site.js
-          node --test scripts/tests/downloads.test.mjs
+          node --test scripts/tests/downloads.test.mjs scripts/tests/site.test.mjs
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
   native:
