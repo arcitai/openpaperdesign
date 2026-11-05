@@ -26,7 +26,11 @@ test('install commands match the successor README when it is checked out beside 
   const readme=new URL('../../../openpaperdesign/README.md',import.meta.url);
   const expected=['codex plugin marketplace add gustavonline/openpaperdesign','codex plugin add openpaperdesign@openpaperdesign','/plugin marketplace add gustavonline/openpaperdesign','/plugin install openpaperdesign@openpaperdesign','/openpaperdesign:home'];
   for(const command of expected)assert.ok(html.includes(command),command);
-  if(!existsSync(readme))return t.skip('sibling successor checkout not present');
+  // GitHub's owner/repo checkout layout can make this sibling path alias the legacy checkout itself.
+  const manifest=new URL('./package.json',readme);
+  if(!existsSync(readme)||!existsSync(manifest))return t.skip('verified sibling successor checkout not present');
+  const identity=JSON.parse(readFileSync(manifest,'utf8'));
+  if(identity.repository?.url!=='https://github.com/gustavonline/openpaperdesign.git')return t.skip('sibling is not the lightweight successor');
   const source=readFileSync(readme,'utf8');
   for(const command of expected)assert.ok(source.includes(command),`successor README no longer contains: ${command}`);
 });
