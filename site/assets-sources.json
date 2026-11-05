@@ -155,6 +155,48 @@
       "output": "assets/gustavonline.jpg",
       "sha256": "85f1ef31fd1243277ffee1e4ad78db187be1275d242f399b4dfad20bd7f847dd",
       "source": "Approved owner portrait used by FamilyMark in the onlinesourdough family footer, production snapshot 2026-10-25. Reused unchanged from onlinesourdough/public/assets/gustav-linkedin-portrait.jpg."
+    },
+    {
+      "path": "site/assets/product-plugin-home.png",
+      "output": "assets/product-plugin-home.png",
+      "sha256": "d11645b37e6079c74ebb8638c7b6878d7e9dc10eb608e4e35e84e5aeb8502616",
+      "capture": {
+        "renderer": "Chromium browser, shipped lightweight Paper renderer",
+        "sourceRepository": "gustavonline/openpaperdesign",
+        "sourceRevision": "918e41ca78a89a05faa0bd644fa5effd9467452f",
+        "version": "0.7.0-preview.14",
+        "viewport": "1440x900",
+        "fixture": "Disposable locally authored Studio planning / From idea to Paper / Empty Paper examples",
+        "limitations": "Actual browser capture of the plugin renderer; no private Papers, native Codex acceptance or public release qualification implied."
+      }
+    },
+    {
+      "path": "site/assets/product-plugin-design.png",
+      "output": "assets/product-plugin-design.png",
+      "sha256": "d64f65f7d183ba6afd3c46c2f2c89df99c697b051e180fd60234d69b6158ad84",
+      "capture": {
+        "renderer": "Chromium browser, shipped lightweight Paper renderer",
+        "sourceRepository": "gustavonline/openpaperdesign",
+        "sourceRevision": "918e41ca78a89a05faa0bd644fa5effd9467452f",
+        "version": "0.7.0-preview.14",
+        "viewport": "1440x900",
+        "fixture": "Disposable locally authored Studio planning / From idea to Paper / Empty Paper examples",
+        "limitations": "Actual browser capture of the plugin renderer; no private Papers, native Codex acceptance or public release qualification implied."
+      }
+    },
+    {
+      "path": "site/assets/product-plugin-diagram.png",
+      "output": "assets/product-plugin-diagram.png",
+      "sha256": "0509b33bbbba9f103c223bf280692289f774430d8cb175daa3276ef4f183074b",
+      "capture": {
+        "renderer": "Chromium browser, shipped lightweight Paper renderer",
+        "sourceRepository": "gustavonline/openpaperdesign",
+        "sourceRevision": "918e41ca78a89a05faa0bd644fa5effd9467452f",
+        "version": "0.7.0-preview.14",
+        "viewport": "1440x900",
+        "fixture": "Disposable locally authored Studio planning / From idea to Paper / Empty Paper examples",
+        "limitations": "Actual browser capture of the plugin renderer; no private Papers, native Codex acceptance or public release qualification implied."
+      }
     }
   ]
 }
